@@ -1,0 +1,190 @@
+"""资格/符合性检查原语与三态判定：纯代码，绝不自动否决。
+
+三态语义：
+- pass              → 通过
+- recommend_reject  → **建议**否决 + 依据（必须人工确认才生效）
+- need_human        → 无法自动判定（human_only / 事实缺失），进入复核队列
+- conflict_flagged  → 冲突（大小写金额不一致、分项合计≠总价、声称与证书不符），不选边
+"""
+from __future__ import annotations
+
+from decimal import Decimal
+
+from app.engine.facts import BidFacts
+from app.engine.models import PrimitiveResult
+
+
+def run_check(check_type: str, params: dict, facts: BidFacts) -> PrimitiveResult:
+    """单一检查原语。params 来自规则包的 criterion_checks。"""
+    if check_type == "human_only":
+        return PrimitiveResult("unknown", "该项需人工判定（如密封、签字、盖章）", need_human=True)
+
+    if check_type == "document_present":
+        name = str(params.get("document") or "")
+        if "保证金" in name:
+            if facts.has_guarantee:
+                return PrimitiveResult("pass", "已找到投标保证金缴纳凭证")
+            return PrimitiveResult(
+                "fail", "投标文件中未找到投标保证金缴纳凭证", need_human=False
+            )
+        if "投标函" in name or "授权" in name:
+            # 按正文判断（章节标题在正文里）；文件名不含章节名，不能拿文件名当依据
+            if "投标函" in facts.text:
+                return PrimitiveResult("pass", "已找到投标函及授权委托书内容")
+            return PrimitiveResult("fail", "投标文件中未找到投标函及授权委托书")
+        if "资质" in name:
+            if facts.has_qualification_cert:
+                return PrimitiveResult("pass", "已找到资质证书信息")
+            return PrimitiveResult("fail", "投标文件中未找到资质证书")
+        # 兜底：按文件名关键词在章节标题/全文中找
+        keyword = name[:6]
+        if keyword and (keyword in facts.text or any(keyword in d for d in facts.documents)):
+            return PrimitiveResult("pass", f"已找到「{name}」相关内容")
+        return PrimitiveResult("fail", f"投标文件中未找到「{name}」")
+
+    if check_type == "value_in_range":
+        field = params.get("field") or ""
+        if field == "registered_capital":
+            value = facts.registered_capital
+            if value is None:
+                return PrimitiveResult("unknown", "未提取到注册资本（需人工核查营业执照）", need_human=True)
+            minimum = Decimal(str(params.get("min") or 0))
+            if value >= minimum:
+                return PrimitiveResult(
+                    "pass", f"注册资本 {_money(value)} ≥ 要求 {_money(minimum)}")
+            return PrimitiveResult(
+                "fail",
+                f"注册资本 {_money(value)} 低于要求 {_money(minimum)}",
+            )
+        return PrimitiveResult("unknown", f"未知数值字段：{field}", need_human=True)
+
+    if check_type == "count_at_least":
+        field = params.get("field") or ""
+        minimum = int(params.get("min_count") or 0)
+        min_amount = Decimal(str(params.get("min_amount_yuan") or 0))
+        if field == "performance":
+            qualified = [a for a in facts.performance_amounts if a >= min_amount]
+            if len(facts.performance_amounts) == 0:
+                return PrimitiveResult("unknown", "未提取到业绩清单（需人工核查）", need_human=True)
+            if len(qualified) >= minimum:
+                return PrimitiveResult(
+                    "pass",
+                    f"满足金额要求的业绩 {len(qualified)} 个 ≥ 要求 {minimum} 个",
+                )
+            return PrimitiveResult(
+                "fail", f"满足金额要求的业绩 {len(qualified)} 个 < 要求 {minimum} 个"
+            )
+        if field == "certificates":
+            count = len(facts.certificates)
+            if count >= minimum:
+                return PrimitiveResult("pass", f"证书 {count} 项 ≥ 要求 {minimum} 项")
+            return PrimitiveResult("fail", f"证书 {count} 项 < 要求 {minimum} 项")
+        return PrimitiveResult("unknown", f"未知计数字段：{field}", need_human=True)
+
+    if check_type == "contains_phrase":
+        phrase = str(params.get("phrase") or "")
+        if phrase and phrase in facts.text:
+            return PrimitiveResult("pass", f"已找到声明「{phrase}」")
+        return PrimitiveResult("fail", f"投标文件中未找到声明「{phrase}」")
+
+    if check_type == "math_relation":
+        return _check_math(params, facts)
+
+    return PrimitiveResult("unknown", f"未知检查类型：{check_type}", need_human=True)
+
+
+def _check_math(params: dict, facts: BidFacts) -> PrimitiveResult:
+    """报价相关算术检查：限价 / 大小写一致 / 分项合计一致。冲突（不一致）不自动选边。"""
+    problems: list[str] = []
+    max_price = params.get("max_yuan") or params.get("max")
+    if max_price is not None and facts.bid_price is not None:
+        if facts.bid_price > Decimal(str(max_price)):
+            problems.append(
+                f"投标报价 {_money(facts.bid_price)} 超过最高限价 {_money(Decimal(str(max_price)))}"
+            )
+    if facts.bid_price is not None and facts.bid_price_upper_value is not None:
+        if facts.bid_price != facts.bid_price_upper_value:
+            problems.append(
+                f"大写金额（{facts.bid_price_upper}＝{_money(facts.bid_price_upper_value)}）"
+                f"与小写金额（{_money(facts.bid_price)}）不一致"
+            )
+    if facts.bid_price is not None and facts.price_items_total is not None:
+        if facts.bid_price != facts.price_items_total:
+            problems.append(
+                f"分项报价合计（{_money(facts.price_items_total)}）"
+                f"与投标总价（{_money(facts.bid_price)}）不一致"
+            )
+    if problems:
+        return PrimitiveResult("fail", "；".join(problems), need_human=True)  # 冲突交人工
+    if facts.bid_price is None:
+        return PrimitiveResult("unknown", "未提取到投标报价", need_human=True)
+    return PrimitiveResult("pass", "报价算术关系一致且未超限价")
+
+
+def _money(value: Decimal) -> str:
+    return f"{value:,.2f}"
+
+
+# ---------------------------------------------------------------------------
+# 判定映射
+# ---------------------------------------------------------------------------
+def verdict_for(
+    criterion_code: str,
+    criterion_name: str,
+    result: PrimitiveResult,
+    on_fail: str = "recommend_reject",
+) -> str:
+    """PrimitiveResult → 三态。绝不产生"rejected"——否决必须人工确认。"""
+    if result.status == "pass":
+        return "pass"
+    if result.status == "fail":
+        if result.need_human:
+            return "conflict_flagged"  # 算术/一致性冲突 → 人工裁决
+        return "recommend_reject" if on_fail == "recommend_reject" else "need_human"
+    return "need_human"
+
+
+# ---------------------------------------------------------------------------
+# 计数类评分（商务分）：确定性
+# ---------------------------------------------------------------------------
+def score_count(criterion: dict, params: dict, facts: BidFacts) -> tuple[Decimal, str, bool]:
+    """count 类评分项。返回 (得分, 说明, 是否有冲突)。
+
+    证书类：只计证书表内的（有复印件的）；正文声称但无证书的 → 冲突标记交人工。
+    """
+    per_item = Decimal(str(params.get("per_item") or 0))
+    max_items = int(params.get("max_items") or 0)
+    max_score = Decimal(str(criterion.get("max_score") or 0))
+    field = params.get("field") or ""
+
+    conflict = False
+    if field == "certificates":
+        # 声称了但证书表里没有 → 冲突（可能是引用造假）
+        cert_keys = [_cert_key(c) for c in facts.certificates]
+        for claim in facts.cert_claims:
+            if _cert_key(claim) not in cert_keys:
+                conflict = True
+        count = len(facts.certificates)
+        detail = f"提供证书 {count} 项"
+        if conflict:
+            detail += "；正文声称的认证中有未附证书复印件的（待人工核查）"
+    elif field == "performance":
+        min_amount = Decimal(str(params.get("min_amount_yuan") or 0))
+        count = len([a for a in facts.performance_amounts if a >= min_amount])
+        detail = f"满足金额要求的业绩 {count} 个"
+    else:
+        count, detail = 0, "未知计数字段"
+
+    effective = min(Decimal(count), Decimal(max_items)) if max_items else Decimal(count)
+    score = (effective * per_item).quantize(Decimal("0.01"))
+    if max_score and score > max_score:
+        score = max_score
+    return score, f"{detail}，得 {score} 分", conflict
+
+
+def _cert_key(name: str) -> str:
+    """证书名归一：'ISO9001质量管理体系认证' 与 'ISO9001...' 视为同一项。"""
+    import re
+
+    m = re.match(r"(ISO\s?\d+|CMMI\s?\d?)", name)
+    return re.sub(r"\s+", "", m.group(1)) if m else name

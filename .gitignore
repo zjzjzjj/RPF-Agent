@@ -1,0 +1,22 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+
+# ---- 运行数据（上传原件、渲染缓存、数据库）----
+data/uploads/
+data/renders/
+data/*.db
+data/*.db-wal
+data/*.db-shm
+
+# ---- 前端 ----
+frontend/node_modules/
+frontend/dist/
+
+# ---- 本地环境 ----
+.env
+.env.local

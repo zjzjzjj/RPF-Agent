@@ -1,0 +1,200 @@
+"""投标事实抽取：从投标文件文本中确定性地提取评分所需事实。
+
+MVP 用确定性正则（对结构化程度较高的标书命中率足够，且全程可复算）；
+真实场景的长尾格式后续接 LLM 两段式抽取——抽取接口不变，只换实现。
+
+设计约束：这里抽出的只是"事实"（报价是多少、业绩有几个），**判定**由
+objective/primitives 做；事实与判定分离才能保证"客观分可复算一致"。
+"""
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from decimal import Decimal
+
+_UPPER_DIGITS = {"零": 0, "壹": 1, "贰": 2, "叁": 3, "肆": 4, "伍": 5, "陆": 6, "柒": 7, "捌": 8, "玖": 9}
+_RUN_UPPER = re.compile(r"[零壹贰叁肆伍陆柒捌玖拾佰仟万亿圆元整角分]{4,}")
+# 行首：前导分隔符* + 可选编号 + 后随分隔符*。
+# 兼容 "1 某项目" / "1. 某项目" / "1、某项目" / "（1）某项目" / "| 1 | 某项目"。
+_SEP = r"(?:[|｜]|\s)"
+_ROW_PREFIX = r"[|｜、.．\s）)]*(?:[（(]?\d+[）)]?)?[|｜、.．\s）)]*"
+_RE_PRICE_TOTAL_ROW = re.compile(
+    r"投标总价\s*[：:（(]*(?:大写|小写)?[）)]?\s*[|｜]?\s*([\d,，]+(?:\.\d+)?)"
+)
+_RE_PRICE_SYMBOL = re.compile(r"[¥￥]\s*([\d,，]+(?:\.\d+)?)")
+_RE_PRICE_TOTAL_CN = re.compile(r"投标总价人民币([零壹贰叁肆伍陆柒捌玖拾佰仟万亿圆元整]+)")
+_RE_ITEMS_TOTAL_ROW = re.compile(r"^\s*[|｜]?\s*合计\s*[|｜]?\s*([\d,，]+(?:\.\d+)?)", re.M)
+_RE_ITEM_ROW = re.compile(
+    r"^\s*" + _ROW_PREFIX + r"\s*(.{2,60}?)\s*" + _SEP + r"\s*([\d,，]+(?:\.\d+)?)\s*"
+    + _SEP + r"\s*(\d{4})\s*年",
+    re.M,
+)
+_RE_CAPITAL = re.compile(r"注册资本[：:]*人民币?([\d,，]+(?:\.\d+)?)\s*万元")
+_RE_CERT_ROW = re.compile(
+    r"^\s*" + _ROW_PREFIX + r"\s*((?:ISO\s?\d+|CMMI\s?\d?)[^\n|｜]{0,60})", re.M
+)
+# 证书行里的证书编号/有效期（用于把名称与编号切开）
+_RE_CERT_TAIL = re.compile(r"\s+[A-Z][A-Za-z]{1,8}[-–]\d|\s+\d{4}\s*年")
+_RE_CERT_CLAIM = re.compile(r"已通过\s*((?:ISO\s?\d+|CMMI\s?\d?)[^，。；；()（）]{0,30})")
+_RE_QUAL_CERT = re.compile(r"信息系统集成及服务资质")
+# 保证金：否定语境不算已缴纳（"未缴纳/无需缴纳"不得因含"缴纳"而命中）
+_RE_GUARANTEE = re.compile(r"(?<![未无需不予])缴纳\s*投标\s*保证金")
+_RE_WAN_UNIT = re.compile(r"万元")
+
+
+def parse_upper_amount(text: str) -> Decimal | None:
+    """大写金额 → Decimal。
+
+    "柒佰陆拾万元整" → 7,600,000；"柒佰零伍万元整" → 7,050,000；
+    "壹万贰仟叁佰肆拾伍元陆角柒分" → 12,345.67（角/分按小数处理，不丢精度）。
+    """
+    m = _RUN_UPPER.search(text)
+    if not m:
+        return None
+    run = m.group(0)
+    # 角/分单独处理（1 角 = 0.1 元，1 分 = 0.01 元），整数部分在 元/圆 处截断
+    fraction = Decimal(0)
+    fm = re.search(r"[圆元]?(?:([零壹贰叁肆伍陆柒捌玖])角)?(?:([零壹贰叁肆伍陆柒捌玖])分)?[整]?$", run)
+    if fm and (fm.group(1) or fm.group(2)):
+        if fm.group(1):
+            fraction += Decimal(_UPPER_DIGITS.get(fm.group(1), 0)) / 10
+        if fm.group(2):
+            fraction += Decimal(_UPPER_DIGITS.get(fm.group(2), 0)) / 100
+    integer_part = re.split(r"[圆元]", run)[0]
+    run = integer_part
+    total = 0
+    section = 0
+    number = 0
+    saw_digit = False
+    for ch in run:
+        if ch in _UPPER_DIGITS:
+            number = _UPPER_DIGITS[ch]
+            saw_digit = True
+        elif ch == "拾":
+            section += (number or 1) * 10
+            number = 0
+        elif ch == "佰":
+            section += (number or 1) * 100
+            number = 0
+        elif ch == "仟":
+            section += (number or 1) * 1000
+            number = 0
+        elif ch == "万":
+            section = (section + number) * 10_000
+            total += section
+            section = 0
+            number = 0
+        elif ch == "亿":
+            total = (total + section + number) * 100_000_000
+            section = 0
+            number = 0
+    value = total + section + number
+    if not saw_digit:
+        return None
+    return Decimal(value) + fraction
+
+
+def _money(s: str) -> Decimal:
+    return Decimal(s.replace(",", "").replace("，", ""))
+
+
+def _contextual_price(text: str) -> Decimal | None:
+    """¥ 回退必须带语境：优先取"投标总价/投标报价/报价"附近的金额。
+
+    裸取全文第一个 ¥ 会把保证金（¥50,000）当成投标报价——那种错误
+    会直接污染价格分这个最敏感的确定性输入。兜底顺序：
+    ① 报价语境附近 → ② 非保证金/押金语境且非零的金额 → ③ 放弃（宁缺勿错，
+    人工可在报价确认卡点手工录入）。
+    """
+    first_non_deposit: Decimal | None = None
+    for m in _RE_PRICE_SYMBOL.finditer(text):
+        value = _money(m.group(1))
+        context = text[max(0, m.start() - 40) : m.start()]
+        if any(k in context for k in ("投标总价", "投标报价", "总报价", "报价")):
+            return value
+        if first_non_deposit is None and value != 0 and not any(
+            k in context for k in ("保证金", "押金", "税", "利息")
+        ):
+            first_non_deposit = value
+    # 宁缺勿错：没有报价语境、且候选都被排除时返回 None（人工在确认卡点录入）
+    return first_non_deposit
+
+
+@dataclass
+class BidFacts:
+    text: str
+    bid_price: Decimal | None = None
+    bid_price_upper: str | None = None
+    bid_price_upper_value: Decimal | None = None
+    price_items_total: Decimal | None = None
+    registered_capital: Decimal | None = None
+    performance_amounts: list[Decimal] = field(default_factory=list)
+    certificates: list[str] = field(default_factory=list)  # 证书表内的（有复印件）
+    cert_claims: list[str] = field(default_factory=list)  # 正文声称的（可能无证书）
+    has_qualification_cert: bool = False
+    has_guarantee: bool = False
+    credit_statement: bool = False
+    placeholders: list[str] = field(default_factory=list)
+    documents: list[str] = field(default_factory=list)  # 章节标题
+
+
+def extract_bid_facts(text: str, documents: list[str] | None = None) -> BidFacts:
+    facts = BidFacts(text=text, documents=documents or [])
+
+    # 报价：多级策略——"投标总价"行（含"投标总价："变体）→ 带语境的 ¥ → 非保证金/押金语境的 ¥。
+    # 宁缺勿错：都取不到就留 None，由人工在报价确认卡点录入。
+    if m := _RE_PRICE_TOTAL_ROW.search(text):
+        facts.bid_price = _money(m.group(1))
+    else:
+        facts.bid_price = _contextual_price(text)
+    # 大写金额
+    if m := _RE_PRICE_TOTAL_CN.search(text):
+        facts.bid_price_upper = m.group(1)
+        facts.bid_price_upper_value = parse_upper_amount(m.group(1))
+    # 分项合计
+    if m := _RE_ITEMS_TOTAL_ROW.search(text):
+        facts.price_items_total = _money(m.group(1))
+
+    # 注册资本
+    if m := _RE_CAPITAL.search(text):
+        facts.registered_capital = _money(m.group(1)) * Decimal(10_000)
+
+    # 业绩（表格行：编号 名称 金额 年份；管道或空格分隔）
+    # 表头若声明"万元"单位，金额要做 ×10000 换算，否则出现 10000 倍低估
+    lines = text.split("\n")
+    for m in _RE_ITEM_ROW.finditer(text):
+        name, amount, year = m.group(1).strip(" |｜"), m.group(2), m.group(3)
+        if "项目名称" in name or "合同金额" in name:
+            continue
+        value = _money(amount)
+        line_no = text.count("\n", 0, m.start())
+        for back in range(line_no - 1, max(-1, line_no - 12), -1):
+            header = lines[back] if 0 <= back < len(lines) else ""
+            if "合同金额" in header or "金额" in header:
+                if _RE_WAN_UNIT.search(header):
+                    value *= Decimal(10_000)
+                break
+        facts.performance_amounts.append(value)
+
+    # 体系认证：表内（有证书）与正文声称（可能无证书）分开记
+    for m in _RE_CERT_ROW.finditer(text):
+        raw = m.group(1)
+        name = _RE_CERT_TAIL.split(raw)[0]
+        name = re.sub(r"\s+", "", name)
+        if name and name not in facts.certificates:
+            facts.certificates.append(name)
+    for m in _RE_CERT_CLAIM.finditer(text):
+        name = re.sub(r"\s+", "", m.group(1))
+        if name and name not in facts.cert_claims:
+            facts.cert_claims.append(name)
+
+    facts.has_qualification_cert = bool(_RE_QUAL_CERT.search(text))
+    facts.has_guarantee = bool(_RE_GUARANTEE.search(text))
+    facts.credit_statement = bool(re.search(r"未被列入失信被执行人名单", text))
+
+    for pattern, label in ((r"[X×]{2}项目", "XX项目占位符"), (r"待定|待补充", "待定/待补充")):
+        for m in re.finditer(pattern, text):
+            fragment = text[max(0, m.start() - 10) : m.end() + 10].replace("\n", " ")
+            facts.placeholders.append(f"{label}：…{fragment}…")
+
+    return facts

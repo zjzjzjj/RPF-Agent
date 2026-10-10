@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>评标报告 · {{ project.name }}</title>
+<style>
+  body { font-family: "Microsoft YaHei", "SimSun", sans-serif; margin: 32px auto; max-width: 1100px; color: #222; line-height: 1.65; }
+  h1 { color: #1f4e79; border-bottom: 3px solid #1f4e79; padding-bottom: 8px; }
+  h2 { color: #1f4e79; margin-top: 32px; border-left: 5px solid #1f4e79; padding-left: 10px; }
+  h3 { margin-top: 20px; }
+  table { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 13px; }
+  th, td { border: 1px solid #bbb; padding: 6px 8px; text-align: left; vertical-align: top; }
+  th { background: #eef3f8; }
+  .meta td { border: none; padding: 2px 8px 2px 0; }
+  .quote { background: #fffbe6; padding: 6px 8px; border-radius: 4px; font-size: 12.5px; }
+  .tag { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 12px; margin-right: 4px; }
+  .ok { background: #f6ffed; border: 1px solid #b7eb8f; color: #389e0d; }
+  .warn { background: #fff7e6; border: 1px solid #ffd591; color: #d46b08; }
+  .bad { background: #fff1f0; border: 1px solid #ffa39e; color: #cf1322; }
+  .muted { color: #888; font-size: 12px; }
+  .notice { background: #f0f5ff; border: 1px solid #adc6ff; border-radius: 6px; padding: 10px 14px; font-size: 13px; }
+  @media print { h2 { page-break-after: avoid; } table { page-break-inside: auto; } tr { page-break-inside: avoid; } }
+</style>
+</head>
+<body>
+<h1>评标报告</h1>
+<table class="meta">
+  <tr><td>项目名称</td><td><b>{{ project.name }}</b></td><td>项目编号</td><td>{{ project.id }}</td></tr>
+  <tr><td>招标编号</td><td>{{ project.code or "—" }}</td><td>招标人</td><td>{{ project.purchaser or "—" }}</td></tr>
+  <tr><td>最高限价</td><td>{{ project.max_price or "—" }} 元</td><td>生成时间</td><td>{{ generated_at }}</td></tr>
+  <tr><td>规则版本</td><td>v{{ rule_package.version }}（哈希 {{ rule_package.content_hash or "—" }}）</td>
+      <td>评分运行</td><td>#{{ run.id }}（{{ run.status }}）</td></tr>
+  <tr><td>模型</td><td>{{ run.llm_provider or "—" }} / {{ run.llm_model or "—" }}</td>
+      <td>运行时间</td><td>{{ run.started_at or "—" }} ~ {{ run.finished_at or "—" }}</td></tr>
+</table>
+
+<div class="notice">
+  <b>合规声明：</b>本报告由 AI 辅助评标系统生成。客观分（资格性/符合性审查、价格分、计数类评分）由确定性程序计算，
+  可复算、可审计；主观分由 AI 提供建议并附原文依据，最终分值由评审人员逐项确认。
+  所有否决类结论均需人工确认方可生效。本报告不替代评标委员会的法定评审职责，最终评审结论以评标委员会确认为准。
+</div>
+
+<h2>一、评标结果排名</h2>
+{% if ranking.warnings %}
+  {% for w in ranking.warnings %}<div class="warn tag">提示：{{ w }}</div>{% endfor %}
+{% endif %}
+<table>
+  <tr><th>名次</th><th>投标人</th><th>投标报价（元）</th><th>总分</th><th>价格分</th><th>技术分</th><th>商务分</th><th>备注</th></tr>
+  {% for row in ranking.rows %}
+  <tr>
+    <td>{{ row.rank }}</td>
+    <td>{{ row.bidder_name }}</td>
+    <td>{{ row.bid_price or "—" }}</td>
+    <td><b>{{ row.total }}</b>{% if row.missing_final %}<span class="warn tag">部分未定分</span>{% endif %}</td>
+    <td>{{ row.price_score or "—" }}</td>
+    <td>{{ row.tech_total }}</td>
+    <td>{{ row.commercial_total }}</td>
+    <td>
+      {% if row.veto_flag %}<span class="bad tag">建议否决/已否决</span>{% endif %}
+      {% for t in row.tie_explanations %}<div class="muted">{{ t }}</div>{% endfor %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+<div class="muted">
+  并列名次处理顺序：① 投标报价低者在前 ② 技术得分高者在前 ③ 商务得分高者在前 ④ 名称字典序。
+  建议否决的投标人仍参与排名以便交叉验证，其名次不构成定标依据。
+</div>
+
+<h2>二、分投标人评分明细与原文依据</h2>
+{% for bidder in bidders %}
+<h3>{{ bidder.name }}{% if bidder.bid_price %}（投标报价 {{ bidder.bid_price }} 元）{% endif %}</h3>
+<table>
+  <tr><th style="width:70px">编号</th><th style="width:150px">评分项</th><th style="width:70px">类别</th>
+      <th style="width:80px">得分</th><th style="width:110px">复核状态</th><th>招标文件依据与投标文件证据</th></tr>
+  {% for item in bidder['items'] %}
+  <tr>
+    <td>{{ item.code }}</td>
+    <td>{{ item.name }}{% if item.is_veto %}<span class="bad tag">否决项</span>{% endif %}</td>
+    <td>{{ item.category }}</td>
+    <td>
+      {% if item.is_veto %}
+        {{ item.machine_status or "—" }}
+      {% else %}
+        {{ item.final_score if item.final_score is not none else "未定分" }}
+        {% if item.max_score %} / {{ item.max_score }}{% endif %}
+        {% if item.ai_suggested_score %}<div class="muted">AI 建议 {{ item.ai_suggested_score }}</div>{% endif %}
+      {% endif %}
+    </td>
+    <td>
+      {{ item.review_status }}
+      {% if item.evaluator_actor %}<div class="muted">{{ item.evaluator_actor }}{% if item.confirm_time %} · {{ item.confirm_time }}{% endif %}</div>{% endif %}
+    </td>
+    <td>
+      {% if item.source_quote %}
+        <div class="quote">招标文件第 {{ item.source_page or "?" }} 页：{{ item.source_quote }}</div>
+      {% else %}
+        <span class="bad tag">无招标文件依据</span>
+      {% endif %}
+      {% for c in item.citations %}
+        <div class="quote" style="margin-top:4px">
+          {% if c.verified %}<span class="ok tag">已核验</span>{% else %}<span class="warn tag">未核验（{{ c.verify_method or "未定位" }}）</span>{% endif %}
+          {% if c.page_no %}投标文件第 {{ c.page_no }} 页{% endif %}
+          {% if c.node_id %}（{{ c.node_id }}）{% endif %}
+          {% if c.created_by == "human" %}<span class="tag">人工补录</span>{% endif %}
+          ：{{ c.quote }}
+        </div>
+      {% endfor %}
+      {% if not item.is_veto and not item.citations %}
+        <div class="muted">无证据引用——该项分值须人工补录证据或降级处理。</div>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+{% endfor %}
+
+<h2>三、复核与操作留痕（可答复质疑）</h2>
+<table>
+  <tr><th style="width:170px">时间</th><th style="width:120px">操作人</th><th style="width:110px">对象</th><th style="width:100px">动作</th><th>理由</th></tr>
+  {% for r in reviews %}
+  <tr>
+    <td>{{ r.created_at }}</td><td>{{ r.actor }}</td>
+    <td>{{ r.subject_type }} #{{ r.subject_id }}</td>
+    <td>{{ r.action }}</td><td>{{ r.reason }}</td>
+  </tr>
+  {% endfor %}
+</table>
+
+<h2>四、审计流水（摘要）</h2>
+<table>
+  <tr><th style="width:170px">时间</th><th style="width:120px">操作人</th><th style="width:180px">动作</th><th>对象</th></tr>
+  {% for a in audit %}
+  <tr><td>{{ a.created_at }}</td><td>{{ a.actor }}</td><td>{{ a.action }}</td><td>{{ a.subject }}</td></tr>
+  {% endfor %}
+</table>
+
+<p class="muted" style="margin-top:28px">
+  本报告由 RPF Agent 自动生成 · 规则版本哈希 {{ rule_package.content_hash or "—" }} ·
+  生成时间 {{ generated_at }} · 数据来源：招标文件、投标文件、评分运行 #{{ run.id }}
+</p>
+</body>
+</html>

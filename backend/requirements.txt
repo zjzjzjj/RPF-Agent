@@ -1,0 +1,26 @@
+# ---- 运行时（框架阶段）----
+fastapi>=0.141
+uvicorn>=0.52
+pydantic>=2.13
+pydantic-settings>=2.15
+sqlalchemy>=2.0
+alembic>=1.13
+python-multipart>=0.0.20
+sse-starlette>=3.0
+jinja2>=3.1
+
+# ---- 文档解析（MIT / Apache / BSD；不用 AGPL 的 PyMuPDF）----
+pdfplumber>=0.11
+pypdfium2>=5.0
+python-docx>=1.2
+# 可选：pymupdf（AGPL，仅本地实验用，默认关闭）——见 docs/decisions/0001
+
+# ---- LLM（OpenAI 兼容客户端，接 DeepSeek/Qwen 等）----
+openai>=1.40
+httpx>=0.28
+
+# ---- 样例数据生成 ----
+reportlab>=5.0
+
+# ---- 测试 ----
+pytest>=8.0

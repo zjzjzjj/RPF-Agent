@@ -1,0 +1,409 @@
+import { useMemo, useState } from "react";
+import { useNavigate, useParams } from "react-router-dom";
+import {
+  Alert,
+  Button,
+  Card,
+  Col,
+  Divider,
+  Input,
+  InputNumber,
+  List,
+  Modal,
+  Row,
+  Space,
+  Spin,
+  Tag,
+  Typography,
+  message,
+} from "antd";
+import { EyeInvisibleOutlined, EyeOutlined, ReloadOutlined } from "@ant-design/icons";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { api } from "../api/client";
+import { useScore, useScoreEvidence } from "../api/hooks";
+import PdfPageViewer, { type Highlight } from "../components/PdfPageViewer";
+import type { Citation } from "../types";
+import { REVIEW_STATUS_LABELS } from "../types";
+
+const METHOD_LABEL: Record<string, string> = {
+  exact: "逐字精确命中",
+  ws_insensitive: "逐字命中（忽略排版换行）",
+  prefix_fallback: "前缀回退（部分命中，待人工核对）",
+  sentence_fallback: "句读片段命中（待人工核对）",
+};
+
+export default function EvidenceWorkbench() {
+  const { pid = "", sid = "" } = useParams();
+  const scoreId = Number(sid);
+  const qc = useQueryClient();
+  const navigate = useNavigate();
+  const { data: score, isLoading } = useScore(scoreId);
+  const { data: citations } = useScoreEvidence(scoreId);
+  const [selected, setSelected] = useState<number | null>(null);
+  const [humanScore, setHumanScore] = useState<number | null>(null);
+  const [reason, setReason] = useState("");
+  const [blindDialog, setBlindDialog] = useState(false);
+  const [blindReason, setBlindReason] = useState("");
+
+  const revealed = !!score?.ai_revealed_at;
+
+  const invalidate = () => {
+    qc.invalidateQueries({ queryKey: ["score", scoreId] });
+    qc.invalidateQueries({ queryKey: ["matrix"] });
+    qc.invalidateQueries({ queryKey: ["reviewQueue", pid] });
+  };
+
+  const reveal = useMutation({
+    mutationFn: (payload: { blind_skip: boolean; reason: string }) =>
+      api.post(`/scores/${scoreId}/reveal`, payload),
+    onSuccess: () => {
+      invalidate();
+      setBlindDialog(false);
+      message.success("已解锁 AI 建议（解锁动作已留痕）");
+    },
+    onError: (e: Error) => message.error(e.message),
+  });
+
+  const review = useMutation({
+    mutationFn: (payload: { action: string; score?: number | null; reason: string }) =>
+      api.post(`/scores/${scoreId}/review`, payload),
+    onSuccess: () => {
+      invalidate();
+      setReason("");
+      message.success("复核动作已记录（含操作人、时间与理由）");
+    },
+    onError: (e: Error) => message.error(e.message),
+  });
+
+  const highlights: Highlight[] = useMemo(() => {
+    const out: Highlight[] = [];
+    for (const cit of citations ?? []) {
+      if (!cit.bbox_json || !cit.page_no) continue;
+      out.push({
+        id: cit.id,
+        page: cit.page_no,
+        boxes: cit.bbox_json,
+        pageSize: cit.page_size_json,
+        color:
+          selected === cit.id
+            ? "rgba(250, 204, 21, 0.55)"
+            : cit.verified
+              ? "rgba(134, 239, 172, 0.35)"
+              : "rgba(252, 165, 165, 0.35)",
+        label: cit.quote.slice(0, 40),
+      });
+    }
+    return out;
+  }, [citations, selected]);
+
+  const focusPage =
+    citations?.find((c) => c.id === selected)?.page_no ??
+    citations?.find((c) => c.page_no)?.page_no ??
+    1;
+
+  if (isLoading || !score) return <Spin />;
+
+  const isVeto = score.score_type === "veto";
+  const isSubjective = score.score_type === "subjective";
+
+  return (
+    <div>
+      <Space style={{ marginBottom: 8 }}>
+        <Button onClick={() => navigate(`/p/${pid}/matrix`)}>← 返回评分矩阵</Button>
+        <Typography.Title level={5} style={{ margin: 0 }}>
+          {score.bidder_name} · {score.criterion_code} {score.criterion_name}
+        </Typography.Title>
+        <Tag color={isVeto ? "red" : isSubjective ? "purple" : "blue"}>
+          {isVeto ? "否决项" : isSubjective ? "主观分（AI 仅建议）" : "确定性计算"}
+        </Tag>
+        <Tag>{REVIEW_STATUS_LABELS[score.review_status] ?? score.review_status}</Tag>
+        {score.evidence_status === "verified" && <Tag color="green">证据已核验</Tag>}
+        {score.evidence_status === "unverified" && <Tag color="orange">证据待人工核对</Tag>}
+        {score.evidence_status === "none" && !isVeto && <Tag color="red">无证据</Tag>}
+      </Space>
+
+      <Row gutter={16}>
+        <Col xs={24} lg={11}>
+          <Card size="small" title="评分项与依据">
+            {score.source_quote && (
+              <>
+                <Typography.Text type="secondary">招标文件原文（第 {score.source_page ?? "?"} 页）</Typography.Text>
+                <Typography.Paragraph style={{ background: "#fffbe6", padding: 8, borderRadius: 4 }}>
+                  {score.source_quote}
+                </Typography.Paragraph>
+              </>
+            )}
+            {score.levels.length > 0 && (
+              <>
+                <Typography.Text type="secondary">档位判据</Typography.Text>
+                <List
+                  size="small"
+                  dataSource={score.levels}
+                  renderItem={(lv) => (
+                    <List.Item>
+                      <Space align="start">
+                        <Tag>{lv.label}</Tag>
+                        <span>
+                          {lv.min}-{lv.max} 分
+                        </span>
+                        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                          {lv.criteria}
+                        </Typography.Text>
+                      </Space>
+                    </List.Item>
+                  )}
+                />
+              </>
+            )}
+          </Card>
+
+          <Card size="small" title="判定与评分" style={{ marginTop: 12 }}>
+            {!isVeto && (
+              <Alert
+                type="info"
+                showIcon
+                style={{ marginBottom: 8 }}
+                message={
+                  isSubjective
+                    ? "请先给出你的独立评分，再解锁 AI 建议（防锚定：未解锁时系统不返回 AI 分值）"
+                    : "该分项由确定性引擎计算，可复算；复核确认后生效"
+                }
+              />
+            )}
+
+            {isVeto ? (
+              <div>
+                <Typography.Paragraph>
+                  机器判定：
+                  <Tag color={score.machine_status === "pass" ? "green" : score.machine_status === "recommend_reject" ? "red" : "orange"}>
+                    {score.machine_status === "pass"
+                      ? "通过"
+                      : score.machine_status === "recommend_reject"
+                        ? "建议否决（须人工确认）"
+                        : score.machine_status === "conflict_flagged"
+                          ? "冲突，需人工裁决"
+                          : "待人工"}
+                  </Tag>
+                </Typography.Paragraph>
+                {score.warnings_json?.map((w, i) => (
+                  <Alert key={i} type="warning" showIcon message={w.message} style={{ marginBottom: 6 }} />
+                ))}
+              </div>
+            ) : (
+              <Space direction="vertical" style={{ width: "100%" }}>
+                <Space>
+                  <span>你的评分：</span>
+                  <InputNumber
+                    min={0}
+                    max={score.max_score ? Number(score.max_score) : undefined}
+                    value={humanScore ?? (score.human_score ? Number(score.human_score) : null)}
+                    onChange={(v) => setHumanScore(v)}
+                    disabled={!!score.final_score && score.review_status === "human_confirmed"}
+                  />
+                  <span>/ {score.max_score ?? "?"} 分</span>
+                </Space>
+
+                {!revealed && isSubjective && (
+                  <Space>
+                    <Button
+                      icon={<EyeOutlined />}
+                      disabled={humanScore == null}
+                      onClick={() =>
+                        reveal.mutate({ blind_skip: false, reason: "已完成独立评分，解锁 AI 建议" })
+                      }
+                    >
+                      解锁 AI 建议
+                    </Button>
+                    <Button icon={<EyeInvisibleOutlined />} onClick={() => setBlindDialog(true)}>
+                      跳过盲评直接查看
+                    </Button>
+                  </Space>
+                )}
+
+                {revealed && isSubjective && (
+                  <Alert
+                    type="success"
+                    showIcon
+                    message={
+                      <span>
+                        AI 建议：<b>{score.ai_suggested_score ?? "—"}</b> 分
+                        {score.ai_level_label ? `（${score.ai_level_label}档）` : ""}
+                        {score.ai_confidence != null ? `，置信度 ${Math.round(score.ai_confidence * 100)}%` : ""}
+                      </span>
+                    }
+                    description={
+                      <div>
+                        <div>{score.ai_reasoning}</div>
+                        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                          AI 建议仅供参考；采纳与否由你决定，且必须给出理由。
+                        </Typography.Text>
+                      </div>
+                    }
+                  />
+                )}
+
+                {!isSubjective && score.machine_score != null && (
+                  <Typography.Paragraph>
+                    确定性计算得分：<b>{score.machine_score}</b> / {score.max_score} 分
+                    {score.warnings_json?.map((w) => w.formula_explanation).filter(Boolean).map((f, i) => (
+                      <Typography.Paragraph key={i} type="secondary" style={{ fontSize: 12 }}>
+                        {f}
+                      </Typography.Paragraph>
+                    ))}
+                  </Typography.Paragraph>
+                )}
+
+                {score.warnings_json?.map((w, i) =>
+                  w.message ? <Alert key={i} type="warning" showIcon message={w.message} /> : null
+                )}
+              </Space>
+            )}
+
+            <Divider style={{ margin: "12px 0" }} />
+            <Input.TextArea
+              rows={2}
+              placeholder="复核理由（确认/改分/否决均必填，记入留痕）"
+              value={reason}
+              onChange={(e) => setReason(e.target.value)}
+            />
+            <Space style={{ marginTop: 8 }} wrap>
+              {isVeto ? (
+                <>
+                  <Button
+                    type="primary"
+                    disabled={!reason.trim()}
+                    loading={review.isPending}
+                    onClick={() => review.mutate({ action: "confirm", reason })}
+                  >
+                    确认通过（不否决）
+                  </Button>
+                  <Button
+                    danger
+                    disabled={!reason.trim() || score.machine_status !== "recommend_reject"}
+                    onClick={() =>
+                      Modal.confirm({
+                        title: "确认否决该投标人？",
+                        content: "否决为法定评审职责，确认后投标人状态将置为已否决，操作将留痕。",
+                        onOk: () => review.mutateAsync({ action: "confirm_reject", reason }),
+                      })
+                    }
+                  >
+                    确认否决
+                  </Button>
+                </>
+              ) : (
+                <>
+                  <Button
+                    type="primary"
+                    disabled={!reason.trim()}
+                    loading={review.isPending}
+                    onClick={() =>
+                      review.mutate({
+                        action: humanScore != null ? "override" : "confirm",
+                        score: humanScore,
+                        reason,
+                      })
+                    }
+                  >
+                    {humanScore != null ? "保存人工分（改分）" : "确认 AI/引擎建议"}
+                  </Button>
+                  <Button
+                    disabled={!reason.trim()}
+                    onClick={() => review.mutate({ action: "flag_conflict", reason })}
+                  >
+                    标记冲突
+                  </Button>
+                </>
+              )}
+            </Space>
+            <div style={{ marginTop: 8, fontSize: 12, color: "#888" }}>
+              注意：系统不提供"全部采纳"；每次确认都单独留痕（操作人 {score.evaluator_actor ?? "—"}
+              {score.confirm_time ? `，${score.confirm_time}` : ""}）。
+            </div>
+          </Card>
+        </Col>
+
+        <Col xs={24} lg={13}>
+          <Card
+            size="small"
+            title={`证据（${citations?.length ?? 0} 条）`}
+            extra={
+              <Button
+                size="small"
+                icon={<ReloadOutlined />}
+                onClick={() => qc.invalidateQueries({ queryKey: ["evidence", scoreId] })}
+              >
+                刷新
+              </Button>
+            }
+          >
+            <List
+              size="small"
+              dataSource={citations ?? []}
+              locale={{ emptyText: "没有证据引用——无证据不评分，该项应由人工补录证据或降级" }}
+              renderItem={(cit: Citation) => (
+                <List.Item
+                  onClick={() => setSelected(cit.id)}
+                  style={{
+                    cursor: "pointer",
+                    background: selected === cit.id ? "#e6f4ff" : undefined,
+                    borderRadius: 4,
+                  }}
+                >
+                  <Space direction="vertical" size={2} style={{ width: "100%" }}>
+                    <Space wrap>
+                      {cit.verified ? <Tag color="green">已核验</Tag> : <Tag color="red">未核验</Tag>}
+                      <Tag>{METHOD_LABEL[cit.verify_method ?? ""] ?? cit.verify_method ?? "未定位"}</Tag>
+                      <Tag>第 {cit.page_no ?? "?"} 页</Tag>
+                      {cit.node_id && <Tag color="blue">{cit.node_id}</Tag>}
+                      <Tag>{cit.created_by === "human" ? "人工补录" : cit.created_by === "engine" ? "引擎生成" : "AI 引用"}</Tag>
+                    </Space>
+                    <Typography.Text style={{ background: "#fffbe6", padding: 4, borderRadius: 4, display: "block" }}>
+                      {cit.quote}
+                    </Typography.Text>
+                    {cit.candidates_json && cit.candidates_json.length > 0 && (
+                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                        候选位置：{cit.candidates_json.map((c) => `第${c.page_no}页`).join("、")}（点击后请在右侧核对）
+                      </Typography.Text>
+                    )}
+                  </Space>
+                </List.Item>
+              )}
+            />
+          </Card>
+
+          {citations?.some((c) => c.document_id) ? (
+            <Card size="small" title="原件定位（高亮为证据所在位置）" style={{ marginTop: 12 }}>
+              <PdfPageViewer
+                documentId={citations.find((c) => c.document_id && c.page_no)!.document_id!}
+                focusPage={focusPage}
+                highlights={highlights}
+              />
+            </Card>
+          ) : null}
+        </Col>
+      </Row>
+
+      <Modal
+        open={blindDialog}
+        title="跳过盲评，直接查看 AI 建议"
+        onCancel={() => setBlindDialog(false)}
+        onOk={() => reveal.mutate({ blind_skip: true, reason: blindReason })}
+        okButtonProps={{ disabled: !blindReason.trim() }}
+      >
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 8 }}
+          message="先看 AI 建议可能产生锚定效应，影响评审独立性。跳过盲评必须说明理由（将留痕）。"
+        />
+        <Input.TextArea
+          rows={2}
+          placeholder="跳过盲评的理由"
+          value={blindReason}
+          onChange={(e) => setBlindReason(e.target.value)}
+        />
+      </Modal>
+    </div>
+  );
+}
