@@ -14,6 +14,7 @@ from decimal import Decimal
 
 from sqlalchemy import select
 
+from app import config
 from app.db.models import (
     Criterion,
     CriterionCheck,
@@ -33,13 +34,33 @@ from app.jobs.handlers import register
 from app.jobs.queue import JobContext
 from app.llm.base import LLMError
 from app.llm.gateway import Gateway, get_gateway
-from app.parsing.normalize import normalize
+from app.parsing.normalize import normalize_no_ws
 from app.rules import prompts
 from app.rules.model import ExtractedCriterion, RuleExtraction
 
 log = logging.getLogger("bid_eval.rules")
 
-MAX_COMPILE_CHARS = 30_000  # 超长文档的 MVP 截断（真实长文档按章节分段是后续优化）
+MAX_COMPILE_CHARS = 30_000  # 送进模型的招标文件字符预算（超预算按章节优先级选取，不再盲目截头）
+
+# 章节优先级：真实招标文件的"评标办法/评分细则"通常排在最后（本文档在第 89-97 页），
+# 盲目截前 N 字符会把它整段丢掉——评分项一条都抽不出来，只剩前附表的资格与否决条款。
+# 这里按关键词给页分档，先保证评分办法进模型，再补资格与否决依据。
+COMPILE_TIERS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    (
+        "scoring",
+        (
+            "评标办法", "评标方法", "评分办法", "评分细则", "评分标准", "评分内容",
+            "评审因素", "评审办法", "评审细则", "价格分", "报价部分", "最佳报价",
+            "商务部分", "技术部分", "商务分", "技术分", "主观分", "客观分",
+        ),
+    ),
+    (
+        "eligibility",
+        (
+            "资格要求", "资格审查", "符合性审查", "否决", "废标", "无效标", "投标人须知",
+        ),
+    ),
+)
 
 
 def _load_tender_text(document_id: int) -> tuple[str, Document]:
@@ -59,6 +80,96 @@ def _load_tender_text(document_id: int) -> tuple[str, Document]:
     return text, doc
 
 
+def _load_tender_pages(document_id: int) -> list[tuple[int, str]]:
+    with session_scope() as s:
+        rows = s.execute(
+            select(DocumentPage.page_no, DocumentPage.text)
+            .where(DocumentPage.document_id == document_id)
+            .order_by(DocumentPage.page_no)
+        ).all()
+    return [(int(no), txt or "") for no, txt in rows]
+
+
+def select_compile_text(pages: list[tuple[int, str]], budget: int = MAX_COMPILE_CHARS) -> tuple[str, dict]:
+    """章节感知选取：预算内优先保住评分办法，再补资格与否决依据。
+
+    输出始终按页序拼接，页间以换行相连——与 ``_load_tender_text`` 同源同序，
+    因此 LLM 给出的 quote 仍能在 document_pages 上逐字定位核验。
+
+    返回 (text, meta)，meta 记录各档入选页数与是否发生裁剪，便于审计与排查。
+    """
+    full = "\n".join(t for _no, t in pages)
+    if len(full) <= budget:
+        return full, {
+            "truncated": False,
+            "chars": len(full),
+            "total_chars": len(full),
+            "pages": [no for no, _t in pages],
+            "tiers": {},
+        }
+
+    by_page = dict(pages)
+    chosen: set[int] = set()
+    used = 0
+    tier_hits: dict[str, int] = {}
+    for name, keywords in COMPILE_TIERS:
+        # 关键词只出现在章节首页是常态：续页（如"符合性审查"否决情形 (2)-(15)）自身零命中，
+        # 若只按本页命中排序，续页会被同档位里低信息量的页挤掉。这里给相邻页半个权重，
+        # 让章节成段入选。输出顺序另行按页序重排，不受影响。
+        raw = {
+            page_no: sum(1 for k in keywords if k in text)
+            for page_no, text in pages
+            if page_no not in chosen
+        }
+        order = [p for p, _t in pages]
+        pos = {p: i for i, p in enumerate(order)}
+        scored: list[tuple[float, int]] = []
+        for page_no in order:
+            if page_no in chosen:
+                continue
+            i = pos[page_no]
+            neighbor = 0.0
+            if i > 0:
+                neighbor = max(neighbor, raw.get(order[i - 1], 0))
+            if i + 1 < len(order):
+                neighbor = max(neighbor, raw.get(order[i + 1], 0))
+            score = raw.get(page_no, 0) + 0.5 * neighbor
+            if score > 0:
+                scored.append((score, page_no))
+        scored.sort(key=lambda x: (-x[0], x[1]))
+        picked = 0
+        for _score, page_no in scored:
+            cost = len(by_page[page_no]) + 1
+            if used + cost > budget:
+                continue
+            chosen.add(page_no)
+            used += cost
+            picked += 1
+        tier_hits[name] = picked
+
+    # 预算未用满时按页序回填，尽量让模型看到上下文（不改变已入选页的相对顺序）
+    if used < budget:
+        for page_no, text in pages:
+            if page_no in chosen:
+                continue
+            cost = len(text) + 1
+            if used + cost > budget:
+                break
+            chosen.add(page_no)
+            used += cost
+        tier_hits["fill"] = len(chosen) - sum(tier_hits.values())
+
+    selected = [(no, t) for no, t in pages if no in chosen]
+    meta = {
+        "truncated": True,
+        "chars": sum(len(t) + 1 for _no, t in selected),
+        "total_chars": len(full),
+        "pages": [no for no, _t in selected],
+        "tiers": tier_hits,
+    }
+    return "\n".join(t for _no, t in selected), meta
+
+
 def _next_version(project_id: str) -> int:
     with session_scope() as s:
         row = s.execute(
@@ -69,20 +180,38 @@ def _next_version(project_id: str) -> int:
 
 
 def find_node_for_quote(document_id: int, page_no: int | None, quote: str) -> str | None:
-    """在给定页上找"包含该引文的最深节点"。"""
-    q = normalize(quote)
+    """在给定页（及相邻页）上找"包含该引文的最深节点"。
+
+    两个真实世界的坑（浙江中烟项目实测，26 条里 19 条栽在这上面）：
+
+    ① 软换行：节点文本里是换行，normalize 后成空格，而模型引文跨行逐字复制、不含
+       空格。用朴素子串包含会因这一个空格失配——引文核验通过了，节点却定位不到。
+    ② 跨页节点只归属一页：如"报价部分（60分）"节点落在 p96，而引文页码是 p97；
+       模型引文也常非逐字（尾部有出入），证据层用 prefix_fallback 才通过。
+
+    因此这里与证据核验保持同一口径：空白不敏感 + 相邻页 + 前缀逐级回退。
+    """
+    q = normalize_no_ws(quote)
     if not q:
         return None
+    page = page_no or -1
+    pages = [page] + [p for p in (page - 1, page + 1) if p > 0]
     with session_scope() as s:
         rows = s.execute(
-            select(DocNode).where(DocNode.document_id == document_id, DocNode.page == (page_no or -1))
+            select(DocNode).where(DocNode.document_id == document_id, DocNode.page.in_(pages))
         ).scalars().all()
-    best: DocNode | None = None
-    for n in rows:
-        if q in normalize(n.text or ""):
-            if best is None or n.depth > best.depth:
-                best = n
-    return best.node_id if best is not None else None
+    needles = [q] + [normalize_no_ws(quote[:n]) for n in config.PREFIX_FALLBACK_LENGTHS]
+    for needle in needles:
+        if not needle:
+            continue
+        best: DocNode | None = None
+        for n in rows:
+            if needle in normalize_no_ws(n.text or ""):
+                if best is None or n.depth > best.depth:
+                    best = n
+        if best is not None:
+            return best.node_id
+    return None
 
 
 def _triage(c: ExtractedCriterion, quote_verified: bool, has_node: bool) -> str:
@@ -271,10 +400,13 @@ def compile_rules(
     """执行一次编译，返回新草稿规则包 id。"""
     from app.llm.registry import get_provider
 
-    text, doc = _load_tender_text(document_id)
-    if len(text) > MAX_COMPILE_CHARS:
-        text = text[:MAX_COMPILE_CHARS]
-        log.warning("招标文件超长，编译截断至 %d 字符", MAX_COMPILE_CHARS)
+    _text, doc = _load_tender_text(document_id)  # 校验 kind/parse_status 并取回 doc
+    text, sel = select_compile_text(_load_tender_pages(document_id))
+    if sel["truncated"]:
+        log.warning(
+            "招标文件超长（%d 字符），按章节优先级选取 %d 字符，入选页 %s，档位命中 %s",
+            sel["total_chars"], sel["chars"], sel.get("pages"), sel.get("tiers"),
+        )
 
     gateway = get_gateway() if provider is None and model is None else Gateway(get_provider(provider, model))
     user_prompt = prompts.RULE_USER_TEMPLATE.format(clause_text=text)

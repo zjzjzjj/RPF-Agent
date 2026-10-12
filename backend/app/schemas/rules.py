@@ -98,6 +98,8 @@ class CriterionPatch(BaseModel):
     is_veto: bool | None = None
     veto_consequence: str | None = None
     required_evidence: str | None = None
+    # 引文改正：模型抽短/抽错时人工修正原文依据；改动会同步到证据引用并重新核验
+    source_quote: str | None = None
     reason: str = Field(min_length=1)
 
 
@@ -123,6 +125,9 @@ class PriceFormulaPatch(BaseModel):
     rounding: int | None = None
     exclude_invalid: bool | None = None
     tax_basis: str | None = None
+    # 扩展参数（表结构的既定扩展位）：如不对称扣分的
+    # {"deduct_rate_down": "0.4", "deduct_rate_up": "0.8"}。
+    params_json: dict[str, Any] | None = None
     reason: str = Field(min_length=1)
 
 

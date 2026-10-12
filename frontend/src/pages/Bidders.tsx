@@ -172,6 +172,7 @@ export default function Bidders() {
       </Space>
 
       <Table<Bidder>
+        scroll={{ x: 1100 }}
         rowKey="id"
         dataSource={bidders ?? []}
         pagination={false}

@@ -85,6 +85,14 @@ def compute_price_scores(bids: list[PriceBid], formula: dict) -> PriceComputatio
     exclude_invalid = bool(formula.get("exclude_invalid", True))
     deduct_rate = Decimal(str(formula.get("deduct_rate") or 0))
 
+    # 不对称扣分率：真实招标文件常见"每低 1% 扣 0.4、每高 1% 扣 0.8"这类上下不同费率，
+    # 单一 deduct_rate 表达不了（浙江中烟某项目 5 家报价即为此型）。扩展参数放
+    # params_json——表结构既定的扩展位。只给 deduct_rate 时两个方向都取它，
+    # 行为与改动前完全一致。
+    ext = formula.get("params_json") or {}
+    rate_down = Decimal(str(ext.get("deduct_rate_down", deduct_rate)))
+    rate_up = Decimal(str(ext.get("deduct_rate_up", deduct_rate)))
+
     in_benchmark = [b.price for b in bids if not (b.excluded and exclude_invalid)]
     if not in_benchmark:
         return PriceComputation(
@@ -109,10 +117,18 @@ def compute_price_scores(bids: list[PriceBid], formula: dict) -> PriceComputatio
 
         if formula_type in ("benchmark_ratio", "lowest_ratio"):
             raw = max_score * benchmark / b.price
+            calc = (f"价格分={_fmt(max_score, places)}×{_fmt(benchmark)}"
+                    f"/{_fmt(b.price)}={_fmt(raw, places)}")
         elif formula_type == "deviation_deduct":
-            raw = max_score - deduct_rate * abs(deviation)
+            rate = rate_up if deviation >= 0 else rate_down
+            raw = max_score - rate * abs(deviation)
+            calc = (f"偏离基准 {_fmt(deviation, 2)}%，每 1 个百分点扣 {_fmt(rate)} 分："
+                    f"{_fmt(max_score, places)}−{_fmt(rate)}×{_fmt(abs(deviation), 2)}"
+                    f"={_fmt(raw, places)}")
         elif formula_type == "above_deduct":
-            raw = max_score - deduct_rate * max(Decimal(0), deviation)
+            raw = max_score - rate_up * max(Decimal(0), deviation)
+            calc = (f"高于基准 {_fmt(max(Decimal(0), deviation), 2)}%，"
+                    f"每 1 个百分点扣 {_fmt(rate_up)} 分：{_fmt(raw, places)}")
         else:
             raise ValueError(f"未知价格公式类型：{formula_type}")
 
@@ -120,10 +136,7 @@ def compute_price_scores(bids: list[PriceBid], formula: dict) -> PriceComputatio
         score = _q(capped, places)
         if capped != raw:
             note += f"（未封顶前 {_fmt(raw, places)}，已按上下限截取）"
-        parts.append(
-            f"{b.name}：价格分={_fmt(max_score, places)}×{_fmt(benchmark)}/{_fmt(b.price)}"
-            f"={_fmt(raw, places)}→{score}{note}"
-        )
+        parts.append(f"{b.name}：{calc}→{score}{note}")
         results.append(
             PriceResult(
                 bidder_id=b.bidder_id,

@@ -19,9 +19,10 @@ import {
   Tag,
   Tooltip,
   Typography,
+  Upload,
   message,
 } from "antd";
-import { PlayCircleOutlined, CheckOutlined, PlusOutlined, ThunderboltOutlined } from "@ant-design/icons";
+import { PlayCircleOutlined, CheckOutlined, PlusOutlined, ThunderboltOutlined, UploadOutlined } from "@ant-design/icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import { useDocuments, useJob, useModels, useRules } from "../api/hooks";
@@ -49,6 +50,22 @@ export default function TenderRules() {
   const [detail, setDetail] = useState<CriterionOut | null>(null);
 
   const tenderDoc = documents?.find((d) => d.kind === "tender" && d.parse_status !== "pending");
+  const tenderFailed = documents?.some((d) => d.kind === "tender" && d.parse_status === "failed");
+
+  const uploadTender = useMutation({
+    mutationFn: (file: File) => {
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("kind", "tender");
+      return api.upload<{ document_id: number; job_id: number }>(`/projects/${pid}/documents`, formData);
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["documents", pid] });
+      qc.invalidateQueries({ queryKey: ["workbench", pid] });
+      message.success("招标文件已上传，解析中…");
+    },
+    onError: (e: Error) => message.error(e.message),
+  });
 
   const compile = useMutation({
     mutationFn: () =>
@@ -109,7 +126,7 @@ export default function TenderRules() {
 
   return (
     <div>
-      <Row justify="space-between" align="middle">
+      <Row justify="space-between" align="middle" gutter={[16, 12]}>
         <Col>
           <Typography.Title level={4}>招标文件与评分规则</Typography.Title>
         </Col>
@@ -138,7 +155,34 @@ export default function TenderRules() {
         </Col>
       </Row>
 
-      {!tenderDoc && <Alert type="info" showIcon message="请先在项目工作台/投标人页上传招标文件并等待解析完成" />}
+      {!tenderDoc && (
+        <Alert
+          style={{ marginTop: 12 }}
+          type="info"
+          showIcon
+          message="请先上传招标文件，解析完成后才能编译规则"
+          description={
+            <Space direction="vertical" size="small">
+              <Typography.Text type="secondary">
+                支持 PDF / Word（.docx），系统将自动解析页文本与条款树。
+                {tenderFailed ? "上次上传的文件解析失败，请更换文件重试。" : ""}
+              </Typography.Text>
+              <Upload
+                showUploadList={false}
+                accept=".pdf,.docx"
+                beforeUpload={(file) => {
+                  uploadTender.mutate(file);
+                  return false; // 阻止 antd 默认上传，统一走 mutation
+                }}
+              >
+                <Button type="primary" icon={<UploadOutlined />} loading={uploadTender.isPending}>
+                  上传招标文件
+                </Button>
+              </Upload>
+            </Space>
+          }
+        />
+      )}
 
       {job && (
         <Alert
@@ -205,6 +249,7 @@ export default function TenderRules() {
 
           <Card title="评分项（逐条确认；系统不提供“全部采纳”）" style={{ marginTop: 12 }}>
             <Table<CriterionOut>
+              scroll={{ x: 1000 }}
               rowKey="id"
               dataSource={criteria}
               pagination={false}

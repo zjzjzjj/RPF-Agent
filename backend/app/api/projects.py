@@ -76,6 +76,10 @@ def patch_project(project_id: str, body: ProjectPatch, actor: str = Depends(get_
 
 @router.get("/projects/{project_id}/workbench", response_model=WorkbenchOut)
 def get_workbench(project_id: str) -> WorkbenchOut:
+    # 先回收僵尸运行：卡在 running 但任务已不在的运行会让整个项目永远显示"评分运行中"。
+    from app.services.scoring_service import reconcile_stale_runs
+
+    reconcile_stale_runs(project_id)
     with session_scope() as s:
         project = _get_project_or_404(s, project_id)
         stages: list[StageState] = []
@@ -193,15 +197,27 @@ def get_workbench(project_id: str) -> WorkbenchOut:
         elif pending_review:
             stages.append(StageState(key="review", label="人工复核", state="active",
                                      detail=f"{pending_review} 项待复核", todo_count=int(pending_review)))
-            blockers.append(f"有 {pending_review} 项评分待人工复核")
+            # 复核不再是"阻塞"：报告可以先出草稿，把疑问标出，复核后再刷新。
+            # 这里只提示"定稿前需处理"，不阻断任何后续步骤。
         else:
             stages.append(StageState(key="review", label="人工复核", state="done", detail="全部已复核"))
 
-        # ⑥ 报告
-        if project.status == "completed":
-            stages.append(StageState(key="report", label="评标报告", state="done", detail="已生成"))
-        else:
+        # ⑥ 报告：有评分运行即可出**草稿**（未复核项在报告内逐条标注为疑问），
+        # 全部复核完毕后同一入口即为定稿。不再要求"复核完成后可生成"。
+        if run is None:
             stages.append(StageState(key="report", label="评标报告", state="pending",
-                                     detail="复核完成后可生成"))
+                                     detail="发起评分后可生成"))
+        elif run.status in ("queued", "running"):
+            stages.append(StageState(key="report", label="评标报告", state="pending",
+                                     detail="评分运行完成后可生成"))
+        elif project.status == "completed" and not pending_review:
+            stages.append(StageState(key="report", label="评标报告", state="done", detail="已定稿"))
+        elif pending_review:
+            stages.append(StageState(key="report", label="评标报告", state="active",
+                                     detail=f"可生成草稿报告（{pending_review} 项待复核）",
+                                     todo_count=0))
+        else:
+            stages.append(StageState(key="report", label="评标报告", state="active",
+                                     detail="可生成定稿报告"))
 
         return WorkbenchOut(project=ProjectOut.model_validate(project), stages=stages, blockers=blockers)

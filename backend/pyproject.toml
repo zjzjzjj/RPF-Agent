@@ -1,0 +1,14 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rpf-agent-backend"
+version = "0.1.0"
+description = "RPF Agent backend app package（editable install 供兄弟项目复用 parsing/rules/llm/evidence/jobs）"
+requires-python = ">=3.11"
+# 依赖留在 requirements.txt（单一来源，避免双源版本漂移）；本包只负责让 `app` 可导入
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["app*"]

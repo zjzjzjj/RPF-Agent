@@ -19,6 +19,11 @@
   .bad { background: #fff1f0; border: 1px solid #ffa39e; color: #cf1322; }
   .muted { color: #888; font-size: 12px; }
   .notice { background: #f0f5ff; border: 1px solid #adc6ff; border-radius: 6px; padding: 10px 14px; font-size: 13px; }
+  .draft { background: #fff1f0; border: 2px solid #ff7875; border-radius: 6px; padding: 12px 16px; margin: 16px 0; }
+  .draft h2 { border: none; color: #cf1322; margin: 0 0 6px 0; padding: 0; font-size: 18px; }
+  .sev-high { background: #fff1f0; border: 1px solid #ffa39e; color: #cf1322; }
+  .sev-medium { background: #fff7e6; border: 1px solid #ffd591; color: #d46b08; }
+  .sev-low { background: #f6ffed; border: 1px solid #b7eb8f; color: #389e0d; }
   @media print { h2 { page-break-after: avoid; } table { page-break-inside: auto; } tr { page-break-inside: avoid; } }
 </style>
 </head>
@@ -28,11 +33,28 @@
   <tr><td>项目名称</td><td><b>{{ project.name }}</b></td><td>项目编号</td><td>{{ project.id }}</td></tr>
   <tr><td>招标编号</td><td>{{ project.code or "—" }}</td><td>招标人</td><td>{{ project.purchaser or "—" }}</td></tr>
   <tr><td>最高限价</td><td>{{ project.max_price or "—" }} 元</td><td>生成时间</td><td>{{ generated_at }}</td></tr>
+  <tr><td>报告状态</td><td><b>{{ status_label }}</b></td>
+      <td>复核进度</td><td>{{ progress.settled }} / {{ progress.total }} 已处置{% if progress.open %}（{{ progress.open }} 项待处理）{% endif %}</td></tr>
   <tr><td>规则版本</td><td>v{{ rule_package.version }}（哈希 {{ rule_package.content_hash or "—" }}）</td>
       <td>评分运行</td><td>#{{ run.id }}（{{ run.status }}）</td></tr>
   <tr><td>模型</td><td>{{ run.llm_provider or "—" }} / {{ run.llm_model or "—" }}</td>
       <td>运行时间</td><td>{{ run.started_at or "—" }} ~ {{ run.finished_at or "—" }}</td></tr>
 </table>
+
+{% if status == "draft" %}
+<div class="draft">
+  <h2>⚠ 本报告为草稿，不得作为最终评审结论</h2>
+  <p>尚有 <b>{{ progress.open }}</b> 项评分未经人工处置，其中 <b>{{ progress.blocking }}</b> 项为需优先裁决事项
+     （建议否决、判定冲突、证据未核验）。</p>
+  <p>草稿中的排名与总分为<b>暂定值</b>：未定分项不计入总分，建议否决者仍参与排名仅供交叉验证。
+     人工复核完成后，从同一入口重新生成即为<b>定稿报告</b>，草稿与定稿共用同一规则版本哈希，可逐项对照。</p>
+  <p class="muted">疑问逐条列于「三、疑问清单」。</p>
+</div>
+{% else %}
+<div class="notice" style="background:#f6ffed;border-color:#b7eb8f">
+  <b>本报告为定稿：</b>全部 {{ progress.total }} 项评分均已人工处置（疑问清单已清空），可提交评标委员会确认。
+</div>
+{% endif %}
 
 <div class="notice">
   <b>合规声明：</b>本报告由 AI 辅助评标系统生成。客观分（资格性/符合性审查、价格分、计数类评分）由确定性程序计算，
@@ -84,7 +106,9 @@
       {% else %}
         {{ item.final_score if item.final_score is not none else "未定分" }}
         {% if item.max_score %} / {{ item.max_score }}{% endif %}
-        {% if item.ai_suggested_score %}<div class="muted">AI 建议 {{ item.ai_suggested_score }}</div>{% endif %}
+        {% if item.ai_suggested_score %}<div class="muted">AI 建议 {{ item.ai_suggested_score }}</div>
+        {% elif item.ai_revealed %}<div class="muted">AI 未给出建议分</div>
+        {% else %}<div class="muted">AI 建议未解锁（防锚定：先给独立分再解锁）</div>{% endif %}
       {% endif %}
     </td>
     <td>
@@ -115,7 +139,67 @@
 </table>
 {% endfor %}
 
-<h2>三、复核与操作留痕（可答复质疑）</h2>
+<h2>三、疑问清单（待人工处置）</h2>
+{% if not open_questions %}
+<div class="notice" style="background:#f6ffed;border-color:#b7eb8f">无疑问项——全部评分已人工处置。</div>
+{% else %}
+<div class="muted">
+  共 {{ progress.open }} 项，涉及 {{ progress.criteria_open }} 个评分项，按严重度排序。
+  高severity项在处置前<b>不得作为定标依据</b>。处置入口：复核队列 / 评分矩阵 → 点进证据核验工作台。
+</div>
+
+<h3>按评分项汇总（处置入口一致，可批量裁决）</h3>
+<table>
+  <tr><th>严重度</th><th>类型</th><th>评分项</th><th>类别</th><th>涉及投标人</th><th>所需处置</th></tr>
+  {% for g in open_by_criterion %}
+  <tr>
+    <td><span class="tag sev-{{ g.severity }}">{{ {"high":"高","medium":"中","low":"低"}[g.severity] }}</span></td>
+    <td>{{ g.label }}</td>
+    <td>{{ g.code }} {{ g.criterion }}{% if g.max_score %}（满分 {{ g.max_score }}）{% endif %}</td>
+    <td>{{ g.category }}</td>
+    <td>
+      {% for b in g.bidders %}
+        <div>{{ b.bidder }}{% if b.final_score is not none %}（当前 {{ b.final_score }}）{% endif %}</div>
+      {% endfor %}
+    </td>
+    <td>
+      {{ g.action }}
+      {% if g.bidders and g.bidders[0].machine_message %}
+        <div class="muted">机器判定（以首家为例）：{{ g.bidders[0].machine_message }}</div>
+      {% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+
+<h3>逐条明细</h3>
+<table>
+  <tr><th>严重度</th><th>类型</th><th>投标人</th><th>评分项</th><th>类别</th>
+      <th>当前状态</th><th>疑问与所需处置</th></tr>
+  {% for q in open_questions %}
+  <tr>
+    <td><span class="tag sev-{{ q.severity }}">{{ {"high":"高","medium":"中","low":"低"}[q.severity] }}</span></td>
+    <td>{{ q.label }}</td>
+    <td>{{ q.bidder }}</td>
+    <td>{{ q.code }} {{ q.criterion }}{% if q.max_score %}（满分 {{ q.max_score }}）{% endif %}</td>
+    <td>{{ q.category }}</td>
+    <td>
+      {{ q.review_status }}
+      {% if q.final_score is not none %}<div class="muted">当前分 {{ q.final_score }}</div>
+      {% else %}<div class="muted">未定分</div>{% endif %}
+      {% if q.evidence_status != "verified" %}<div class="muted">证据：{{ q.evidence_status }}</div>{% endif %}
+    </td>
+    <td>
+      {{ q.action }}
+      {% if q.machine_message %}<div class="muted">机器判定：{{ q.machine_message }}</div>{% endif %}
+      {% if q.source_page %}<div class="quote">招标文件第 {{ q.source_page }} 页：{{ q.source_quote }}</div>{% endif %}
+    </td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+
+<h2>四、复核与操作留痕（可答复质疑）</h2>
 <table>
   <tr><th style="width:170px">时间</th><th style="width:120px">操作人</th><th style="width:110px">对象</th><th style="width:100px">动作</th><th>理由</th></tr>
   {% for r in reviews %}
@@ -127,7 +211,7 @@
   {% endfor %}
 </table>
 
-<h2>四、审计流水（摘要）</h2>
+<h2>五、审计流水（摘要）</h2>
 <table>
   <tr><th style="width:170px">时间</th><th style="width:120px">操作人</th><th style="width:180px">动作</th><th>对象</th></tr>
   {% for a in audit %}

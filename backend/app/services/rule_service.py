@@ -17,6 +17,7 @@ from app.db.models import (
     Criterion,
     CriterionCheck,
     CriterionLevel,
+    EvidenceCitation,
     PackageValidation,
     PriceFormula,
     ReviewRecord,
@@ -26,6 +27,7 @@ from app.db.models import (
 from app.db.session import session_scope
 from app.deps import get_actor  # noqa: F401  （API 层使用）
 from app.errors import Conflict, FrozenPackageError, NotFound, ValidationFailed
+from app.evidence.verifier import verify_citation
 from app.rules import compiler
 from app.rules.freeze import build_snapshot, content_hash
 
@@ -76,7 +78,8 @@ def edit_price_formula(
     if not reason.strip():
         raise ValidationFailed("修改价格公式必须填写理由（公式直接决定价格分）")
     allowed = {"formula_type", "benchmark_method", "trim_ratio", "k", "deduct_rate",
-               "upper_bound", "lower_bound", "rounding", "exclude_invalid", "tax_basis"}
+               "upper_bound", "lower_bound", "rounding", "exclude_invalid", "tax_basis",
+               "params_json"}
     with session_scope() as s:
         pkg = _require_draft(package_id)
         formula = s.execute(
@@ -275,7 +278,7 @@ def edit_criterion(criterion_id: int, patch: dict[str, Any], actor: str, reason:
     if not reason.strip():
         raise ValidationFailed("修改评分项必须填写理由")
     allowed = {"name", "description", "max_score", "weight", "category", "score_type",
-               "is_veto", "veto_consequence", "required_evidence"}
+               "is_veto", "veto_consequence", "required_evidence", "source_quote"}
     with session_scope() as s:
         crit = s.get(Criterion, criterion_id)
         if crit is None:
@@ -289,16 +292,44 @@ def edit_criterion(criterion_id: int, patch: dict[str, Any], actor: str, reason:
                 new_value_json={k: str(v) for k, v in patch.items() if k in allowed},
             )
         )
+        quote_changed = False
         for key, value in patch.items():
             if key in allowed:
                 old = getattr(crit, key)
+                if key == "source_quote" and value != old:
+                    quote_changed = True
                 setattr(crit, key, value)
                 _record_edit(s, crit, key, old, value, actor, reason)
         crit.status = "verified"  # 人工处置过即视为已确认（理由已留痕）
         s.add(crit)
         s.flush()
+        citation_id = None
+        if quote_changed:
+            # 引文被人工改正：同步到证据引用并重新核验，否则"无证据不评分"名存实亡
+            # ——旧引文（模型抽短/抽错）核验不过，改了正文却不改证据，两者会长期不一致。
+            cit = s.execute(
+                select(EvidenceCitation).where(EvidenceCitation.criterion_id == criterion_id).limit(1)
+            ).scalar_one_or_none()
+            if cit is not None:
+                cit.quote = crit.source_quote or ""
+                cit.verified = False
+                cit.verify_method = None
+                s.add(cit)
+                s.flush()
+                citation_id = cit.id
         s.expunge(crit)
         package_id = crit.package_id
+    if citation_id is not None:
+        cit = verify_citation(citation_id)
+        if cit is not None:
+            with session_scope() as s:
+                crit = s.get(Criterion, criterion_id)
+                if crit is not None:
+                    crit.source_page = cit.page_no
+                    crit.source_node_id = compiler.find_node_for_quote(
+                        cit.document_id or 0, cit.page_no, cit.quote or ""
+                    )
+                    s.add(crit)
     compiler.run_validations(package_id)
     return crit
 

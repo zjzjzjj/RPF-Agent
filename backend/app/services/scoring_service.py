@@ -91,14 +91,71 @@ def create_run(
 
 @register("evaluate")
 def evaluate_job(ctx: JobContext, payload: dict) -> dict:
-    run_id = int(payload["run_id"])
-    provider = payload.get("provider")
-    model = payload.get("model")
-    stages_total = 4
-    ctx.start(total=stages_total, message="加载规则快照")
-    summary = execute_run(run_id, provider=provider, model=model, ctx=ctx)
+    # run_id 解析与 ctx.start 都放进 try：create_run 是先提交 status='queued' 的运行
+    # 再 submit 任务，任何在 execute_run 之前抛出的异常（payload 缺键、ctx 写库失败）
+    # 都会让运行永久停在 queued——既不是 running 也不是终态，谁也回收不了。
+    run_id: int | None = None
+    try:
+        run_id = int(payload["run_id"])
+        provider = payload.get("provider")
+        model = payload.get("model")
+        ctx.start(total=4, message="加载规则快照")
+        summary = execute_run(run_id, provider=provider, model=model, ctx=ctx)
+    except Exception as exc:
+        # 运行状态必须与任务结局一致：失败不回写会留下"永远运行中/永远排队"的僵尸运行，
+        # 工作台与报告都取最新运行，于是整个项目卡死再也出不来。
+        if run_id is not None:
+            with session_scope() as s:
+                run = s.get(EvaluationRun, run_id)
+                if run is not None and run.status in ("queued", "running"):
+                    run.status = "failed"
+                    run.finished_at = utcnow()
+                    run.config_json = {
+                        **(run.config_json or {}),
+                        "error": f"{type(exc).__name__}: {exc}"[:500],
+                    }
+                    s.add(run)
+        raise
     ctx.advance(message="完成")
     return summary
+
+
+def reconcile_stale_runs(project_id: str) -> int:
+    """把"已无对应任务"的非终态运行标记为失败，返回修复条数。
+
+    与 jobs 的僵尸回收同一思路：进程被杀、任务异常未回写等情况下，运行会永久停在
+    queued/running，挡住工作台与报告。**必须同时扫 queued**——create_run 先落库
+    queued 再 submit，submit 失败或任务在进入 execute_run 前就抛错时，
+    运行停在 queued，只扫 running 会把它漏掉。
+    """
+    from app.db.models import Job
+
+    fixed = 0
+    with session_scope() as s:
+        runs = s.execute(
+            select(EvaluationRun).where(
+                EvaluationRun.project_id == project_id,
+                EvaluationRun.status.in_(("queued", "running")),
+            )
+        ).scalars().all()
+        for run in runs:
+            alive = s.execute(
+                select(Job.id).where(
+                    Job.kind == "evaluate",
+                    Job.status.in_(("queued", "running")),
+                    Job.payload_json["run_id"].as_integer() == run.id,
+                ).limit(1)
+            ).first()
+            if alive is None:
+                run.status = "failed"
+                run.finished_at = utcnow()
+                run.config_json = {
+                    **(run.config_json or {}),
+                    "error": "运行中断（对应任务已结束或进程重启），已自动标记为失败",
+                }
+                s.add(run)
+                fixed += 1
+    return fixed
 
 
 # ---------------------------------------------------------------------------
@@ -237,14 +294,17 @@ def execute_run(
         facts = facts_by_bidder[bid_id]
         for c in count_items:
             params = c.get("params") or {}
-            score, detail, conflict = score_count(c, params, facts)  # type: ignore[arg-type]
+            result = score_count(c, params, facts)  # type: ignore[arg-type]
+            # unresolved 以结构化键落库：下游（报告疑问清单）直接判读，
+            # 不再靠匹配 detail 的中文措辞——那种耦合已经断过一次。
             _upsert_score(
                 run_id, bid_id, c,
-                machine_score=score,
+                machine_score=result.score,
                 machine_status="pass",
-                review_status="conflict_flagged" if conflict else "pending",
-                final_score=score,
-                warnings_json=([{"message": detail}]),
+                review_status="conflict_flagged" if result.conflict else "pending",
+                final_score=result.score,
+                warnings_json=([{"message": result.detail, "unresolved": result.unresolved}]
+                               if result.unresolved else [{"message": result.detail}]),
             )
             stats["objective"] += 1
 

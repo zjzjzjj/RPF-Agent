@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from decimal import Decimal
 
 from app.engine.facts import BidFacts
@@ -147,8 +148,50 @@ def verdict_for(
 # ---------------------------------------------------------------------------
 # 计数类评分（商务分）：确定性
 # ---------------------------------------------------------------------------
-def score_count(criterion: dict, params: dict, facts: BidFacts) -> tuple[Decimal, str, bool]:
-    """count 类评分项。返回 (得分, 说明, 是否有冲突)。
+@dataclass
+class CountResult:
+    """计数类评分结果。
+
+    ``unresolved`` 是**机器可读**的"算不出来"原因，供下游（报告疑问清单）直接判读：
+    靠匹配 detail 里的中文措辞会让两处代码静默漂移——该耦合已经断过一次
+    （score_count 说"满足金额要求的业绩 0 个"，而下游在找"未提取到业绩清单"）。
+    """
+
+    score: Decimal
+    detail: str
+    conflict: bool
+    # None=正常算出 | "field_missing"=未给出计数口径 | "no_facts"=未抽取到事实
+    unresolved: str | None = None
+
+
+def _infer_count_field(criterion: dict) -> str | None:
+    """field 缺失时按评分项名称推断"数什么"。
+
+    抽取契约长期没有 field 字段（提示词也没写），真实模型路径下 count 项因此恒 0 分。
+
+    推断必须保守，只认**明确属于投标人主体**的两类，且只看名称（描述里常出现
+    "验收证书""认证"等无关词，用它判断会把业绩项误判成证书项）：
+    - 名称须同时含主体词（投标人/公司/企业）与口径词（业绩/案例 → performance，
+      认证/资质/证书 → certificates）
+    - 人员级（项目负责人、工程师、团队…）一律不推断：facts 模型里没有个人业绩桶，
+      猜错会产出静默错误的数字，比可见的 0 分更危险。
+    """
+    name = str(criterion.get("name") or "")
+    if any(k in name for k in ("项目负责人", "工程师", "人员", "团队", "项目经理", "拟派")):
+        return None  # 人员级：不猜
+    if not any(k in name for k in ("投标人", "公司", "企业", "供应商")):
+        return None  # 主体不明确：不猜
+    # 业绩优先于证书：业绩项的名称里也可能出现"证书"（如"业绩证明材料"），
+    # 先判业绩可避免把业绩误算成证书。
+    if any(k in name for k in ("业绩", "案例", "合同")):
+        return "performance"
+    if any(k in name for k in ("认证", "资质", "证书", "体系")):
+        return "certificates"
+    return None
+
+
+def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
+    """count 类评分项。
 
     证书类：只计证书表内的（有复印件的）；正文声称但无证书的 → 冲突标记交人工。
     """
@@ -156,6 +199,15 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> tuple[Decimal
     max_items = int(params.get("max_items") or 0)
     max_score = Decimal(str(criterion.get("max_score") or 0))
     field = params.get("field") or ""
+    inferred = ""
+    unresolved: str | None = None
+    if not field:
+        guessed = _infer_count_field(criterion)
+        if guessed:
+            field = guessed
+            inferred = "（计数字段由评分项名称推断，请核对）"
+        else:
+            unresolved = "field_missing"
 
     conflict = False
     if field == "certificates":
@@ -165,21 +217,36 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> tuple[Decimal
             if _cert_key(claim) not in cert_keys:
                 conflict = True
         count = len(facts.certificates)
-        detail = f"提供证书 {count} 项"
-        if conflict:
-            detail += "；正文声称的认证中有未附证书复印件的（待人工核查）"
+        # 一条都没抽到 ≠ 一条都不合格：前者是抽取能力问题，必须与"确实 0 项"区分开，
+        # 否则 0 分会被当成评分结论进入总分。
+        if not facts.certificates and not facts.cert_claims:
+            detail = "未提取到证书清单（需人工核查）"
+            unresolved = "no_facts"
+        else:
+            detail = f"提供证书 {count} 项"
+            if conflict:
+                detail += "；正文声称的认证中有未附证书复印件的（待人工核查）"
     elif field == "performance":
         min_amount = Decimal(str(params.get("min_amount_yuan") or 0))
         count = len([a for a in facts.performance_amounts if a >= min_amount])
-        detail = f"满足金额要求的业绩 {count} 个"
+        if not facts.performance_amounts:
+            detail = "未提取到业绩清单（需人工核查）"
+            unresolved = "no_facts"
+        else:
+            detail = f"满足金额要求的业绩 {count} 个"
     else:
-        count, detail = 0, "未知计数字段"
+        count = 0
+        detail = "未知计数字段（评分项未给出 field，且无法从名称安全推断）"
+        unresolved = "field_missing"
 
     effective = min(Decimal(count), Decimal(max_items)) if max_items else Decimal(count)
     score = (effective * per_item).quantize(Decimal("0.01"))
     if max_score and score > max_score:
         score = max_score
-    return score, f"{detail}，得 {score} 分", conflict
+    return CountResult(
+        score=score, detail=f"{detail}，得 {score} 分{inferred}", conflict=conflict,
+        unresolved=unresolved,
+    )
 
 
 def _cert_key(name: str) -> str:

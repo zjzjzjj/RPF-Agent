@@ -31,6 +31,13 @@ RULE_SYSTEM_PROMPT = """你是一名严谨的招标文件结构化助手。任�
   | "count_at_least"（业绩/数量门槛）| "contains_phrase"（须包含声明）| "math_relation"（报价算术/限价）
   | "human_only"（无法自动判定，如密封、签字）
 - params: check_type 的参数，如 {"min": 10000000} 或 {"document": "投标保证金缴纳凭证"}
+- count_at_least 必须在 **params 内**给出 field（数什么），只能是这两个值之一：
+  "performance"（业绩案例数）| "certificates"（认证/资质证书数）
+  例：业绩每个得 2 分 → {"check_type":"count_at_least","params":{"field":"performance","per_item":"2"}}
+      认证每项得 1 分 → {"check_type":"count_at_least","params":{"field":"certificates","per_item":"1"}}
+  若原文还有金额门槛，在 params 内另加 "min_amount_yuan"：
+      {"field":"performance","per_item":"2","min_amount_yuan":"600000"}
+  field 写在 params 之外会被丢弃，该评分项将无法计算、只能得 0 分。
 - formula 参数（price 类）：formula_type:"benchmark_ratio"，benchmark_method:"average"，
   k: 基准价系数（如 0.95），upper_bound: 价格分上限，rounding: 保留小数位
 - count 类：count_per_item: 每单位得分

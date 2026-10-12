@@ -238,6 +238,69 @@ export interface Ranking {
   warnings: string[];
 }
 
+/** 报告疑问条目：草稿报告把待处置项逐条标出，复核后刷新即为定稿。 */
+export interface OpenQuestion {
+  kind: string;
+  severity: "high" | "medium" | "low";
+  label: string;
+  action: string;
+  machine_message: string;
+  bidder: string;
+  bidder_id: number;
+  score_id: number;
+  code: string;
+  criterion: string;
+  category: string;
+  max_score: string | null;
+  final_score: string | null;
+  machine_status: string | null;
+  review_status: string;
+  evidence_status: string;
+  source_page: number | null;
+  source_quote: string | null;
+}
+
+export interface ReportProgress {
+  total: number;
+  settled: number;
+  open: number;
+  blocking: number;
+  by_kind: Record<string, number>;
+  criteria_open: number;
+}
+
+/** 按评分项聚合的疑问：同一否决条款在每家投标人上各报一条，聚合后可批量裁决。 */
+export interface OpenByCriterion {
+  code: string;
+  criterion: string;
+  category: string;
+  max_score: string | null;
+  kind: string;
+  severity: OpenQuestion["severity"];
+  label: string;
+  action: string;
+  bidders: {
+    bidder: string;
+    bidder_id: number;
+    score_id: number;
+    final_score: string | null;
+    machine_message: string;
+  }[];
+}
+
+export interface ReportOut {
+  status: "draft" | "final";
+  status_label: string;
+  progress: ReportProgress;
+  open_questions: OpenQuestion[];
+  open_by_criterion: OpenByCriterion[];
+  project: { id: string; name: string };
+  run: { id: number; status: string };
+  rule_package: { version: number | null; content_hash: string | null };
+  generated_at: string;
+  ranking: Ranking;
+}
+
 export interface ReviewQueueItem {
   score_record_id: number;
   bidder_id: number;

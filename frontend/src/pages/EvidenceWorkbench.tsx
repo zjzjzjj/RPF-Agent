@@ -122,7 +122,7 @@ export default function EvidenceWorkbench() {
         {score.evidence_status === "none" && !isVeto && <Tag color="red">无证据</Tag>}
       </Space>
 
-      <Row gutter={16}>
+      <Row gutter={[16, 16]}>
         <Col xs={24} lg={11}>
           <Card size="small" title="评分项与依据">
             {score.source_quote && (

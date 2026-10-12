@@ -120,6 +120,45 @@ def _contextual_price(text: str) -> Decimal | None:
     return first_non_deposit
 
 
+# 报价标签后跟金额的窗口长度。真实开标一览表把金额放在表头**下一行**
+# （"投标总价（含税） 税率\n1 壹佰柒拾肆万玖仟元整 6% …"），同行正则够不着，
+# 必须向后看一小段；窗口取窄值以免越过表格读到别的金额（如投标保证金）。
+_PRICE_LABEL_WINDOW = 160
+# "小写：￥1,526,400.00 元" —— 真实标书常在标签与数字之间夹货币符号，必须容忍
+_RE_PRICE_LOWER_LABEL = re.compile(r"小写[：:\s]*[¥￥]?\s*([\d,，]+(?:\.\d+)?)")
+# "投标价（含增值税,人民币元） 1749000.00" —— 分项报价表的含税合计行。
+# (?!\s*不) 必需："不含增值税"含"含增值税"子串，少了它会把不含税价当成投标报价。
+_RE_PRICE_INCL_VAT = re.compile(
+    r"投标价\s*[（(](?!\s*不)[^）)\n]{0,30}含增值税[^）)\n]{0,30}[）)]\s*[|｜]?\s*([\d,，]+(?:\.\d+)?)"
+)
+_RE_TOTAL_LABEL = re.compile(r"投标总价")
+
+
+def _price_near_total_label(text: str) -> Decimal | None:
+    """在"投标总价"标签之后的窗口里找金额（先小写、再大写）。
+
+    真实标书里报价有三种写法，同行正则都够不着，这里统一兜住：
+    ① 独立开标一览表：``大写:壹佰柒拾玖万陆仟柒佰元`` / ``小写：1796700``
+    ② 正文表格：``投标总价（含税） 税率`` 换行后 ``1 壹佰柒拾肆万玖仟元整 6%``
+    ③ 分项报价表：``投标价（含增值税,人民币元） 1749000.00``
+
+    大写只认 4 字以上的连续大写金额。取数只看表头**之后的前几行**并取该行首个大写：
+    "投标保证金"是表头列名，出现在报价之前，按邻近字样排除会把真报价误杀、
+    反而取到后面那列的保证金金额。
+    """
+    for m in _RE_TOTAL_LABEL.finditer(text):
+        tail = text[m.end() : m.end() + _PRICE_LABEL_WINDOW]
+        if lm := _RE_PRICE_LOWER_LABEL.search(tail):
+            return _money(lm.group(1))
+        for line in tail.split("\n")[:3]:
+            if lm := _RE_PRICE_LOWER_LABEL.search(line):
+                return _money(lm.group(1))
+            if um := _RUN_UPPER.search(line):
+                if value := parse_upper_amount(um.group(0)):
+                    return value
+    return None
+
+
 @dataclass
 class BidFacts:
     text: str
@@ -141,9 +180,14 @@ class BidFacts:
 def extract_bid_facts(text: str, documents: list[str] | None = None) -> BidFacts:
     facts = BidFacts(text=text, documents=documents or [])
 
-    # 报价：多级策略——"投标总价"行（含"投标总价："变体）→ 带语境的 ¥ → 非保证金/押金语境的 ¥。
-    # 宁缺勿错：都取不到就留 None，由人工在报价确认卡点录入。
+    # 报价：多级策略（宁缺勿错，都取不到就留 None，由人工在报价确认卡点录入）：
+    # ① "投标总价：金额" 同行 → ② 标签后窗口内的小写/大写金额（真实标书的换行表格）
+    # → ③ "投标价（含增值税…）" 合计行 → ④ 带语境的 ¥。
     if m := _RE_PRICE_TOTAL_ROW.search(text):
+        facts.bid_price = _money(m.group(1))
+    elif (near := _price_near_total_label(text)) is not None:
+        facts.bid_price = near
+    elif m := _RE_PRICE_INCL_VAT.search(text):
         facts.bid_price = _money(m.group(1))
     else:
         facts.bid_price = _contextual_price(text)

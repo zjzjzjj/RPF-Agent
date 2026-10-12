@@ -10,6 +10,7 @@ import type {
   PackageDetail,
   Project,
   Ranking,
+  ReportOut,
   ReviewQueueItem,
   ScoreOut,
   Workbench,
@@ -126,6 +127,15 @@ export function useRanking(pid: string) {
   return useQuery({
     queryKey: ["ranking", pid],
     queryFn: () => api.get<Ranking>(`/projects/${pid}/ranking`),
+    enabled: !!pid,
+  });
+}
+
+/** 评标报告（草稿/定稿）。有评分运行即可取——草稿把疑问逐条标出。 */
+export function useReport(pid: string) {
+  return useQuery({
+    queryKey: ["report", pid],
+    queryFn: () => api.get<ReportOut>(`/projects/${pid}/report`),
     enabled: !!pid,
   });
 }

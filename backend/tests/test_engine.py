@@ -105,6 +105,56 @@ def test_benchmark_average_below():
     assert "低于平均价" in expl
 
 
+def test_price_asymmetric_deduct_real_case():
+    """不对称扣分率：真实项目（浙江中烟行业烟叶平台运维）5 家报价。
+
+    公式：有效投标人 ≤5 家 → 全部报价算术平均为最佳报价值；等于基准得满分 60；
+    每低 1 个百分点扣 0.4 分，每高 1 个百分点扣 0.8 分。
+
+    期望值取自该项目官方《价格评分表》，逐家严格相等——单一 deduct_rate
+    表达不了这种上下不同费率，故走 params_json 的 deduct_rate_down/up。
+    """
+    formula = {
+        "formula_type": "deviation_deduct",
+        "benchmark_method": "average",
+        "k": "1",
+        "max_score": "60",
+        "rounding": 2,
+        "exclude_invalid": False,
+        "lower_bound": "0",
+        "upper_bound": "60",
+        "params_json": {"deduct_rate_down": "0.4", "deduct_rate_up": "0.8"},
+    }
+    bids = [
+        PriceBid(1, "浙江创联", D("1526400.00")),
+        PriceBid(2, "厦门海晟融创", D("1796700.00")),
+        PriceBid(3, "深圳小河流", D("1800000.00")),
+        PriceBid(4, "浩鲸云计算", D("1857999.80")),
+        PriceBid(5, "咏数智能", D("1749000.00")),
+    ]
+    comp = compute_price_scores(bids, formula)
+    assert comp.benchmark == D("1746019.96")  # 官方评标基准价
+    official = {
+        1: "54.97", 2: "57.68", 3: "57.53", 4: "54.87", 5: "59.86",
+    }
+    got = {r.bidder_id: str(r.price_score) for r in comp.results}
+    assert got == official
+
+
+def test_price_symmetric_rate_unchanged_by_extension():
+    """只给 deduct_rate 时两个方向都取它——扩展不得改变既有行为。"""
+    formula = {
+        "formula_type": "deviation_deduct", "benchmark_method": "lowest",
+        "k": "1", "max_score": "60", "deduct_rate": "0.5", "rounding": 2,
+        "exclude_invalid": False, "lower_bound": "0", "upper_bound": "60",
+    }
+    bids = [PriceBid(1, "基准", D("1000000")), PriceBid(2, "高10", D("1100000"))]
+    comp = compute_price_scores(bids, formula)
+    by_id = {r.bidder_id: r.price_score for r in comp.results}
+    assert by_id[1] == D("60.00")   # 与基准价一致，偏离 0
+    assert by_id[2] == D("55.00")   # 偏离 +10% → 60-0.5×10（上下同费率）
+
+
 def test_benchmark_second_lowest():
     base, _ = compute_benchmark([D("100"), D("90"), D("120")], "second_lowest", D("1"))
     assert base == D("100.00")
@@ -244,6 +294,87 @@ def test_price_fallback_requires_context():
     assert facts.bid_price is None  # 无投标语境 → 宁可不抽，不能乱抽
     facts2 = extract_bid_facts("投标报价：¥7,000,000.00")
     assert facts2.bid_price == D("7000000.00")
+
+
+# ---- 真实标书格式（浙江中烟项目实测）------------------------------------------
+# 样例数据里的 "投标总价：金额" 同行写法在真实标书中很少见；金额通常落在
+# 表头**下一行**，且小写前常夹货币符号。以下四种形态均取自真实开标一览表。
+
+
+def test_price_real_standalone_bid_sheet():
+    """独立开标一览表：表头行 + 大写/小写各占一行。"""
+    text = "\n".join(
+        [
+            "开标一览表",
+            "招标编号: C202501BA2001716013881",
+            "投标总价（含税）(元) 税率 项目负责人 投标保证金 备注",
+            "大写:壹佰柒拾玖万陆仟柒佰元 6% 高文强 10000元 无",
+            "整",
+            "小写：1796700",
+        ]
+    )
+    facts = extract_bid_facts(text)
+    assert facts.bid_price == D("1796700")
+
+
+def test_price_real_lower_case_with_currency_symbol():
+    """小写与数字之间夹货币符号（"小写：￥1,526,400.00"）必须仍能抽到。"""
+    text = "\n".join(
+        [
+            "投标总价（含税） 税率 投标保证金",
+            "小写：￥1,526,400.00 元",
+            "人民币",
+            "1 6% 杨祥海 无",
+            "壹万元整",
+            "大写：壹佰伍拾贰万陆仟肆佰元整",
+        ]
+    )
+    facts = extract_bid_facts(text)
+    assert facts.bid_price == D("1526400.00")
+
+
+def test_price_real_upper_case_row_without_label():
+    """正文表格：表头后一行是裸大写金额，没有"大写"字样。"""
+    text = "\n".join(
+        [
+            "3-1 开标一览表",
+            "序号 投标总价（含税） 税率 项目负责人 投标保证金 备注",
+            "1 壹佰柒拾肆万玖仟元整 6% 郑得龙 壹万元 /",
+        ]
+    )
+    facts = extract_bid_facts(text)
+    assert facts.bid_price == D("1749000")
+
+
+def test_price_real_incl_vat_row():
+    """分项报价表的含税合计行。"""
+    text = "\n".join(
+        [
+            "投标分项报价表",
+            "投标价（不含增值税,人民币元） 1650000",
+            "增值税税率 6 %",
+            "投标价（含增值税,人民币元） 1749000.00",
+        ]
+    )
+    facts = extract_bid_facts(text)
+    assert facts.bid_price == D("1749000.00")
+
+
+def test_price_real_deposit_not_taken_as_bid_price():
+    """大写回退不得把投标保证金当成投标报价。
+
+    真实表格里保证金同样写作大写（"人民币壹万元整"），若只按"首个大写金额"取，
+    会把 10000 当成报价——直接污染价格分这个最敏感的确定性输入。
+    """
+    text = "\n".join(
+        [
+            "投标总价（含税） 税率 项目负责人 投标保证金 备注",
+            "大写:壹佰伍拾贰万陆仟肆佰元 6% 杨祥海 人民币壹万元整 无",
+            "整",
+        ]
+    )
+    facts = extract_bid_facts(text)
+    assert facts.bid_price == D("1526400")
 
 
 def test_extract_performance_wan_unit():

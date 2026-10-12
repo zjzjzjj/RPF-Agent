@@ -32,8 +32,19 @@ class Finding:
         }
 
 
-def run_validators(snapshot: dict, node_exists: Callable[[str], bool] | None = None) -> list[Finding]:
-    """按顺序跑全部校验器，返回 findings（error 在前）。"""
+def run_validators(
+    snapshot: dict,
+    node_exists: Callable[[str], bool] | None = None,
+    *,
+    total_max: Decimal | str | int | None = None,
+    price_weight_range: tuple[Decimal | str | int, Decimal | str | int] | None = None,
+) -> list[Finding]:
+    """按顺序跑全部校验器，返回 findings（error 在前）。
+
+    total_max / price_weight_range 为可选覆盖（语料库等非完整规则包场景用）；
+    缺省时保持原行为：total_max 取 snapshot.package.total_max 或 100，
+    price_weight_range 取 (10, 60)。
+    """
     findings: list[Finding] = []
     criteria = snapshot.get("criteria", [])
     by_code = {c["code"]: c for c in criteria}
@@ -97,16 +108,18 @@ def run_validators(snapshot: dict, node_exists: Callable[[str], bool] | None = N
     price_max = [c.get("max_score") for c in criteria if c["category"] == "price"]
     if price_max and price_max[0] is not None:
         v = Decimal(str(price_max[0]))
-        if not (Decimal("10") <= v <= Decimal("60")):
+        lo, hi = price_weight_range if price_weight_range is not None else ("10", "60")
+        if not (Decimal(str(lo)) <= v <= Decimal(str(hi))):
             findings.append(Finding("PRICE_WEIGHT_RANGE", "warn",
-                                    f"价格分权重 {v} 分超出常规区间（10–40）", "package"))
+                                    f"价格分权重 {v} 分超出常规区间（{lo}–{hi}）", "package"))
 
     # ⑨ 总分 = 各项满分之和（只统计非否决项）
     scored = [c for c in criteria if not c.get("is_veto")]
     maxes = [c.get("max_score") for c in scored]
     if all(m is not None for m in maxes) and maxes:
         total = sum((Decimal(str(m)) for m in maxes), ZERO)
-        target = Decimal(str(snapshot.get("package", {}).get("total_max", 100)))
+        target = total_max if total_max is not None else snapshot.get("package", {}).get("total_max", 100)
+        target = Decimal(str(target))
         if total != target:
             findings.append(Finding("TOTAL_SCORE", "error",
                                     f"各评分项满分之和 {total} ≠ {target}", "package"))

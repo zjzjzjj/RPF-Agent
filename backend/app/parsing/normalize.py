@@ -89,6 +89,11 @@ def normalize_no_ws_with_map(text: str) -> tuple[str, list[int]]:
     return "".join(chars), idx
 
 
+def normalize_no_ws(text: str) -> str:
+    """空白不敏感形态（说明见 normalize_no_ws_with_map）。"""
+    return normalize_no_ws_with_map(text)[0]
+
+
 def normalize_for_match(text: str) -> str:
     """核验用的宽松形态：再折叠大小写（英文），中文不受影响。"""
     return normalize(text).casefold()
