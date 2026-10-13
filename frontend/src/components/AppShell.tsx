@@ -135,7 +135,7 @@ export default function AppShell({
         <div className="sidebar-note">
           <FileProtectOutlined />
           <strong>每一分，都有据可循</strong>
-          <p>原文证据 · 人工复核 · 全程留痕</p>
+          <p>原文证据 · 可溯裁决 · 全程留痕</p>
         </div>
         <div className="sidebar-version">
           <span className="version-dot" />

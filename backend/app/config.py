@@ -97,6 +97,27 @@ TEXT_PROBE_PAGES = 5  # 判定文字层时抽样的前 N 页
 DOCX_APPROX_CHARS_PER_PAGE = 1800  # docx 虚拟分页的每页字符数
 
 
+def pdf_engine() -> str:
+    """PDF 主解析引擎：pymupdf（默认）| pdfplumber（MIT 回退，见 decisions/0001）。"""
+    return os.environ.get("BID_EVAL_PDF_ENGINE", "pymupdf").strip().lower()
+
+
+# ---------------------------------------------------------------------------
+# OCR（扫描件兜底，rapidocr-onnxruntime）
+# ---------------------------------------------------------------------------
+OCR_PAGE_MIN_CHARS = 30  # 页字符数低于此值 → 该页走 OCR（低于抽样阈值，防"扫描封面+数字正文"误判）
+OCR_RENDER_SCALE = 2.0  # OCR 页渲染倍率（≈144dpi，中文 12pt 可靠）
+
+
+def ocr_enabled() -> bool:
+    return os.environ.get("BID_EVAL_OCR", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def ocr_max_pages() -> int:
+    """单本文档 OCR 页数上限（护栏）；超限的缺字页跳过并记警告。"""
+    return int(os.environ.get("BID_EVAL_OCR_MAX_PAGES", 60))
+
+
 def max_upload_bytes() -> int:
     return int(os.environ.get("BID_EVAL_MAX_UPLOAD_MB", MAX_UPLOAD_MB)) * 1024 * 1024
 

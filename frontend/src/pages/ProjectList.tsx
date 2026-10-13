@@ -11,9 +11,11 @@ import {
   InputNumber,
   Modal,
   Pagination,
+  Popconfirm,
   Segmented,
   Select,
   Skeleton,
+  Space,
   Table,
   Tag,
   Tooltip,
@@ -23,6 +25,7 @@ import {
   AuditOutlined,
   CheckCircleOutlined,
   ClockCircleOutlined,
+  DeleteOutlined,
   FileProtectOutlined,
   FolderOpenOutlined,
   PlusOutlined,
@@ -135,6 +138,15 @@ export default function ProjectList() {
     },
     onError: (e: Error) =>
       message.error(e.message || "创建项目失败，请稍后重试"),
+  });
+
+  const remove = useMutation({
+    mutationFn: (pid: string) => api.del<{ deleted: string }>(`/projects/${pid}`),
+    onSuccess: (r) => {
+      qc.invalidateQueries({ queryKey: ["projects"] });
+      message.success(`项目 ${r.deleted} 已删除`);
+    },
+    onError: (e: Error) => message.error(e.message || "删除项目失败"),
   });
   const resetFilters = () => {
     setSearch("");
@@ -414,11 +426,34 @@ export default function ProjectList() {
               {
                 title: "",
                 key: "action",
-                width: 110,
+                width: 160,
                 render: (_, p) => (
-                  <Link className="project-enter" to={`/p/${p.id}`}>
-                    进入项目 <ArrowRightOutlined />
-                  </Link>
+                  <Space>
+                    <Link className="project-enter" to={`/p/${p.id}`}>
+                      进入项目 <ArrowRightOutlined />
+                    </Link>
+                    <Popconfirm
+                      title="删除该项目？"
+                      description="文档、规则、评分与报告数据将一并删除且不可恢复。"
+                      okText="删除"
+                      okButtonProps={{ danger: true }}
+                      cancelText="取消"
+                      onConfirm={(e) => {
+                        e?.stopPropagation();
+                        remove.mutate(p.id);
+                      }}
+                      onCancel={(e) => e?.stopPropagation()}
+                    >
+                      <Button
+                        danger
+                        type="text"
+                        size="small"
+                        icon={<DeleteOutlined />}
+                        aria-label={`删除项目 ${p.name}`}
+                        onClick={(e) => e.stopPropagation()}
+                      />
+                    </Popconfirm>
+                  </Space>
                 ),
               },
             ]}
@@ -429,36 +464,55 @@ export default function ProjectList() {
               {filtered
                 .slice((currentPage - 1) * 8, currentPage * 8)
                 .map((p) => (
-                  <Link
-                    key={p.id}
-                    to={`/p/${p.id}`}
-                    className="project-grid-card"
-                  >
-                    <div className="project-grid-top">
-                      <span className="project-file-icon">
-                        <FileProtectOutlined />
-                      </span>
-                      {statusTag(p)}
-                    </div>
-                    <h3>{p.name}</h3>
-                    <div className="project-code">{p.project_code || p.id}</div>
-                    <dl>
-                      <div>
-                        <dt>招标人</dt>
-                        <dd>{p.purchaser || "—"}</dd>
+                  <div key={p.id} className="project-grid-card">
+                    <Link to={`/p/${p.id}`} className="project-grid-card-link">
+                      <div className="project-grid-top">
+                        <span className="project-file-icon">
+                          <FileProtectOutlined />
+                        </span>
+                        {statusTag(p)}
                       </div>
-                      <div>
-                        <dt>最高限价</dt>
-                        <dd>{formatPrice(p.max_price, p.currency)}</dd>
+                      <h3>{p.name}</h3>
+                      <div className="project-code">{p.project_code || p.id}</div>
+                      <dl>
+                        <div>
+                          <dt>招标人</dt>
+                          <dd>{p.purchaser || "—"}</dd>
+                        </div>
+                        <div>
+                          <dt>最高限价</dt>
+                          <dd>{formatPrice(p.max_price, p.currency)}</dd>
+                        </div>
+                      </dl>
+                      <div className="project-grid-footer">
+                        <span>{formatDate(p.updated_at)} 更新</span>
+                        <span>
+                          进入项目 <ArrowRightOutlined />
+                        </span>
                       </div>
-                    </dl>
-                    <div className="project-grid-footer">
-                      <span>{formatDate(p.updated_at)} 更新</span>
-                      <span>
-                        进入项目 <ArrowRightOutlined />
-                      </span>
-                    </div>
-                  </Link>
+                    </Link>
+                    <Popconfirm
+                      title="删除该项目？"
+                      description="文档、规则、评分与报告数据将一并删除且不可恢复。"
+                      okText="删除"
+                      okButtonProps={{ danger: true }}
+                      cancelText="取消"
+                      onConfirm={() => remove.mutate(p.id)}
+                    >
+                      <Button
+                        danger
+        type="text"
+                        size="small"
+                        icon={<DeleteOutlined />}
+                        aria-label={`删除项目 ${p.name}`}
+                        className="project-grid-delete"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                        }}
+                      />
+                    </Popconfirm>
+                  </div>
                 ))}
             </div>
             <Pagination

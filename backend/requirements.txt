@@ -9,11 +9,18 @@ python-multipart>=0.0.20
 sse-starlette>=3.0
 jinja2>=3.1
 
-# ---- 文档解析（MIT / Apache / BSD；不用 AGPL 的 PyMuPDF）----
-pdfplumber>=0.11
-pypdfium2>=5.0
+# ---- 文档解析 ----
+# 主引擎 pymupdf（AGPL-3.0）：2026-10-13 许可决策反转，见 docs/decisions/0001
+# （内部自用部署可满足 AGPL；闭源交付场景可 BID_EVAL_PDF_ENGINE=pdfplumber 一行回退）
+pymupdf>=1.24
+pdfplumber>=0.11           # MIT，回退引擎
+pypdfium2>=5.0             # Apache/BSD，页图渲染（证据高亮）与 OCR 页渲染
 python-docx>=1.2
-# 可选：pymupdf（AGPL，仅本地实验用，默认关闭）——见 docs/decisions/0001
+
+# ---- OCR（扫描件识别兜底）----
+# rapidocr-onnxruntime（Apache-2.0）：纯 pip 离线中文 OCR，无需系统二进制；
+# 未安装时扫描件整本拒绝并明确提示（不崩溃），见 backend/app/parsing/ocr.py
+rapidocr-onnxruntime>=1.4
 
 # ---- LLM（OpenAI 兼容客户端，接 DeepSeek/Qwen 等）----
 openai>=1.40

@@ -31,6 +31,47 @@ from app.errors import NotFound, ValidationFailed
 from app.rules import compiler
 
 
+def auto_resolve_merge(
+    merge_package_id: int,
+    actor: str,
+    provider: str | None = None,
+    model: str | None = None,
+) -> int:
+    """全自动合并：生成匹配提案并按既定策略全部自动采纳（不进人工抽屉）。
+
+    策略（用户拍板 2026-10-13）：
+    - 全部配对 → override（模板条目被招标文件条款覆盖）；
+    - 未配对模板条目 → drop_template（招标文件未规定，弃用）；
+    - 未配对文档条目 → append_document（招标文件新增条款，追加为文件依据）。
+    每条决定理由模板化非空（resolve 强校验），OverrideRecord/ReviewRecord 全留痕。
+    复用 resolve_proposal，不另写执行路径。返回模板包 id。
+    """
+    from app.rules.merger import generate_match_proposal
+
+    proposal = generate_match_proposal(merge_package_id, provider, model)
+    decisions: list[dict] = []
+    for p in proposal["pairs"]:
+        decisions.append({
+            "action": "override",
+            "pair_id": p["pair_id"],
+            "reason": (f"自动合并（{p.get('match_method') or 'deterministic'}，"
+                       f"相似度 {p.get('similarity')}）：招标文件条款覆盖模板条目"),
+        })
+    for t in proposal["unmatched_template"]:
+        decisions.append({
+            "action": "drop_template",
+            "template_criterion_id": t["id"],
+            "reason": "自动合并：招标文件未规定该模板条目，按既定策略弃用",
+        })
+    for d in proposal["unmatched_document"]:
+        decisions.append({
+            "action": "append_document",
+            "document_criterion_id": d["id"],
+            "reason": "自动合并：招标文件新增条款，模板无对应条目，追加为文件依据",
+        })
+    return resolve_proposal(merge_package_id, decisions, actor)
+
+
 def resolve_proposal(merge_package_id: int, decisions: list[dict], actor: str) -> int:
     """执行合并处置，返回模板包 id。
 

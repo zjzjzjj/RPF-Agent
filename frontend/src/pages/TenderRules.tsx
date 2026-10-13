@@ -13,6 +13,7 @@ import {
   InputNumber,
   List,
   Modal,
+  Popconfirm,
   Progress,
   Row,
   Select,
@@ -25,7 +26,7 @@ import {
   Upload,
   message,
 } from "antd";
-import { PlayCircleOutlined, CheckOutlined, PlusOutlined, ThunderboltOutlined, UploadOutlined, SwapOutlined } from "@ant-design/icons";
+import { PlayCircleOutlined, CheckOutlined, PlusOutlined, ThunderboltOutlined, ReloadOutlined, UploadOutlined, SwapOutlined } from "@ant-design/icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import { useCoverage, useDocuments, useJob, useMatchProposal, useModels, useRules } from "../api/hooks";
@@ -61,8 +62,11 @@ export default function TenderRules() {
   const isTemplatePackage = rules?.origin === "template";
   const canMerge = rules?.origin === "template" || rules?.origin === "merged";
 
-  const tenderDoc = documents?.find((d) => d.kind === "tender" && d.parse_status !== "pending");
-  const tenderFailed = documents?.some((d) => d.kind === "tender" && d.parse_status === "failed");
+  const tenderDoc = documents?.find(
+    (d) => d.kind === "tender" && (d.parse_status === "parsed" || d.parse_status === "degraded"),
+  );
+  const tenderFailedDoc = documents?.find((d) => d.kind === "tender" && d.parse_status === "failed");
+  const tenderFailed = !!tenderFailedDoc;
 
   const uploadTender = useMutation({
     mutationFn: (file: File) => {
@@ -94,7 +98,7 @@ export default function TenderRules() {
     onError: (e: Error) => message.error(e.message),
   });
 
-  // merge 编译任务成功后：记录临时编译包 id，供匹配提案审核
+  // merge 编译任务成功后：全自动模式已在后端自动采纳配对；人工模式进提案抽屉
   useEffect(() => {
     if (
       job &&
@@ -104,10 +108,41 @@ export default function TenderRules() {
       typeof job.result_json.package_id === "number"
     ) {
       mergeCompileRef.current = false;
-      setMergePackageId(job.result_json.package_id);
-      message.success("合并编译完成，已生成匹配提案，请逐对审核");
+      const r = job.result_json as Record<string, unknown>;
+      if (r.target_package_id != null) {
+        message.success("已自动合并：模板条目已按招标文件覆盖/追加/弃用（留痕可查）");
+        qc.invalidateQueries({ queryKey: ["coverage", r.target_package_id] });
+      } else {
+        setMergePackageId(job.result_json.package_id);
+        message.success("合并编译完成，已生成匹配提案，请逐对审核");
+        if (typeof r.auto_resolve_error === "string" && r.auto_resolve_error) {
+          message.warning(`自动合并未执行：${r.auto_resolve_error}`);
+        }
+      }
     }
   }, [job]);
+
+  const acceptAll = useMutation({
+    mutationFn: (reason: string) =>
+      api.post<{ accepted: number }>(`/rules/packages/${rules!.id}/accept-all`, { reason }),
+    onSuccess: (r) => {
+      qc.invalidateQueries({ queryKey: ["rules", pid] });
+      qc.invalidateQueries({ queryKey: ["coverage", rules?.id ?? null] });
+      message.success(`已批量采纳 ${r.accepted} 项并留痕`);
+    },
+    onError: (e: Error) => message.error(e.message),
+  });
+
+  const signoffAll = useMutation({
+    mutationFn: (reason: string) =>
+      api.post<{ signed_off: number }>(`/rules/packages/${rules!.id}/signoff-all`, { reason }),
+    onSuccess: (r) => {
+      qc.invalidateQueries({ queryKey: ["rules", pid] });
+      qc.invalidateQueries({ queryKey: ["coverage", rules?.id ?? null] });
+      message.success(`已批量签批 ${r.signed_off} 项并留痕`);
+    },
+    onError: (e: Error) => message.error(e.message),
+  });
 
   const accept = useMutation({
     mutationFn: (id: number) =>
@@ -167,6 +202,7 @@ export default function TenderRules() {
   const errors = (rules?.validations ?? []).filter((v) => v.severity === "error");
   const warns = (rules?.validations ?? []).filter((v) => v.severity !== "error");
   const unconfirmed = criteria.filter((c) => c.status !== "verified");
+  const verifiedCount = criteria.length - unconfirmed.length;
   const pendingSignoff = criteria.filter(
     (c) => c.origin === "template" && c.status === "needs_signoff",
   ).length;
@@ -213,7 +249,7 @@ export default function TenderRules() {
         </Col>
       </Row>
 
-      {isTemplatePackage ? (
+      {isTemplatePackage && (
         <Alert
           style={{ marginTop: 12 }}
           type="success"
@@ -221,24 +257,46 @@ export default function TenderRules() {
           message={`已从通用模板实例化规则草稿（${rules.template_id} v${rules.library_version}）`}
           description={
             <Typography.Text type="secondary">
-              当前条目均为模板兜底（P5 来源，招标文件未规定），可先逐条签批后确认、冻结；
-              上传招标文件后点击「编译并生成覆盖提案（merge）」，可将模板条目逐条覆盖为招标文件依据。
+              当前条目均为模板兜底（P5 来源，招标文件未规定），可签批后确认、冻结。
+              上传招标文件后点击「编译并与模板合并」，配对将自动采纳：
+              模板条目被招标文件条款逐条覆盖、新增条款追加、未规定条目弃用（全程留痕）。
             </Typography.Text>
           }
         />
-      ) : (
-        !tenderDoc && (
-          <Alert
-            style={{ marginTop: 12 }}
-            type="info"
-            showIcon
-            message="请先上传招标文件，解析完成后才能编译规则"
-            description={
-              <Space direction="vertical" size="small">
-                <Typography.Text type="secondary">
-                  支持 PDF / Word（.docx），系统将自动解析页文本与条款树。
-                  {tenderFailed ? "上次上传的文件解析失败，请更换文件重试。" : ""}
-                </Typography.Text>
+      )}
+      {!tenderDoc && (
+        <Alert
+          style={{ marginTop: 12 }}
+          type="info"
+          showIcon
+          message={
+            isTemplatePackage
+              ? "上传招标文件以优化规则（将与模板自动合并）"
+              : "请先上传招标文件，解析完成后才能编译规则"
+          }
+          description={
+            <Space direction="vertical" size="small">
+              <Typography.Text type="secondary">
+                支持 PDF（含扫描件，自动 OCR）/ Word（.docx），系统将自动解析页文本与条款树。
+              </Typography.Text>
+              {tenderFailedDoc && (
+                <Alert
+                  type="error"
+                  showIcon
+                  message="上次上传的文件解析失败，原因如下（更换文件或点「重新解析」重试）："
+                  description={
+                    <ul style={{ margin: 0, paddingLeft: 18 }}>
+                      {(tenderFailedDoc.warnings_json ?? []).map((w, i) => (
+                        <li key={i}>
+                          {w.code ? `[${w.code}] ` : ""}
+                          {w.message}
+                        </li>
+                      ))}
+                    </ul>
+                  }
+                />
+              )}
+              <Space>
                 <Upload
                   showUploadList={false}
                   accept=".pdf,.docx"
@@ -251,10 +309,23 @@ export default function TenderRules() {
                     上传招标文件
                   </Button>
                 </Upload>
+                {tenderFailedDoc && (
+                  <Button
+                    icon={<ReloadOutlined />}
+                    onClick={async () => {
+                      const r = await api.post(`/documents/${tenderFailedDoc.id}/reparse`);
+                      qc.invalidateQueries({ queryKey: ["documents", pid] });
+                      message.success("已重新解析");
+                      void r;
+                    }}
+                  >
+                    重新解析
+                  </Button>
+                )}
               </Space>
-            }
-          />
-        )
+            </Space>
+          }
+        />
       )}
 
       {job && (
@@ -301,6 +372,30 @@ export default function TenderRules() {
               )}
               <span style={{ marginLeft: "auto" }}>
                 <Space>
+                  {rules.status === "draft" && verifiedCount > 0 && (
+                    <Popconfirm
+                      title="全部采纳？"
+                      description={`将批量确认 ${verifiedCount} 项已核验条目，理由统一记入留痕。`}
+                      okText="全部采纳"
+                      onConfirm={() => acceptAll.mutate("批量采纳：与招标文件原文核对一致")}
+                      cancelText="取消"
+                    >
+                      <Button loading={acceptAll.isPending}>全部采纳</Button>
+                    </Popconfirm>
+                  )}
+                  {rules.status === "draft" && pendingSignoff > 0 && (
+                    <Popconfirm
+                      title="全部签批？"
+                      description={`将批量签批 ${pendingSignoff} 项模板兜底条目（启用须有依据，将留痕）。`}
+                      okText="全部签批"
+                      onConfirm={() =>
+                        signoffAll.mutate("批量签批：招标文件未细化该项，按通用评标惯例启用")
+                      }
+                      cancelText="取消"
+                    >
+                      <Button loading={signoffAll.isPending}>全部签批</Button>
+                    </Popconfirm>
+                  )}
                   <Button
                     disabled={rules.status !== "draft" || unconfirmed.length > 0}
                     onClick={() => confirm.mutate()}
@@ -343,7 +438,7 @@ export default function TenderRules() {
             </Card>
           )}
 
-          <Card title="评分项（逐条确认；系统不提供“全部采纳”）" style={{ marginTop: 12 }}>
+          <Card title="评分项（支持全部采纳 / 全部签批，逐条留痕）" style={{ marginTop: 12 }}>
             <Table<CriterionOut>
               scroll={{ x: 1000 }}
               rowKey="id"

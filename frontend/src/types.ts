@@ -447,4 +447,13 @@ export const REVIEW_STATUS_LABELS: Record<string, string> = {
   human_overridden: "已改分",
   conflict_flagged: "冲突待裁决",
   not_applicable: "不适用",
+  auto_confirmed: "已自动裁决",
+};
+
+export const MACHINE_STATUS_LABELS: Record<string, string> = {
+  pass: "通过",
+  fail: "不通过",
+  recommend_reject: "建议否决",
+  need_human: "待人工",
+  conflict_flagged: "冲突",
 };

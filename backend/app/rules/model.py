@@ -70,6 +70,19 @@ class ExtractedCriterion(BaseModel):
             return int(m.group()) if m else None
         return None
 
+    @field_validator("params", mode="before")
+    @classmethod
+    def _coerce_params(cls, v: object) -> dict:
+        """模型把 params 输出为 null 时按空对象处置——个别字段违约不应整包拒绝
+        （真实标书编译曾因 criteria[n].params=null 整包失败，2026-10-13）。"""
+        return {} if v is None else v
+
+    @field_validator("levels", mode="before")
+    @classmethod
+    def _coerce_levels(cls, v: object) -> list:
+        """levels 输出为 null 时按空档位处置（主观项缺档位会由分诊标记 ambiguous）。"""
+        return [] if v is None else v
+
     @field_validator("quote")
     @classmethod
     def _quote_not_empty(cls, v: str | None) -> str | None:

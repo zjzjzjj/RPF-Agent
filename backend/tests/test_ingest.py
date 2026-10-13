@@ -22,7 +22,7 @@ def test_tender_upload_and_parse(client, project, samples_dir):
     doc = client.get(f"/api/documents/{out['document_id']}").json()
     assert doc["parse_status"] == "parsed"
     assert doc["page_count"] >= 5
-    assert doc["parse_engine"] == "pdfplumber"
+    assert doc["parse_engine"] in ("pymupdf", "pymupdf+ocr")
 
     # 条款树：根节点下应能找到"评标办法"章节
     nodes = client.get(f"/api/documents/{out['document_id']}/nodes").json()

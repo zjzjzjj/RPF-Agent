@@ -175,14 +175,16 @@ export default function EvidenceWorkbench() {
               <div>
                 <Typography.Paragraph>
                   机器判定：
-                  <Tag color={score.machine_status === "pass" ? "green" : score.machine_status === "recommend_reject" ? "red" : "orange"}>
+                  <Tag color={score.machine_status === "pass" ? "green" : score.machine_status === "recommend_reject" || score.machine_status === "fail" ? "red" : "orange"}>
                     {score.machine_status === "pass"
                       ? "通过"
                       : score.machine_status === "recommend_reject"
-                        ? "建议否决（须人工确认）"
-                        : score.machine_status === "conflict_flagged"
-                          ? "冲突，需人工裁决"
-                          : "待人工"}
+                        ? "建议否决（全自动模式已裁决收敛，见留痕）"
+                        : score.machine_status === "fail"
+                          ? "不通过（已自动裁决）"
+                          : score.machine_status === "conflict_flagged"
+                            ? "冲突，需人工裁决"
+                            : "待人工"}
                   </Tag>
                 </Typography.Paragraph>
                 {score.warnings_json?.map((w, i) => (

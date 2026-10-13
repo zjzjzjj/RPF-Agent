@@ -298,13 +298,13 @@ export default function ProjectWorkbench() {
           </div>
           <div>
             <AuditOutlined />
-            <h3>主观分需确认</h3>
-            <p>先独立判断，再核对 AI 建议与原文证据。</p>
+            <h3>评分有据可依</h3>
+            <p>先依据原文证据裁决，AI 建议与推理过程全部可查。</p>
           </div>
           <div>
             <SafetyCertificateOutlined />
-            <h3>否决由人工裁决</h3>
-            <p>系统提供建议与依据，由评审人员确认结果。</p>
+            <h3>否决可追溯</h3>
+            <p>系统提供建议与依据，否决结论由裁决记录（人工或自动）给出并留痕。</p>
           </div>
           <div>
             <FileProtectOutlined />

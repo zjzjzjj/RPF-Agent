@@ -408,8 +408,67 @@ def set_levels(criterion_id: int, levels: list[dict], actor: str, reason: str) -
     return crit
 
 
+def accept_all_criteria(package_id: int, actor: str, reason: str) -> dict:
+    """批量采纳：对全部 status=='verified' 条目逐条写 accept 留痕（单事务，全成全败）。
+
+    与逐条 accept_criterion 同语义（verified 条目的复核留痕，不改状态），
+    仅省去逐次请求；2026-10-13 应用户要求移除"故意不提供全部采纳"限制。
+    """
+    if not reason.strip():
+        raise ValidationFailed("批量采纳必须填写理由")
+    _require_draft(package_id)
+    accepted = 0
+    with session_scope() as s:
+        for crit in list_criteria(package_id):
+            if crit.status != "verified":
+                continue
+            accepted += 1
+            s.add(
+                ReviewRecord(
+                    subject_type="criterion", subject_id=str(crit.id), action="accept",
+                    actor=actor, reason=reason,
+                )
+            )
+    from app.services import audit_service
+
+    audit_service.log(package_id, actor, "rules.accept_all", "package",
+                      str(package_id), {"accepted": accepted, "reason": reason})
+    return {"accepted": accepted}
+
+
+def signoff_all_criteria(package_id: int, actor: str, reason: str) -> dict:
+    """批量签批：对全部 origin=='template' 且 status=='needs_signoff' 条目执行签批。"""
+    if not reason.strip():
+        raise ValidationFailed("批量签批必须填写理由")
+    _require_draft(package_id)
+    signed = 0
+    with session_scope() as s:
+        for crit in list_criteria(package_id):
+            if crit.origin != "template" or crit.status != "needs_signoff":
+                continue
+            crit.status = "verified"
+            crit.signoff_json = {
+                "actor": actor,
+                "reason": reason,
+                "time": utcnow().isoformat(),
+            }
+            s.add(crit)
+            signed += 1
+            s.add(
+                ReviewRecord(
+                    subject_type="criterion", subject_id=str(crit.id), action="signoff",
+                    actor=actor, reason=reason,
+                )
+            )
+    from app.services import audit_service
+
+    audit_service.log(package_id, actor, "rules.signoff_all", "package",
+                      str(package_id), {"signed_off": signed, "reason": reason})
+    return {"signed_off": signed}
+
+
 def accept_criterion(criterion_id: int, actor: str, reason: str) -> Criterion:
-    """逐条确认（系统故意不提供"全部采纳"）。"""
+    """逐条确认（批量采纳见 accept_all_criteria）。"""
     if not reason.strip():
         raise ValidationFailed("确认必须填写理由")
     with session_scope() as s:

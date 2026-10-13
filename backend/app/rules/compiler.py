@@ -515,7 +515,7 @@ def compile_rules_job(ctx: JobContext, payload: dict) -> dict:
     provider = payload.get("provider")
     model = payload.get("model")
     merge_target_id = payload.get("merge_target_id")
-    ctx.start(total=3, message="加载招标文件")
+    ctx.start(total=4, message="加载招标文件")
     _load_tender_text(document_id)
     ctx.advance(message="LLM 抽取评分规则")
     package_id = compile_rules(
@@ -523,5 +523,21 @@ def compile_rules_job(ctx: JobContext, payload: dict) -> dict:
         merge_target_id=int(merge_target_id) if merge_target_id else None,
     )
     ctx.advance(message="校验与分诊完成")
+
+    result: dict = {"package_id": package_id}
+    if merge_target_id and config.auto_mode():
+        # 全自动模式：合并配对自动采纳（覆盖/追加/弃用全留痕），不再进人工抽屉。
+        # best-effort：合并处置失败不让编译失败，原因进 result_json 供前端提示。
+        ctx.advance(message="自动合并：生成匹配提案并采纳")
+        try:
+            from app.services import merge_service
+
+            target_id = merge_service.auto_resolve_merge(
+                package_id, actor=actor, provider=provider, model=model)
+            result.update(auto_resolved=True, target_package_id=target_id)
+        except Exception as exc:  # noqa: BLE001 —— 人工兜底通道保留（匹配提案抽屉）
+            log.warning("自动合并失败（可人工在匹配提案抽屉处置）：%s", exc)
+            result.update(auto_resolved=False, auto_resolve_error=str(exc)[:300])
+
     ctx.advance(message="完成")
-    return {"package_id": package_id}
+    return result

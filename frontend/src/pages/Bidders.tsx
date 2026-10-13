@@ -305,7 +305,7 @@ export default function Bidders() {
                   color={
                     item.verdict === "pass"
                       ? "green"
-                      : item.verdict === "recommend_reject"
+                      : item.verdict === "recommend_reject" || item.verdict === "fail"
                         ? "red"
                         : "orange"
                   }
@@ -314,9 +314,11 @@ export default function Bidders() {
                     ? "通过"
                     : item.verdict === "recommend_reject"
                       ? "建议否决"
-                      : item.verdict === "conflict_flagged"
-                        ? "冲突"
-                        : "待人工"}
+                      : item.verdict === "fail"
+                        ? "不通过"
+                        : item.verdict === "conflict_flagged"
+                          ? "冲突"
+                          : "待人工"}
                 </Tag>
                 <span>
                   {item.code} {item.name}

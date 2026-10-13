@@ -58,6 +58,15 @@ def get_project(project_id: str) -> ProjectOut:
         return ProjectOut.model_validate(_get_project_or_404(s, project_id))
 
 
+@router.delete("/projects/{project_id}")
+def delete_project(project_id: str, actor: str = Depends(get_actor)) -> dict:
+    """删除项目及全部关联数据（文档/规则/评分/报告），审计与复核留痕保留。"""
+    from app.services import project_service
+
+    counts = project_service.delete_project(project_id)
+    return {"deleted": project_id, **counts}
+
+
 @router.patch("/projects/{project_id}", response_model=ProjectOut)
 def patch_project(project_id: str, body: ProjectPatch, actor: str = Depends(get_actor)) -> ProjectOut:
     with session_scope() as s:
@@ -193,12 +202,14 @@ def get_workbench(project_id: str) -> WorkbenchOut:
                     ScoreRecord.review_status.in_(("pending", "ai_suggested", "conflict_flagged")),
                 )
             ).scalar_one()
-        if config.auto_mode():
+        if run is None:
+            # 尚未发起评分：不能宣称"自动裁决已完成"（auto 分支必须晚于无运行判断）
+            stages.append(StageState(key="review", label="自动裁决", state="pending",
+                                     detail="发起评分后由 LLM 带原文证据自动裁决"))
+        elif config.auto_mode():
             # 全自动模式：没有人工复核阶段，模糊项已由 LLM 裁决收敛（auto_confirmed）
             stages.append(StageState(key="review", label="自动裁决", state="done",
                                      detail="模糊项已由 LLM 带原文证据裁决并留痕"))
-        elif run is None:
-            stages.append(StageState(key="review", label="人工复核", state="pending", detail="—"))
         elif pending_review:
             stages.append(StageState(key="review", label="人工复核", state="active",
                                      detail=f"{pending_review} 项待复核", todo_count=int(pending_review)))

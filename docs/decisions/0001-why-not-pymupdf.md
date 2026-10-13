@@ -1,7 +1,7 @@
-# 决策记录 0001：为什么主解析路径不用 PyMuPDF
+# 决策记录 0001：是否使用 PyMuPDF
 
 - 日期：2026-10-09
-- 状态：已采纳
+- 状态：**已反转（2026-10-13，主路径切换为 PyMuPDF，见文末）**
 
 ## 背景
 
@@ -42,3 +42,21 @@ PDF 文本与坐标提取的候选方案：
   （`numbering.py::looks_like_toc`）。
 - **SQLite 事务隔离**：未提交的行对其他连接不可见。核验（独立会话）必须在事务提交后进行
   （`rules/compiler.py` 的"先提交、后核验、再回填"）。
+
+---
+
+## 反转记录（2026-10-13）：主路径切换为 PyMuPDF
+
+按项目方向调整（用户指令），主解析路径改用 PyMuPDF，理由：
+
+1. **真实上传失败修复需要**：pdfplumber 主路径的魔数检查（头 5 字节必须 %PDF）
+   会拒收政府平台下载的带电子签章/前导垃圾字节的 PDF；PyMuPDF 天然容忍前导垃圾。
+2. **文字层提取更稳**：`get_text("dict")` 的行/坐标质量优于 pdfminer 的长尾表现
+   （CID 字体乱码等），且内置 `find_tables`。
+3. **OCR 集成底座**：扫描件 OCR 兜底（rapidocr-onnxruntime）需要稳定的页渲染与
+   文本坐标底座，PyMuPDF 一体化提供。
+4. **AGPL 义务可满足**：系统定位为招标人/代理机构**内部自用部署**，向最终用户
+   提供源码的义务可接受并以此留痕。
+
+回退开关：`BID_EVAL_PDF_ENGINE=pdfplumber` 一行切回（pdfplumber 保留为回退引擎，
+MIT 闭包不变，不加 OCR）。requirements.txt 已更新。

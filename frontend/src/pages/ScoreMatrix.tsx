@@ -12,11 +12,19 @@ const CATEGORY_ORDER = ["qualification", "compliance", "price", "technical", "co
 
 function cellStyle(cell: MatrixCell | undefined): { bg: string; label: string; tip: string } {
   if (!cell) return { bg: "#f0f0f0", label: "—", tip: "未评分" };
+  // 全自动模式终态优先：已自动裁决（LLM 带原文证据或确定性判定），不再有待人工中间态
+  if (cell.review_status === "auto_confirmed") {
+    if (cell.machine_status === "recommend_reject")
+      return { bg: "#fff1f0", label: "已否决", tip: "全自动模式终态：LLM/确定性裁决否决（留痕可查）" };
+    if (cell.machine_status === "fail")
+      return { bg: "#fff1f0", label: "不通过", tip: "全自动模式终态：裁决不通过（留痕可查）" };
+    return { bg: "#e6f4ff", label: cell.final_score ?? "已裁决", tip: "已自动裁决（LLM 带原文证据，留痕可查）" };
+  }
   if (cell.score_type === "veto") {
     if (cell.review_status === "human_confirmed" && cell.machine_status === "pass")
       return { bg: "#f6ffed", label: "通过", tip: "已人工确认通过" };
     if (cell.machine_status === "recommend_reject")
-      return { bg: "#fff1f0", label: "建议否决", tip: "AI 建议否决，等待人工确认（绝不自动否决）" };
+      return { bg: "#fff1f0", label: "建议否决", tip: "AI 建议否决，等待人工确认（人工模式）" };
     if (cell.review_status === "conflict_flagged")
       return { bg: "#fff7e6", label: "冲突", tip: "存在冲突，需人工裁决" };
     if (cell.machine_status === "need_human") return { bg: "#fff7e6", label: "待人工", tip: "无法自动判定" };
@@ -27,6 +35,7 @@ function cellStyle(cell: MatrixCell | undefined): { bg: string; label: string; t
   if (cell.review_status === "conflict_flagged") return { bg: "#fff7e6", label: "冲突", tip: "冲突待裁决" };
   if (cell.review_status === "ai_suggested")
     return { bg: "#f9f0ff", label: "AI建议", tip: "AI 已给出建议分（需人工确认；未解锁前不展示分值）" };
+  if (cell.machine_status === "fail") return { bg: "#fff1f0", label: "不通过", tip: "裁决不通过" };
   if (cell.final_score != null) return { bg: "#fafafa", label: cell.final_score, tip: "确定性计算得分（待复核）" };
   return { bg: "#fff7e6", label: "待人工", tip: "无证据或无法自动判定" };
 }
@@ -41,7 +50,9 @@ export default function ScoreMatrix() {
   const [jobId, setJobId] = useState<number | null>(null);
   const { data: job } = useJob(jobId);
 
-  const latestRun = runs?.[0];
+  // 失败的运行不顶掉成功运行的数据（失败时矩阵空白曾是"无法正常运行"的主因之一）
+  const latestRun =
+    runs?.find((r) => r.status === "succeeded") ?? runs?.[0];
   const { data: matrix, isLoading } = useMatrix(latestRun?.id ?? null);
   const { data: models } = useModels();
   const [selectedModel, setSelectedModel] = useState<string | undefined>(undefined);
@@ -188,6 +199,9 @@ export default function ScoreMatrix() {
             <div style={{ marginTop: 12 }}>
               <Space size="large" wrap>
                 <span>
+                  <Tag color="geekblue">已自动裁决</Tag> 全自动模式终态（LLM 带原文证据，留痕可查）
+                </span>
+                <span>
                   <Tag color="green">已确认</Tag> 人工确认的分数
                 </span>
                 <span>
@@ -197,7 +211,7 @@ export default function ScoreMatrix() {
                   <Tag color="orange">待人工/冲突</Tag> 需人工裁决
                 </span>
                 <span>
-                  <Tag color="red">建议否决</Tag> 绝不自动否决，须人工确认
+                  <Tag color="red">已否决/不通过</Tag> 裁决终态（自动或人工确认）
                 </span>
               </Space>
             </div>

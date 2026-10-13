@@ -145,6 +145,20 @@ def accept_criterion(criterion_id: int, body: ReasonBody, actor: str = Depends(g
     return CriterionOut.model_validate(crit)
 
 
+@router.post("/rules/packages/{package_id}/accept-all")
+def accept_all(package_id: int, body: ReasonBody, actor: str = Depends(get_actor)) -> dict:
+    out = rule_service.accept_all_criteria(package_id, actor, body.reason)
+    audit_service.log(None, actor, "rules.accept_all", "package", str(package_id), out)
+    return out
+
+
+@router.post("/rules/packages/{package_id}/signoff-all")
+def signoff_all(package_id: int, body: ReasonBody, actor: str = Depends(get_actor)) -> dict:
+    out = rule_service.signoff_all_criteria(package_id, actor, body.reason)
+    audit_service.log(None, actor, "rules.signoff_all", "package", str(package_id), out)
+    return out
+
+
 @router.post("/rules/packages/{package_id}/criteria", response_model=CriterionOut)
 def add_criterion(package_id: int, body: NewCriterionBody, actor: str = Depends(get_actor)):
     crit = rule_service.add_criterion(package_id, body.model_dump(), actor, body.reason)

@@ -5,6 +5,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import { reportUrl } from "../api/client";
 import { useRanking, useReport } from "../api/hooks";
 import type { OpenByCriterion, OpenQuestion, RankingRow } from "../types";
+import { REVIEW_STATUS_LABELS } from "../types";
 
 const SEVERITY_META: Record<OpenQuestion["severity"], { color: string; text: string }> = {
   high: { color: "red", text: "高" },
@@ -61,11 +62,11 @@ export default function RankingReport() {
           type="error"
           showIcon
           style={{ marginBottom: 12 }}
-          message={`本报告为草稿，尚有 ${report.progress.open} 项未经人工处置（其中 ${report.progress.blocking} 项需优先裁决）`}
+          message={`本报告为草稿，尚有 ${report.progress.open} 项未定稿处置（其中 ${report.progress.blocking} 项需优先裁决）`}
           description={
             <div>
               草稿中的排名与总分为<b>暂定值</b>：未定分项不计入总分，建议否决者仍参与排名仅供交叉验证。
-              逐项复核完成后点「重算排名与报告」即为<b>定稿</b>，两者共用同一规则版本哈希，可逐项对照。
+              逐项处置完成后点「重算排名与报告」即为<b>定稿</b>，两者共用同一规则版本哈希，可逐项对照。
             </div>
           }
         />
@@ -75,7 +76,7 @@ export default function RankingReport() {
           type="success"
           showIcon
           style={{ marginBottom: 12 }}
-          message={`本报告为定稿：全部 ${report.progress.total} 项评分均已人工处置`}
+          message={`本报告为定稿：全部 ${report.progress.total} 项评分均已处置（人工确认或自动裁决，全程留痕）`}
         />
       )}
 
@@ -219,7 +220,7 @@ export default function RankingReport() {
                 width: 140,
                 render: (_v, q) => (
                   <div>
-                    <div>{q.review_status}</div>
+                    <div>{REVIEW_STATUS_LABELS[q.review_status] ?? q.review_status}</div>
                     <div style={{ color: "#888", fontSize: 12 }}>
                       {q.final_score !== null ? `当前分 ${q.final_score}` : "未定分"}
                     </div>
@@ -274,7 +275,8 @@ export default function RankingReport() {
                     { title: "评分项", dataIndex: "criterion" },
                     { title: "类别", dataIndex: "category", width: 120 },
                     { title: "得分", dataIndex: "final_score", width: 100, render: (v) => v ?? "未定分" },
-                    { title: "复核状态", dataIndex: "review_status", width: 140 },
+                    { title: "复核状态", dataIndex: "review_status", width: 140,
+                      render: (v: string) => REVIEW_STATUS_LABELS[v] ?? v },
                   ]}
                 />
               </div>
