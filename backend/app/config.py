@@ -160,7 +160,19 @@ def llm_model() -> str:
 
 
 def llm_timeout_s() -> float:
-    return float(os.environ.get("BID_EVAL_LLM_TIMEOUT_S", 120))
+    return float(os.environ.get("BID_EVAL_LLM_TIMEOUT_S", 300))
+
+
+def llm_max_output_tokens() -> int:
+    """compile 等大 JSON 输出的 max_tokens。None 时 provider 默认输出上限
+    （DeepSeek deepseek-chat 默认 4K）会截断长规则包 JSON——编译真实标书的
+    已实证失败原因；8192 覆盖 87 条级规则包。"""
+    return int(os.environ.get("BID_EVAL_LLM_MAX_TOKENS", 8192))
+
+
+def llm_retry_backoff_s() -> float:
+    """规则抽取两次尝试之间的退避秒数（限流/超时后的第二次尝试缓冲）。"""
+    return float(os.environ.get("BID_EVAL_LLM_RETRY_BACKOFF_S", 2))
 
 
 def llm_max_concurrency() -> int:

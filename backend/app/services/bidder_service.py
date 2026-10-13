@@ -100,7 +100,7 @@ def extract_price(bidder_id: int) -> Bidder:
     if doc_ids and facts.bid_price is not None:
         from app.evidence.verifier import create_citation
 
-        quote = _find_price_quote(text)
+        quote = _find_price_quote(text, facts.bid_price)
         if quote:
             evidence_id = create_citation(
                 doc_ids[0], quote, role="price", created_by="engine"
@@ -123,14 +123,24 @@ def extract_price(bidder_id: int) -> Bidder:
         return bidder
 
 
-def _find_price_quote(text: str) -> str | None:
-    """从文本中找到包含报价的整行（作为证据引文）。"""
+def _find_price_quote(text: str, price: Decimal | None = None) -> str | None:
+    """从文本中找到包含报价的整行（作为证据引文）。
+
+    “投标总价”行优先；兜底找含报价数字本身（裸/千分位两种写法）的整行——
+    开标一览表跨行断裂形态下，数据行（如 `2401143 2545211.58 郑峪嘉`）是唯一证据。
+    """
     for line in text.split("\n"):
         if "投标总价" in line and any(ch.isdigit() for ch in line):
             return line.strip()
     for line in text.split("\n"):
         if "投标总价人民币" in line:
             return line.strip()
+    if price is not None:
+        raw = f"{price:f}".rstrip("0").rstrip(".")
+        grouped = f"{price:,.2f}"
+        for line in text.split("\n"):
+            if raw in line or grouped in line:
+                return line.strip()
     return None
 
 

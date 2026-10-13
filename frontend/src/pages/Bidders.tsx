@@ -6,11 +6,13 @@ import {
   Card,
   Form,
   Input,
+  InputNumber,
   List,
   Modal,
   Space,
   Table,
   Tag,
+  Tooltip,
   Typography,
   Upload,
   message,
@@ -27,6 +29,114 @@ const PRICE_TAG: Record<string, { color: string; text: string }> = {
   conflict: { color: "red", text: "冲突待裁决" },
 };
 
+/** 人工录入报价：受控 Modal（静态 Modal.confirm 的 okButtonProps 一次性求值，
+ *  disabled 永远卡在初始态——那是"人工录入不可用"的根因，2026-10-13）。 */
+function ManualPriceModal({
+  bidder,
+  onClose,
+}: {
+  bidder: Bidder | null;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const [price, setPrice] = useState<number | null>(null);
+  const [reason, setReason] = useState("");
+  const setPriceManual = useMutation({
+    mutationFn: ({ id, price_yuan, reason }: { id: number; price_yuan: number; reason: string }) =>
+      api.post(`/bidders/${id}/price/set`, { price_yuan, reason }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["bidders"] });
+      message.success("报价已人工录入并确认（留痕）");
+      onClose();
+    },
+    onError: (e: Error) => message.error(e.message),
+  });
+  if (!bidder) return null;
+  const valid = price != null && Number(price) > 0 && !!reason.trim();
+  return (
+    <Modal
+      open
+      title={`人工录入报价：${bidder.name}`}
+      onCancel={onClose}
+      okText="录入并确认（留痕）"
+      okButtonProps={{ disabled: !valid, loading: setPriceManual.isPending }}
+      onOk={async () =>
+        await setPriceManual.mutateAsync({ id: bidder.id, price_yuan: Number(price), reason })
+      }
+    >
+      <InputNumber
+        style={{ width: "100%", marginTop: 8 }}
+        min={0.01}
+        precision={2}
+        placeholder="投标报价（元），如 7600000"
+        value={price}
+        onChange={(v) => setPrice(v ?? null)}
+      />
+      <Input.TextArea
+        placeholder="录入理由（必填；抽取失败或抽错时的兜底，价格分的最敏感输入）"
+        rows={2}
+        style={{ marginTop: 8 }}
+        value={reason}
+        onChange={(e) => setReason(e.target.value)}
+      />
+    </Modal>
+  );
+}
+
+/** 确认报价：受控 Modal（同族隐患消除；理由可空，空时用默认理由兜底）。 */
+function ConfirmPriceModal({
+  bidder,
+  onClose,
+}: {
+  bidder: Bidder | null;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const [reason, setReason] = useState("");
+  const confirmPrice = useMutation({
+    mutationFn: ({ id, reason }: { id: number; reason: string }) =>
+      api.post(`/bidders/${id}/price/confirm`, { reason }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["bidders"] });
+      message.success("报价已人工确认（价格分输入的强制卡点）");
+      onClose();
+    },
+    onError: (e: Error) => message.error(e.message),
+  });
+  if (!bidder) return null;
+  const conflict = (bidder.price_breakdown_json as { conflict?: boolean } | null)?.conflict;
+  return (
+    <Modal
+      open
+      title={`确认 ${bidder.name} 的投标报价`}
+      onCancel={onClose}
+      okText="确认（留痕）"
+      okButtonProps={{ loading: confirmPrice.isPending }}
+      onOk={async () =>
+        await confirmPrice.mutateAsync({
+          id: bidder.id,
+          reason: reason.trim() || "与开标一览表核对一致",
+        })
+      }
+    >
+      <p>
+        报价：<b>{bidder.bid_price ? Number(bidder.bid_price).toLocaleString() : "—"} 元</b>
+        （{bidder.bid_price_upper ? `大写：${bidder.bid_price_upper}` : "无大写金额"}）
+      </p>
+      {conflict && (
+        <Alert type="error" showIcon message="大小写金额或分项合计存在冲突，请核对原件后再确认" />
+      )}
+      <Input.TextArea
+        placeholder="确认理由（必填，记入留痕）"
+        rows={2}
+        style={{ marginTop: 8 }}
+        value={reason}
+        onChange={(e) => setReason(e.target.value)}
+      />
+    </Modal>
+  );
+}
+
 export default function Bidders() {
   const { pid = "" } = useParams();
   const qc = useQueryClient();
@@ -37,6 +147,8 @@ export default function Bidders() {
   const [jobId, setJobId] = useState<number | null>(null);
   const { data: job } = useJob(jobId);
   const [preview, setPreview] = useState<{ bidder: Bidder; items: { code: string; name: string; verdict: string; message: string }[] } | null>(null);
+  const [manualTarget, setManualTarget] = useState<Bidder | null>(null);
+  const [confirmTarget, setConfirmTarget] = useState<Bidder | null>(null);
 
   const create = useMutation({
     mutationFn: (values: { name: string; unified_code?: string }) =>
@@ -54,53 +166,8 @@ export default function Bidders() {
       qc.invalidateQueries({ queryKey: ["bidders", pid] });
       message.success(`报价已抽取（${r.price_status === "conflict" ? "存在冲突，需人工裁决" : "待确认"}）`);
     },
-  });
-
-  const confirmPrice = useMutation({
-    mutationFn: ({ id, reason }: { id: number; reason: string }) =>
-      api.post(`/bidders/${id}/price/confirm`, { reason }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["bidders", pid] });
-      message.success("报价已人工确认（价格分输入的强制卡点）");
-    },
     onError: (e: Error) => message.error(e.message),
   });
-
-  const setPriceManual = useMutation({
-    mutationFn: ({ id, price_yuan, reason }: { id: number; price_yuan: number; reason: string }) =>
-      api.post(`/bidders/${id}/price/set`, { price_yuan, reason }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["bidders", pid] });
-      message.success("报价已人工录入并确认（留痕）");
-    },
-    onError: (e: Error) => message.error(e.message),
-  });
-
-  const manualPriceDialog = (bidder: Bidder) => {
-    let price = "";
-    let reason = "";
-    Modal.confirm({
-      title: `人工录入报价：${bidder.name}`,
-      content: (
-        <div>
-          <Input
-            placeholder="投标报价（元），如 7600000"
-            style={{ marginTop: 8 }}
-            onChange={(e) => (price = e.target.value)}
-          />
-          <Input.TextArea
-            placeholder="录入理由（必填；抽取失败或抽错时的兜底，价格分的最敏感输入）"
-            rows={2}
-            style={{ marginTop: 8 }}
-            onChange={(e) => (reason = e.target.value)}
-          />
-        </div>
-      ),
-      okButtonProps: { disabled: !price || !reason.trim() || isNaN(Number(price)) },
-      onOk: () =>
-        setPriceManual.mutateAsync({ id: bidder.id, price_yuan: Number(price), reason }),
-    });
-  };
 
   const uploadDoc = useMutation({
     mutationFn: async ({ bidderId, file }: { bidderId: number; file: File }) => {
@@ -126,31 +193,6 @@ export default function Bidders() {
     onSuccess: (r) => setPreview(r),
     onError: (e: Error) => message.error(e.message),
   });
-
-  const confirmDialog = (bidder: Bidder) => {
-    let reason = "";
-    Modal.confirm({
-      title: `确认 ${bidder.name} 的投标报价`,
-      content: (
-        <div>
-          <p>
-            报价：<b>{bidder.bid_price ? Number(bidder.bid_price).toLocaleString() : "—"} 元</b>
-            （大写：{bidder.bid_price_upper ?? "—"}）
-          </p>
-          {(bidder.price_breakdown_json as { conflict?: boolean })?.conflict && (
-            <Alert type="error" showIcon message="大小写金额或分项合计存在冲突，请核对原件后再确认" />
-          )}
-          <Input.TextArea
-            placeholder="确认理由（必填，记入留痕）"
-            onChange={(e) => (reason = e.target.value)}
-            rows={2}
-            style={{ marginTop: 8 }}
-          />
-        </div>
-      ),
-      onOk: () => confirmPrice.mutateAsync({ id: bidder.id, reason: reason || "与开标一览表核对一致" }),
-    });
-  };
 
   const docsByBidder = (bidderId: number) =>
     (documents ?? []).filter((d) => d.bidder_id === bidderId);
@@ -212,9 +254,11 @@ export default function Bidders() {
                     return false;
                   }}
                 >
-                  <Button size="small" icon={<InboxOutlined />}>
-                    上传投标文件
-                  </Button>
+                  <Tooltip title="支持 PDF（含扫描件自动 OCR）。若报价在 Excel 报价表中，请将该表页导出为 PDF 上传，或使用「人工录入」。">
+                    <Button size="small" icon={<InboxOutlined />}>
+                      上传投标文件
+                    </Button>
+                  </Tooltip>
                 </Upload>
               </Space>
             ),
@@ -232,6 +276,11 @@ export default function Bidders() {
                     </Tag>
                   )}
                 </span>
+                {!row.bid_price && (
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    请确认文件含开标一览表，或直接人工录入
+                  </Typography.Text>
+                )}
                 {row.bid_price_upper && (
                   <Typography.Text type="secondary">大写：{row.bid_price_upper}</Typography.Text>
                 )}
@@ -255,11 +304,11 @@ export default function Bidders() {
                   type="primary"
                   ghost
                   disabled={!row.bid_price || row.price_status === "confirmed"}
-                  onClick={() => confirmDialog(row)}
+                  onClick={() => setConfirmTarget(row)}
                 >
                   确认报价
                 </Button>
-                <Button size="small" onClick={() => manualPriceDialog(row)}>
+                <Button size="small" onClick={() => setManualTarget(row)}>
                   人工录入
                 </Button>
                 <Button size="small" onClick={() => qualificationPreview.mutate(row)}>
@@ -282,6 +331,9 @@ export default function Bidders() {
         </Form>
       </Modal>
 
+      <ManualPriceModal bidder={manualTarget} onClose={() => setManualTarget(null)} />
+      <ConfirmPriceModal bidder={confirmTarget} onClose={() => setConfirmTarget(null)} />
+
       <Modal
         open={!!preview}
         title={`资格/符合性预判：${preview?.bidder.name ?? ""}`}
@@ -293,7 +345,7 @@ export default function Bidders() {
           type="info"
           showIcon
           style={{ marginBottom: 8 }}
-          message="预判只读且不生效；正式结论以评分运行的记录为准，且否决必须人工确认。"
+          message="预判只读且不生效；正式结论以评分运行的记录为准（裁决留痕可溯）。"
         />
         <List
           size="small"

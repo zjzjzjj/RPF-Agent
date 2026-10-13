@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from decimal import Decimal
 
 from sqlalchemy import select
@@ -404,16 +405,22 @@ def compile_rules(
     provider: str | None = None,
     model: str | None = None,
     merge_target_id: int | None = None,
+    *,
+    selection_meta_out: dict | None = None,
 ) -> int:
     """执行一次编译，返回新草稿规则包 id。
 
     merge_target_id 非空 = merge 模式（S1）：产物为临时编译包，指向模板包，
     供逐条覆盖匹配（设计稿 §5.1 阶段 A）。
+    selection_meta_out 非空时被原地写入选段元数据（truncated/chars/tiers），供
+    调用层（compile_rules_job）落 Job.result_json 审计——不改返回值契约。
     """
     from app.llm.registry import get_provider
 
     _text, doc = _load_tender_text(document_id)  # 校验 kind/parse_status 并取回 doc
     text, sel = select_compile_text(_load_tender_pages(document_id))
+    if selection_meta_out is not None:
+        selection_meta_out.update(sel)
     if sel["truncated"]:
         log.warning(
             "招标文件超长（%d 字符），按章节优先级选取 %d 字符，入选页 %s，档位命中 %s",
@@ -439,14 +446,20 @@ def compile_rules(
                 prompt,
                 RuleExtraction,
                 data_class=doc.data_class,
+                max_tokens=config.llm_max_output_tokens(),
             )
             last_error = None
             break
         except LLMError as exc:
             last_error = exc
             log.warning("规则抽取第 %d 次尝试失败：%s", attempt, exc)
+            if attempt == 1:
+                time.sleep(config.llm_retry_backoff_s())  # 超时/限流后退避再试
     if extraction is None:
-        raise AppError(f"规则抽取失败（含修复重试）：{last_error}")
+        raise AppError(
+            f"规则抽取失败（含修复重试）：{last_error}；"
+            "若持续失败，多为模型输出上限不足或模型上下文过小，请更换模型后重试"
+        )
 
     version = _next_version(project_id)
     with session_scope() as s:
@@ -518,13 +531,23 @@ def compile_rules_job(ctx: JobContext, payload: dict) -> dict:
     ctx.start(total=4, message="加载招标文件")
     _load_tender_text(document_id)
     ctx.advance(message="LLM 抽取评分规则")
+    selection_meta: dict = {}
     package_id = compile_rules(
         project_id, document_id, actor, provider, model,
         merge_target_id=int(merge_target_id) if merge_target_id else None,
+        selection_meta_out=selection_meta,
     )
-    ctx.advance(message="校验与分诊完成")
+    if selection_meta.get("truncated"):
+        ctx.advance(message=(
+            f"已按章节优先级选取 {selection_meta['chars']}/{selection_meta['total_chars']} 字符"
+            f"（{len(selection_meta.get('pages') or [])} 页；档位命中 {selection_meta.get('tiers') or {}}）"
+        ))
+    else:
+        ctx.advance(message="校验与分诊完成")
 
     result: dict = {"package_id": package_id}
+    if selection_meta.get("truncated"):
+        result["selection_meta"] = selection_meta
     if merge_target_id and config.auto_mode():
         # 全自动模式：合并配对自动采纳（覆盖/追加/弃用全留痕），不再进人工抽屉。
         # best-effort：合并处置失败不让编译失败，原因进 result_json 供前端提示。

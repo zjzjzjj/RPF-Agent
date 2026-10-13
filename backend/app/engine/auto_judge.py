@@ -96,7 +96,25 @@ def refine_with_llm(
 
     任何路径都返回 need_human=False 的 PrimitiveResult（全自动不悬挂）。
     """
-    truncated = bid_text[:MAX_BID_CHARS]
+    truncated = bid_text
+    if len(bid_text) > MAX_BID_CHARS:
+        # 章节感知选段：按条款名/描述/原文引用关键词，超长标书不再只看头部
+        from app.engine.selection import (
+            derive_keywords,
+            select_chunks_by_tier,
+            split_text_chunks,
+        )
+
+        picked, _meta = select_chunks_by_tier(
+            split_text_chunks(bid_text),
+            (("criterion", derive_keywords({
+                "name": f"{criterion.get('name') or ''} {criterion.get('description') or ''}".strip(),
+                "quote": criterion.get("quote") or criterion.get("source_quote") or "",
+            })),),
+            MAX_BID_CHARS,
+            fallback_diffuse=True,
+        )
+        truncated = "\n".join(t for _i, t in picked)
     user = (
         f"<rule>\n{json.dumps(_rule_payload(criterion), ensure_ascii=False, indent=1)}\n</rule>\n"
         f"<facts>\n{json.dumps(_facts_summary(facts), ensure_ascii=False, indent=1)}\n</facts>\n"

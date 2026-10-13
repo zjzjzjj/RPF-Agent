@@ -24,7 +24,7 @@ from app.rules import prompts
 
 log = logging.getLogger("bid_eval.subjective")
 
-MAX_BID_CHARS = 20_000  # MVP 截断；真实长标书按章节检索是后续优化
+MAX_BID_CHARS = 20_000  # 送审预算；超长标书按评分项关键词选段（不再头部盲截）
 
 
 class SubjectiveOutput(BaseModel):
@@ -88,8 +88,27 @@ def suggest_score(
 
     truncated = bid_text
     if len(truncated) > MAX_BID_CHARS:
-        truncated = truncated[:MAX_BID_CHARS]
-        warnings.append(f"投标文件超长，截断至前 {MAX_BID_CHARS} 字符参与评审")
+        # 章节感知选段：按评分项名称/证据要求派生关键词选相关段落（保序拼接），
+        # 替换过去的头部盲截——200 页标书只看前 4% 曾把尾部"售后服务方案"
+        # 系统性评成最低档（无证据→兜底）。
+        from app.engine.selection import (
+            derive_keywords,
+            select_chunks_by_tier,
+            split_text_chunks,
+        )
+
+        picked, meta = select_chunks_by_tier(
+            split_text_chunks(bid_text),
+            (("criterion", derive_keywords(criterion)),),
+            MAX_BID_CHARS,
+            fallback_diffuse=True,
+        )
+        truncated = "\n".join(t for _i, t in picked)
+        warnings.append(
+            f"投标文件超长（{meta['total_chars']} 字符），已按评分项"
+            f"「{criterion.get('name')}」关键词选取 {meta['chars']} 字符参与评审"
+            "（保留原文次序）"
+        )
 
     user = prompts.SUBJECTIVE_USER_TEMPLATE.format(
         name=criterion.get("name") or "",

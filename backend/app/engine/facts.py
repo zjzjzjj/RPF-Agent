@@ -120,6 +120,100 @@ def _contextual_price(text: str) -> Decimal | None:
     return first_non_deposit
 
 
+# ---------------------------------------------------------------------------
+# 第 5 级兜底：开标一览表窗口扫描（真实标书的表头跨行断裂形态，2026-10-13）
+# 实测《北京先进数通投标文件.pdf》p303：表头断成 3 行、数据行断成 2 行，
+# 四级标签-金额邻近正则全灭。mwb 借鉴（xlsx_parser PRICE_KEYWORDS +
+# signal_runners._AMOUNT_RE 的 ≥10000 元阈值）：
+# "开标一览表"章节锚点 + 2000 字符窗口 + 语境词预筛 + 税率显式配对判含税价。
+# ---------------------------------------------------------------------------
+_RE_OPEN_BID_HEADING = re.compile(r"开标一览表|开标一览|报价一览表")
+_PRICE_SECTION_WINDOW = 2000
+_RE_MONEY_LIKE = re.compile(
+    r"(?<![\d.a-zA-Z])(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d{5,}(?:\.\d+)?)(?![\d.]*%[^\d]|[\d.]*%\s)"
+)
+_PRICE_CONTEXT_WORDS = ("投标价", "投标报价", "报价", "总价", "含增值税", "含税")
+_RE_TAX_RATE = re.compile(r"(\d{1,2}(?:\.\d+)?)\s*%")
+_RE_DATE_CONTEXT = re.compile(r"\d{4}\s*年|\d{1,2}\s*月|\d{4}[-/]\d")
+
+
+def _money_candidates(window: str) -> list[Decimal]:
+    """窗口内金额形态候选（≥10000；排除税率/日期/小额序号）。"""
+    out: list[Decimal] = []
+    for m in _RE_MONEY_LIKE.finditer(window):
+        raw = m.group(1).replace(",", "")
+        try:
+            value = Decimal(raw)
+        except InvalidOperation:
+            continue
+        if value < 10_000:
+            continue
+        # 日期连写（20240601 形态或紧邻年月日）
+        ctx = window[max(0, m.start() - 6): m.end() + 6]
+        if _RE_DATE_CONTEXT.search(ctx):
+            continue
+        out.append(value)
+    return out
+
+
+def _tax_paired_price(window: str, candidates: list[Decimal]) -> Decimal | None:
+    """显式配对："(b - a) / a ≈ 税率%" → 返回含税价 b。p303 实测
+    2545211.58 / 2401143 - 1 = 6.03%（6% 税率，0.5% 容差内命中）。"""
+    head = window[:400]
+    has_excl = ("不含增值税" in head or "不含税" in head)
+    has_incl = ("含增值税" in head or "含税" in head)
+    if not (has_excl and has_incl):
+        return None
+    rates = [Decimal(m.group(1)) for m in _RE_TAX_RATE.finditer(head)
+             if Decimal(m.group(1)) < 50]
+    if not rates:
+        return None
+    for b in candidates:
+        for a in candidates:
+            if a >= b:
+                continue
+            try:
+                implied = (b - a) / a * 100
+            except InvalidOperation:
+                continue
+            if any(abs(implied - r) <= Decimal("0.5") for r in rates):
+                return b
+    return None
+
+
+def _price_from_open_bid_section(text: str) -> Decimal | None:
+    """开标一览表章节锚点 + 2000 字符窗口扫描。多锚点择优
+    （得分 = 语境词命中 + 显式配对×2；并列取更靠后锚点——真章节在目录之后）。"""
+    best: tuple[int, Decimal] | None = None
+    for m in _RE_OPEN_BID_HEADING.finditer(text):
+        window = text[m.start(): m.start() + _PRICE_SECTION_WINDOW]
+        if not any(w in window for w in _PRICE_CONTEXT_WORDS):
+            continue  # 目录假锚点
+        # 跨行断裂的表头拼接——行间必须插分隔符：行尾数字与下一行行首数字
+        # 无缝相连会拼出假金额（实测 2000000.00\n10000 → 12000000.00）
+        window_joined = " ".join(window.split("\n"))
+        candidates = _money_candidates(window_joined) or _money_candidates(window)
+        if not candidates:
+            continue
+        paired = _tax_paired_price(window_joined, candidates)
+        score = sum(1 for w in _PRICE_CONTEXT_WORDS if w in window)
+        chosen: Decimal
+        if paired is not None:
+            score += 2
+            chosen = paired
+        else:
+            # 保守回退取最大（增值税恒正 → 含税 > 不含税，与限价对比口径一致）；
+            # 候选恰为整万且窗口含"保证金" → 软降权（保证金列与真报价并列时弃它）
+            def _rank(v: Decimal) -> tuple:
+                is_round_wan = v % 10_000 == 0
+                return (1 if (is_round_wan and "保证金" in window) else 0, v)
+
+            chosen = max(candidates, key=_rank)
+        if best is None or score >= best[0]:
+            best = (score, chosen)
+    return best[1] if best else None
+
+
 # 报价标签后跟金额的窗口长度。真实开标一览表把金额放在表头**下一行**
 # （"投标总价（含税） 税率\n1 壹佰柒拾肆万玖仟元整 6% …"），同行正则够不着，
 # 必须向后看一小段；窗口取窄值以免越过表格读到别的金额（如投标保证金）。
@@ -192,6 +286,9 @@ def extract_bid_facts(text: str, documents: list[str] | None = None) -> BidFacts
         facts.bid_price = near
     elif m := _RE_PRICE_INCL_VAT.search(text):
         facts.bid_price = _money(m.group(1))
+    elif (ob := _price_from_open_bid_section(text)) is not None:
+        # ⑤ 结构锚点兜底（强于④的全局弱启发）：开标一览表跨行断裂表单
+        facts.bid_price = ob
     else:
         facts.bid_price = _contextual_price(text)
     # 大写金额

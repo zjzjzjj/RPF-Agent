@@ -58,6 +58,8 @@ export default function TenderRules() {
   const [signoffTarget, setSignoffTarget] = useState<CriterionOut | null>(null);
   const [mergePackageId, setMergePackageId] = useState<number | null>(null);
   const [proposalOpen, setProposalOpen] = useState(false);
+  const [unfreezeOpen, setUnfreezeOpen] = useState(false);
+  const [unfreezeReason, setUnfreezeReason] = useState("");
   const mergeCompileRef = useRef(false);
   const isTemplatePackage = rules?.origin === "template";
   const canMerge = rules?.origin === "template" || rules?.origin === "merged";
@@ -140,6 +142,20 @@ export default function TenderRules() {
       qc.invalidateQueries({ queryKey: ["rules", pid] });
       qc.invalidateQueries({ queryKey: ["coverage", rules?.id ?? null] });
       message.success(`已批量签批 ${r.signed_off} 项并留痕`);
+    },
+    onError: (e: Error) => message.error(e.message),
+  });
+
+  // 解冻并创建新版本：冻结包复制为可编辑草稿（原包保持只读留痕，历史评分不受影响）
+  const newVersion = useMutation({
+    mutationFn: (reason: string) =>
+      api.post<{ id: number; version: number }>(`/rules/packages/${rules!.id}/versions`, { reason }),
+    onSuccess: (r) => {
+      qc.invalidateQueries({ queryKey: ["rules", pid] });
+      qc.invalidateQueries({ queryKey: ["coverage", r.id] });
+      setUnfreezeOpen(false);
+      setUnfreezeReason("");
+      message.success(`已创建 v${r.version} 草稿（原冻结包保持只读留痕）`);
     },
     onError: (e: Error) => message.error(e.message),
   });
@@ -409,6 +425,12 @@ export default function TenderRules() {
                   >
                     冻结（进入只读）
                   </Button>
+                  {rules.status === "frozen" && (
+                    <Button icon={<SwapOutlined />} loading={newVersion.isPending}
+                      onClick={() => setUnfreezeOpen(true)}>
+                      解冻并创建新版本
+                    </Button>
+                  )}
                 </Space>
               </span>
             </Space>
@@ -439,6 +461,27 @@ export default function TenderRules() {
           )}
 
           <Card title="评分项（支持全部采纳 / 全部签批，逐条留痕）" style={{ marginTop: 12 }}>
+            {/* 解冻弹层 */}
+            <Modal
+              open={unfreezeOpen}
+              title={`解冻并创建新版本（当前 v${rules.version}）`}
+              onCancel={() => setUnfreezeOpen(false)}
+              okText="创建新草稿"
+              okButtonProps={{ disabled: !unfreezeReason.trim(), loading: newVersion.isPending }}
+              onOk={() => newVersion.mutate(unfreezeReason.trim())}
+            >
+              <Typography.Text type="secondary">
+                将把当前冻结包复制一份可编辑草稿（条目、签批与覆盖记录全部沿用）；
+                原冻结包保持只读留痕，历史评分结果不受影响。创建新版本必须填写理由。
+              </Typography.Text>
+              <Input.TextArea
+                rows={2}
+                style={{ marginTop: 12 }}
+                placeholder="解冻/修订理由（必填，记入留痕）"
+                value={unfreezeReason}
+                onChange={(e) => setUnfreezeReason(e.target.value)}
+              />
+            </Modal>
             <Table<CriterionOut>
               scroll={{ x: 1000 }}
               rowKey="id"
