@@ -1,0 +1,22 @@
+{
+  "id": "general-law",
+  "version": "1.0.0",
+  "extends": null,
+  "name": "法律通用规则包·全量（87条通用规则）",
+  "description": "覆盖形式评审(FORM-001~037)、资格评审(QUAL-001~023)、响应性评审(RES-001~012)、否决投标(REJ-001~015)，依据本地法规库法条级知识库自动编译。否决项须评标委员会确认后生效；招标文件级规则按项目确认。",
+  "scope": "law",
+  "source": "LAW",
+  "total_max": 100,
+  "status": "draft",
+  "enabled": true,
+  "rule_count": 87,
+  "external_refs": [
+    "招标文件://投标人须知前附表"
+  ],
+  "generated_from": {
+    "artifact": "生成_规则包_通用规则库全量.json",
+    "artifact_sha256_16": "a1891ac7dc0e9333",
+    "law_nodes": 21,
+    "non_law_criteria": 5
+  }
+}

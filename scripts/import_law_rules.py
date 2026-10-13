@@ -2,20 +2,23 @@
 """法律通用规则包导入脚本（S-Law，进程内 TestClient，无需启动服务）。
 
 用法：
-    py -3 scripts/import_law_rules.py --dry-run [--package <json>]        # 纯校验，不落库
+    py -3 scripts/import_law_rules.py --dry-run                            # 纯校验，不落库
     py -3 scripts/import_law_rules.py --new-project "法律规则演示" --confirm --freeze
     py -3 scripts/import_law_rules.py --project PRJ-XXXX [--confirm] [--freeze]
 
+缺省源 = 仓库内固定通用规则包（backend/app/rules/library/law_packs/general-law，
+由 scripts/build_law_pack.py 从法规库制品生成），知识库缺省 = 仓库 data/law_kb.json。
+
+从外部法规库制品导入（绕过仓库包）：
+    py -3 scripts/import_law_rules.py --artifact <规则包.json> --kb <知识库.json> ...
+
 参数：
-    --package     默认 <工作区>/261010/文件/法规库/00_索引/生成_规则包_通用规则库全量.json
-    --law-kb      默认 <同目录>/生成_法条知识库.json
-    --refresh-kb  强制覆盖 vendoring 的知识库
     --dry-run     只跑 validate_only 打印 findings（error>0 → exit 2），不建 app、不写库
     --confirm     导入成功后顺带调既有 confirm 端点
     --freeze      （隐含 --confirm）冻结规则包
 
 知识库路径（必需步骤）：confirm/freeze 的 run_validations 读 config.law_kb_path()。
-导入路径会把 --law-kb vendoring 到该默认位置（BID_EVAL_LAW_KB_PATH 可覆盖）；
+从制品导入时会把 --kb vendoring 到该默认位置（BID_EVAL_LAW_KB_PATH 可覆盖）；
 dry-run 是同进程纯内存校验，直接把该 env 指向源文件即可。
 """
 from __future__ import annotations
@@ -30,9 +33,9 @@ from pathlib import Path
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "backend"))
 
-WORKSPACE = REPO.parent  # ZJUBJ（RPF Agent 与 261010 同级）
-DEFAULT_PKG = WORKSPACE / "261010/文件/法规库/00_索引/生成_规则包_通用规则库全量.json"
-DEFAULT_KB = WORKSPACE / "261010/文件/法规库/00_索引/生成_法条知识库.json"
+# 外部法规库制品的缺省位置（目录曾从 261010/文件/法规库 上移至 ZJUBJ 顶层）
+DEFAULT_PKG = Path(r"E:\ZJUBJ\法规库\00_索引\生成_规则包_通用规则库全量.json")
+DEFAULT_KB = Path(r"E:\ZJUBJ\法规库\00_索引\生成_法条知识库.json")
 
 
 def _load_json(path: Path) -> dict:
@@ -162,8 +165,12 @@ def _import(args: argparse.Namespace, pkg: dict) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="法律通用规则包导入（S-Law）")
-    parser.add_argument("--package", type=Path, default=DEFAULT_PKG, help="规则包 JSON 路径")
-    parser.add_argument("--law-kb", type=Path, default=DEFAULT_KB, help="法条知识库 JSON 路径")
+    parser.add_argument("--package", "--artifact", dest="package", type=Path, default=None,
+                        help="外部法规库制品 JSON（缺省用仓库内固定规则包 "
+                             "law_packs/general-law）")
+    parser.add_argument("--law-kb", "--kb", dest="law_kb", type=Path, default=None,
+                        help="法条知识库 JSON（缺省用仓库 vendored 的 data/law_kb.json；"
+                             "传 --package 时缺省取法规库制品同目录知识库）")
     parser.add_argument("--project", help="已有项目 ID")
     parser.add_argument("--new-project", help="新建项目名称（与 --project 二选一）")
     parser.add_argument("--dry-run", action="store_true", help="只校验不落库")
@@ -175,7 +182,19 @@ def main() -> int:
     if args.freeze:
         args.confirm = True
 
-    pkg = _load_json(args.package)
+    if args.package is not None:
+        pkg = _load_json(args.package)
+        if args.law_kb is None:
+            args.law_kb = DEFAULT_KB
+    else:
+        from app.rules.library.law_pack_loader import load_law_pack
+
+        pkg = load_law_pack()
+        if args.law_kb is None:
+            from app import config
+
+            args.law_kb = config.law_kb_path()
+
     if args.dry_run:
         return _dry_run(pkg, args.law_kb)
     return _import(args, pkg)

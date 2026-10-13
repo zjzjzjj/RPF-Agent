@@ -1,0 +1,27 @@
+{
+  "code": "QUAL-001",
+  "category": "qualification",
+  "name": "营业执照-有效性",
+  "max_score": null,
+  "score_type": "veto",
+  "is_veto": true,
+  "veto_consequence": "disqualify",
+  "description": "营业执照在投标截止日处于有效期内、登记状态为存续（在营），名称与投标人一致；通过国家企业信用信息公示系统核验。",
+  "levels": [],
+  "check_type": "document_present",
+  "params": {
+    "document": "营业执照"
+  },
+  "formula_type": null,
+  "benchmark_method": null,
+  "k": null,
+  "upper_bound": null,
+  "rounding": null,
+  "count_per_item": null,
+  "quote": "投标人应当具备承担招标项目的能力；国家有关规定对投标人资格条件或者招标文件对投标人资格条件有规定的，投标人应当具备规定的资格条件",
+  "page_hint": null,
+  "confidence": null,
+  "source_node_id": "法条://中华人民共和国招标投标法（2017年修正本）/第二十六条",
+  "source_quote": "投标人应当具备承担招标项目的能力；国家有关规定对投标人资格条件或者招标文件对投标人资格条件有规定的，投标人应当具备规定的资格条件",
+  "weight": null
+}

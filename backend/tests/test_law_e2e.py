@@ -1,7 +1,7 @@
 """法律规则包端到端：导入 → 确认 → 冻结 → 评分执行（match 第五桶 + 串通检测）。
 
 主链用合成包（6 条：4 veto + 2 match）保证快速与 hermetic；
-真制品 87 条用例 skipif（只验导入到冻结，不跑评分，避免 87×N 记录拖慢）。
+固化包 87 条用例（law_packs/general-law）只验导入到冻结，不跑评分，避免 87×N 记录拖慢。
 
 核心回归护栏（对应计划 §八·2）：
 - ranking warnings == []（改动前 match 会按"未定分"逐家报警）；
@@ -19,11 +19,11 @@ import pytest
 
 from .conftest import upload_pdf, wait_job
 from .test_law_import import _doc  # 合成 6 条法律包（与导入测试同源）
+from app.rules import law_kb as lk
+from app.rules.library.law_pack_loader import load_law_pack, reset_law_pack_cache
 
 REPO = Path(__file__).resolve().parents[2]
-WORKSPACE = REPO.parent
-REAL_PKG = WORKSPACE / "261010/文件/法规库/00_索引/生成_规则包_通用规则库全量.json"
-REAL_KB = WORKSPACE / "261010/文件/法规库/00_索引/生成_法条知识库.json"
+REPO_KB = REPO / "data" / "law_kb.json"
 
 
 @pytest.fixture()
@@ -148,19 +148,14 @@ def test_full_chain_import_confirm_freeze_score(client, law_chain) -> None:  # n
     assert r.json()["final_score"] is None
 
 
-@pytest.mark.skipif(
-    not (REAL_PKG.exists() and REAL_KB.exists()),
-    reason="本地法规库制品缺失（261010/文件/法规库）",
-)
-def test_import_real_artifact(client, monkeypatch) -> None:  # noqa: ANN001
-    """真制品 87 条：导入 → 校验 0 error → 确认 → 冻结（不跑评分，防拖慢）。"""
-    import app.rules.law_kb as lk
-
-    monkeypatch.setenv("BID_EVAL_LAW_KB_PATH", str(REAL_KB))
+def test_import_packed_general_law(client, monkeypatch) -> None:
+    """固化包 87 条：导入 → 校验 0 error → 确认 → 冻结（不跑评分，防拖慢）。"""
+    monkeypatch.setenv("BID_EVAL_LAW_KB_PATH", str(REPO_KB))
     lk.reset_cache()
+    reset_law_pack_cache()
     try:
-        pid = client.post("/api/projects", json={"name": "真制品 87 条"}).json()["id"]
-        doc = json.loads(REAL_PKG.read_text(encoding="utf-8"))
+        pid = client.post("/api/projects", json={"name": "固定规则包 87 条"}).json()["id"]
+        doc = load_law_pack()
         r = client.post(f"/api/projects/{pid}/rules/import-law", json=doc)
         assert r.status_code == 200, r.text
         out = r.json()
@@ -178,3 +173,4 @@ def test_import_real_artifact(client, monkeypatch) -> None:  # noqa: ANN001
         assert cov["template_fallback_pending"] == 0
     finally:
         lk.reset_cache()
+        reset_law_pack_cache()
