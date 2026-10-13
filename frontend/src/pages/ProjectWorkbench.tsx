@@ -45,7 +45,7 @@ const STAGE_PATH: Record<string, string> = {
   rules: "/rules",
   bidders: "/bidders",
   evaluate: "/matrix",
-  review: "/review",
+  review: "/report",
   report: "/report",
 };
 const STAGE_ICON: Record<string, ReactNode> = {

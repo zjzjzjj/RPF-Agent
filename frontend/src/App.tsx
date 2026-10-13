@@ -9,7 +9,6 @@ const TenderRules = lazy(() => import("./pages/TenderRules"));
 const Bidders = lazy(() => import("./pages/Bidders"));
 const ScoreMatrix = lazy(() => import("./pages/ScoreMatrix"));
 const EvidenceWorkbench = lazy(() => import("./pages/EvidenceWorkbench"));
-const ReviewQueue = lazy(() => import("./pages/ReviewQueue"));
 const RankingReport = lazy(() => import("./pages/RankingReport"));
 
 function NotFound() {
@@ -44,7 +43,6 @@ function ProjectShell() {
           <Route path="bidders" element={<Bidders />} />
           <Route path="matrix" element={<ScoreMatrix />} />
           <Route path="evidence/:sid" element={<EvidenceWorkbench />} />
-          <Route path="review" element={<ReviewQueue />} />
           <Route path="report" element={<RankingReport />} />
           <Route path="*" element={<NotFound />} />
         </Routes>

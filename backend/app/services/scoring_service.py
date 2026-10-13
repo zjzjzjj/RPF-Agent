@@ -12,10 +12,12 @@ from decimal import Decimal
 
 from sqlalchemy import func, select
 
+from app import config
 from app.db.models import (
     Bidder,
     EvidenceCitation,
     EvaluationRun,
+    ReviewRecord,
     RulePackage,
     ScoreRecord,
     utcnow,
@@ -54,17 +56,56 @@ def create_run(
             raise ValidationFailed("规则包尚未冻结，不能发起评分（先完成规则确认与冻结）")
         if not bidder_ids:
             raise ValidationFailed("未选择投标人")
-        unconfirmed = []
+        unconfirmed: list[str] = []
+        dropped_no_price: list[str] = []
+        auto = config.auto_mode()
+        kept: list[int] = []
         for bid_id in bidder_ids:
             bidder = s.get(Bidder, bid_id)
             if bidder is None or bidder.project_id != project_id:
                 raise NotFound(f"投标人 {bid_id} 不存在")
-            if bidder.price_status != "confirmed":
+            if bidder.price_status == "confirmed":
+                kept.append(bid_id)
+                continue
+            if not auto:
                 unconfirmed.append(bidder.name)
+                continue
+            # 全自动模式：抽取报价直接生效（报价冲突项由评分内 LLM 裁决并留痕）；
+            # 连报价都没抽到的无法评分，自动剔除并留痕，不阻塞整场。
+            if bidder.bid_price is None:
+                dropped_no_price.append(bidder.name)
+                s.add(
+                    ReviewRecord(
+                        subject_type="price", subject_id=str(bidder.id), action="flag_conflict",
+                        actor=actor,
+                        reason="全自动模式：未抽取到报价，无法参与评分，已自动剔除",
+                        old_value_json={"price_status": bidder.price_status},
+                    )
+                )
+                continue
+            bidder.price_status = "confirmed"
+            s.add(bidder)
+            s.add(
+                ReviewRecord(
+                    subject_type="price", subject_id=str(bidder.id), action="confirm",
+                    actor=actor,
+                    reason="全自动模式：抽取报价直接生效（冲突项由评分内 LLM 裁决并留痕）",
+                    old_value_json={"price_status": bidder.price_status},
+                    new_value_json={"price_status": "confirmed",
+                                    "price": str(bidder.bid_price)},
+                )
+            )
+            kept.append(bid_id)
         if unconfirmed:
             raise ValidationFailed(
                 f"以下投标人报价尚未人工确认：{'、'.join(unconfirmed)}（价格分输入必须经人工确认）"
             )
+        if auto:
+            bidder_ids = kept
+            if not bidder_ids:
+                raise ValidationFailed(
+                    f"所选投标人报价均无法自动确认（未抽取到报价：{'、'.join(dropped_no_price)}）"
+                )
         run = EvaluationRun(
             project_id=project_id,
             package_id=package_id,
@@ -73,7 +114,10 @@ def create_run(
             status="queued",
             stages_json=stages or ["objective", "price", "subjective"],
             llm_provider=provider,
-            config_json={"bidder_ids": bidder_ids},
+            config_json={
+                "bidder_ids": bidder_ids,
+                **({"auto_dropped_bidders": dropped_no_price} if auto and dropped_no_price else {}),
+            },
         )
         s.add(run)
         s.flush()
@@ -273,7 +317,10 @@ def execute_run(
     for bid_id in bidder_ids:
         facts = facts_by_bidder[bid_id]
         for c in veto_items:
-            result = _eval_veto(c, facts)  # type: ignore[arg-type]
+            result = _eval_veto(  # type: ignore[arg-type]
+                c, facts,
+                text=text_by_bidder.get(bid_id), gateway=gateway, data_class=data_class,
+            )
             _upsert_score(
                 run_id, bid_id, c,
                 machine_status=result["verdict"],
@@ -341,6 +388,7 @@ def execute_run(
             result = _eval_veto(  # type: ignore[arg-type]
                 c, facts,
                 on_fail="recommend_reject" if c.get("is_veto") else "need_human",
+                text=text_by_bidder.get(bid_id), gateway=gateway, data_class=data_class,
             )
             _upsert_score(
                 run_id, bid_id, c,
@@ -375,6 +423,16 @@ def execute_run(
         run.finished_at = utcnow()
         s.add(run)
 
+    if config.auto_mode():
+        # 全自动模式：客观裁决直接落投标人状态（否决/进入评分），无需人工确认
+        with session_scope() as s:
+            for bid_id in bidder_ids:
+                bidder = s.get(Bidder, bid_id)
+                if bidder is None:
+                    continue
+                bidder.status = "rejected" if bid_id in excluded_bidders else "scored"
+                s.add(bidder)
+
     return {
         "run_id": run_id,
         "objective": stats["objective"],
@@ -387,17 +445,44 @@ def execute_run(
     }
 
 
-def _eval_veto(c: dict, facts, on_fail: str = "recommend_reject") -> dict:  # noqa: ANN001
+def _eval_veto(  # noqa: ANN001
+    c: dict,
+    facts,
+    on_fail: str = "recommend_reject",
+    text: str | None = None,
+    gateway=None,
+    data_class: str = "synthetic",
+) -> dict:
     check_type = c.get("check_type")
     params = c.get("params") or {}
     if not check_type:
         return {"verdict": "need_human", "message": "该条款缺少可执行的检查定义"}
     result = run_check(check_type, params, facts)
-    verdict = verdict_for(c["code"], c["name"], result, on_fail=on_fail)
+    if (
+        config.auto_mode()
+        and gateway is not None
+        and (result.status == "unknown" or (result.status == "fail" and result.need_human))
+    ):
+        # 全自动模式：human_only / 冲突 / 信号命中 → LLM 带原文证据裁决，收敛终态。
+        # 终态词汇不经过 verdict_for（那是人工模式的映射）：fail 的 machine_status
+        # 按否决语义落 recommend_reject，非否决项落 fail——review_status 一律
+        # auto_confirmed（由 _upsert_score 中央转换），不再有"待人工"的中间态。
+        from app.engine.auto_judge import refine_with_llm
+
+        result = refine_with_llm(gateway, c, facts, text or "", result, data_class=data_class)
+        verdict = (
+            "pass" if result.status == "pass"
+            else ("recommend_reject" if on_fail == "recommend_reject" else "fail")
+        )
+    else:
+        verdict = verdict_for(c["code"], c["name"], result, on_fail=on_fail)
     return {"verdict": verdict, "message": result.message, "evidence": result.evidence_quote}
 
 
 def _review_status_for_verdict(result: dict) -> str:
+    # 全自动模式：一切判定直接收敛终态（LLM 裁决/确定性判定），不进复核队列
+    if config.auto_mode():
+        return "auto_confirmed"
     v = result["verdict"]
     if v == "pass":
         return "pending"  # 客观通过项仍走人工复核流（防错，但默认可批量浏览）
@@ -419,6 +504,9 @@ def _upsert_score(
     final_score: Decimal | None = None,
     warnings_json: list | None = None,
 ) -> ScoreRecord:
+    # 全自动模式：所有复核态（pending/ai_suggested/conflict_flagged）收敛为终态
+    if config.auto_mode() and review_status in ("pending", "ai_suggested", "conflict_flagged"):
+        review_status = "auto_confirmed"
     with session_scope() as s:
         row = s.execute(
             select(ScoreRecord).where(
@@ -549,7 +637,23 @@ def _persist_subjective(
     with session_scope() as s:
         row = s.get(ScoreRecord, row.id)
         row.evidence_status = evidence_status
-        if suggestion.status == "ai_suggested" and evidence_status != "verified":
+        if config.auto_mode():
+            # 全自动模式：AI 建议直接生效；给不出分的按最低档兜底（宁严勿纵），
+            # 警告与 reasoning 全部保留在 ai_raw_json / warnings 供事后审计
+            if suggestion.status == "ai_suggested":
+                row.final_score = suggestion.score
+            else:
+                mins = [Decimal(str(lv.get("min")))
+                        for lv in (criterion.get("levels") or []) if lv.get("min") is not None]
+                fallback = min(mins) if mins else Decimal(0)
+                row.final_score = fallback
+                row.warnings_json = (row.warnings_json or []) + [
+                    {"message": f"全自动模式：模型未给出有效分值，按最低档兜底（{fallback} 分）"}
+                ]
+            row.machine_status = "pass"  # 终态：已定分（兜底详情在 warnings）
+            row.review_status = "auto_confirmed"
+            s.add(row)
+        elif suggestion.status == "ai_suggested" and evidence_status != "verified":
             # 无已核验证据 → 建议仍记录，但降级为待人工
             row.review_status = "pending"
             row.warnings_json = (row.warnings_json or []) + [

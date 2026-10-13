@@ -16,7 +16,6 @@ import {
 import {
   ApartmentOutlined,
   ArrowLeftOutlined,
-  AuditOutlined,
   CheckCircleOutlined,
   FileProtectOutlined,
   FileTextOutlined,
@@ -38,7 +37,6 @@ const NAVIGATION = [
   { path: "/rules", label: "招标文件与规则", icon: <FileTextOutlined /> },
   { path: "/bidders", label: "投标人管理", icon: <TeamOutlined /> },
   { path: "/matrix", label: "评分矩阵", icon: <TableOutlined /> },
-  { path: "/review", label: "复核队列", icon: <AuditOutlined /> },
   { path: "/report", label: "排名与报告", icon: <TrophyOutlined /> },
 ];
 

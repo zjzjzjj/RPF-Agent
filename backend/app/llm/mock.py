@@ -18,6 +18,7 @@ from app.parsing.normalize import normalize_no_ws_with_map
 TASK_RULE_EXTRACTION = "extract_rules"
 TASK_SUBJECTIVE_SCORE = "score_subjective"
 TASK_RULE_MATCH = "match_rules"
+TASK_AUTO_JUDGE = "auto_judge"
 
 _RE_TASK = re.compile(r"\[\[TASK:([a-z_]+)\]\]")
 _RE_DELIM = re.compile(r"<(\w+)>\n(.*?)\n</\1>", re.S)
@@ -66,6 +67,8 @@ class MockProvider:
             payload = self._score_subjective(blocks)
         elif task == TASK_RULE_MATCH:
             payload = self._match_rules(blocks)
+        elif task == TASK_AUTO_JUDGE:
+            payload = self._auto_judge(blocks)
         else:
             payload = {"error": f"mock 不支持的任务：{task}"}
         return LLMResult(
@@ -420,3 +423,65 @@ class MockProvider:
                     "rationale": f"[mock] 名称相似度 {best_sim:.2f}",
                 })
         return {"pairs": pairs}
+
+    # ------------------------------------------------------------------
+    # 全自动裁决（确定性关键词命中：与 objective.document_present 同思路）
+    # ------------------------------------------------------------------
+    def _auto_judge(self, blocks: dict[str, str]) -> dict:
+        """human_only/冲突项的确定性裁决：条款关键词在投标文本中命中 → pass。
+
+        mock 是管路测试，不做真语义：关键词取自条款名称（剥掉"未经/没有/未"等
+        否定前缀的实词），任一 ≥2 字词在 <bid> 文本或章节标题中命中即 pass 并附
+        逐字证据；全部落空 → fail（宁严勿纵，与真实链路同一取向）。
+        """
+        import json as _json
+
+        try:
+            rule = _json.loads(blocks.get("rule", "{}"))
+            facts = _json.loads(blocks.get("facts", "{}"))
+        except _json.JSONDecodeError:
+            return {"verdict": "fail", "reasoning": "[mock] 输入块解析失败",
+                    "evidence": [], "confidence": 0.0}
+
+        name = str(rule.get("name") or "")
+        bid_text = blocks.get("bid", "")
+        documents: list[str] = facts.get("documents") or []
+
+        # 关键词：按标点切分实词，剥否定前缀（"未经盖章"→"盖章"）
+        raw_words = re.split(r"[，。；、（）()\s/与和及或的]", name)
+        words = []
+        for w in raw_words:
+            for neg in ("未经", "没有", "未", "不"):
+                if w.startswith(neg) and len(w) > len(neg):
+                    w = w[len(neg):]
+            if len(w) >= 2:
+                words.append(w)
+        words = list(dict.fromkeys(words))[:5] or [name[:4]]
+
+        hits: list[tuple[str, str]] = []
+        for w in words:
+            idx = bid_text.find(w)
+            if idx >= 0:
+                hits.append((w, bid_text[max(0, idx - 20): idx + len(w) + 40].replace("\n", " ")))
+            else:
+                for title in documents:
+                    if w in title:
+                        hits.append((w, f"（章节标题）{title}"))
+                        break
+
+        if hits:
+            word, ctx = hits[0]
+            return {
+                "verdict": "pass",
+                "reasoning": f"[mock] 条款关键词「{word}」在投标文件中命中，其余 "
+                             f"{len(hits) - 1} 项关键词亦命中或已核。",
+                "evidence": [{"quote": ctx}] if len(ctx.replace('（章节标题）', '')) >= 8 else [],
+                "confidence": 0.75,
+            }
+        return {
+            "verdict": "fail",
+            "reasoning": f"[mock] 投标文件中未找到与「{name}」相关的内容（关键词 "
+                         f"{'、'.join(words)} 全部落空），宁严勿纵按不通过处理。",
+            "evidence": [],
+            "confidence": 0.7,
+        }

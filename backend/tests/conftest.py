@@ -26,12 +26,18 @@ def samples_dir() -> Path:
 
 @pytest.fixture()
 def app_env(tmp_path, monkeypatch):
-    """隔离环境：临时 data 目录 + 全新引擎。"""
+    """隔离环境：临时 data 目录 + 全新引擎。
+
+    存量测试默认走**人工回退模式**（BID_EVAL_AUTO_MODE=0）——它们守护的正是
+    三态/复核队列那套回退路径的语义。全自动语义由显式开启 auto 的用例覆盖
+    （test_auto_pipeline.py 等，设 BID_EVAL_AUTO_MODE=1）。
+    """
     monkeypatch.setenv("BID_EVAL_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("BID_EVAL_DB_PATH", str(tmp_path / "test.db"))
     monkeypatch.setenv("BID_EVAL_UPLOAD_DIR", str(tmp_path / "uploads"))
     monkeypatch.setenv("BID_EVAL_RENDER_DIR", str(tmp_path / "renders"))
     monkeypatch.setenv("BID_EVAL_LLM_PROVIDER", "mock")
+    monkeypatch.setenv("BID_EVAL_AUTO_MODE", "0")
 
     from app.db import session as db_session
 

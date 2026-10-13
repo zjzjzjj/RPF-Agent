@@ -42,9 +42,10 @@ REVIEW_LABELS = {
     "human_overridden": "已人工改分",
     "conflict_flagged": "冲突待裁决",
     "not_applicable": "不适用",
+    "auto_confirmed": "已自动裁决（LLM 带原文证据）",
 }
 
-SETTLED_STATUSES = ("human_confirmed", "human_overridden")
+SETTLED_STATUSES = ("human_confirmed", "human_overridden", "auto_confirmed")
 
 # 疑问分类：报告"先出草稿、把疑问标出"的核心。每条待复核记录归入唯一一类，
 # 按严重度排序，让人一眼看到"哪几条真的需要现在裁决"。

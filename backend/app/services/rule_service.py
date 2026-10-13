@@ -28,6 +28,7 @@ from app.db.session import session_scope
 from app.deps import get_actor  # noqa: F401  （API 层使用）
 from app.errors import Conflict, FrozenPackageError, NotFound, ValidationFailed
 from app.evidence.verifier import verify_citation
+from app import config
 from app.rules import compiler
 from app.rules.freeze import build_snapshot, content_hash
 
@@ -579,8 +580,47 @@ def _touch_package_updated(package_id: int) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 确认与冻结（人工卡点 ②）
+# 确认与冻结（人工卡点 ②；全自动模式下自动收敛阻断项）
 # ---------------------------------------------------------------------------
+def _auto_settle_blocking(package_id: int, actor: str) -> None:
+    """全自动模式：把阻断 confirm/freeze 的非 verified 条目自动收敛并留痕。
+
+    - needs_signoff（模板兜底）→ 补 signoff_json（等价人工签批的自动形态）；
+    - 其余（needs_input/ambiguous/conflict…）→ 置 verified + edit_json 记录原状态。
+    逐条写 ReviewRecord（actor="auto"），事后审计可完整还原"哪些项被自动采纳"。
+    """
+    with session_scope() as s:
+        crits = s.execute(
+            select(Criterion).where(Criterion.package_id == package_id)
+        ).scalars().all()
+        for c in crits:
+            if c.status in ("verified", "retired"):
+                continue
+            old = c.status
+            c.status = "verified"
+            if c.origin == "template" and old == "needs_signoff":
+                c.signoff_json = {
+                    "actor": actor,
+                    "reason": "全自动模式：模板兜底条目自动签批",
+                    "time": utcnow().isoformat(),
+                }
+            c.edit_json = {
+                "auto_mode": True,
+                "from_status": old,
+                "reason": "全自动模式：阻断确认/冻结的条目自动采纳并留痕",
+            }
+            s.add(c)
+            s.add(
+                ReviewRecord(
+                    subject_type="criterion", subject_id=str(c.id), action="edit",
+                    actor=actor,
+                    reason=f"全自动模式自动采纳（原状态 {old}）",
+                    old_value_json={"status": old},
+                    new_value_json={"status": "verified"},
+                )
+            )
+
+
 def _blocking_items(package_id: int) -> list[str]:
     crits = list_criteria(package_id)
     # retired（本项目无此项）不阻断：它已从快照/总分口径中排除
@@ -593,6 +633,8 @@ def _blocking_items(package_id: int) -> list[str]:
 
 def confirm_package(package_id: int, actor: str) -> RulePackage:
     pkg = _require_draft(package_id)
+    if config.auto_mode():
+        _auto_settle_blocking(package_id, actor)
     findings = compiler.run_validations(package_id)
     errors = [f for f in findings if f["severity"] == "error"]
     if errors:
@@ -626,6 +668,8 @@ def freeze_package(package_id: int, actor: str) -> RulePackage:
     pkg = get_package(package_id)
     if pkg.status != "confirmed":
         raise ValidationFailed("只有已确认的规则包可以冻结")
+    if config.auto_mode():
+        _auto_settle_blocking(package_id, actor)
 
     # 冻结是最后一道闸门：即使确认时校验通过，这里也必须重跑并清零 error
     findings = compiler.run_validations(package_id)

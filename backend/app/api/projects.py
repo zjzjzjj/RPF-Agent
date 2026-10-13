@@ -7,6 +7,7 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 from sqlalchemy import func, select
 
+from app import config
 from app.db.models import Bidder, Criterion, Document, EvaluationRun, Project, RulePackage, ScoreRecord
 from app.db.session import session_scope
 from app.deps import get_actor, new_project_id
@@ -192,7 +193,11 @@ def get_workbench(project_id: str) -> WorkbenchOut:
                     ScoreRecord.review_status.in_(("pending", "ai_suggested", "conflict_flagged")),
                 )
             ).scalar_one()
-        if run is None:
+        if config.auto_mode():
+            # 全自动模式：没有人工复核阶段，模糊项已由 LLM 裁决收敛（auto_confirmed）
+            stages.append(StageState(key="review", label="自动裁决", state="done",
+                                     detail="模糊项已由 LLM 带原文证据裁决并留痕"))
+        elif run is None:
             stages.append(StageState(key="review", label="人工复核", state="pending", detail="—"))
         elif pending_review:
             stages.append(StageState(key="review", label="人工复核", state="active",

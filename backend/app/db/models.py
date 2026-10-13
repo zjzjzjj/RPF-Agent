@@ -435,7 +435,8 @@ class ScoreRecord(Base):
 
     evidence_status: Mapped[str] = mapped_column(String(16), default="none")  # verified|unverified|none
     review_status: Mapped[str] = mapped_column(String(24), default="pending", index=True)
-    # pending|ai_suggested|human_confirmed|human_overridden|conflict_flagged|not_applicable
+    # pending|ai_suggested|human_confirmed|human_overridden|conflict_flagged|not_applicable|auto_confirmed
+    # auto_confirmed：全自动模式（BID_EVAL_AUTO_MODE=1，默认）下 LLM 裁决/确定性判定的终态
     ai_revealed_at: Mapped[datetime | None] = mapped_column(DateTime)  # 防锚定解锁时间戳
     evaluator_actor: Mapped[str | None] = mapped_column(String(64))
     confirm_time: Mapped[datetime | None] = mapped_column(DateTime)
@@ -447,7 +448,7 @@ class ScoreRecord(Base):
         UniqueConstraint("run_id", "bidder_id", "criterion_id", name="uq_score_records_run_bidder_criterion"),
         CheckConstraint(
             "review_status IN ('pending','ai_suggested','human_confirmed','human_overridden',"
-            "'conflict_flagged','not_applicable')",
+            "'conflict_flagged','not_applicable','auto_confirmed')",
             name="review_status_valid",
         ),
     )

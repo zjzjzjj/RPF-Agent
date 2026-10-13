@@ -1,11 +1,13 @@
-"""端到端验收脚本（离线 Mock，可重复）。
+"""端到端验收脚本（离线 Mock，可重复）。人工回退模式的验收——断言三态/复核队列语义。
 
 用法：
     python scripts/run_e2e.py --provider mock --assert-expected   # 全链路 + 断言 expected_scores.json
     python scripts/run_e2e.py --dump-nodes                        # 只解析招标文件并打印条款树
     python scripts/run_e2e.py --provider deepseek --no-assert     # 真实模型跑通（需配置 API）
 
-断言口径（对应验收指标）：
+全自动模式的验收见 scripts/run_auto_pipeline.py（默认 BID_EVAL_AUTO_MODE=1 的语义）。
+
+断言口径（对应验收指标，人工模式语义）：
 - 价格分与生成侧独立计算的真值**精确一致**（0 差异）
 - 资格/符合性三态与 expected 一致（建议否决 ≠ 自动否决）
 - 商务计数分精确
@@ -62,6 +64,8 @@ def main() -> int:
 
     if args.provider == "mock":
         os.environ.setdefault("BID_EVAL_LLM_PROVIDER", "mock")
+    # 本脚本的断言口径是人工回退模式（三态/复核队列）；全自动验收走 run_auto_pipeline.py
+    os.environ.setdefault("BID_EVAL_AUTO_MODE", "0")
 
     tmp = tempfile.mkdtemp(prefix="bid-eval-e2e-")
     os.environ.setdefault("BID_EVAL_DATA_DIR", tmp)
