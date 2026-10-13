@@ -3,8 +3,10 @@ import { api } from "../api/client";
 import type {
   Bidder,
   Citation,
+  Coverage,
   DocumentOut,
   JobOut,
+  MatchProposal,
   Matrix,
   ModelsOut,
   PackageDetail,
@@ -13,6 +15,8 @@ import type {
   ReportOut,
   ReviewQueueItem,
   ScoreOut,
+  TemplateDetail,
+  TemplateSummary,
   Workbench,
 } from "../types";
 
@@ -137,6 +141,42 @@ export function useReport(pid: string) {
     queryKey: ["report", pid],
     queryFn: () => api.get<ReportOut>(`/projects/${pid}/report`),
     enabled: !!pid,
+  });
+}
+
+/** 通用评分规则库模板目录（S0） */
+export function useTemplates() {
+  return useQuery({
+    queryKey: ["templates"],
+    queryFn: () => api.get<TemplateSummary[]>("/rules/templates"),
+    staleTime: 3600_000,
+  });
+}
+
+export function useTemplate(templateId: string | null) {
+  return useQuery({
+    queryKey: ["template", templateId],
+    queryFn: () => api.get<TemplateDetail>(`/rules/templates/${templateId}`),
+    enabled: !!templateId,
+    staleTime: 3600_000,
+  });
+}
+
+/** 覆盖率报告（S0） */
+export function useCoverage(packageId: number | null) {
+  return useQuery({
+    queryKey: ["coverage", packageId],
+    queryFn: () => api.get<Coverage>(`/rules/packages/${packageId}/coverage`),
+    enabled: packageId != null && packageId > 0,
+  });
+}
+
+/** 匹配提案（S1） */
+export function useMatchProposal(mergePackageId: number | null) {
+  return useQuery({
+    queryKey: ["matchProposal", mergePackageId],
+    queryFn: () => api.get<MatchProposal>(`/rules/packages/${mergePackageId}/match-proposal`),
+    enabled: mergePackageId != null && mergePackageId > 0,
   });
 }
 

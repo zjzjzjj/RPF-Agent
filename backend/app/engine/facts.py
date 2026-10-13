@@ -175,6 +175,9 @@ class BidFacts:
     credit_statement: bool = False
     placeholders: list[str] = field(default_factory=list)
     documents: list[str] = field(default_factory=list)  # 章节标题
+    # 跨投标人串通信号（engine/collusion.py 预计算后注入；单家抽取无法产出）。
+    # 结构：{"signals": [...], "detail": str, "available": bool}；未注入 = 空 dict → need_human 兜底
+    cross_bidder: dict = field(default_factory=dict)
 
 
 def extract_bid_facts(text: str, documents: list[str] | None = None) -> BidFacts:

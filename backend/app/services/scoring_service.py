@@ -215,6 +215,7 @@ def execute_run(
     count_items = [c for c in criteria if c["score_type"] == "count"]
     price_items = [c for c in criteria if c["score_type"] == "formula"]
     subjective_items = [c for c in criteria if c["score_type"] == "subjective"]
+    match_items = [c for c in criteria if c["score_type"] == "match"]
 
     # ---- 事实与文本 ----
     facts_by_bidder: dict[int, object] = {}
@@ -240,12 +241,34 @@ def execute_run(
                 if confidential is not None:
                     data_class = "confidential"
 
+    # ---- 串通信号预计算（跨投标人视角；事实/判定分离：run_check 只读信号）----
+    # 设计见 engine/collusion.py：报价完全相同/等差规律/同文档作者 → 信号而非结论。
+    from app.db.models import Document
+    from app.engine.collusion import compute_cross_bidder_signals
+
+    with session_scope() as s:
+        prices = {
+            b.id: (Decimal(str(b.bid_price)) if b.bid_price is not None else None)
+            for b in s.execute(select(Bidder).where(Bidder.id.in_(bidder_ids))).scalars()
+        }
+        authors: dict[int, list[str]] = {}
+        for _doc_id, doc_bidder_id, author in s.execute(
+            select(Document.id, Document.bidder_id, Document.author).where(
+                Document.bidder_id.in_(bidder_ids), Document.author.isnot(None)
+            )
+        ).all():
+            if (author or "").strip():
+                authors.setdefault(doc_bidder_id, []).append(author.strip())
+    for bid_id, sig in compute_cross_bidder_signals(prices, authors).items():
+        if bid_id in facts_by_bidder:
+            facts_by_bidder[bid_id].cross_bidder = sig
+
     if ctx:
         ctx.advance(message=f"客观审查 {len(veto_items)} 项")
 
     # ---- ① 资格/符合性（三态）----
-    stats = {"objective": 0, "price": 0, "subjective": 0, "need_human": 0, "citations_verified": 0,
-             "citations_total": 0}
+    stats = {"objective": 0, "price": 0, "subjective": 0, "match": 0,
+             "need_human": 0, "citations_verified": 0, "citations_total": 0}
     excluded_bidders: set[int] = set()  # 客观审查未通过 → 不进基准价（exclude_invalid）
     for bid_id in bidder_ids:
         facts = facts_by_bidder[bid_id]
@@ -308,6 +331,25 @@ def execute_run(
             )
             stats["objective"] += 1
 
+    # ---- ③+ match 判断项：不计分，落三态判定记录 ----
+    # 法律包的 8 条形式/响应性检查（score_type=match）：此前被静默跳过。
+    # 不传 machine_score/final_score → 两者保持 NULL（判断项不打分）；
+    # 非否决 match 的 on_fail=need_human → 绝不产生 recommend_reject。
+    for bid_id in bidder_ids:
+        facts = facts_by_bidder[bid_id]
+        for c in match_items:
+            result = _eval_veto(  # type: ignore[arg-type]
+                c, facts,
+                on_fail="recommend_reject" if c.get("is_veto") else "need_human",
+            )
+            _upsert_score(
+                run_id, bid_id, c,
+                machine_status=result["verdict"],
+                review_status=_review_status_for_verdict(result),
+                warnings_json=[{"message": result.get("message")}] if result.get("message") else None,
+            )
+            stats["match"] += 1
+
     # ---- ④ 主观分建议 ----
     if "subjective" in stages and subjective_items:
         if ctx:
@@ -338,19 +380,20 @@ def execute_run(
         "objective": stats["objective"],
         "price": stats["price"],
         "subjective": stats["subjective"],
+        "match": stats["match"],
         "need_human": int(need_human),
         "citations_total": stats["citations_total"],
         "citations_verified": stats["citations_verified"],
     }
 
 
-def _eval_veto(c: dict, facts) -> dict:  # noqa: ANN001
+def _eval_veto(c: dict, facts, on_fail: str = "recommend_reject") -> dict:  # noqa: ANN001
     check_type = c.get("check_type")
     params = c.get("params") or {}
     if not check_type:
         return {"verdict": "need_human", "message": "该条款缺少可执行的检查定义"}
     result = run_check(check_type, params, facts)
-    verdict = verdict_for(c["code"], c["name"], result, on_fail="recommend_reject")
+    verdict = verdict_for(c["code"], c["name"], result, on_fail=on_fail)
     return {"verdict": verdict, "message": result.message, "evidence": result.evidence_quote}
 
 

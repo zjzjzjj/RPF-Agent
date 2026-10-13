@@ -48,6 +48,8 @@ class ExtractedDocument:
     nodes: list[ExtractedNode] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     engine: str = "unknown"
+    # 文档作者元数据（docx core_properties / pdf metadata）——串通检测信号源
+    author: str | None = None
     # {page_no: [bbox, ...]} —— 表格区域（供条款树排除编号扫描、供评分表结构化）
     table_boxes: dict[int, list[tuple[float, float, float, float]]] = field(default_factory=dict)
     # 有内容损失迹象（单页提取失败、表格探测失败等）→ 落库为 degraded，不静默

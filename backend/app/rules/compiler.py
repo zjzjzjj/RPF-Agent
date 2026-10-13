@@ -270,7 +270,8 @@ def _persist_criterion(
             n += 1
         code = f"{base}~{n}"
     used_codes.add(code)
-    crit = Criterion(        package_id=package_id,
+    crit = Criterion(
+        package_id=package_id,
         code=code,
         category=c.category,
         name=c.name,
@@ -362,6 +363,12 @@ def run_validations(package_id: int) -> list[dict]:
         source_doc = pkg.source_document_id if pkg else None
 
     def _node_exists(node_id: str) -> bool:
+        # 法律规则的引用指向法条知识库而非项目文档（设计稿 §4.4）：
+        # 真实核验"该法规该条是否在知识库里"，查无即 CITATION_UNREACHABLE。
+        from app.rules.law_kb import LAW_PREFIX, node_exists as law_node_exists
+
+        if node_id.startswith(LAW_PREFIX):
+            return law_node_exists(node_id)
         if source_doc is None:
             return False
         with session_scope() as s:
@@ -396,8 +403,13 @@ def compile_rules(
     actor: str,
     provider: str | None = None,
     model: str | None = None,
+    merge_target_id: int | None = None,
 ) -> int:
-    """执行一次编译，返回新草稿规则包 id。"""
+    """执行一次编译，返回新草稿规则包 id。
+
+    merge_target_id 非空 = merge 模式（S1）：产物为临时编译包，指向模板包，
+    供逐条覆盖匹配（设计稿 §5.1 阶段 A）。
+    """
     from app.llm.registry import get_provider
 
     _text, doc = _load_tender_text(document_id)  # 校验 kind/parse_status 并取回 doc
@@ -443,6 +455,7 @@ def compile_rules(
             version=version,
             status="draft",
             source_document_id=document_id,
+            merge_target_id=merge_target_id,
             compiled_by=actor,
             model=result.model,
             prompt_version=None,
@@ -501,10 +514,14 @@ def compile_rules_job(ctx: JobContext, payload: dict) -> dict:
     actor = payload.get("actor", "system")
     provider = payload.get("provider")
     model = payload.get("model")
+    merge_target_id = payload.get("merge_target_id")
     ctx.start(total=3, message="加载招标文件")
     _load_tender_text(document_id)
     ctx.advance(message="LLM 抽取评分规则")
-    package_id = compile_rules(project_id, document_id, actor, provider, model)
+    package_id = compile_rules(
+        project_id, document_id, actor, provider, model,
+        merge_target_id=int(merge_target_id) if merge_target_id else None,
+    )
     ctx.advance(message="校验与分诊完成")
     ctx.advance(message="完成")
     return {"package_id": package_id}

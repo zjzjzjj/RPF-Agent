@@ -59,13 +59,35 @@ def run_validators(
         # ③ 引用可达：source_node_id 必须存在且 quote 非空
         if c.get("source_node_id"):
             if node_exists is not None and not node_exists(c["source_node_id"]):
+                # 法条:// 引用走法条知识库核验（区别于项目文档 doc_nodes，误导排查要分开说）
+                where = (
+                    "在法条知识库中不存在"
+                    if str(c["source_node_id"]).startswith("法条://")
+                    else "在文档中不存在"
+                )
                 findings.append(Finding("CITATION_UNREACHABLE", "error",
-                                        f"评分项「{c['name']}」的条款引用 {c['source_node_id']} 在文档中不存在",
+                                        f"评分项「{c['name']}」的条款引用 {c['source_node_id']} {where}",
                                         "criterion", code))
-        if not (c.get("source_quote") or "").strip():
+        # 模板条目（P5）没有原文，QUOTE_REQUIRED 按 origin 分支豁免（设计稿 §6.1）；
+        # 其"依据缺失"由 TEMPLATE_FALLBACK_SIGNOFF 承担（error，阻断冻结）。
+        if c.get("origin") != "template" and not (c.get("source_quote") or "").strip():
             findings.append(Finding("QUOTE_REQUIRED", "error",
                                     f"评分项「{c['name']}」缺少招标文件原文引用（无证据的标准不得作为评分依据）",
                                     "criterion", code))
+
+        # 模板兜底签批（设计稿 §6.1）：模板条目未经签批不得执行
+        if c.get("origin") == "template" and c.get("status") != "retired" and not c.get("signoff"):
+            findings.append(Finding("TEMPLATE_FALLBACK_SIGNOFF", "error",
+                                    f"评分项「{c['name']}」为模板兜底（P5），招标文件未规定；未签批不得冻结",
+                                    "criterion", code,
+                                    "请在签批队列中逐条确认启用理由"))
+        # 合规红线（S0 为 warn，S2 转 error）：价格/否决/资格类模板兜底即使签批也需单列
+        if c.get("origin") == "template" and c.get("status") != "retired":
+            if c.get("is_veto") or c.get("category") in ("qualification", "compliance", "price"):
+                findings.append(Finding("TEMPLATE_FALLBACK_ESSENTIAL", "warn",
+                                        f"评分项「{c['name']}」为模板兜底且属资格/符合性/价格/否决类，"
+                                        "签批理由应在报告中单列",
+                                        "criterion", code))
 
         # ⑤ 价格公式变量完备
         if c["score_type"] == "formula":

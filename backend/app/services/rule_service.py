@@ -45,10 +45,29 @@ def get_package(package_id: int) -> RulePackage:
 
 
 def current_package(project_id: str) -> RulePackage | None:
+    """项目当前生效的规则包（排除 superseded 旧版与 merge 辅助临时包）。"""
     with session_scope() as s:
         pkg = s.execute(
-            select(RulePackage).where(RulePackage.project_id == project_id)
-            .order_by(RulePackage.version.desc()).limit(1)
+            select(RulePackage).where(
+                RulePackage.project_id == project_id,
+                RulePackage.status != "superseded",
+                RulePackage.merge_target_id.is_(None),
+            ).order_by(RulePackage.version.desc()).limit(1)
+        ).scalar_one_or_none()
+        if pkg is not None:
+            s.expunge(pkg)
+        return pkg
+
+
+def current_template_package(project_id: str) -> RulePackage | None:
+    """项目当前可合并的模板来源草稿包（origin='template' 且非 superseded）。"""
+    with session_scope() as s:
+        pkg = s.execute(
+            select(RulePackage).where(
+                RulePackage.project_id == project_id,
+                RulePackage.origin == "template",
+                RulePackage.status.in_(("draft", "confirmed")),
+            ).order_by(RulePackage.version.desc()).limit(1)
         ).scalar_one_or_none()
         if pkg is not None:
             s.expunge(pkg)
@@ -173,9 +192,14 @@ def get_validations(package_id: int) -> list[PackageValidation]:
 
 
 def load_criteria_for_snapshot(s: Session, package_id: int) -> list[dict[str, Any]]:  # noqa: ANN001
-    """把业务行组装成快照形状（校验器/冻结共用）。"""
+    """把业务行组装成快照形状（校验器/冻结共用）。
+
+    retired（人工判定"本项目无此项"）不进快照、不参与总分/权重校验（设计稿 §4.1）。
+    """
     rows = s.execute(
-        select(Criterion).where(Criterion.package_id == package_id).order_by(Criterion.sort_order)
+        select(Criterion)
+        .where(Criterion.package_id == package_id, Criterion.status != "retired")
+        .order_by(Criterion.sort_order)
     ).scalars().all()
     level_rows = s.execute(
         select(CriterionLevel).order_by(CriterionLevel.id)
@@ -218,6 +242,7 @@ def load_criteria_for_snapshot(s: Session, package_id: int) -> list[dict[str, An
         check = checks_by_crit.get(c.id)
         out.append(
             {
+                "id": c.id,  # 合并匹配（S1）用；冻结快照不写该字段
                 "code": c.code,
                 "category": c.category,
                 "name": c.name,
@@ -233,6 +258,13 @@ def load_criteria_for_snapshot(s: Session, package_id: int) -> list[dict[str, An
                 "source_quote": c.source_quote,
                 "status": c.status,
                 "sort_order": c.sort_order,
+                "origin": c.origin,
+                "template_code": c.template_code,
+                "template_hash": c.template_hash,
+                "library_version": c.library_version,
+                "p_source": c.p_source,
+                "signoff": c.signoff_json,
+                "override": c.override_json,
                 "levels": levels_by_crit.get(c.id, []),
                 "check_type": check.check_type if check else None,
                 "params": check.params_json if check else {},
@@ -443,6 +475,102 @@ def add_criterion(package_id: int, body: dict, actor: str, reason: str) -> Crite
     return crit
 
 
+def signoff_criterion(criterion_id: int, actor: str, reason: str) -> Criterion:
+    """模板兜底条目签批（设计稿 §6.2）。
+
+    仅对 origin='template' 且 status='needs_signoff' 生效；签批后 status → verified，
+    origin 仍是 template，冻结包与报告中永远标注"模板兜底（已签批）"。
+    """
+    if not reason.strip():
+        raise ValidationFailed("签批必须填写理由（模板兜底是 P5 来源，启用必须有依据）")
+    with session_scope() as s:
+        crit = s.get(Criterion, criterion_id)
+        if crit is None:
+            raise NotFound("评分项不存在")
+        _require_draft(crit.package_id)
+        if crit.origin != "template":
+            raise ValidationFailed("只有模板条目（origin=template）需要签批")
+        if crit.status != "needs_signoff":
+            raise ValidationFailed(f"评分项状态为 {crit.status}，不能签批")
+        crit.signoff_json = {"by": actor, "at": utcnow().isoformat(), "reason": reason}
+        crit.status = "verified"
+        s.add(crit)
+        s.add(
+            ReviewRecord(
+                subject_type="criterion", subject_id=str(criterion_id), action="signoff",
+                actor=actor, reason=reason,
+                old_value_json={"status": "needs_signoff"},
+                new_value_json={"status": "verified", "signoff": crit.signoff_json},
+            )
+        )
+        s.flush()
+        s.expunge(crit)
+        package_id = crit.package_id
+    compiler.run_validations(package_id)
+    return crit
+
+
+def coverage_report(package_id: int) -> dict:
+    """覆盖率报告（设计稿 §6.3）：文档覆盖 / 模板兜底已签批 / 待签批 / 已退休 / 人工。"""
+    with session_scope() as s:
+        pkg = s.get(RulePackage, package_id)
+        if pkg is None:
+            raise NotFound("规则包不存在")
+        rows = s.execute(
+            select(Criterion).where(Criterion.package_id == package_id).order_by(Criterion.sort_order)
+        ).scalars().all()
+
+    def _bucket(c: Criterion) -> str:  # noqa: ANN001
+        if c.origin == "law":
+            # 法律层（P0）：权威原文 + 法条核验，免签批，自成一桶
+            if c.status == "retired":
+                return "retired"
+            return "law"
+        if c.origin == "template":
+            if c.status == "retired":
+                return "retired"
+            if c.signoff_json is not None:
+                return "template_fallback_signed"
+            return "template_fallback_pending"
+        if c.origin == "manual":
+            return "manual"
+        return "document_backed"
+
+    counts = {"document_backed": 0, "template_fallback_signed": 0,
+              "template_fallback_pending": 0, "retired": 0, "manual": 0, "law": 0}
+    by_category: dict[str, dict] = {}
+    essential_uncovered: list[str] = []
+    for c in rows:
+        cat = by_category.setdefault(c.category, {
+            "total": 0, "document_backed": 0, "template_fallback_signed": 0,
+            "template_fallback_pending": 0, "retired": 0, "manual": 0, "law": 0})
+        bucket = _bucket(c)
+        counts[bucket] += 1
+        cat["total"] += 1
+        cat[bucket] += 1
+        if bucket == "template_fallback_pending" and (
+            c.is_veto or c.category in ("qualification", "compliance", "price")
+        ):
+            essential_uncovered.append(c.template_code or c.code)
+
+    price_rows = [c for c in rows if c.category == "price"]
+    price_covered = bool(price_rows) and all(
+        c.origin != "template" or c.signoff_json is not None for c in price_rows
+    )
+    veto_rows = [c for c in rows if c.is_veto]
+    veto_covered = sum(
+        1 for c in veto_rows if c.origin != "template" or c.signoff_json is not None
+    )
+    return {
+        "total": len(rows),
+        **counts,
+        "by_category": by_category,
+        "essential_uncovered": essential_uncovered,
+        "price_covered": price_covered,
+        "veto_covered_ratio": round(veto_covered / len(veto_rows), 4) if veto_rows else 1.0,
+    }
+
+
 def _touch_package_updated(package_id: int) -> None:
     with session_scope() as s:
         pkg = s.get(RulePackage, package_id)
@@ -455,7 +583,12 @@ def _touch_package_updated(package_id: int) -> None:
 # ---------------------------------------------------------------------------
 def _blocking_items(package_id: int) -> list[str]:
     crits = list_criteria(package_id)
-    return [f"{c.code} {c.name}（{c.status}）" for c in crits if c.status != "verified"]
+    # retired（本项目无此项）不阻断：它已从快照/总分口径中排除
+    return [
+        f"{c.code} {c.name}（{c.status}）"
+        for c in crits
+        if c.status != "verified" and c.status != "retired"
+    ]
 
 
 def confirm_package(package_id: int, actor: str) -> RulePackage:
@@ -509,7 +642,11 @@ def freeze_package(package_id: int, actor: str) -> RulePackage:
         pkg_row = s.get(RulePackage, package_id)
         snapshot = build_snapshot(
             {"project_id": pkg_row.project_id, "version": pkg_row.version,
-             "status": "frozen", "total_max": 100},
+             "status": "frozen", "total_max": 100,
+             "origin": pkg_row.origin,
+             "template_id": pkg_row.template_id,
+             "template_hash": pkg_row.template_hash,
+             "library_version": pkg_row.library_version},
             criteria,
         )
         pkg_row.snapshot_json = snapshot
@@ -636,7 +773,8 @@ def new_version(package_id: int, actor: str, reason: str) -> RulePackage:
 _CRIT_FIELDS = (
     "code", "category", "name", "description", "max_score", "weight", "score_type",
     "is_veto", "veto_consequence", "required_evidence", "source_node_id", "source_page",
-    "source_quote", "status", "edit_json", "confidence", "sort_order",
+    "source_quote", "status", "origin", "template_code", "template_hash", "library_version",
+    "override_json", "signoff_json", "p_source", "edit_json", "confidence", "sort_order",
 )
 
 

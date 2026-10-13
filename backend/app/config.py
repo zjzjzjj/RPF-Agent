@@ -57,6 +57,15 @@ def database_url() -> str:
     return f"sqlite:///{db_path().as_posix()}"
 
 
+def law_kb_path() -> Path:
+    """法条知识库 JSON（法律规则包 source_node_id 的核验源）。
+
+    由 261010 法规库的 build_fatiao_kb.py 生成；服务进程与脚本进程读同一路径，
+    脚本侧负责把制品 vendoring 到这里（见 scripts/import_law_rules.py）。
+    """
+    return Path(os.environ.get("BID_EVAL_LAW_KB_PATH", data_dir() / "law_kb.json"))
+
+
 def upload_dir() -> Path:
     return Path(os.environ.get("BID_EVAL_UPLOAD_DIR", data_dir() / "uploads"))
 

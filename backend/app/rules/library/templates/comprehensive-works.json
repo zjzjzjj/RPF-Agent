@@ -1,0 +1,258 @@
+{
+  "template_id": "comprehensive-works",
+  "name": "综合评分法（工程类）通用模板",
+  "method": "comprehensive",
+  "applicable": {"procurement": "works"},
+  "library_version": "1.0.0",
+  "notes": "工程评标惯例：价格 40、技术 40、商务 20。政采工程与招标投标工程两套制度分支的适用差异（如评标办法依据）需在覆盖时按项目核实；全部条目均为候选，未经招标文件覆盖并签批不得执行。",
+  "criteria": [
+    {
+      "template_code": "T1.1",
+      "category": "qualification",
+      "name": "具有独立法人资格",
+      "score_type": "veto",
+      "is_veto": true,
+      "veto_consequence": "disqualify",
+      "description": "投标人须为在中华人民共和国境内注册、具有独立承担民事责任能力的法人。",
+      "checks": [
+        {"check_type": "document_present", "field": null, "params": {"document": "营业执照"}, "on_fail": "recommend_reject"}
+      ],
+      "max_score": null,
+      "levels": [],
+      "formula": null,
+      "weight": null,
+      "essential": true,
+      "hint": "覆盖时必须逐字引用招标文件原文"
+    },
+    {
+      "template_code": "T1.2",
+      "category": "qualification",
+      "name": "具备招标文件要求的建筑业企业资质",
+      "score_type": "veto",
+      "is_veto": true,
+      "veto_consequence": "disqualify",
+      "description": "投标人须具备招标文件载明的建筑业企业资质等级且在有效期内。",
+      "checks": [
+        {"check_type": "document_present", "field": null, "params": {"document": "资质证书"}, "on_fail": "recommend_reject"}
+      ],
+      "max_score": null,
+      "levels": [],
+      "formula": null,
+      "weight": null,
+      "essential": true,
+      "hint": "覆盖时替换为具体资质类别与等级要求"
+    },
+    {
+      "template_code": "T1.3",
+      "category": "qualification",
+      "name": "具备有效的安全生产许可证",
+      "score_type": "veto",
+      "is_veto": true,
+      "veto_consequence": "disqualify",
+      "description": "投标人须具备有效的安全生产许可证。",
+      "checks": [
+        {"check_type": "document_present", "field": null, "params": {"document": "安全生产许可证"}, "on_fail": "recommend_reject"}
+      ],
+      "max_score": null,
+      "levels": [],
+      "formula": null,
+      "weight": null,
+      "essential": true,
+      "hint": "通用判据，覆盖时替换为招标文件要求"
+    },
+    {
+      "template_code": "T1.4",
+      "category": "qualification",
+      "name": "未被列入失信被执行人名单",
+      "score_type": "veto",
+      "is_veto": true,
+      "veto_consequence": "disqualify",
+      "description": "投标人未被列入失信被执行人名单及招投标失信行为名单。",
+      "checks": [
+        {"check_type": "document_present", "field": null, "params": {"document": "信用承诺函"}, "on_fail": "recommend_reject"}
+      ],
+      "max_score": null,
+      "levels": [],
+      "formula": null,
+      "weight": null,
+      "essential": true,
+      "hint": "覆盖时替换为招标文件指定的查询渠道与证明形式"
+    },
+    {
+      "template_code": "T2.1",
+      "category": "compliance",
+      "name": "投标函已按要求签署并加盖公章",
+      "score_type": "veto",
+      "is_veto": true,
+      "veto_consequence": "disqualify",
+      "description": "投标函须由法定代表人或其授权代表签署并加盖投标人公章。",
+      "checks": [
+        {"check_type": "human_only", "field": null, "params": {}, "on_fail": "recommend_reject"}
+      ],
+      "max_score": null,
+      "levels": [],
+      "formula": null,
+      "weight": null,
+      "essential": true,
+      "hint": "签字/盖章属人工判定原语；覆盖时引用招标文件对应否决条款"
+    },
+    {
+      "template_code": "T2.2",
+      "category": "compliance",
+      "name": "投标保证金已按招标文件要求缴纳",
+      "score_type": "veto",
+      "is_veto": true,
+      "veto_consequence": "disqualify",
+      "description": "投标人须按招标文件要求提交投标保证金。",
+      "checks": [
+        {"check_type": "document_present", "field": null, "params": {"document": "投标保证金缴纳凭证"}, "on_fail": "recommend_reject"}
+      ],
+      "max_score": null,
+      "levels": [],
+      "formula": null,
+      "weight": null,
+      "essential": true,
+      "hint": "覆盖时替换为招标文件载明的保证金金额与形式"
+    },
+    {
+      "template_code": "T2.3",
+      "category": "compliance",
+      "name": "投标报价唯一且不高于最高限价",
+      "score_type": "veto",
+      "is_veto": true,
+      "veto_consequence": "disqualify",
+      "description": "投标人须对同一项目提交唯一报价，且报价不得高于最高投标限价。",
+      "checks": [
+        {"check_type": "math_relation", "field": null, "params": {}, "on_fail": "recommend_reject"}
+      ],
+      "max_score": null,
+      "levels": [],
+      "formula": null,
+      "weight": null,
+      "essential": true,
+      "hint": "覆盖时可在 params.max_yuan 填入本项目最高限价"
+    },
+    {
+      "template_code": "T3.1",
+      "category": "price",
+      "name": "投标报价得分",
+      "score_type": "formula",
+      "is_veto": false,
+      "veto_consequence": null,
+      "description": "以全部有效投标报价的算术平均价为基准价（系数 k=1.0），评标价每高于基准价一定比例扣分。",
+      "checks": [],
+      "formula": {
+        "formula_type": "benchmark_ratio",
+        "benchmark_method": "average",
+        "k": 1.0,
+        "upper_bound": 40,
+        "lower_bound": 0,
+        "rounding": 2
+      },
+      "max_score": 40,
+      "levels": [],
+      "weight": null,
+      "essential": true,
+      "hint": "覆盖时必须替换为招标文件载明的价格分计算公式"
+    },
+    {
+      "template_code": "T4.1",
+      "category": "technical",
+      "name": "施工组织设计方案",
+      "score_type": "subjective",
+      "is_veto": false,
+      "veto_consequence": null,
+      "description": "对投标人施工组织设计方案的科学性、针对性及可操作性进行综合评价。",
+      "checks": [],
+      "formula": null,
+      "max_score": 20,
+      "levels": [
+        {"label": "优", "min": 17, "max": 20, "criteria": "方案科学、针对性强、可操作性好（通用判据，覆盖时替换）"},
+        {"label": "良", "min": 12, "max": 16, "criteria": "方案较科学、针对性较强、可操作性较好（通用判据，覆盖时替换）"},
+        {"label": "一般", "min": 6, "max": 11, "criteria": "方案基本可行、针对性一般（通用判据，覆盖时替换）"},
+        {"label": "差", "min": 0, "max": 5, "criteria": "方案不可行或存在重大缺陷（通用判据，覆盖时替换）"}
+      ],
+      "weight": null,
+      "essential": true,
+      "hint": "覆盖时必须替换为招标文件的具体评分要点"
+    },
+    {
+      "template_code": "T4.2",
+      "category": "technical",
+      "name": "施工进度计划与保障措施",
+      "score_type": "subjective",
+      "is_veto": false,
+      "veto_consequence": null,
+      "description": "对投标人施工进度计划的合理性及保障措施的有效性进行综合评价。",
+      "checks": [],
+      "formula": null,
+      "max_score": 10,
+      "levels": [
+        {"label": "优", "min": 9, "max": 10, "criteria": "进度合理、保障措施有力（通用判据，覆盖时替换）"},
+        {"label": "良", "min": 6, "max": 8, "criteria": "进度较合理、保障措施较充分（通用判据，覆盖时替换）"},
+        {"label": "一般", "min": 3, "max": 5, "criteria": "进度基本可行、保障措施一般（通用判据，覆盖时替换）"},
+        {"label": "差", "min": 0, "max": 2, "criteria": "进度不可行或缺少关键节点（通用判据，覆盖时替换）"}
+      ],
+      "weight": null,
+      "essential": false,
+      "hint": "覆盖时必须替换为招标文件的具体评分要点"
+    },
+    {
+      "template_code": "T4.3",
+      "category": "technical",
+      "name": "安全文明施工与质量保证措施",
+      "score_type": "subjective",
+      "is_veto": false,
+      "veto_consequence": null,
+      "description": "对投标人安全文明施工与工程质量保证措施的完善性进行综合评价。",
+      "checks": [],
+      "formula": null,
+      "max_score": 10,
+      "levels": [
+        {"label": "优", "min": 9, "max": 10, "criteria": "措施完善、体系健全（通用判据，覆盖时替换）"},
+        {"label": "良", "min": 6, "max": 8, "criteria": "措施较完善、体系较健全（通用判据，覆盖时替换）"},
+        {"label": "一般", "min": 3, "max": 5, "criteria": "措施基本齐全、体系一般（通用判据，覆盖时替换）"},
+        {"label": "差", "min": 0, "max": 2, "criteria": "措施缺失或明显不满足要求（通用判据，覆盖时替换）"}
+      ],
+      "weight": null,
+      "essential": false,
+      "hint": "覆盖时必须替换为招标文件的具体评分要点"
+    },
+    {
+      "template_code": "T5.1",
+      "category": "commercial",
+      "name": "同类工程业绩",
+      "score_type": "count",
+      "is_veto": false,
+      "veto_consequence": null,
+      "description": "按投标人提供的近年同类工程业绩数量计分，每项 2 分，最高 10 分。",
+      "checks": [
+        {"check_type": "count_at_least", "field": null, "params": {"field": "performance", "per_item": 2, "max_items": 5}, "on_fail": "need_human"}
+      ],
+      "formula": null,
+      "max_score": 10,
+      "levels": [],
+      "weight": null,
+      "essential": true,
+      "hint": "覆盖时替换为招标文件规定的业绩时间范围、金额门槛与证明材料"
+    },
+    {
+      "template_code": "T5.2",
+      "category": "commercial",
+      "name": "项目管理团队配置与项目经理资格",
+      "score_type": "count",
+      "is_veto": false,
+      "veto_consequence": null,
+      "description": "按投标人项目管理团队配置及项目经理执业资格证书情况计分，每项 2 分，最高 10 分。",
+      "checks": [
+        {"check_type": "count_at_least", "field": null, "params": {"field": "certificates", "per_item": 2, "max_items": 5}, "on_fail": "need_human"}
+      ],
+      "formula": null,
+      "max_score": 10,
+      "levels": [],
+      "weight": null,
+      "essential": false,
+      "hint": "覆盖时替换为招标文件要求的团队岗位与证书类型"
+    }
+  ]
+}

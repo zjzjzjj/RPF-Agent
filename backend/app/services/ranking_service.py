@@ -58,7 +58,9 @@ def compute_ranking(project_id: str, run_id: int | None = None) -> dict:
             ):
                 entry["veto_flag"] = True
             final = score.final_score
-            if crit.score_type != "veto":
+            # match 判断项按设计不打分（final 恒 None）：不进 missing_final、不计总分，
+            # 但照常落 breakdown（否则法律包的 8 条检查在评分矩阵里彻底消失）。
+            if crit.score_type not in ("veto", "match"):
                 if final is None:
                     entry["missing_final"].append(crit.name)
                     continue

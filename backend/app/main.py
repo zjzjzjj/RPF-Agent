@@ -20,6 +20,10 @@ async def lifespan(app: FastAPI):
     init_db()
     config.upload_dir().mkdir(parents=True, exist_ok=True)
     config.render_dir().mkdir(parents=True, exist_ok=True)
+    # 通用评分规则库：启动期强校验（坏模板 fail-fast，不让坏模板流入运行时）
+    from app.rules.library.loader import load_templates
+
+    load_templates()
     # 任务 worker 在 jobs/queue.py 就绪后接入（M0 后半段）
     from app.jobs.queue import start_worker, stop_worker
 

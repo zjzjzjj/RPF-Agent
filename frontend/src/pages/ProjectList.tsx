@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import {
   Alert,
@@ -33,7 +33,7 @@ import {
 } from "@ant-design/icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
-import { useProjects } from "../api/hooks";
+import { useProjects, useTemplates } from "../api/hooks";
 import DashboardMetrics from "../components/DashboardMetrics";
 import {
   formatDate,
@@ -60,6 +60,8 @@ export default function ProjectList() {
   const navigate = useNavigate();
   const qc = useQueryClient();
   const { message } = App.useApp();
+  const { data: templates } = useTemplates();
+  const pendingTemplate = useRef<string | undefined>(undefined);
   const projects = data ?? [];
   const active = projects.filter(isActiveProject).length;
   const reviewing = projects.filter((p) => p.status === "reviewing").length;
@@ -108,11 +110,27 @@ export default function ProjectList() {
             ? values.purchaser.trim() || null
             : null,
       }),
-    onSuccess: (project) => {
+    onSuccess: async (project) => {
       qc.invalidateQueries({ queryKey: ["projects"] });
+      const tid = pendingTemplate.current;
+      pendingTemplate.current = undefined;
+      if (tid) {
+        try {
+          // S0：创建成功即从通用模板实例化评分规则草稿（同步、确定性）
+          await api.post(`/projects/${project.id}/rules/instantiate`, {
+            template_id: tid,
+          });
+          message.success("项目已创建，已从通用模板实例化评分规则草稿");
+        } catch (e) {
+          message.error(
+            (e as Error).message || "项目已创建，但模板实例化失败，请稍后重试",
+          );
+        }
+      } else {
+        message.success("评标项目已创建");
+      }
       setOpen(false);
       form.resetFields();
-      message.success("评标项目已创建");
       navigate(`/p/${project.id}`);
     },
     onError: (e: Error) =>
@@ -472,11 +490,20 @@ export default function ProjectList() {
         keyboard={!create.isPending}
         cancelButtonProps={{ disabled: create.isPending }}
       >
-        <p className="modal-intro">先填写项目信息，创建后即可上传招标文件。</p>
+        <p className="modal-intro">
+          先填写项目信息。可选择一份通用评标办法模板：创建后直接生成规则草稿
+          （逐条签批后即可冻结），无需先上传招标文件。
+        </p>
         <Form
           form={form}
           layout="vertical"
-          onFinish={(v) => create.mutate(v)}
+          onFinish={(v) => {
+            pendingTemplate.current =
+              typeof v.base_template_id === "string" && v.base_template_id
+                ? v.base_template_id
+                : undefined;
+            create.mutate(v);
+          }}
           disabled={create.isPending}
         >
           <Form.Item
@@ -489,6 +516,22 @@ export default function ProjectList() {
             <Input
               placeholder="如：某市智慧政务云平台建设项目"
               maxLength={200}
+            />
+          </Form.Item>
+          <Form.Item name="base_template_id" label="评标办法基线模板（可选）">
+            <Select
+              allowClear
+              placeholder="暂不使用（仅上传招标文件编译）"
+              options={[
+                {
+                  value: "",
+                  label: "暂不使用（仅上传招标文件编译）",
+                },
+                ...(templates ?? []).map((t) => ({
+                  value: t.template_id,
+                  label: `${t.name}（${t.criteria_count} 项）`,
+                })),
+              ]}
             />
           </Form.Item>
           <Form.Item name="project_code" label="招标编号">

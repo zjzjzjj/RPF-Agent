@@ -157,6 +157,7 @@ def parse_document(ctx: JobContext, payload: dict) -> dict:
             doc.page_count = len(extracted.pages)
             doc.parse_engine = extracted.engine
             doc.parse_status = "degraded" if extracted.degraded else "parsed"
+            doc.author = extracted.author  # 串通检测信号源（无元数据则 None）
             doc.warnings_json = warnings
 
     ctx.advance(message="完成")

@@ -33,14 +33,23 @@ def build_snapshot(
     package: dict,
     criteria: list[dict],
 ) -> dict:
-    """从业务行组装快照。字段只挑与评分相关的（不含时间戳/操作人）。"""
+    """从业务行组装快照。字段只挑与评分相关的（不含时间戳/操作人）。
+
+    v2：加入规则库溯源字段（origin/template_*/p_source/signoff/override），
+    评分输出与报告可回答"依据是文件条款还是签批的模板兜底"（设计稿 §6.1.4）。
+    v1 快照保持可读（新字段缺省为 None）。
+    """
     return {
-        "schema": "rule_package/v1",
+        "schema": "rule_package/v2",
         "package": {
             "project_id": package.get("project_id"),
             "version": package.get("version"),
             "status": package.get("status"),
             "total_max": package.get("total_max", 100),
+            "origin": package.get("origin", "document"),
+            "template_id": package.get("template_id"),
+            "template_hash": package.get("template_hash"),
+            "library_version": package.get("library_version"),
         },
         "criteria": [
             {
@@ -59,6 +68,13 @@ def build_snapshot(
                 "source_quote": c.get("source_quote"),
                 "status": c.get("status"),
                 "sort_order": c.get("sort_order", 0),
+                "origin": c.get("origin", "document"),
+                "template_code": c.get("template_code"),
+                "template_hash": c.get("template_hash"),
+                "library_version": c.get("library_version"),
+                "p_source": c.get("p_source"),
+                "signoff": _jsonable(c.get("signoff")),
+                "override": _jsonable(c.get("override")),
                 "levels": [
                     {
                         "label": lv.get("label"),

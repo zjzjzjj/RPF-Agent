@@ -165,6 +165,14 @@ def _classify_question(score, crit) -> str | None:
 
     if score.review_status == "conflict_flagged":
         return "conflict"
+    # match 判断项：按设计不打分（final 恒 None），按机器判定三态定性——
+    # 绝不能落入 no_score（"尚未定分/补录分值"对判断项语义完全错误）。
+    if crit.score_type == "match":
+        if score.machine_status == "recommend_reject":
+            return "veto_recommended"   # 防御：仅 is_veto 的 match 可能到此
+        if score.machine_status in (None, "need_human"):
+            return "needs_judgment"     # 中危：机器不可判，逐项裁决
+        return "batch_confirmable"      # 低危：机器 pass，待浏览确认
     # 证据核验只对**主观分**有意义：formula/count/match 的证据是确定性计算过程本身
     # （价格分可复算、计数分有原语与参数），不产生引文，故 evidence_status 恒为 none。
     # 若不区分，所有机器计算分都会被误报为"证据未核验"。

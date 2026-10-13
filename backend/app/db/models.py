@@ -75,6 +75,7 @@ class Document(Base):
     parse_status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
     # pending|parsed|degraded|failed|ocr_required
     parse_engine: Mapped[str | None] = mapped_column(String(64))
+    author: Mapped[str | None] = mapped_column(String(255))  # 文档作者元数据（串通检测信号源）
     warnings_json: Mapped[list | None] = mapped_column(JSON)
     data_class: Mapped[str] = mapped_column(String(24), default="synthetic")
     # synthetic|redacted_sample|confidential
@@ -145,6 +146,13 @@ class RulePackage(Base):
     version: Mapped[int] = mapped_column(Integer, default=1)
     status: Mapped[str] = mapped_column(String(16), default="draft", index=True)
     # draft|confirmed|frozen|superseded
+    origin: Mapped[str] = mapped_column(String(16), default="document")
+    # document|template|merged|law（包级来源：编译自招标文件/实例化自模板库/合并覆盖/法律通用规则包导入）
+    template_id: Mapped[str | None] = mapped_column(String(64))
+    template_hash: Mapped[str | None] = mapped_column(String(32))
+    library_version: Mapped[str | None] = mapped_column(String(32))
+    merge_target_id: Mapped[int | None] = mapped_column(ForeignKey("rule_packages.id"))
+    # merge 模式的临时编译包指向的模板包（S1）；该列非空 = 合并辅助包，不算"当前规则"
     content_hash: Mapped[str | None] = mapped_column(String(32))
     snapshot_json: Mapped[dict | None] = mapped_column(JSON)  # 冻结时全量快照
     parent_version_id: Mapped[int | None] = mapped_column(ForeignKey("rule_packages.id"))
@@ -164,6 +172,9 @@ class RulePackage(Base):
         UniqueConstraint("project_id", "version", name="uq_rule_packages_project_version"),
         CheckConstraint(
             "status IN ('draft','confirmed','frozen','superseded')", name="status_valid"
+        ),
+        CheckConstraint(
+            "origin IN ('document','template','merged','law')", name="origin_valid"
         ),
     )
 
@@ -189,8 +200,17 @@ class Criterion(Base):
     source_node_id: Mapped[str | None] = mapped_column(String(512))
     source_page: Mapped[int | None] = mapped_column(Integer)
     source_quote: Mapped[str | None] = mapped_column(Text)
+    # 规则库溯源（模板路径，设计稿 §4.1）
+    origin: Mapped[str] = mapped_column(String(16), default="document")
+    # template|document|manual|law（当前生效来源；覆盖后由 template → document）
+    template_code: Mapped[str | None] = mapped_column(String(64))  # 模板原始编号（覆盖时保留）
+    template_hash: Mapped[str | None] = mapped_column(String(32))
+    library_version: Mapped[str | None] = mapped_column(String(32))
+    override_json: Mapped[dict | None] = mapped_column(JSON)  # 最近一次覆盖详情（S1）
+    signoff_json: Mapped[dict | None] = mapped_column(JSON)  # {by,at,reason} 模板兜底签批
+    p_source: Mapped[str | None] = mapped_column(String(2))  # 'P0'=法律强制规定；'P5'=模板；'P1'-'P4'=文档；NULL=人工
     status: Mapped[str] = mapped_column(String(16), default="needs_input")
-    # verified|needs_input|ambiguous|gap|conflict|invalid
+    # verified|needs_input|ambiguous|gap|conflict|invalid|needs_signoff|retired
     edit_json: Mapped[dict | None] = mapped_column(JSON)  # {by,at,reason,model_value}
     confidence: Mapped[float | None] = mapped_column(Float)
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
@@ -205,8 +225,12 @@ class Criterion(Base):
             "score_type IN ('veto','formula','count','match','subjective')", name="score_type_valid"
         ),
         CheckConstraint(
-            "status IN ('verified','needs_input','ambiguous','gap','conflict','invalid')",
+            "status IN ('verified','needs_input','ambiguous','gap','conflict','invalid',"
+            "'needs_signoff','retired')",
             name="status_valid",
+        ),
+        CheckConstraint(
+            "origin IN ('template','document','manual','law')", name="origin_valid"
         ),
     )
 
@@ -268,6 +292,34 @@ class PriceFormula(Base):
     source_node_id: Mapped[str | None] = mapped_column(String(512))
     source_quote: Mapped[str | None] = mapped_column(Text)
     confirmed_by: Mapped[str | None] = mapped_column(String(64))
+
+
+class OverrideRecord(Base):
+    """逐条覆盖审计（S1，设计稿 §4.1）。
+
+    独立于 criteria 行内 override_json，供包级时间线与 new_version 复制。
+    记录"压过了哪一条"（won_source/lost_source，调研报告 §2.3）。
+    """
+
+    __tablename__ = "override_records"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    package_id: Mapped[int] = mapped_column(ForeignKey("rule_packages.id"), index=True)  # 模板包
+    merge_package_id: Mapped[int | None] = mapped_column(ForeignKey("rule_packages.id"))
+    action: Mapped[str] = mapped_column(String(16))  # override|keep_template|drop_template|append_document
+    template_criterion_id: Mapped[int | None] = mapped_column(ForeignKey("criteria.id"))
+    document_criterion_id: Mapped[int | None] = mapped_column(ForeignKey("criteria.id"))
+    match_method: Mapped[str | None] = mapped_column(String(16))  # exact|deterministic|llm|human
+    similarity: Mapped[Decimal | None] = mapped_column(Numeric(6, 4))
+    won_source: Mapped[str | None] = mapped_column(String(2))  # P1..P4（压过 P5）
+    lost_source: Mapped[str | None] = mapped_column(String(2))  # 通常为 P5
+    document_id: Mapped[int | None] = mapped_column(ForeignKey("documents.id"))
+    document_node_id: Mapped[str | None] = mapped_column(String(512))
+    document_page: Mapped[int | None] = mapped_column(Integer)
+    quote: Mapped[str | None] = mapped_column(Text)
+    confirmed_by: Mapped[str | None] = mapped_column(String(64))
+    reason: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class PackageValidation(Base):

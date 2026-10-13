@@ -81,6 +81,13 @@ export interface CriterionOut {
   source_page: number | null;
   source_quote: string | null;
   status: string;
+  origin: string;
+  template_code: string | null;
+  template_hash: string | null;
+  library_version: string | null;
+  override_json: Record<string, unknown> | null;
+  signoff_json: { by: string; at: string; reason: string } | null;
+  p_source: string | null;
   edit_json: Record<string, unknown> | null;
   confidence: number | null;
   sort_order: number;
@@ -102,6 +109,10 @@ export interface PackageDetail {
   project_id: string;
   version: number;
   status: string;
+  origin: string;
+  template_id: string | null;
+  template_hash: string | null;
+  library_version: string | null;
   content_hash: string | null;
   parent_version_id: number | null;
   source_document_id: number | null;
@@ -113,6 +124,99 @@ export interface PackageDetail {
   frozen_at: string | null;
   criteria: CriterionOut[];
   validations: ValidationOut[];
+}
+
+/** 通用评分规则库模板（S0） */
+export interface TemplateSummary {
+  template_id: string;
+  name: string;
+  method: string;
+  library_version: string;
+  criteria_count: number;
+  categories_summary: Record<string, number>;
+}
+
+export interface TemplateLevel {
+  label: string;
+  min: string | null;
+  max: string | null;
+  criteria: string;
+}
+
+export interface TemplateCriterion {
+  template_code: string;
+  category: string;
+  name: string;
+  score_type: string;
+  is_veto: boolean;
+  veto_consequence: string | null;
+  max_score: string | null;
+  description: string | null;
+  essential: boolean;
+  hint: string | null;
+  levels: TemplateLevel[];
+  checks: { check_type: string; field: string | null; params: Record<string, unknown>; on_fail: string }[];
+  formula: {
+    formula_type: string;
+    benchmark_method: string;
+    k: string;
+    upper_bound: string | null;
+    lower_bound: string | null;
+    rounding: number;
+  } | null;
+}
+
+export interface TemplateDetail extends TemplateSummary {
+  applicable: Record<string, string>;
+  notes: string | null;
+  criteria: TemplateCriterion[];
+}
+
+/** 覆盖率报告（S0） */
+export interface Coverage {
+  total: number;
+  document_backed: number;
+  template_fallback_signed: number;
+  template_fallback_pending: number;
+  retired: number;
+  manual: number;
+  by_category: Record<string, Record<string, number>>;
+  essential_uncovered: string[];
+  price_covered: boolean;
+  veto_covered_ratio: number;
+}
+
+/** 匹配提案（S1）：模板条目 ↔ 编译条目 */
+export interface MatchCriterionBrief {
+  id: number;
+  code: string;
+  name: string;
+  category: string;
+  score_type: string;
+  is_veto: boolean;
+  max_score: string | null;
+  source_page: number | null;
+  source_quote: string | null;
+  origin: string;
+  status: string;
+}
+
+export interface MatchPair {
+  pair_id: string;
+  match_method: string; // exact|deterministic|llm
+  similarity: number;
+  confidence: number | null;
+  rationale: string | null;
+  template: MatchCriterionBrief;
+  document: MatchCriterionBrief;
+}
+
+export interface MatchProposal {
+  merge_package_id: number;
+  target_package_id: number;
+  pairs: MatchPair[];
+  unmatched_template: MatchCriterionBrief[];
+  unmatched_document: MatchCriterionBrief[];
 }
 
 export interface Bidder {

@@ -91,7 +91,40 @@ def run_check(check_type: str, params: dict, facts: BidFacts) -> PrimitiveResult
     if check_type == "math_relation":
         return _check_math(params, facts)
 
+    if check_type == "collusion_check":
+        return _check_collusion(params, facts)
+
     return PrimitiveResult("unknown", f"未知检查类型：{check_type}", need_human=True)
+
+
+def _check_collusion(params: dict, facts: BidFacts) -> PrimitiveResult:
+    """实施条例第 40 条：读跨投标人预计算信号（scoring_service 注入 facts.cross_bidder）。
+
+    信号由 engine/collusion.py 预计算——本函数只解释，不自建跨家视角。
+    - 命中信号 → fail + need_human（verdict → conflict_flagged，**绝不自动否决**）；
+    - 信号不可用 / 未命中其余情形 → unknown + need_human（机器不可判，转人工）。
+    """
+    sig = getattr(facts, "cross_bidder", None) or {}
+    hits = sig.get("signals") or []
+    if hits:
+        detail = sig.get("detail") or "、".join(hits)
+        return PrimitiveResult(
+            "fail",
+            f"疑似串通信号（须评标委员会认定，不自动否决）：{detail}",
+            need_human=True,
+        )
+    if not sig.get("available"):
+        return PrimitiveResult(
+            "unknown",
+            "跨投标人信号不可用（有效报价或作者元数据不足），须人工核查",
+            need_human=True,
+        )
+    return PrimitiveResult(
+        "unknown",
+        "未见报价规律性差异/同作者信号；串通其余情形（同一人编制或办理、文件异常一致、"
+        "混装、保证金同账户转出）须评标委员会判定",
+        need_human=True,
+    )
 
 
 def _check_math(params: dict, facts: BidFacts) -> PrimitiveResult:

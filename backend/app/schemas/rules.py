@@ -38,6 +38,13 @@ class CriterionOut(BaseModel):
     source_page: int | None
     source_quote: str | None
     status: str
+    origin: str = "document"
+    template_code: str | None = None
+    template_hash: str | None = None
+    library_version: str | None = None
+    override_json: dict | None = None
+    signoff_json: dict | None = None
+    p_source: str | None = None
     edit_json: dict | None
     confidence: float | None
     sort_order: int
@@ -55,6 +62,10 @@ class PackageOut(BaseModel):
     project_id: str
     version: int
     status: str
+    origin: str = "document"
+    template_id: str | None = None
+    template_hash: str | None = None
+    library_version: str | None = None
     content_hash: str | None
     parent_version_id: int | None
     source_document_id: int | None
@@ -86,6 +97,36 @@ class CompileRequest(BaseModel):
     document_id: int
     provider: str | None = None
     model: str | None = None  # 前端可选模型（模型目录内的 id）
+    mode: str = "replace"  # replace|merge（S1：merge = 产出临时编译包供逐条覆盖）
+    merge_target_id: int | None = None  # merge 模式指向的模板包
+
+
+class InstantiateBody(BaseModel):
+    template_id: str = Field(min_length=1)
+
+
+class LawImportBody(BaseModel):
+    """法律规则包制品 JSON 原样投递（顶层 = {package, criteria}，其余键忽略）。"""
+
+    model_config = ConfigDict(extra="ignore")
+
+    package: dict = Field(default_factory=dict)
+    criteria: list[dict] = Field(default_factory=list)
+
+
+class DroppedNodeOut(BaseModel):
+    code: str
+    node_id: str
+
+
+class LawImportOut(BaseModel):
+    package_id: int
+    version: int
+    created: bool
+    imported: int
+    skipped_codes: list[str]
+    dropped_nodes: list[DroppedNodeOut]
+    validations: list[ValidationOut]
 
 
 class CriterionPatch(BaseModel):
@@ -149,3 +190,113 @@ class DiffOut(BaseModel):
     added: list[dict]
     removed: list[dict]
     changed: list[dict]
+
+
+# ---------------------------------------------------------------------------
+# 通用评分规则库（S0）
+# ---------------------------------------------------------------------------
+class TemplateLevelOut(BaseModel):
+    label: str
+    min: Decimal | None
+    max: Decimal | None
+    criteria: str
+
+
+class TemplateCheckOut(BaseModel):
+    check_type: str
+    field: str | None = None
+    params: dict
+    on_fail: str
+
+
+class TemplateFormulaOut(BaseModel):
+    formula_type: str
+    benchmark_method: str
+    k: Decimal
+    upper_bound: Decimal | None = None
+    lower_bound: Decimal | None = None
+    rounding: int = 2
+    trim_ratio: Decimal | None = None
+    deduct_rate: Decimal | None = None
+
+
+class TemplateCriterionOut(BaseModel):
+    template_code: str
+    category: str
+    name: str
+    score_type: str
+    is_veto: bool = False
+    veto_consequence: str | None = None
+    max_score: Decimal | None = None
+    description: str | None = None
+    essential: bool = False
+    hint: str | None = None
+    levels: list[TemplateLevelOut] = []
+    checks: list[TemplateCheckOut] = []
+    formula: TemplateFormulaOut | None = None
+
+
+class TemplateSummaryOut(BaseModel):
+    template_id: str
+    name: str
+    method: str
+    library_version: str
+    criteria_count: int
+    categories_summary: dict[str, int]
+
+
+class TemplateDetailOut(TemplateSummaryOut):
+    applicable: dict
+    notes: str | None = None
+    criteria: list[TemplateCriterionOut]
+
+
+class SignoffBody(BaseModel):
+    reason: str = Field(min_length=1)
+
+
+# ---------------------------------------------------------------------------
+# 逐条覆盖（S1）：匹配提案
+# ---------------------------------------------------------------------------
+class MatchPairOut(BaseModel):
+    pair_id: str
+    match_method: str  # exact|deterministic|llm
+    similarity: float
+    confidence: float | None = None
+    rationale: str | None = None
+    template: dict
+    document: dict
+
+
+class MatchProposalOut(BaseModel):
+    merge_package_id: int
+    target_package_id: int
+    pairs: list[MatchPairOut]
+    unmatched_template: list[dict]
+    unmatched_document: list[dict]
+
+
+class MatchDecision(BaseModel):
+    action: str  # override|drop_template|append_document|reject
+    pair_id: str | None = None
+    template_criterion_id: int | None = None
+    document_criterion_id: int | None = None
+    reason: str = Field(min_length=1)
+
+
+class ResolveProposalBody(BaseModel):
+    decisions: list[MatchDecision] = Field(min_length=1)
+
+
+class CoverageOut(BaseModel):
+    total: int
+    document_backed: int
+    template_fallback_signed: int
+    template_fallback_pending: int
+    retired: int
+    manual: int
+    law: int = 0
+    by_category: dict[str, dict]
+    essential_uncovered: list[str]
+    price_covered: bool
+    veto_covered_ratio: float

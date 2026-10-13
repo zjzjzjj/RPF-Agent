@@ -1,0 +1,141 @@
+{
+  "template_id": "lowest-price",
+  "name": "最低评标价法通用模板",
+  "method": "lowest-price",
+  "applicable": {"procurement": "goods"},
+  "library_version": "1.0.0",
+  "notes": "最低评标价法：满足招标文件全部实质性要求的投标中，投标报价最低者为中标候选人；本模板只含资格/符合性否决项与 100 分价格项，无技术/商务评分项。全部条目均为候选，未经招标文件覆盖并签批不得执行。",
+  "criteria": [
+    {
+      "template_code": "T1.1",
+      "category": "qualification",
+      "name": "具有独立法人资格",
+      "score_type": "veto",
+      "is_veto": true,
+      "veto_consequence": "disqualify",
+      "description": "投标人须为在中华人民共和国境内注册、具有独立承担民事责任能力的法人或其他组织。",
+      "checks": [
+        {"check_type": "document_present", "field": null, "params": {"document": "营业执照"}, "on_fail": "recommend_reject"}
+      ],
+      "max_score": null,
+      "levels": [],
+      "formula": null,
+      "weight": null,
+      "essential": true,
+      "hint": "覆盖时必须逐字引用招标文件原文"
+    },
+    {
+      "template_code": "T1.2",
+      "category": "qualification",
+      "name": "具备招标文件要求的资质条件",
+      "score_type": "veto",
+      "is_veto": true,
+      "veto_consequence": "disqualify",
+      "description": "投标人须具备招标文件载明的相应资质条件且在有效期内。",
+      "checks": [
+        {"check_type": "document_present", "field": null, "params": {"document": "资质证书"}, "on_fail": "recommend_reject"}
+      ],
+      "max_score": null,
+      "levels": [],
+      "formula": null,
+      "weight": null,
+      "essential": true,
+      "hint": "覆盖时替换为具体资质要求"
+    },
+    {
+      "template_code": "T1.3",
+      "category": "qualification",
+      "name": "未被列入失信被执行人名单",
+      "score_type": "veto",
+      "is_veto": true,
+      "veto_consequence": "disqualify",
+      "description": "投标人未被列入失信被执行人名单及招投标失信行为名单。",
+      "checks": [
+        {"check_type": "document_present", "field": null, "params": {"document": "信用承诺函"}, "on_fail": "recommend_reject"}
+      ],
+      "max_score": null,
+      "levels": [],
+      "formula": null,
+      "weight": null,
+      "essential": true,
+      "hint": "覆盖时替换为招标文件指定的查询渠道与证明形式"
+    },
+    {
+      "template_code": "T2.1",
+      "category": "compliance",
+      "name": "投标函已按要求签署并加盖公章",
+      "score_type": "veto",
+      "is_veto": true,
+      "veto_consequence": "disqualify",
+      "description": "投标函须由法定代表人或其授权代表签署并加盖投标人公章。",
+      "checks": [
+        {"check_type": "human_only", "field": null, "params": {}, "on_fail": "recommend_reject"}
+      ],
+      "max_score": null,
+      "levels": [],
+      "formula": null,
+      "weight": null,
+      "essential": true,
+      "hint": "签字/盖章属人工判定原语；覆盖时引用招标文件对应否决条款"
+    },
+    {
+      "template_code": "T2.2",
+      "category": "compliance",
+      "name": "投标保证金已按招标文件要求缴纳",
+      "score_type": "veto",
+      "is_veto": true,
+      "veto_consequence": "disqualify",
+      "description": "投标人须按招标文件要求提交投标保证金。",
+      "checks": [
+        {"check_type": "document_present", "field": null, "params": {"document": "投标保证金缴纳凭证"}, "on_fail": "recommend_reject"}
+      ],
+      "max_score": null,
+      "levels": [],
+      "formula": null,
+      "weight": null,
+      "essential": true,
+      "hint": "覆盖时替换为招标文件载明的保证金金额与形式"
+    },
+    {
+      "template_code": "T2.3",
+      "category": "compliance",
+      "name": "投标报价唯一且不高于最高限价",
+      "score_type": "veto",
+      "is_veto": true,
+      "veto_consequence": "disqualify",
+      "description": "投标人须对同一项目提交唯一报价，且报价不得高于最高投标限价。",
+      "checks": [
+        {"check_type": "math_relation", "field": null, "params": {}, "on_fail": "recommend_reject"}
+      ],
+      "max_score": null,
+      "levels": [],
+      "formula": null,
+      "weight": null,
+      "essential": true,
+      "hint": "覆盖时可在 params.max_yuan 填入本项目最高限价"
+    },
+    {
+      "template_code": "T3.1",
+      "category": "price",
+      "name": "投标报价得分",
+      "score_type": "formula",
+      "is_veto": false,
+      "veto_consequence": null,
+      "description": "最低评标价法价格项：经评审的最低投标报价得满分，其余报价按最低价与评标价的比值折算得分。",
+      "checks": [],
+      "formula": {
+        "formula_type": "lowest_ratio",
+        "benchmark_method": "lowest",
+        "k": 1.0,
+        "upper_bound": 100,
+        "lower_bound": 0,
+        "rounding": 2
+      },
+      "max_score": 100,
+      "levels": [],
+      "weight": null,
+      "essential": true,
+      "hint": "覆盖时必须替换为招标文件载明的价格分计算方法"
+    }
+  ]
+}

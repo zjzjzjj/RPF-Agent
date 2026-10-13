@@ -179,6 +179,7 @@ def reveal_score(score_id: int, body: RevealBody, actor: str = Depends(get_actor
 def review_score(score_id: int, body: ReviewBody, actor: str = Depends(get_actor)) -> ScoreOut:
     from decimal import Decimal, InvalidOperation
 
+    out: ScoreOut | None = None
     with session_scope() as s:
         row = s.get(ScoreRecord, score_id)
         if row is None:
@@ -186,31 +187,39 @@ def review_score(score_id: int, body: ReviewBody, actor: str = Depends(get_actor
         old = {"final": str(row.final_score) if row.final_score is not None else None,
                "review_status": row.review_status}
 
-        if body.action in ("confirm", "override"):
-            if row.score_type == "veto":
-                # 否决项不打分：confirm = 人工核查后确认"通过（不否决）"
-                if body.action == "override":
-                    raise ValidationFailed("否决项不能改分；确认不否决请用 confirm")
-                row.review_status = "human_confirmed"
-                row.evaluator_actor = actor
-                row.confirm_time = utcnow()
-                s.add(row)
-                s.add(
-                    _review_record(
-                        subject_type="score", subject_id=score_id, action="confirm",
-                        actor=actor, reason=body.reason,
-                        old_value_json=old,
-                        new_value_json={"review_status": "human_confirmed",
-                                        "note": "确认该项不构成否决"},
-                    )
+        if body.action in ("confirm", "override") and row.score_type in ("veto", "match"):
+            # 否决项/判断项（match）不打分：confirm = 人工核查后确认结论。
+            # 该分支自带 review_record 并跳过通用尾；audit 必须在 session 外做——
+            # 在写事务内嵌套开第二个写连接会撞 WAL 写锁（database is locked）。
+            if body.action == "override":
+                raise ValidationFailed(
+                    "判断项不打分；确认请用 confirm"
+                    if row.score_type == "match"
+                    else "否决项不能改分；确认不否决请用 confirm"
                 )
-                s.flush()
-                s.expunge(row)
-                out = ScoreOut.model_validate(row)
-                if row.ai_revealed_at is None:
-                    out.ai_suggested_score = None
-                audit_service.log(None, actor, "score.confirm", "score", str(score_id), {})
-                return out
+            row.review_status = "human_confirmed"
+            row.evaluator_actor = actor
+            row.confirm_time = utcnow()
+            s.add(row)
+            s.add(
+                _review_record(
+                    subject_type="score", subject_id=score_id, action="confirm",
+                    actor=actor, reason=body.reason,
+                    old_value_json=old,
+                    new_value_json={
+                        "review_status": "human_confirmed",
+                        "note": ("确认该项判断结论（不计分）" if row.score_type == "match"
+                                 else "确认该项不构成否决"),
+                    },
+                )
+            )
+            s.flush()
+            s.expunge(row)
+            out = ScoreOut.model_validate(row)
+            if row.ai_revealed_at is None:
+                out.ai_suggested_score = None
+
+        elif body.action in ("confirm", "override"):
             new_score = None
             if body.score is not None:
                 try:
@@ -260,22 +269,24 @@ def review_score(score_id: int, body: ReviewBody, actor: str = Depends(get_actor
         elif body.action == "flag_conflict":
             row.review_status = "conflict_flagged"
 
-        s.add(row)
-        s.add(
-            _review_record(
-                subject_type="score", subject_id=score_id, action=body.action,
-                actor=actor, reason=body.reason,
-                old_value_json=old,
-                new_value_json={"final": str(row.final_score) if row.final_score is not None else None,
-                                "review_status": row.review_status},
+        if out is None:  # veto/match 分支已自带 review_record，跳过通用尾
+            s.add(row)
+            s.add(
+                _review_record(
+                    subject_type="score", subject_id=score_id, action=body.action,
+                    actor=actor, reason=body.reason,
+                    old_value_json=old,
+                    new_value_json={"final": str(row.final_score) if row.final_score is not None else None,
+                                    "review_status": row.review_status},
+                )
             )
-        )
-        s.flush()
-        s.expunge(row)
-        out = ScoreOut.model_validate(row)
-        if row.ai_revealed_at is None:
-            out.ai_suggested_score = None
+            s.flush()
+            s.expunge(row)
+            out = ScoreOut.model_validate(row)
+            if row.ai_revealed_at is None:
+                out.ai_suggested_score = None
 
+    # audit 在 session 外统一执行（veto/match 分支的 action 恒为 confirm，字符串与通用口径一致）
     audit_service.log(None, actor, f"score.{body.action}", "score", str(score_id), {})
     return out
 

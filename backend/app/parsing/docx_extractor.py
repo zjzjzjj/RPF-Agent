@@ -61,6 +61,12 @@ def extract_docx(path: str) -> ExtractedDocument:
     except Exception as exc:  # noqa: BLE001
         raise DocumentRejectedError(config.REJECT_EXTRACTION_FAILED, f"docx 打开失败：{exc}") from exc
 
+    # 作者元数据（打开时顺带读取，零额外 IO；取不到不算失败）
+    try:
+        author = (doc.core_properties.author or "").strip() or None
+    except Exception:  # noqa: BLE001
+        author = None
+
     lines = _iter_block_lines(doc)
     if not lines:
         raise DocumentRejectedError(config.REJECT_NO_TEXT_LAYER, "docx 中没有任何文本内容")
@@ -97,4 +103,4 @@ def extract_docx(path: str) -> ExtractedDocument:
     _flush()
 
     warnings = ["docx 为虚拟分页（page_approximate=true），页码为近似值，证据无坐标。"]
-    return ExtractedDocument(pages=pages, engine="python-docx", warnings=warnings)
+    return ExtractedDocument(pages=pages, engine="python-docx", warnings=warnings, author=author)

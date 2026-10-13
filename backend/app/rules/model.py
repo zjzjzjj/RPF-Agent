@@ -87,3 +87,20 @@ class RuleExtraction(BaseModel):
     @classmethod
     def _non_empty_names(cls, v: list[ExtractedCriterion]) -> list[ExtractedCriterion]:
         return [c for c in v if c.name]
+
+
+class MatchPair(BaseModel):
+    """LLM 辅助匹配的一对（封闭菜单：只能在给定候选里选，不得发明配对）。"""
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    template_code: str  # 模板条目编号（T1.1...）
+    document_code: str  # 编译条目编号（2.1.1...）
+    confidence: float = Field(ge=0.0, le=1.0)
+    rationale: str = ""
+
+
+class MatchProposal(BaseModel):
+    """LLM 辅助匹配的一次完整输出。"""
+
+    pairs: list[MatchPair] = Field(default_factory=list)

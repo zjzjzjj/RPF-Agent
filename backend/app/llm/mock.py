@@ -17,6 +17,7 @@ from app.parsing.normalize import normalize_no_ws_with_map
 # 提示词模板中的任务标记（对真实模型无害的标签，mock 用它分派行为）
 TASK_RULE_EXTRACTION = "extract_rules"
 TASK_SUBJECTIVE_SCORE = "score_subjective"
+TASK_RULE_MATCH = "match_rules"
 
 _RE_TASK = re.compile(r"\[\[TASK:([a-z_]+)\]\]")
 _RE_DELIM = re.compile(r"<(\w+)>\n(.*?)\n</\1>", re.S)
@@ -63,6 +64,8 @@ class MockProvider:
             payload = self._extract_rules(blocks)
         elif task == TASK_SUBJECTIVE_SCORE:
             payload = self._score_subjective(blocks)
+        elif task == TASK_RULE_MATCH:
+            payload = self._match_rules(blocks)
         else:
             payload = {"error": f"mock 不支持的任务：{task}"}
         return LLMResult(
@@ -360,3 +363,60 @@ class MockProvider:
             "confidence": round(min(0.95, 0.35 + ratio), 2),
             "insufficient_evidence": False,
         }
+
+    # ------------------------------------------------------------------
+    # 规则配对（确定性启发式：名称包含/相似度，对应 LLM 辅助匹配的 mock 实现）
+    # ------------------------------------------------------------------
+    def _match_rules(self, blocks: dict[str, str]) -> dict:
+        from difflib import SequenceMatcher
+
+        from app.parsing.normalize import normalize_no_ws
+
+        def _entries(tag: str) -> dict[str, dict[str, str]]:
+            out: dict[str, dict[str, str]] = {}
+            for line in (blocks.get(tag) or "").splitlines():
+                line = line.strip()
+                if not line or "|" not in line:
+                    continue
+                parts = [p.strip() for p in line.split("|")]
+                if len(parts) < 4 or not parts[0] or not parts[1]:
+                    continue
+                out[parts[0]] = {
+                    "name": parts[1],
+                    "category": parts[2],
+                    "score_type": parts[3],
+                }
+            return out
+
+        template = _entries("template")
+        document = _entries("document")
+        pairs: list[dict] = []
+        used_doc: set[str] = set()
+        for t_code, t_info in template.items():
+            best_code: str | None = None
+            best_sim = 0.0
+            tn = normalize_no_ws(t_info["name"]) or ""
+            for d_code, d_info in document.items():
+                if d_code in used_doc:
+                    continue
+                # 与确定性层一致的硬过滤：类别与评分类型必须相等
+                if d_info["category"] != t_info["category"] or d_info["score_type"] != t_info["score_type"]:
+                    continue
+                dn = normalize_no_ws(d_info["name"]) or ""
+                if not tn or not dn:
+                    continue
+                # 包含度 = 最长公共子串占较短名称的比例（防止"长度占比"误判）
+                lcs_len = len(_longest_common_substring(tn, dn))
+                containment = lcs_len / min(len(tn), len(dn))
+                sim = max(SequenceMatcher(None, tn, dn).ratio(), containment)
+                if sim > best_sim:
+                    best_sim, best_code = sim, d_code
+            if best_code is not None and best_sim >= 0.5:
+                used_doc.add(best_code)
+                pairs.append({
+                    "template_code": t_code,
+                    "document_code": best_code,
+                    "confidence": round(min(0.95, best_sim), 2),
+                    "rationale": f"[mock] 名称相似度 {best_sim:.2f}",
+                })
+        return {"pairs": pairs}

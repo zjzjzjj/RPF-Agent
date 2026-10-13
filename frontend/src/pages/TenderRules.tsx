@@ -1,16 +1,19 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 import {
   Alert,
   Button,
   Card,
+  Checkbox,
   Col,
+  Drawer,
   Empty,
   Form,
   Input,
   InputNumber,
   List,
   Modal,
+  Progress,
   Row,
   Select,
   Space,
@@ -22,11 +25,11 @@ import {
   Upload,
   message,
 } from "antd";
-import { PlayCircleOutlined, CheckOutlined, PlusOutlined, ThunderboltOutlined, UploadOutlined } from "@ant-design/icons";
+import { PlayCircleOutlined, CheckOutlined, PlusOutlined, ThunderboltOutlined, UploadOutlined, SwapOutlined } from "@ant-design/icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
-import { useDocuments, useJob, useModels, useRules } from "../api/hooks";
-import type { CriterionOut, ValidationOut } from "../types";
+import { useCoverage, useDocuments, useJob, useMatchProposal, useModels, useRules } from "../api/hooks";
+import type { CriterionOut, MatchCriterionBrief, MatchPair, ValidationOut } from "../types";
 import { CATEGORY_LABELS } from "../types";
 
 const STATUS_TAG: Record<string, { color: string; text: string }> = {
@@ -36,6 +39,8 @@ const STATUS_TAG: Record<string, { color: string; text: string }> = {
   gap: { color: "red", text: "缺口" },
   conflict: { color: "red", text: "冲突" },
   invalid: { color: "red", text: "非法" },
+  needs_signoff: { color: "orange", text: "兜底待签批" },
+  retired: { color: "default", text: "已退休" },
 };
 
 export default function TenderRules() {
@@ -44,10 +49,17 @@ export default function TenderRules() {
   const { data: documents } = useDocuments(pid);
   const { data: rules, isLoading } = useRules(pid);
   const { data: models } = useModels();
+  const { data: coverage } = useCoverage(rules?.id ?? null);
   const [jobId, setJobId] = useState<number | null>(null);
   const [selectedModel, setSelectedModel] = useState<string | undefined>(undefined);
   const { data: job } = useJob(jobId);
   const [detail, setDetail] = useState<CriterionOut | null>(null);
+  const [signoffTarget, setSignoffTarget] = useState<CriterionOut | null>(null);
+  const [mergePackageId, setMergePackageId] = useState<number | null>(null);
+  const [proposalOpen, setProposalOpen] = useState(false);
+  const mergeCompileRef = useRef(false);
+  const isTemplatePackage = rules?.origin === "template";
+  const canMerge = rules?.origin === "template" || rules?.origin === "merged";
 
   const tenderDoc = documents?.find((d) => d.kind === "tender" && d.parse_status !== "pending");
   const tenderFailed = documents?.some((d) => d.kind === "tender" && d.parse_status === "failed");
@@ -68,14 +80,34 @@ export default function TenderRules() {
   });
 
   const compile = useMutation({
-    mutationFn: () =>
-      api.post<{ job_id: number }>(`/projects/${pid}/rules/compile`, {
+    mutationFn: () => {
+      const isMerge = canMerge && !!tenderDoc;
+      mergeCompileRef.current = isMerge;
+      return api.post<{ job_id: number }>(`/projects/${pid}/rules/compile`, {
         document_id: tenderDoc?.id,
         model: selectedModel ?? null,
-      }),
+        mode: isMerge ? "merge" : "replace",
+        merge_target_id: isMerge ? rules!.id : null,
+      });
+    },
     onSuccess: (r) => setJobId(r.job_id),
     onError: (e: Error) => message.error(e.message),
   });
+
+  // merge 编译任务成功后：记录临时编译包 id，供匹配提案审核
+  useEffect(() => {
+    if (
+      job &&
+      job.status === "succeeded" &&
+      mergeCompileRef.current &&
+      job.result_json &&
+      typeof job.result_json.package_id === "number"
+    ) {
+      mergeCompileRef.current = false;
+      setMergePackageId(job.result_json.package_id);
+      message.success("合并编译完成，已生成匹配提案，请逐对审核");
+    }
+  }, [job]);
 
   const accept = useMutation({
     mutationFn: (id: number) =>
@@ -117,12 +149,27 @@ export default function TenderRules() {
     onError: (e: Error) => message.error(e.message),
   });
 
+  const signoff = useMutation({
+    mutationFn: ({ id, reason }: { id: number; reason: string }) =>
+      api.post(`/rules/criteria/${id}/signoff`, { reason }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["rules", pid] });
+      qc.invalidateQueries({ queryKey: ["coverage", rules?.id] });
+      message.success("已签批并留痕（模板兜底）");
+      setSignoffTarget(null);
+    },
+    onError: (e: Error) => message.error(e.message),
+  });
+
   if (isLoading) return <Spin />;
 
   const criteria = rules?.criteria ?? [];
   const errors = (rules?.validations ?? []).filter((v) => v.severity === "error");
   const warns = (rules?.validations ?? []).filter((v) => v.severity !== "error");
   const unconfirmed = criteria.filter((c) => c.status !== "verified");
+  const pendingSignoff = criteria.filter(
+    (c) => c.origin === "template" && c.status === "needs_signoff",
+  ).length;
 
   return (
     <div>
@@ -144,44 +191,70 @@ export default function TenderRules() {
             />
             <Button
               type="primary"
-              icon={<PlayCircleOutlined />}
+              icon={canMerge ? <SwapOutlined /> : <PlayCircleOutlined />}
               disabled={!tenderDoc}
               loading={compile.isPending}
               onClick={() => compile.mutate()}
             >
-              编译评分规则（AI 抽取 + 确定性校验）
+              {canMerge
+                ? "编译并生成覆盖提案（merge）"
+                : "编译评分规则（AI 抽取 + 确定性校验）"}
             </Button>
+            {canMerge && (
+              <Button
+                icon={<CheckOutlined />}
+                disabled={!mergePackageId}
+                onClick={() => setProposalOpen(true)}
+              >
+                匹配提案审核{mergePackageId ? "（有新提案）" : ""}
+              </Button>
+            )}
           </Space>
         </Col>
       </Row>
 
-      {!tenderDoc && (
+      {isTemplatePackage ? (
         <Alert
           style={{ marginTop: 12 }}
-          type="info"
+          type="success"
           showIcon
-          message="请先上传招标文件，解析完成后才能编译规则"
+          message={`已从通用模板实例化规则草稿（${rules.template_id} v${rules.library_version}）`}
           description={
-            <Space direction="vertical" size="small">
-              <Typography.Text type="secondary">
-                支持 PDF / Word（.docx），系统将自动解析页文本与条款树。
-                {tenderFailed ? "上次上传的文件解析失败，请更换文件重试。" : ""}
-              </Typography.Text>
-              <Upload
-                showUploadList={false}
-                accept=".pdf,.docx"
-                beforeUpload={(file) => {
-                  uploadTender.mutate(file);
-                  return false; // 阻止 antd 默认上传，统一走 mutation
-                }}
-              >
-                <Button type="primary" icon={<UploadOutlined />} loading={uploadTender.isPending}>
-                  上传招标文件
-                </Button>
-              </Upload>
-            </Space>
+            <Typography.Text type="secondary">
+              当前条目均为模板兜底（P5 来源，招标文件未规定），可先逐条签批后确认、冻结；
+              上传招标文件后点击「编译并生成覆盖提案（merge）」，可将模板条目逐条覆盖为招标文件依据。
+            </Typography.Text>
           }
         />
+      ) : (
+        !tenderDoc && (
+          <Alert
+            style={{ marginTop: 12 }}
+            type="info"
+            showIcon
+            message="请先上传招标文件，解析完成后才能编译规则"
+            description={
+              <Space direction="vertical" size="small">
+                <Typography.Text type="secondary">
+                  支持 PDF / Word（.docx），系统将自动解析页文本与条款树。
+                  {tenderFailed ? "上次上传的文件解析失败，请更换文件重试。" : ""}
+                </Typography.Text>
+                <Upload
+                  showUploadList={false}
+                  accept=".pdf,.docx"
+                  beforeUpload={(file) => {
+                    uploadTender.mutate(file);
+                    return false; // 阻止 antd 默认上传，统一走 mutation
+                  }}
+                >
+                  <Button type="primary" icon={<UploadOutlined />} loading={uploadTender.isPending}>
+                    上传招标文件
+                  </Button>
+                </Upload>
+              </Space>
+            }
+          />
+        )
       )}
 
       {job && (
@@ -197,12 +270,35 @@ export default function TenderRules() {
       {rules && rules.id !== 0 && (
         <>
           <Card size="small" style={{ marginTop: 12 }}>
-            <Space wrap>
+            <Space wrap style={{ width: "100%" }}>
               <Tag color="blue">版本 v{rules.version}</Tag>
               <Tag>{rules.status === "draft" ? "草稿" : rules.status === "confirmed" ? "已确认" : rules.status === "frozen" ? "已冻结" : rules.status}</Tag>
+              {rules.origin === "template" && (
+                <Tag color="geekblue">
+                  模板包 {rules.template_id} v{rules.library_version}
+                </Tag>
+              )}
               {rules.content_hash && <Tag color="purple">内容哈希 {rules.content_hash}</Tag>}
               <Tag>{criteria.length} 个评分项</Tag>
               {unconfirmed.length > 0 && <Tag color="orange">{unconfirmed.length} 项待确认</Tag>}
+              {coverage && (
+                <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+                  <Progress
+                    size="small"
+                    style={{ width: 180 }}
+                    percent={Math.round(
+                      ((coverage.document_backed + coverage.template_fallback_signed) /
+                        Math.max(1, coverage.total)) *
+                        100,
+                    )}
+                    format={() => `${coverage.document_backed + coverage.template_fallback_signed}/${coverage.total}`}
+                  />
+                  <Typography.Text type="secondary">文档覆盖</Typography.Text>
+                  {pendingSignoff > 0 && (
+                    <Tag color="orange">签批待办 {pendingSignoff}</Tag>
+                  )}
+                </span>
+              )}
               <span style={{ marginLeft: "auto" }}>
                 <Space>
                   <Button
@@ -276,9 +372,29 @@ export default function TenderRules() {
                   render: (v: string, row) => (row.is_veto ? <Tag color="red">否决项</Tag> : <Tag>{v}</Tag>),
                 },
                 {
+                  title: "来源",
+                  dataIndex: "origin",
+                  width: 130,
+                  render: (_, row) => {
+                    if (row.origin === "template") {
+                      return row.signoff_json ? (
+                        <Tooltip title={`模板兜底（已签批：${row.signoff_json.by} ${row.signoff_json.at.slice(0, 10)}）`}>
+                          <Tag color="orange">模板兜底·已签批</Tag>
+                        </Tooltip>
+                      ) : (
+                        <Tag color="gold">模板兜底（待签批）</Tag>
+                      );
+                    }
+                    if (row.origin === "manual") {
+                      return <Tag color="purple">人工</Tag>;
+                    }
+                    return <Tag color="blue">招标文件</Tag>;
+                  },
+                },
+                {
                   title: "状态",
                   dataIndex: "status",
-                  width: 130,
+                  width: 120,
                   render: (s: string) => {
                     const t = STATUS_TAG[s] ?? { color: "default", text: s };
                     return <Tag color={t.color}>{t.text}</Tag>;
@@ -295,27 +411,44 @@ export default function TenderRules() {
                         </Typography.Text>
                       </Tooltip>
                     ) : (
-                      <Tag color="red">无引用</Tag>
+                      row.origin === "template" ? (
+                        <Tag color="orange">模板兜底</Tag>
+                      ) : (
+                        <Tag color="red">无引用</Tag>
+                      )
                     ),
                 },
                 {
                   title: "操作",
-                  width: 180,
+                  width: 220,
                   render: (_, row) => (
                     <Space>
                       <Button size="small" onClick={() => setDetail(row)}>
                         查看/修正
                       </Button>
-                      <Button
-                        size="small"
-                        type="primary"
-                        ghost
-                        icon={<CheckOutlined />}
-                        disabled={row.status !== "verified"}
-                        onClick={() => accept.mutate(row.id)}
-                      >
-                        确认
-                      </Button>
+                      {row.origin === "template" && row.status === "needs_signoff" && (
+                        <Button
+                          size="small"
+                          type="primary"
+                          ghost
+                          icon={<CheckOutlined />}
+                          onClick={() => setSignoffTarget(row)}
+                        >
+                          签批
+                        </Button>
+                      )}
+                      {row.origin !== "template" && (
+                        <Button
+                          size="small"
+                          type="primary"
+                          ghost
+                          icon={<CheckOutlined />}
+                          disabled={row.status !== "verified"}
+                          onClick={() => accept.mutate(row.id)}
+                        >
+                          确认
+                        </Button>
+                      )}
                     </Space>
                   ),
                 },
@@ -330,7 +463,76 @@ export default function TenderRules() {
       )}
 
       <CriterionModal pid={pid} criterion={detail} onClose={() => setDetail(null)} />
+      <SignoffModal
+        pid={pid}
+        criterion={signoffTarget}
+        onClose={() => setSignoffTarget(null)}
+      />
+      <MatchProposalDrawer
+        pid={pid}
+        mergePackageId={mergePackageId}
+        open={proposalOpen}
+        onClose={() => setProposalOpen(false)}
+      />
     </div>
+  );
+}
+
+function SignoffModal({
+  pid,
+  criterion,
+  onClose,
+}: {
+  pid: string;
+  criterion: CriterionOut | null;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const [reason, setReason] = useState("");
+
+  if (!criterion) return null;
+  return (
+    <Modal
+      open
+      title={`签批模板兜底：${criterion.code} ${criterion.name}`}
+      onCancel={onClose}
+      onOk={() => {
+        const r = reason.trim();
+        if (!r) {
+          message.warning("请填写签批理由");
+          return;
+        }
+        api
+          .post(`/rules/criteria/${criterion.id}/signoff`, { reason: r })
+          .then(() => {
+            qc.invalidateQueries({ queryKey: ["rules", pid] });
+            qc.invalidateQueries({ queryKey: ["coverage", criterion.package_id] });
+            message.success("已签批并留痕（模板兜底）");
+            onClose();
+          })
+          .catch((e: Error) => message.error(e.message));
+      }}
+      okText="签批并留痕"
+      cancelText="取消"
+      okButtonProps={{ disabled: !reason.trim() }}
+    >
+      <Alert
+        type="warning"
+        showIcon
+        style={{ marginBottom: 12 }}
+        message="模板兜底（P5 来源）"
+        description="该条目来自通用模板，招标文件未明文规定。签批表示你确认在本项目启用此通用判据；签批人与理由将永久留痕，并在冻结包与评标报告中标注「模板兜底（已签批）」。"
+      />
+      <Typography.Paragraph type="secondary">
+        模板：{criterion.template_code} · {criterion.library_version ?? ""}
+      </Typography.Paragraph>
+      <Input.TextArea
+        placeholder="签批理由（必填；例如：招标文件未细化该项，按通用评标惯例启用）"
+        value={reason}
+        onChange={(e) => setReason(e.target.value)}
+        rows={3}
+      />
+    </Modal>
   );
 }
 
@@ -493,5 +695,218 @@ function CriterionModal({
         </Tooltip>
       </Space>
     </Modal>
+  );
+}
+
+function MatchProposalDrawer({
+  pid,
+  mergePackageId,
+  open,
+  onClose,
+}: {
+  pid: string;
+  mergePackageId: number | null;
+  open: boolean;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const { data: proposal, isLoading } = useMatchProposal(open ? mergePackageId : null);
+  const [checkedPairs, setCheckedPairs] = useState<Set<string>>(new Set());
+  const [dropIds, setDropIds] = useState<Set<number>>(new Set());
+  const [appendIds, setAppendIds] = useState<Set<number>>(new Set());
+  const [reason, setReason] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+
+  // 提案加载后：全部配对预勾选（仍需逐对过目，点击提交才生效）
+  useEffect(() => {
+    if (proposal) {
+      setCheckedPairs(new Set(proposal.pairs.map((p) => p.pair_id)));
+    }
+  }, [proposal]);
+
+  const toggleDrop = (id: number) => {
+    setDropIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+  const toggleAppend = (id: number) => {
+    setAppendIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const decisionCount = checkedPairs.size + dropIds.size + appendIds.size;
+
+  const submit = async () => {
+    if (!proposal || !mergePackageId) return;
+    const r = reason.trim();
+    if (!r) {
+      message.warning("请填写处置理由（将写入每条留痕）");
+      return;
+    }
+    const decisions: Record<string, unknown>[] = [];
+    for (const p of proposal.pairs) {
+      if (checkedPairs.has(p.pair_id)) {
+        decisions.push({ action: "override", pair_id: p.pair_id, reason: r });
+      }
+    }
+    for (const id of dropIds) {
+      decisions.push({ action: "drop_template", template_criterion_id: id, reason: r });
+    }
+    for (const id of appendIds) {
+      decisions.push({ action: "append_document", document_criterion_id: id, reason: r });
+    }
+    if (!decisions.length) {
+      message.warning("请至少选择一个处置动作");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const res = await api.post<{ target_package_id: number }>(
+        `/rules/packages/${mergePackageId}/match-proposal/resolve`,
+        { decisions },
+      );
+      qc.invalidateQueries({ queryKey: ["rules", pid] });
+      qc.invalidateQueries({ queryKey: ["coverage", res.target_package_id] });
+      message.success("匹配处置已生效并留痕");
+      onClose();
+    } catch (e) {
+      message.error((e as Error).message || "处置失败");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Drawer
+      title="匹配提案审核（模板条目 ↔ 招标文件条目）"
+      width={960}
+      open={open}
+      onClose={onClose}
+      destroyOnClose
+    >
+      {isLoading || !proposal ? (
+        <Spin />
+      ) : (
+        <>
+          <Alert
+            type="info"
+            showIcon
+            style={{ marginBottom: 12 }}
+            message={`共 ${proposal.pairs.length} 对匹配建议 · 模板未覆盖 ${proposal.unmatched_template.length} · 编译条目未匹配 ${proposal.unmatched_document.length}`}
+            description="确认覆盖后，模板条目升级为招标文件依据（P5→P1–P4）；未覆盖的模板兜底仍需逐条签批。任何覆盖在点击「提交处置」前不生效。"
+          />
+
+          {proposal.pairs.length > 0 && (
+            <Card size="small" title="匹配建议（勾选 = 确认覆盖）" style={{ marginBottom: 12 }}>
+              <Table<MatchPair>
+                rowKey="pair_id"
+                size="small"
+                pagination={false}
+                dataSource={proposal.pairs}
+                rowSelection={{
+                  selectedRowKeys: [...checkedPairs],
+                  onChange: (keys) => setCheckedPairs(new Set(keys as string[])),
+                }}
+                columns={[
+                  { title: "模板", dataIndex: ["template", "code"], width: 70 },
+                  { title: "模板名称", dataIndex: ["template", "name"], width: 170 },
+                  { title: "", width: 24, render: () => "⇄" },
+                  { title: "文件", dataIndex: ["document", "code"], width: 70 },
+                  { title: "文件名称（原文依据）", dataIndex: ["document", "name"], width: 220 },
+                  {
+                    title: "相似度",
+                    width: 80,
+                    render: (_, p) => (
+                      <Tag color={p.similarity >= 0.7 ? "green" : "gold"}>
+                        {Math.round(p.similarity * 100)}%
+                      </Tag>
+                    ),
+                  },
+                  {
+                    title: "方式",
+                    width: 90,
+                    render: (_, p) => <Tag>{p.match_method}</Tag>,
+                  },
+                ]}
+              />
+            </Card>
+          )}
+
+          {proposal.unmatched_template.length > 0 && (
+            <Card size="small" title="未覆盖模板条目（勾选 = 弃用：本项目无此项，不进快照）" style={{ marginBottom: 12 }}>
+              <List
+                size="small"
+                dataSource={proposal.unmatched_template}
+                renderItem={(t) => (
+                  <List.Item
+                    actions={[
+                      <Checkbox key="drop" checked={dropIds.has(t.id)} onChange={() => toggleDrop(t.id)}>
+                        弃用
+                      </Checkbox>,
+                    ]}
+                  >
+                    <List.Item.Meta
+                      title={`${t.code} ${t.name}`}
+                      description={t.category}
+                    />
+                  </List.Item>
+                )}
+              />
+            </Card>
+          )}
+
+          {proposal.unmatched_document.length > 0 && (
+            <Card size="small" title="未匹配编译条目（勾选 = 追加为文件依据条目）" style={{ marginBottom: 12 }}>
+              <List
+                size="small"
+                dataSource={proposal.unmatched_document}
+                renderItem={(d) => (
+                  <List.Item
+                    actions={[
+                      <Checkbox key="append" checked={appendIds.has(d.id)} onChange={() => toggleAppend(d.id)}>
+                        追加
+                      </Checkbox>,
+                    ]}
+                  >
+                    <List.Item.Meta
+                      title={`${d.code} ${d.name}`}
+                      description={
+                        d.source_quote
+                          ? `第 ${d.source_page ?? "?"} 页 · ${d.source_quote}`
+                          : d.category
+                      }
+                    />
+                  </List.Item>
+                )}
+              />
+            </Card>
+          )}
+
+          <Input.TextArea
+            placeholder="处置理由（必填；将写入每条覆盖/追加/弃用的留痕）"
+            value={reason}
+            onChange={(e) => setReason(e.target.value)}
+            rows={2}
+            style={{ marginBottom: 12 }}
+          />
+          <Button
+            type="primary"
+            block
+            loading={submitting}
+            disabled={decisionCount === 0 || !reason.trim()}
+            onClick={submit}
+          >
+            提交处置（{decisionCount} 项）
+          </Button>
+        </>
+      )}
+    </Drawer>
   );
 }
