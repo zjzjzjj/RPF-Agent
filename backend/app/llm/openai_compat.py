@@ -4,11 +4,16 @@
 """
 from __future__ import annotations
 
+import re
 import time
 from urllib.parse import urlparse
 
 from app import config
 from app.llm.base import LLMError, LLMResult
+
+# 推理模型（DeepSeek-V4 / GLM 混合思考等）常把 <think>…</think> 内联在 content
+# 里，思考文本含花括号会污染下游 extract_json 的首个"{"定位——在源头剥掉。
+_THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 
 
 class OpenAICompatProvider:
@@ -62,6 +67,7 @@ class OpenAICompatProvider:
 
         choice = resp.choices[0] if resp.choices else None
         text = (choice.message.content if choice and choice.message else "") or ""
+        text = _THINK_RE.sub("", text).strip()
         usage = getattr(resp, "usage", None)
         return LLMResult(
             text=text,

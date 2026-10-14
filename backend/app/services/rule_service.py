@@ -793,6 +793,15 @@ def new_version(package_id: int, actor: str, reason: str) -> RulePackage:
     if not reason.strip():
         raise ValidationFailed("创建新版本必须填写理由")
     pkg = get_package(package_id)
+    # 解冻语义：仅冻结包可派生新版本（前端「解冻并创建新版本」按钮即走此端点）。
+    # draft 应直接编辑；confirmed 走 confirm→freeze 流；superseded 已被评价流水
+    # 引用，不允许再派生（此前不设防是个边界漏洞，2026-10-13 收紧）。
+    if pkg.status == "draft":
+        raise Conflict("规则包已是草稿，可直接编辑，无需创建新版本")
+    if pkg.status == "confirmed":
+        raise Conflict("规则包已确认：请先冻结，再创建新版本")
+    if pkg.status == "superseded":
+        raise Conflict("该版本已被新版本取代，不能再次派生")
     with session_scope() as s:
         version = s.execute(
             select(RulePackage.version).where(RulePackage.project_id == pkg.project_id)
@@ -804,6 +813,12 @@ def new_version(package_id: int, actor: str, reason: str) -> RulePackage:
             status="draft",
             parent_version_id=package_id,
             source_document_id=pkg.source_document_id,
+            # 规则库溯源字段落必须随版本链延续（此前不复制，模板/法律/合并包
+            # 派生的新版本会退化成 origin="document"——2026-10-13 修掉）
+            origin=pkg.origin,
+            template_id=pkg.template_id,
+            template_hash=pkg.template_hash,
+            library_version=pkg.library_version,
             compiled_by=actor,
             model=pkg.model,
             created_by=actor,
