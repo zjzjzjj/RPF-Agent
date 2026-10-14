@@ -237,7 +237,7 @@ export default function EvidenceWorkbench() {
                       <div>
                         <div>{score.ai_reasoning}</div>
                         <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                          AI 建议仅供参考；采纳与否由你决定，且必须给出理由。
+                          AI 建议与推理过程仅供参考与审计；最终分值以裁决记录为准（自动或人工）。
                         </Typography.Text>
                       </div>
                     }
@@ -319,8 +319,8 @@ export default function EvidenceWorkbench() {
               )}
             </Space>
             <div style={{ marginTop: 8, fontSize: 12, color: "#888" }}>
-              注意：系统不提供"全部采纳"；每次确认都单独留痕（操作人 {score.evaluator_actor ?? "—"}
-              {score.confirm_time ? `，${score.confirm_time}` : ""}）。
+              每次确认都单独留痕并记入审计（操作人 {score.evaluator_actor ?? "—"}
+              {score.confirm_time ? `，${score.confirm_time}` : ""}）；规则包支持"全部采纳/全部签批"批量操作（同样逐条留痕）。
             </div>
           </Card>
         </Col>

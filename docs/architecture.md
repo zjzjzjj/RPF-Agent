@@ -89,3 +89,25 @@ projects ─┬─ documents ─┬─ document_pages
 | `JobRunner` | jobs 表 + 进程内 worker | kuncore workflow（含人工审批卡点） |
 | `StorageBackend` | 本地磁盘 | S3 / MinIO |
 | ORM | 纯 SQLAlchemy，无 SQLite 专有 SQL | 改 `DATABASE_URL` 即迁 Postgres |
+
+---
+
+## 变更补充（2026-10-13，详见 docs/decisions/0001~0003）
+
+**运行模式双轨**：`BID_EVAL_AUTO_MODE`（默认 1）全自动——模糊项（human_only/冲突/串通信号）由
+`engine/auto_judge.py` LLM 带原文证据裁决收敛终态；主观分 LLM 直写 final_score；
+confirm/freeze 阻断项自动采纳；报告直接 final。置 0 回退人工模式（上文三态/防锚定/
+复核队列的描述适用于回退模式，代码路径完整保留）。两模式共用 ReviewRecord/audit 留痕。
+
+**数据模型增补**：
+- `score_records.review_status` 扩 `'auto_confirmed'`（自动裁决终态，CHECK 已迁移，
+  `scripts/migrate_auto_review.py`）；`machine_status` 全自动下可落 `fail`/`rejected` 语义
+- `rule_packages` 版本链：`new_version` 仅 frozen 可派生，origin/template_*/library_version
+  随版本链延续；物理删除项目走 `services/project_service.py` 外键依赖序（审计保留）
+- **法规规则包**（rules/library/law_packs/general-law）：87 条一条一文件 + pack.json +
+  policies.json（21 个法条原文），`law_pack_loader` fail-fast 组装 `{package, criteria}`
+  喂既有 `law_import_service`（origin='law'/p_source='P0'/免签批，法条逐条核验 fail-closed）
+- 解析层：主引擎 **PyMuPDF**（`parsing/pdf_pymupdf.py`，扫描页逐页 OCR 兜底
+  `parsing/ocr.py` rapidocr，磁盘缓存），`BID_EVAL_PDF_ENGINE=pdfplumber` 一行回退
+- 长文档：`engine/selection.py` 章节约束选段（编译超 30k 按档位关键词选页；
+  投标文件超 20k 按评分项关键词选段）；compile 传 max_tokens（默认 8192）
