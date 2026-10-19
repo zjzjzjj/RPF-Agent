@@ -103,6 +103,19 @@ def pdf_engine() -> str:
 
 
 # ---------------------------------------------------------------------------
+# 评审委员会（AI 评委独立评分 + 去尾平均）
+# ---------------------------------------------------------------------------
+def committee_size() -> int:
+    """主观分评审 Agent 数（默认 1 = 单评委，直接采纳其建议分）。
+
+    2026-10-14 用户指令：5 评委去尾平均的独立性收益有限（同模型采样分数雷同），
+    改回单评委。设为 >=2 恢复委员会去尾平均（size>=3 才有去尾意义）。
+    确定性项（否决/计数/价格）不组委员会（客观分必须一致原则）。
+    """
+    return max(1, int(os.environ.get("BID_EVAL_COMMITTEE_SIZE", 1)))
+
+
+# ---------------------------------------------------------------------------
 # OCR（扫描件兜底，rapidocr-onnxruntime）
 # ---------------------------------------------------------------------------
 OCR_PAGE_MIN_CHARS = 30  # 页字符数低于此值 → 该页走 OCR（低于抽样阈值，防"扫描封面+数字正文"误判）
@@ -111,6 +124,67 @@ OCR_RENDER_SCALE = 2.0  # OCR 页渲染倍率（≈144dpi，中文 12pt 可靠�
 
 def ocr_enabled() -> bool:
     return os.environ.get("BID_EVAL_OCR", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def ocr_engine() -> str:
+    """扫描页 OCR 引擎：rapidocr（默认，本地）| remote_paddle（mwb 自部署 PaddleOCR-VL）。
+
+    remote_paddle 失败时解析层自动回退 rapidocr（见 pdf_pymupdf._ocr_page）。
+    """
+    return os.environ.get("BID_EVAL_OCR_ENGINE", "rapidocr").strip().lower()
+
+
+def paddle_ocr_url() -> str:
+    """PaddleOCR-VL vLLM 服务地址（mwb coll-det-gpu-ocr-proxy，OpenAI 兼容协议）。"""
+    return os.environ.get("BID_EVAL_PADDLE_OCR_URL", "http://100.100.30.150:16102").strip()
+
+
+def embed_url() -> str:
+    """bge-m3 嵌入服务地址（mwb coll-det-gpu-embed-proxy，POST /embed 协议）。"""
+    return os.environ.get("BID_EVAL_EMBED_URL", "http://100.100.30.150:16400").strip()
+
+
+def selection_mode() -> str:
+    """主观分选段方式：keyword（默认，关键词分层）| vector（bge-m3 向量检索 + 关键词兜底）。"""
+    return os.environ.get("BID_EVAL_SELECTION", "keyword").strip().lower()
+
+
+def llm_disable_thinking() -> bool:
+    """关闭 Qwen3 等推理模型的 <think> 输出（经 chat_template_kwargs 下发）。
+
+    本地 vLLM 部署 Qwen3 默认思考模式：回答前生成大段推理，拖慢且曾把长题
+    顶到 max_tokens 截断。硅基流动等云端端点不识别该参数——默认关。
+    """
+    return os.environ.get("BID_EVAL_LLM_DISABLE_THINKING", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
+def llm_seed() -> int | None:
+    """请求级随机种子（vLLM 支持 seed 参数）：同输入同输出，消除跨轮判档跳变。"""
+    raw = os.environ.get("BID_EVAL_LLM_SEED", "42").strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def llm_transient_retries() -> bool:
+    """瞬态失败（超时/限流/5xx）重试开关（默认开，重试 2 次）。"""
+    return os.environ.get("BID_EVAL_LLM_TRANSIENT_RETRIES", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def review_clusters() -> int:
+    """分层评审的证据簇数 K（默认 3）：每（投标人×评分项）取 K 个不相交证据簇
+    分别深评后聚合。设 1 退化为单次评审。"""
+    return max(1, int(os.environ.get("BID_EVAL_REVIEW_CLUSTERS", 3)))
+
+
+def review_mode() -> str:
+    """主观评审模式：hierarchical（默认，分层证据评审）| legacy（单次选段）。"""
+    return os.environ.get("BID_EVAL_REVIEW_MODE", "hierarchical").strip().lower()
 
 
 def ocr_max_pages() -> int:
@@ -142,9 +216,12 @@ PREFIX_FALLBACK_LENGTHS = (60, 40, 25, 15)  # 前缀回退逐级尝试长度
 # ---------------------------------------------------------------------------
 # LLM
 # ---------------------------------------------------------------------------
-def llm_provider() -> str:
-    """mock | openai（OpenAI 兼容端点，可指向 DeepSeek/Qwen 等）。"""
-    return os.environ.get("BID_EVAL_LLM_PROVIDER", "mock")
+def llm_provider() -> str | None:
+    """OpenAI 兼容 provider 名（openai/siliconflow/deepseek/qwen/glm/kimi）。
+
+    未设置返回 None——registry 据此 fail-fast 报 LLM_NOT_CONFIGURED，不静默降级。
+    """
+    return os.environ.get("BID_EVAL_LLM_PROVIDER") or None
 
 
 def llm_base_url() -> str | None:
@@ -186,7 +263,7 @@ def llm_daily_call_budget() -> int:
 
 def llm_prompt_version() -> str:
     """提示词版本号；进入缓存键与审计记录。改 prompt 必须同步改它。"""
-    return os.environ.get("BID_EVAL_PROMPT_VERSION", "2026-10-09.1")
+    return os.environ.get("BID_EVAL_PROMPT_VERSION", "2026-10-14.1")
 
 
 def local_endpoint_hosts() -> list[str]:

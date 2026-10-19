@@ -172,6 +172,15 @@ def has_blocking_errors(findings: list[Finding]) -> bool:
 def _check_level_closure(c: dict) -> list[Finding]:
     levels = c.get("levels") or []
     if not levels:
+        # 真实标书常把主观分拆在子项里（如"协同办公（0-2分）、行政管理（0-2分）…"），
+        # 原文没有档位表。引擎本就支持无档位评分（按判据在 0-满分内给分，
+        # 见 subjective.py 的 levels_text 兜底），故有满分时只 warn 不阻断；
+        # 连满分都没有则完全不可评，保持 error。
+        if c.get("max_score") is not None:
+            return [Finding("LEVELS_MISSING", "warn",
+                            f"主观评分项「{c['name']}」没有任何档位（原文未给分值档位，将按 0-满分综合评定）",
+                            "criterion", c["code"],
+                            "如原文有档位表请人工补录；无档位时主观分按 0-满分综合评定")]
         return [Finding("LEVELS_MISSING", "error",
                         f"主观评分项「{c['name']}」没有任何档位", "criterion", c["code"])]
     for lv in levels:
@@ -197,10 +206,17 @@ def _check_level_closure(c: dict) -> list[Finding]:
             problems.append(Finding("LEVEL_RANGE_INVALID", "error",
                                     f"「{c['name']}」档位「{label}」区间下界大于上界", "criterion", c["code"]))
     for (lo1, hi1, l1), (lo2, hi2, l2) in zip(intervals, intervals[1:]):
-        if hi1 >= lo2:
-            # 端点重合或区间相交 → 同一分值可落进两个档位，歧义
+        if hi1 > lo2:
+            # 区间内部相交 → 同一分值可落进两个档位，真歧义
             problems.append(Finding("LEVEL_OVERLAP", "error",
                                     f"「{c['name']}」档位「{l1}」与「{l2}」区间重叠", "criterion", c["code"]))
+        elif hi1 == lo2:
+            # 端点共享（原文常见写法："得0-2分/得2-3分"）——评分时按较低档确定性归属
+            #（level_for_score 取首个命中档），不阻断，提示留痕即可
+            problems.append(Finding("LEVEL_OVERLAP", "warn",
+                                    f"「{c['name']}」档位「{l1}」与「{l2}」共享边界值 {hi1}"
+                                    "（原文如此，评分时该分值归入较低档）",
+                                    "criterion", c["code"]))
         elif hi1 + 1 < lo2:
             # 整数分值档位之间允许正好相邻（如 16 与 17），中间留空则是空洞
             problems.append(Finding("LEVEL_GAP", "error",

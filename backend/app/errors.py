@@ -69,6 +69,18 @@ class LLMBudgetExceeded(AppError):
     default_message = "已达到模型调用预算上限，本次运行中止"
 
 
+class LLMNotConfigured(AppError):
+    """未配置 LLM provider（BID_EVAL_LLM_PROVIDER）——fail-fast，不静默降级。
+
+    注意：不得继承 llm.base.LLMError——compile 的重试循环只对 LLMError 退避
+    重试，配置错误应当立即失败并给出可操作提示，而不是伪装成模型故障。
+    """
+
+    code = "LLM_NOT_CONFIGURED"
+    http_status = 500
+    default_message = "未配置 LLM provider"
+
+
 class DataClassDenied(AppError):
     """数据分级策略拒绝：非本地端点不允许接收 confidential 数据。"""
 

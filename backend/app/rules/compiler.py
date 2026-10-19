@@ -2,7 +2,7 @@
 
 流程（对应方案 ③④ 步）：
 1. 取招标文件全文（页序拼接，与 document_pages 逐字一致，保证引文可定位）；
-2. 走 LLM 网关抽取（Mock=确定性正则 / 真实模型=语义抽取）；
+2. 走 LLM 网关抽取（真实模型语义抽取）；
 3. 每条规则的 quote 建证据引用并核验（无证据不评分）；
 4. 六态分诊：verified / needs_input / ambiguous（档位无分值）/ gap / conflict / invalid；
 5. 跑 12 条确定性校验器，findings 落库。

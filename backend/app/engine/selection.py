@@ -11,10 +11,19 @@
 "投标书超长"的系统性错评（200 页标书头部截断只看前 4%，尾部"售后方案"必然
 被评最低档）由此修复：(subjective/auto_judge) 超预算时按评分项关键词选段，
 替代盲目的头部截断。
+
+向量选段（BID_EVAL_SELECTION=vector，2026-10-14）：bge-m3（mwb 自部署）对
+评分项描述与标书分块做语义检索，同义表述的证据不再依赖字面关键词命中；
+嵌入服务不可用时自动回退关键词分档。
 """
 from __future__ import annotations
 
+import logging
 import re
+
+from app import config
+
+log = logging.getLogger("bid_eval.engine.selection")
 
 Chunk = tuple[int, str]  # (chunk 序号, 文本)
 
@@ -201,3 +210,181 @@ def _diffuse_pick(chunks: list[Chunk], budget: int) -> tuple[list[Chunk], dict]:
             "tiers": {},
         },
     )
+
+
+# ---------------------------------------------------------------------------
+# 向量选段（bge-m3）与统一入口
+# ---------------------------------------------------------------------------
+def select_chunks_by_vector(
+    chunks: list[Chunk],
+    query_text: str,
+    budget: int,
+) -> tuple[list[Chunk], dict] | None:
+    """bge-m3 语义检索选段。嵌入服务不可用 → None（调用方回退关键词分档）。
+
+    打分 = 查询向量与 chunk 向量的余弦（bge-m3 输出已 L2 归一化，点积即余弦）；
+    高分块连同相邻块成组入选（保持上下文完整），输出按原序。
+    """
+    from app.evidence import embed_client
+
+    if not chunks or not query_text.strip():
+        return None
+    try:
+        qvec = embed_client.embed_one(query_text)
+        if qvec is None:
+            return None
+        cvecs = embed_client.embed_batch([body for _i, body in chunks])
+        if any(v is None for v in cvecs):
+            return None
+    except RuntimeError as exc:
+        log.warning("向量选段不可用，回退关键词：%s", exc)
+        return None
+
+    scores = [embed_client.cosine(qvec, v) for v in cvecs if v is not None]
+    scored_order = sorted(range(len(chunks)), key=lambda i: -scores[i])
+    picked_ids: set[int] = set()
+    used = 0
+    vector_hits = 0
+    for idx in scored_order:
+        if scores[idx] <= 0:
+            break
+        if idx in picked_ids:
+            continue
+        length = len(chunks[idx][1])
+        if used + length > budget:
+            continue
+        picked_ids.add(idx)
+        used += length
+        vector_hits += 1
+        for j in (idx - 1, idx + 1):
+            if 0 <= j < len(chunks) and j not in picked_ids:
+                jlen = len(chunks[j][1])
+                if used + jlen <= budget:
+                    picked_ids.add(j)
+                    used += jlen
+
+    if not picked_ids:
+        return None
+    final_ids = sorted(picked_ids)
+    total = sum(len(chunks[i][1]) for i in final_ids)
+    return (
+        [chunks[i] for i in final_ids],
+        {
+            "truncated": total < sum(len(t) for _i, t in chunks),
+            "chars": total,
+            "total_chars": sum(len(t) for _i, t in chunks),
+            "ids": [chunks[i][0] for i in final_ids],
+            "tiers": {"vector": vector_hits},
+        },
+    )
+
+
+def _criterion_query_text(criterion: dict) -> str:
+    parts = [
+        str(criterion.get("name") or ""),
+        str(criterion.get("description") or ""),
+        str(criterion.get("required_evidence") or ""),
+        str(criterion.get("quote") or criterion.get("source_quote") or ""),
+    ]
+    return "\n".join(p for p in parts if p.strip())[:2000]
+
+
+def select_chunks_for_criterion(
+    chunks: list[Chunk],
+    criterion: dict,
+    budget: int,
+    fallback_diffuse: bool = True,
+) -> tuple[list[Chunk], dict]:
+    """统一入口：vector 模式优先（BID_EVAL_SELECTION=vector），失败回退关键词分档。"""
+    if config.selection_mode() == "vector":
+        try:
+            out = select_chunks_by_vector(
+                chunks, _criterion_query_text(criterion), budget
+            )
+            if out is not None:
+                out[1]["mode"] = "vector"
+                return out
+        except Exception as exc:  # noqa: BLE001 —— 选段是尽力环节，绝不阻塞评分
+            log.warning("向量选段异常，回退关键词：%s", exc)
+    picked, meta = select_chunks_by_tier(
+        chunks,
+        (("criterion", derive_keywords(criterion)),),
+        budget,
+        fallback_diffuse=fallback_diffuse,
+    )
+    meta["mode"] = "keyword"
+    return picked, meta
+
+
+def build_evidence_map(
+    chunks: list[Chunk],
+    criterion: dict,
+    *,
+    min_gap: int = 2,
+) -> tuple[list[dict], str] | None:
+    """证据地图：全量分块按相关性排序并聚类为不相交证据簇（零 LLM 成本）。
+
+    返回 (簇列表, 排序用查询文本)；嵌入服务不可用返回 None。
+    簇结构：{"ids": [块序号], "chars": 总字符, "score": 聚合相似度}——
+    相邻高分组块合并为一簇，簇与簇之间至少间隔 min_gap 个低分块（保证语义独立）。
+    """
+    from app.evidence import embed_client
+
+    query = _criterion_query_text(criterion)
+    if not chunks or not query.strip():
+        return None
+    try:
+        qvec = embed_client.embed_one(query)
+        if qvec is None:
+            return None
+        cvecs = embed_client.embed_batch([body for _i, body in chunks])
+        if any(v is None for v in cvecs):
+            return None
+    except RuntimeError as exc:
+        log.warning("证据地图构建失败：%s", exc)
+        return None
+
+    scores = [embed_client.cosine(qvec, v) for v in cvecs if v is not None]
+    order = sorted(range(len(chunks)), key=lambda i: -scores[i])
+
+    # 贪心聚类：从最高分块起，双向行走吸收「相对高分」相邻块成簇。
+    # 阈值必须用相对分（top 分的 ≥55%）——bge-m3 对中文文本的余弦普遍为正，
+    # 绝对阈值 >0 会让整本文本聚成一个巨型簇（2026-10-16 实证：57 万字符
+    # 单簇，分层形同虚设）。相对阈值保证只有与核心证据同量级相关的块才并入。
+    top = scores[order[0]]
+    if top <= 0:
+        return None
+    floor_seed = top * 0.55  # 开新簇的种子门槛（保留多簇潜力）
+    floor_extend = top * 0.75  # 行走扩展门槛（更严——防连续大片被吞成巨型簇）
+    claimed: set[int] = set()
+    clusters: list[dict] = []
+    for seed_idx in order:
+        if scores[seed_idx] < floor_seed or seed_idx in claimed:
+            continue
+        if any(abs(seed_idx - c_id) <= min_gap for cid in clusters for c_id in cid["ids"]):
+            continue
+        ids = [seed_idx]
+        claimed.add(seed_idx)
+        for direction in (-1, 1):
+            j = seed_idx
+            while True:
+                nxt = j + direction
+                if 0 <= nxt < len(chunks) and nxt not in claimed and scores[nxt] >= floor_extend:
+                    ids.append(nxt)
+                    claimed.add(nxt)
+                    j = nxt
+                else:
+                    break
+        ids.sort()
+        chars = sum(len(chunks[i][1]) for i in ids)
+        clusters.append({
+            "ids": ids,
+            "chunk_nos": [chunks[i][0] for i in ids],
+            "chars": chars,
+            "score": round(max(scores[i] for i in ids), 4),
+        })
+        if len(clusters) >= 12:  # 安全上限：证据簇过多时只保留最相关的前 12 簇
+            break
+    if not clusters:
+        return None
+    return clusters, query

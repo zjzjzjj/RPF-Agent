@@ -46,7 +46,7 @@ def _page_lines(page) -> tuple[list[str], list[tuple[float, float, float, float]
 
     两步：① get_text("dict") 取原始行（spans 无空格拼接）；② **按 y 区间重叠合并
     视觉行**——PyMuPDF 把表格一行按单元格拆成多行（"档次"/"分值区间"/"评分标准"
-    各一行），而下游（条款树编号扫描、mock/LLM 的评分表抽取、mock 证据定位）依赖
+    各一行），而下游（条款树编号扫描、LLM 的评分表抽取与证据定位）依赖
     "优 17-20分 判据…" 这样的整行形态；pdfplumber 的 extract_text_lines 正是按
     视觉行返回的，这里必须对齐，否则评分表抽取整块丢失。
     """
@@ -91,19 +91,48 @@ def _page_tables(page) -> list[tuple[float, float, float, float]]:  # noqa: ANN0
 # ---------------------------------------------------------------------------
 # OCR 兜底（扫描页）
 # ---------------------------------------------------------------------------
-def _ocr_cache_path(png_bytes: bytes) -> Path:
+def _ocr_cache_path(png_bytes: bytes, engine: str) -> Path:
     import hashlib
 
-    key = hashlib.sha256(b"rapidocr-v1\x00" + png_bytes).hexdigest()[:16]
+    key = hashlib.sha256(f"{engine}-v1\x00".encode() + png_bytes).hexdigest()[:16]
     return config.data_dir() / "ocr_cache" / key / "result.json"
 
 
+def _has_large_image(page) -> bool:  # noqa: ANN001
+    """页面含大幅图像（单图占比 ≥35%）——「标题+扫描图」混排页的典型形态。
+
+    这类页正文标题让字符数超过 OCR 阈值（30），但扫描图内容（合同/发票/验收
+    报告）从未被识别（2026-10-15 实证：龙即 309 页、p133 验收报告 6143 字符
+    丢失）。触发条件补充：字数少 + 大图 → 必须走 OCR。
+    """
+    try:
+        rect = page.rect
+        page_area = max(1.0, float(rect.width) * float(rect.height))
+        for img in page.get_image_info():
+            bbox = img.get("bbox")
+            if not bbox:
+                continue
+            w = max(0.0, float(bbox[2]) - float(bbox[0]))
+            h = max(0.0, float(bbox[3]) - float(bbox[1]))
+            if (w * h) / page_area >= 0.35:
+                return True
+    except Exception:  # noqa: BLE001 —— 图像探测失败按无图处理
+        return False
+    return False
+
+
 def _ocr_page(pix) -> list[tuple[str, tuple[float, float, float, float]]]:  # noqa: ANN001
-    """渲染页图 → RapidOCR → [(行文本, PDF 点坐标 bbox)]。调用方保证 ocr 可用。"""
+    """渲染页图 → OCR → [(行文本, PDF 点坐标 bbox)]。调用方保证 ocr 可用。
+
+    引擎选择（BID_EVAL_OCR_ENGINE）：remote_paddle（mwb 自部署 PaddleOCR-VL，
+    扫描件识别质量显著更好）优先；调用失败或未配置时回退本地 rapidocr。
+    remote 引擎返回整页文本无 bbox，以"单条全页行"融入行模型（0,0)-(页宽,页高)。
+    """
     scale = config.OCR_RENDER_SCALE
     png_bytes = pix.tobytes("png")
 
-    cache_file = _ocr_cache_path(png_bytes)
+    engine = config.ocr_engine()
+    cache_file = _ocr_cache_path(png_bytes, engine)
     lines: list[tuple[str, tuple[float, float, float, float]]] | None = None
     if cache_file.exists():
         try:
@@ -113,21 +142,10 @@ def _ocr_page(pix) -> list[tuple[str, tuple[float, float, float, float]]]:  # no
             lines = None
 
     if lines is None:
-        import io
-
-        import numpy as np
-        from PIL import Image
-
-        from app.parsing import ocr as ocr_mod
-
-        if ocr_mod.get_ocr() is None:
-            raise RuntimeError("OCR 组件未安装")
-        img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
-        # recognize 返回像素 bbox → ÷ 渲染倍率换算回 PDF 点坐标（同为 top-left 原点）
-        lines = [
-            (t, (b[0] / scale, b[1] / scale, b[2] / scale, b[3] / scale))
-            for t, b in ocr_mod.recognize(np.array(img)[:, :, ::-1])  # RGB → BGR
-        ]
+        if engine == "remote_paddle":
+            lines = _ocr_page_remote(png_bytes, pix)
+        else:
+            lines = _ocr_page_rapid(png_bytes, scale)
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         cache_file.write_text(
             json.dumps([[t, list(b)] for t, b in lines], ensure_ascii=False),
@@ -135,6 +153,40 @@ def _ocr_page(pix) -> list[tuple[str, tuple[float, float, float, float]]]:  # no
         )
 
     return lines
+
+
+def _ocr_page_remote(png_bytes: bytes, pix) -> list[tuple[str, tuple[float, float, float, float]]]:  # noqa: ANN001
+    """PaddleOCR-VL 整页识别；失败回退 rapidocr 并记警告。"""
+    from app.parsing import paddle_client
+
+    try:
+        text = paddle_client.remote_ocr_page(png_bytes)
+    except RuntimeError as exc:
+        log.warning("remote_paddle 失败，回退 rapidocr：%s", exc)
+        return _ocr_page_rapid(png_bytes, config.OCR_RENDER_SCALE)
+    if not text:
+        return _ocr_page_rapid(png_bytes, config.OCR_RENDER_SCALE)
+    page_w, page_h = pix.width / config.OCR_RENDER_SCALE, pix.height / config.OCR_RENDER_SCALE
+    return [(text, (0.0, 0.0, float(page_w), float(page_h)))]
+
+
+def _ocr_page_rapid(png_bytes: bytes, scale: float) -> list[tuple[str, tuple[float, float, float, float]]]:  # noqa: ANN001
+    """本地 rapidocr 引擎（原路径）。"""
+    import io
+
+    import numpy as np
+    from PIL import Image
+
+    from app.parsing import ocr as ocr_mod
+
+    if ocr_mod.get_ocr() is None:
+        raise RuntimeError("OCR 组件未安装")
+    img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    # recognize 返回像素 bbox → ÷ 渲染倍率换算回 PDF 点坐标（同为 top-left 原点）
+    return [
+        (t, (b[0] / scale, b[1] / scale, b[2] / scale, b[3] / scale))
+        for t, b in ocr_mod.recognize(np.array(img)[:, :, ::-1])  # RGB → BGR
+    ]
 
 
 def extract_pdf(path: str) -> ExtractedDocument:
@@ -190,7 +242,10 @@ def extract_pdf(path: str) -> ExtractedDocument:
             source = "text"
             has_layer = True
 
-            if chars < config.OCR_PAGE_MIN_CHARS:
+            need_ocr = chars < config.OCR_PAGE_MIN_CHARS or (
+                chars < 200 and _has_large_image(page)
+            )
+            if need_ocr:
                 has_images = bool(page.get_images())
                 if chars == 0 and not has_images:
                     # 真空白页（分隔页）：不浪费 OCR，也不算退化

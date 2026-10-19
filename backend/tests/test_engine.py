@@ -470,11 +470,49 @@ def test_validator_level_gap():
 
 def test_validator_level_overlap_and_top():
     snap = _valid_snapshot()
-    snap["criteria"][1]["levels"][0]["max"] = "18"  # 优 17-18 与 良 12-16 不重叠但顶≠20
-    snap["criteria"][1]["levels"][0]["max"] = "20"
-    snap["criteria"][1]["levels"][1]["max"] = "17"  # 良 12-17 与 优 17-20 重叠
+    # 内部相交：良 12-18 与 优 17-20 在 17-18 上真重叠 → error
+    snap["criteria"][1]["levels"][1]["max"] = "18"
     findings = run_validators(snap)
-    assert any(f.code == "LEVEL_OVERLAP" for f in findings)
+    assert any(f.code == "LEVEL_OVERLAP" and f.severity == "error" for f in findings)
+
+
+def test_validator_level_shared_boundary_warn_only():
+    """真实标书写法「得0-2分/得2-3分」：端点共享只是 warn，不再阻断冻结。
+
+    取自浙江中烟招标文件第 97 页的实际档位形状（故障案例）。
+    """
+    snap = {
+        "package": {"project_id": "P", "version": 1, "status": "draft"},
+        "criteria": [
+            {"code": "1", "category": "technical", "name": "故障响应流程及应急预案",
+             "max_score": "4", "score_type": "subjective", "is_veto": False,
+             "source_quote": "故障响应流程及应急预案（4分）",
+             "levels": [
+                 {"label": "得3-4分", "min": "3", "max": "4", "criteria": "故障响应及时"},
+                 {"label": "得2-3分", "min": "2", "max": "3", "criteria": "故障响应较及时"},
+                 {"label": "得0-2分", "min": "0", "max": "2", "criteria": "故障响应不够及时"},
+             ]},
+        ],
+    }
+    findings = run_validators(snap, total_max=4)
+    shared = [f for f in findings if f.code == "LEVEL_OVERLAP"]
+    assert len(shared) == 2 and all(f.severity == "warn" for f in shared)
+    errors = [f for f in findings if f.severity == "error"]
+    assert errors == [], [e.message for e in errors]
+
+
+def test_validator_levels_missing_downgrade():
+    """主观项无档位：有满分 → warn（按 0-满分综合评定）；无满分 → error。"""
+    snap = _valid_snapshot()
+    snap["criteria"][2]["levels"] = []  # 有 max_score=15 → warn
+    findings = run_validators(snap)
+    missing = [f for f in findings if f.code == "LEVELS_MISSING"]
+    assert len(missing) == 1 and missing[0].severity == "warn"
+
+    snap["criteria"][2]["max_score"] = None  # 无满分 → error
+    findings = run_validators(snap)
+    missing = [f for f in findings if f.code == "LEVELS_MISSING"]
+    assert len(missing) == 1 and missing[0].severity == "error"
 
 
 def test_validator_veto_scored():
@@ -519,3 +557,53 @@ def test_validator_price_params_incomplete():
     snap["criteria"][0]["formula"]["k"] = None
     findings = run_validators(snap)
     assert any(f.code == "PRICE_PARAMS_INCOMPLETE" for f in findings)
+
+
+# ---------------------------------------------------------------------------
+# document_present 词组匹配（「机器看不见」≠「不符合」，2026-10-14）
+# ---------------------------------------------------------------------------
+def _facts(text: str):
+    from app.engine.facts import extract_bid_facts
+
+    return extract_bid_facts(text)
+
+
+def test_document_present_phrase_split_hit():
+    """名称按标点拆词组，任一命中即 pass（招标文件该句是「或」列举）。"""
+    from app.engine.objective import run_check
+
+    facts = _facts("我公司具有营业执照及相关资质，现附复印件。")
+    r = run_check(
+        "document_present",
+        {"document": "营业执照、法人证书或其他组织登记证明文件的复印件"},
+        facts,
+    )
+    assert r.status == "pass" and "营业执照" in r.message
+
+
+def test_document_present_normalized_hit():
+    """OCR 软换行/空格打断子串时，归一化后仍应命中。"""
+    from app.engine.objective import run_check
+
+    facts = _facts("详见附件：营 业 执 照 复 印 件。")
+    r = run_check("document_present", {"document": "营业执照复印件"}, facts)
+    assert r.status == "pass"
+
+
+def test_document_present_not_found_is_unknown_not_fail():
+    """全部词组未命中 → unknown + need_human（机器看不见 ≠ 不存在），不再直接 fail。"""
+    from app.engine.objective import run_check
+
+    facts = _facts("本投标文件不含任何证照信息。")
+    r = run_check("document_present", {"document": "投标保证金缴纳凭证"}, facts)
+    assert r.status == "unknown" and r.need_human
+
+
+def test_document_present_guarantee_regex_miss_phrase_fallback():
+    """has_guarantee 正则失效（词序不同）时，词组兜底（归一化）仍能 pass。"""
+    from app.engine.objective import run_check
+
+    facts = _facts("投标保证金 缴纳凭证复印件见附件。")
+    assert not facts.has_guarantee  # 正则要求「缴纳投标保证金」连续出现，此处词序不同
+    r = run_check("document_present", {"document": "投标保证金缴纳凭证"}, facts)
+    assert r.status == "pass"

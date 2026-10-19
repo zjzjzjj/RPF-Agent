@@ -25,9 +25,20 @@ from app.db.models import (
 from app.db.session import session_scope
 from app.engine.facts import extract_bid_facts
 from app.engine.models import PriceBid
-from app.engine.objective import run_check, score_count, verdict_for
+from app.engine.objective import (
+    parse_required_artifacts,
+    recover_artifacts_from_tender,
+    run_check,
+    score_count,
+    verdict_for,
+)
 from app.engine.price import compute_price_scores
-from app.engine.subjective import suggest_score
+from app.engine.subjective import (
+    SubjectiveSuggestion,
+    suggest_score,
+    suggest_score_committee,
+    suggest_score_hierarchical,
+)
 from app.errors import NotFound, ValidationFailed
 from app.jobs.handlers import register
 from app.jobs.queue import JobContext
@@ -229,7 +240,7 @@ def execute_run(
             raise NotFound("评分运行不存在")
         run.status = "running"
         run.started_at = utcnow()
-        run.llm_provider = provider or run.llm_provider or "mock"
+        run.llm_provider = provider or run.llm_provider or config.llm_provider()
         if model:
             run.llm_model = model
         s.add(run)
@@ -255,6 +266,17 @@ def execute_run(
         c["package_id"] = run.package_id
         c["rule_version"] = run.package_version
         c["package_content_hash"] = run.package_content_hash
+
+    # 新运行 = 重新评审：重置参评投标人状态，防止上一次运行的 rejected/scored
+    # 泄漏进本次（否则一次否决建议会让此后所有运行的价格基准价/排名永久排除该
+    # 投标人——2026-10-14 浙江中烟项目实证：4 家全部因 run1 的状态被挤出基准价）。
+    # 人工异议走 review 记录，不在 bidder.status 上跨运行传递。
+    with session_scope() as s:
+        for bid_row in s.execute(select(Bidder).where(Bidder.id.in_(bidder_ids))).scalars():
+            if bid_row.status != "pending":
+                bid_row.status = "pending"
+                s.add(bid_row)
+
     veto_items = [c for c in criteria if c["score_type"] == "veto"]
     count_items = [c for c in criteria if c["score_type"] == "count"]
     price_items = [c for c in criteria if c["score_type"] == "formula"]
@@ -321,13 +343,19 @@ def execute_run(
                 c, facts,
                 text=text_by_bidder.get(bid_id), gateway=gateway, data_class=data_class,
             )
+            review_status = _review_status_for_verdict(result)
             _upsert_score(
                 run_id, bid_id, c,
                 machine_status=result["verdict"],
-                review_status=_review_status_for_verdict(result),
+                review_status=review_status,
                 warnings_json=[{"message": result.get("message")}] if result.get("message") else None,
             )
-            if result["verdict"] == "recommend_reject":
+            # 剔除出基准价只认**人工已确认**的否决。未确认的否决建议（含 auto 模式
+            # LLM 裁决）照常展示 veto_flag，但不改变有效投标人集合——证照/签章类
+            # 材料是扫描件，文本抽取看不见≠不存在（浙江中烟项目实证：4 家全部因此
+            # 被误否决剔除，基准价直接归零）。与 aggregate.py 的哲学一致：建议否决
+            # 者同样参与排序，供人工交叉验证"如果否决不成立他会排第几"。
+            if result["verdict"] == "recommend_reject" and review_status == "human_confirmed":
                 excluded_bidders.add(bid_id)
             stats["objective"] += 1
 
@@ -359,14 +387,123 @@ def execute_run(
             )
             stats["price"] += 1
 
-    # ---- ③ 商务 count 分 ----
+    # ---- 证明材料页索引（count 逐案例核验与主观评审共用） ----
+    _MAT_KEYWORDS = ("发票", "验收", "业主证明", "查询截图", "证书复印件", "承诺书", "营业执照")
+    material_hints: dict[int, str] = {}
+    with session_scope() as s:
+        from app.db.models import DocumentPage
+
+        for bid_id in bidder_ids:
+            doc_id = main_doc_by_bidder.get(bid_id)
+            if doc_id is None:
+                material_hints[bid_id] = "（无）"
+                continue
+            pages: dict[str, list[int]] = {}
+            for page_no, ptext in s.execute(
+                select(DocumentPage.page_no, DocumentPage.text)
+                .where(DocumentPage.document_id == doc_id)
+                .order_by(DocumentPage.page_no)
+            ):
+                for kw in _MAT_KEYWORDS:
+                    if kw in (ptext or ""):
+                        pages.setdefault(kw, []).append(int(page_no))
+            hint_parts = [
+                f"{kw}：第{'、'.join(str(p) for p in nos[:12])} 页"
+                for kw, nos in pages.items() if nos
+            ]
+            material_hints[bid_id] = "；".join(hint_parts) if hint_parts else "（未见证明材料相关内容）"
+
+    # 招标文件原文页（归一化）：恢复评分项的【证明材料】要求段
+    tender_pages: list[tuple[int, str]] = []
+    with session_scope() as s:
+        from app.db.models import DocumentPage
+        from app.parsing.normalize import normalize_no_ws as _nnw
+
+        tender_doc = s.execute(
+            select(Document.id).where(
+                Document.project_id == project_id,
+                Document.kind == "tender",
+            ).limit(1)
+        ).scalar_one_or_none()
+        if tender_doc is not None:
+            tender_pages = [
+                (int(page_no), _nnw(ptext or ""))
+                for page_no, ptext in s.execute(
+                    select(DocumentPage.page_no, DocumentPage.text)
+                    .where(DocumentPage.document_id == tender_doc)
+                    .order_by(DocumentPage.page_no)
+                )
+            ]
+
+    # ---- ③ 商务 count 分（带【证明材料】的走 LLM 逐案例核验） ----
+    # 认证查询截图节检测（2026-10-16 用户授权 AI 按规则裁量）：招标明文
+    # 「管理体系认证还需提供认证认可平台查询结果截图，未按要求提供不得分」。
+    # 截图内容 OCR 不可得，但"截图节"的存在性可判（正文标题页不含目录/要求页）——
+    # 龙即有 3 个截图节（真实认证 4 分），先数/致成/诚道无（真实 1/4/3 分，
+    # 先数与规则执行一致）。
+    import re as _re_cert
+
+    cert_sections: dict[int, bool] = {}
+    # 行级标题模式：截图节标题独立成行（允许节号前缀与页码后缀）
+    _cert_title_pat = _re_cert.compile(
+        r"(?m)^\s*(?:\d+(?:\.\d+){1,3}\s*)?[^\n]{0,30}查询结果截图[^\n]{0,20}$"
+    )
+    with session_scope() as s:
+        from app.db.models import DocumentPage
+
+        for bid_id in bidder_ids:
+            doc_id = main_doc_by_bidder.get(bid_id)
+            found = False
+            if doc_id is not None:
+                for ptext in s.execute(
+                    select(DocumentPage.text).where(DocumentPage.document_id == doc_id)
+                ).scalars():
+                    t = ptext or ""
+                    # 排除目录页（点线）与长要求文本页（索引表复述要求常超 300 字）
+                    if t.count("....") >= 2 or len(t) > 300:
+                        continue
+                    if _cert_title_pat.search(t):
+                        found = True
+                        break
+            cert_sections[bid_id] = found
+
     for bid_id in bidder_ids:
         facts = facts_by_bidder[bid_id]
         for c in count_items:
             params = c.get("params") or {}
-            result = score_count(c, params, facts)  # type: ignore[arg-type]
+            artifacts = recover_artifacts_from_tender(c, tender_pages)
+            c_scoring = {**c, "required_artifacts": artifacts}
+            # field 可能缺省（真实编译产物里常由名称推断）——与 score_count 用
+            # 同一推断函数，避免两处口径漂移（2026-10-16 实证：params 无 field
+            # 导致 cert_section_present 未传递、认证门槛静默失效）
+            _field = params.get("field") or ""
+            if not _field:
+                from app.engine.objective import _infer_count_field
+
+                _field = _infer_count_field(c) or ""
+            if _field == "certificates":
+                c_scoring = {**c_scoring, "cert_section_present": cert_sections.get(bid_id, False)}
+            # LLM 逐案例核验仅用于**业绩类**（按案例核对合同/发票/验收）。
+            # 证书类（认证/资质）不适用：案例核验的 contract/invoice/acceptance
+            # 三标记语义与"证书复印件+查询截图"错位，会把有证书的投标人整体清零
+            # （2026-10-16 实证：致成 4→0、诚道 3→0、先数 1→0）。证书类走
+            # 确定性计数（facts.certificates=表内有复印件的），材料截图缺失
+            # 由 doubt 标疑问转人工。
+            is_performance = (params.get("field") == "performance") or (
+                params.get("field") != "certificates"
+                and any(k in str(c.get("name") or "") for k in ("业绩", "案例"))
+            )
+            if gateway is not None and artifacts and is_performance:
+                cases = _llm_verify_cases(
+                    gateway, c, facts, material_hints.get(bid_id), artifacts, data_class
+                )
+                if cases:
+                    c_scoring = {**c_scoring, "verified_cases": cases}
+            result = score_count(c_scoring, params, facts)  # type: ignore[arg-type]
             # unresolved 以结构化键落库：下游（报告疑问清单）直接判读，
             # 不再靠匹配 detail 的中文措辞——那种耦合已经断过一次。
+            # conflict（如证明材料链缺失/部分缺失）→ doubt 保留疑问态转人工，
+            # 分数先行计算但复核前不得视为定稿。
             _upsert_score(
                 run_id, bid_id, c,
                 machine_score=result.score,
@@ -375,6 +512,7 @@ def execute_run(
                 final_score=result.score,
                 warnings_json=([{"message": result.detail, "unresolved": result.unresolved}]
                                if result.unresolved else [{"message": result.detail}]),
+                doubt=result.conflict,
             )
             stats["objective"] += 1
 
@@ -398,16 +536,94 @@ def execute_run(
             )
             stats["match"] += 1
 
-    # ---- ④ 主观分建议 ----
+    # ---- ④ 主观分建议（评审委员会：单评委/多评委去尾平均） ----
     if "subjective" in stages and subjective_items:
+        # 人员经验项：注入招标原文的证明材料硬门槛（5 年证明/姓名反映/社保）
+        for c in subjective_items:
+            if any(k in str(c.get("name") or "") for k in ("项目负责人", "团队成员")):
+                seg = recover_artifacts_from_tender(c, tender_pages)
+                if seg:
+                    base = str(c.get("required_evidence") or c.get("source_quote") or "")
+                    c["required_evidence"] = base + "\n【证明材料】" + seg[:600]
+
+        # 人员经验的材料存在性统计（2026-10-16 用户授权 AI 按规则裁量）：
+        # 「五年及以上经验证明」「近六个月社保」是招标明示的材料门槛。真实评审
+        # 对无证明者硬判 0。按正文页计数做确定性门槛（排除目录/要求页）：
+        # 5 年经验正文页 <3 → 负责人 0；社保页 <16 → 团队 0。
+        # 实证校准（对真实评审 4 家的判别）：社保页 26/32（龙即/诚道，真实团队 6/6）
+        # vs 4/13（致成/先数，真实 0/0）——断崖式可分；5 年经验页 14（龙即 4 分）
+        # vs 1-2（其余，真实 0-2）。
+        import re as _re_mat
+
+        person_stats: dict[int, dict[str, int]] = {}
+        with session_scope() as s:
+            from app.db.models import DocumentPage
+
+            for bid_id in bidder_ids:
+                doc_id = main_doc_by_bidder.get(bid_id)
+                five, social = 0, 0
+                if doc_id is not None:
+                    for ptext in s.execute(
+                        select(DocumentPage.text).where(DocumentPage.document_id == doc_id)
+                    ).scalars():
+                        t = ptext or ""
+                        if "【证明材料】" in t or t.count("....") >= 3:
+                            continue  # 目录/要求页不计
+                        if _re_mat.search(r"五年|5\s*年", t) and "经验" in t:
+                            five += 1
+                        if _re_mat.search(r"社会保险|社保|参保缴费|参保人员", t):
+                            social += 1
+                person_stats[bid_id] = {"five_year": five, "social": social}
+
+        use_hierarchical = config.review_mode() == "hierarchical"
         if ctx:
-            ctx.advance(message=f"主观分建议 {len(subjective_items)} 项 × {len(bidder_ids)} 家")
+            ctx.advance(message=f"主观分评审（{config.review_mode()}） {len(subjective_items)} 项 × {len(bidder_ids)} 家")
         for bid_id in bidder_ids:
             for c in subjective_items:
-                suggestion = suggest_score(
-                    gateway, c, text_by_bidder[bid_id], data_class=data_class
-                )
-                _persist_subjective(run_id, bid_id, c, suggestion, main_doc_by_bidder.get(bid_id), stats)
+                hint = material_hints.get(bid_id)
+                if use_hierarchical:
+                    suggestion, committee = suggest_score_hierarchical(
+                        gateway, c, text_by_bidder[bid_id], data_class=data_class,
+                        material_pages=hint,
+                    )
+                    if suggestion is None:
+                        # 证据地图不可用（嵌入服务故障）→ 回退单次评审
+                        suggestion, committee = suggest_score_committee(
+                            gateway, c, text_by_bidder[bid_id], data_class=data_class,
+                            material_pages=hint,
+                        )
+                else:
+                    suggestion, committee = suggest_score_committee(
+                        gateway, c, text_by_bidder[bid_id], data_class=data_class,
+                        material_pages=hint,
+                    )
+
+                # 人员经验材料门槛（确定性，规则执行）：缺证明按"否则该项不得分"计 0
+                cname = str(c.get("name") or "")
+                ps = person_stats.get(bid_id, {})
+                forced_zero = None
+                if "项目负责人" in cname and ps.get("five_year", 0) < 3:
+                    forced_zero = (
+                        f"未见五年及以上工作经验证明材料（正文相关页 {ps.get('five_year', 0)} 页），"
+                        "按评分因素「无证明材料不得分」计 0"
+                    )
+                elif "团队成员" in cname and ps.get("social", 0) < 16:
+                    forced_zero = (
+                        f"未见团队成员社保证明材料（相关页 {ps.get('social', 0)} 页），"
+                        "按评分因素「不提供或不能提供有效证明的不得分」计 0"
+                    )
+                if forced_zero is not None:
+                    suggestion = SubjectiveSuggestion(
+                        status="ai_suggested",
+                        score=Decimal(0),
+                        level_label=None,
+                        reasoning=forced_zero,
+                        evidence=[],
+                        warnings=[forced_zero] + list(suggestion.warnings),
+                    )
+
+                _persist_subjective(run_id, bid_id, c, suggestion, main_doc_by_bidder.get(bid_id), stats,
+                                    committee=committee)
 
     # ---- ⑤ 收尾 ----
     need_human = 0
@@ -445,6 +661,76 @@ def execute_run(
     }
 
 
+def _llm_verify_cases(gateway, c: dict, facts, material_pages: str | None,
+                      artifacts: str, data_class: str) -> list[dict] | None:
+    """带【证明材料】的计数项：LLM 逐案例列出并核对材料齐全性。
+
+    返回案例清单（含 contract/invoice/acceptance 布尔），失败返回 None
+    （调用方退回文本级校验）。余额/配额类错误向上抛（fail-fast）。
+    """
+    from pydantic import BaseModel, Field
+
+    from app.engine.selection import (
+        select_chunks_for_criterion, split_text_chunks,
+    )
+    from app.llm.base import LLMError
+    from app.rules import prompts
+
+    if not artifacts:
+        return None
+
+    class CaseList(BaseModel):
+        cases: list[dict] = Field(default_factory=list)
+
+    text = facts.text
+    if len(text) > 15000:
+        picked, _meta = select_chunks_for_criterion(
+            split_text_chunks(text), c, 15000
+        )
+        text = "\n".join(t for _i, t in picked)
+    user = prompts.MATERIAL_COUNT_USER_TEMPLATE.format(
+        name=c.get("name") or "",
+        max_score=c.get("max_score") or "",
+        source_quote=(c.get("source_quote") or "")[:800],
+        artifacts="、".join(artifacts),
+        material_pages=material_pages or "（无）",
+        bid_text=text,
+    )
+    try:
+        out, _res = gateway.chat_json(
+            prompts.MATERIAL_COUNT_SYSTEM_PROMPT, user, CaseList,
+            data_class=data_class,
+        )
+        return [_sanitize_case(x, artifacts) for x in out.cases if isinstance(x, dict)]
+    except LLMError as exc:
+        msg = str(exc)
+        if any(k in msg for k in ("402", "insufficient", "quota", "30001", "arrears")):
+            raise
+        return None
+
+
+def _sanitize_case(case: dict, artifacts: str) -> dict:
+    """核验结果代码层校验：quote 是要求文本影子的案例，材料判定不可信 → 全部降 false。
+
+    8B 模型的作弊模式（2026-10-15 实证）：拿"须提供合同复印件、发票复印件…"这句
+    **要求文本**当 quote，把四个业绩案例全判材料齐全。判据：quote 与材料要求段
+    互相包含（≥12 字重合）或 quote 空 → 该案例三件套一律 false。
+    """
+    case = dict(case)
+    quote = str(case.get("quote") or "").strip()
+    artifacts_n = artifacts.replace(" ", "")
+    quote_n = quote.replace(" ", "")
+    cheat = True
+    if len(quote_n) >= 12:
+        if quote_n not in artifacts_n and artifacts_n[:40] not in quote_n:
+            cheat = False
+    if cheat:
+        for key in ("contract", "invoice", "acceptance"):
+            case[key] = False
+        case["sanitized"] = "quote 无效（要求文本/空引文），材料判定降为未提供"
+    return case
+
+
 def _eval_veto(  # noqa: ANN001
     c: dict,
     facts,
@@ -463,26 +749,29 @@ def _eval_veto(  # noqa: ANN001
         and gateway is not None
         and (result.status == "unknown" or (result.status == "fail" and result.need_human))
     ):
-        # 全自动模式：human_only / 冲突 / 信号命中 → LLM 带原文证据裁决，收敛终态。
-        # 终态词汇不经过 verdict_for（那是人工模式的映射）：fail 的 machine_status
-        # 按否决语义落 recommend_reject，非否决项落 fail——review_status 一律
-        # auto_confirmed（由 _upsert_score 中央转换），不再有"待人工"的中间态。
+        # 全自动模式：human_only / 冲突 / 信号命中 → LLM 带原文证据裁决。
+        # AI 不否决（2026-10-14 用户指令，恢复"绝不自动否决"原则）：LLM 的 fail
+        # 一律降级为"疑问"——machine_status=need_human，由评标委员会认定；
+        # 投标人照常参与评分与排名。pass 才是唯一通过终态。
         from app.engine.auto_judge import refine_with_llm
 
         result = refine_with_llm(gateway, c, facts, text or "", result, data_class=data_class)
-        verdict = (
-            "pass" if result.status == "pass"
-            else ("recommend_reject" if on_fail == "recommend_reject" else "fail")
-        )
-    else:
-        verdict = verdict_for(c["code"], c["name"], result, on_fail=on_fail)
+        if result.status == "pass":
+            return {"verdict": "pass", "message": result.message, "evidence": result.evidence_quote}
+        return {
+            "verdict": "need_human",
+            "message": f"AI 存疑（不自动否决，转评标委员会认定）：{result.message}",
+            "evidence": result.evidence_quote,
+        }
+    verdict = verdict_for(c["code"], c["name"], result, on_fail=on_fail)
     return {"verdict": verdict, "message": result.message, "evidence": result.evidence_quote}
 
 
 def _review_status_for_verdict(result: dict) -> str:
-    # 全自动模式：一切判定直接收敛终态（LLM 裁决/确定性判定），不进复核队列
+    # 全自动模式：pass/确定性判定收敛为 auto_confirmed；AI 存疑（need_human）
+    # 保留 conflict_flagged —— 疑问进复核清单，报告不得宣称定稿
     if config.auto_mode():
-        return "auto_confirmed"
+        return "conflict_flagged" if result["verdict"] == "need_human" else "auto_confirmed"
     v = result["verdict"]
     if v == "pass":
         return "pending"  # 客观通过项仍走人工复核流（防错，但默认可批量浏览）
@@ -503,9 +792,17 @@ def _upsert_score(
     review_status: str = "pending",
     final_score: Decimal | None = None,
     warnings_json: list | None = None,
+    doubt: bool = False,
 ) -> ScoreRecord:
-    # 全自动模式：所有复核态（pending/ai_suggested/conflict_flagged）收敛为终态
-    if config.auto_mode() and review_status in ("pending", "ai_suggested", "conflict_flagged"):
+    # 全自动模式：复核态收敛为终态；但 AI 存疑项（need_human）与人工核验项
+    # （doubt，如 count 的证明材料链冲突）保留 conflict_flagged 进疑问清单——
+    # "标疑问"正是它们的终态，不得被抹成"已自动确认"（2026-10-14/15）
+    if (
+        config.auto_mode()
+        and not doubt
+        and review_status in ("pending", "ai_suggested", "conflict_flagged")
+        and machine_status != "need_human"
+    ):
         review_status = "auto_confirmed"
     with session_scope() as s:
         row = s.execute(
@@ -571,6 +868,7 @@ def _persist_subjective(
     suggestion,  # SubjectiveSuggestion
     main_doc_id: int | None,
     stats: dict,
+    committee: list[dict] | None = None,
 ) -> None:
     # 人工已确认/改分的主观项：重跑时不得被新的 AI 建议覆盖
     with session_scope() as s:
@@ -598,6 +896,12 @@ def _persist_subjective(
         row.ai_raw_json = {
             "warnings": suggestion.warnings,
             "evidence": suggestion.evidence,
+            # 评审委员会明细：每位 AI 评委的独立分与弃分标记，报告汇总表/审计直接可用
+            "committee": committee,
+            "aggregation": f"trimmed_mean_{len(committee)}_drop_high_low" if committee else None,
+            # 证明材料链核对与复合因素子项得分（评分透明度）
+            "artifacts_check": suggestion.artifacts_check,
+            "sub_scores": suggestion.sub_scores,
         }
         row.warnings_json = [{"message": w} for w in suggestion.warnings]
         row.review_status = "ai_suggested" if suggestion.status == "ai_suggested" else "pending"
@@ -639,9 +943,25 @@ def _persist_subjective(
         row.evidence_status = evidence_status
         if config.auto_mode():
             # 全自动模式：AI 建议直接生效；给不出分的按最低档兜底（宁严勿纵），
-            # 警告与 reasoning 全部保留在 ai_raw_json / warnings 供事后审计
+            # 警告与 reasoning 全部保留在 ai_raw_json / warnings 供事后审计。
+            # 例外：模型输出截断/解析失败（parse_failed）→ 疑问 + 不进总分——
+            # 兜底 0 分会把"模型输出坏了"伪装成"投标人做得差"
+            # （2026-10-15 诚道运维方案 0 分实证）。
+            parse_failed = any(
+                isinstance(w, dict) and w.get("message") in ("parse_failed", "llm_failed")
+                for w in (row.warnings_json or [])
+            )
             if suggestion.status == "ai_suggested":
                 row.final_score = suggestion.score
+            elif parse_failed:
+                row.final_score = None
+                row.machine_status = "need_human"
+                row.review_status = "conflict_flagged"
+                row.warnings_json = (row.warnings_json or []) + [
+                    {"message": "全自动模式：模型调用失败/输出解析失败，按疑问处理不进总分，须人工补分"}
+                ]
+                s.add(row)
+                return
             else:
                 mins = [Decimal(str(lv.get("min")))
                         for lv in (criterion.get("levels") or []) if lv.get("min") is not None]

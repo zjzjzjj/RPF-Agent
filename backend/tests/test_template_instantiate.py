@@ -182,7 +182,7 @@ def test_demo_scoring_full_chain(client, samples_dir) -> None:  # noqa: ANN001
 
     resp = client.post(f"/api/projects/{pid}/runs",
                        json={"package_id": package_id, "bidder_ids": bidder_ids,
-                             "stages": ["objective", "price", "subjective"]})
+                             "stages": ["objective", "price"]})  # 客观+价格全确定性，无需任何模型
     assert resp.status_code == 200, resp.text
     job = wait_job(client, resp.json()["job_id"], timeout=180)
     assert job["status"] == "succeeded", job.get("error")

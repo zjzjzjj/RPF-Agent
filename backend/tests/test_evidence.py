@@ -99,5 +99,32 @@ def test_verifier_fabricated(tender_document_id):
     assert not cit.verified
 
 
+def test_page_hint_string_coerced(client, tender_document_id):
+    """LLM 证据的 page_hint 是字符串形态（"第97页"/"97"）——入库归一为 int，
+    且存量字符串行核验不再 TypeError（2026-10-14 真实评分运行实证）。"""
+    from app.db.session import session_scope
+    from app.db.models import EvidenceCitation
+    from app.evidence.verifier import coerce_page_hint, create_citation, verify_citation
+
+    assert coerce_page_hint("第97页") == 97
+    assert coerce_page_hint("P3") == 3
+    assert coerce_page_hint(None) is None
+    assert coerce_page_hint("无数字") is None
+
+    cit_id = create_citation(
+        tender_document_id, PRICE_QUOTE, page_hint="第4页", role="criterion_source", verify=False
+    )
+    cit = verify_citation(cit_id)
+    assert cit.page_no == 4 and cit.verified
+
+    # 存量脏数据：直接把 page_no 写成字符串，核验仍要工作
+    with session_scope() as s:
+        row = s.get(EvidenceCitation, cit_id)
+        row.page_no = "4"
+        s.add(row)
+    cit = verify_citation(cit_id)
+    assert cit.page_no == 4 and cit.verified
+
+
 def test_normalize_quote_still_matches(normalize_check=True):
     assert normalize("价格分＝４０×") == "价格分=40x"

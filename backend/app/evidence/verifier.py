@@ -17,6 +17,25 @@ from app.evidence.locator import DocumentSource, locate
 log = logging.getLogger("bid_eval.evidence")
 
 
+def coerce_page_hint(value) -> int | None:  # noqa: ANN001
+    """页码提示归一为 int。
+
+    主观分证据的 page_hint 是 LLM 原始输出（"97"/"第97页"/"P3" 都出现过），不走
+    compile 契约的 _coerce_page_hint；字符串落库后会在 locate() 里与 int 比较
+    TypeError（2026-10-14 真实评分运行实证）。入口统一归一，取首个数字。
+    """
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    import re as _re
+
+    m = _re.search(r"\d+", str(value))
+    return int(m.group()) if m else None
+
+
 def verify_citation(citation_id: int) -> EvidenceCitation | None:
     """核验一条证据引用并落库（本函数是 verified 的唯一写入点）。"""
     with session_scope() as s:
@@ -25,7 +44,7 @@ def verify_citation(citation_id: int) -> EvidenceCitation | None:
             return None
         document_id = cit.document_id
         quote = cit.quote
-        hint = cit.page_no
+        hint = coerce_page_hint(cit.page_no)  # 存量行可能存了字符串形态
 
     verified = False
     method = None
@@ -75,6 +94,7 @@ def create_citation(
     verify: bool = True,
 ) -> int:
     """创建证据引用（可选立即核验）。返回 citation id。"""
+    page_hint = coerce_page_hint(page_hint)
     with session_scope() as s:
         cit = EvidenceCitation(
             document_id=document_id,

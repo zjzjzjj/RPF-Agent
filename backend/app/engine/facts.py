@@ -16,22 +16,27 @@ _UPPER_DIGITS = {"零": 0, "壹": 1, "贰": 2, "叁": 3, "肆": 4, "伍": 5, "�
 _RUN_UPPER = re.compile(r"[零壹贰叁肆伍陆柒捌玖拾佰仟万亿圆元整角分]{4,}")
 # 行首：前导分隔符* + 可选编号 + 后随分隔符*。
 # 兼容 "1 某项目" / "1. 某项目" / "1、某项目" / "（1）某项目" / "| 1 | 某项目"。
-_SEP = r"(?:[|｜]|\s)"
-_ROW_PREFIX = r"[|｜、.．\s）)]*(?:[（(]?\d+[）)]?)?[|｜、.．\s）)]*"
 _RE_PRICE_TOTAL_ROW = re.compile(
     r"投标总价\s*[：:（(]*(?:大写|小写)?[）)]?\s*[|｜]?\s*([\d,，]+(?:\.\d+)?)"
 )
 _RE_PRICE_SYMBOL = re.compile(r"[¥￥]\s*([\d,，]+(?:\.\d+)?)")
 _RE_PRICE_TOTAL_CN = re.compile(r"投标总价人民币([零壹贰叁肆伍陆柒捌玖拾佰仟万亿圆元整]+)")
 _RE_ITEMS_TOTAL_ROW = re.compile(r"^\s*[|｜]?\s*合计\s*[|｜]?\s*([\d,，]+(?:\.\d+)?)", re.M)
-_RE_ITEM_ROW = re.compile(
-    r"^\s*" + _ROW_PREFIX + r"\s*(.{2,60}?)\s*" + _SEP + r"\s*([\d,，]+(?:\.\d+)?)\s*"
-    + _SEP + r"\s*(\d{4})\s*年",
-    re.M,
+# 业绩行（行级匹配）：占有量词消除灾难性回溯。
+# 旧版 `[|｜、.．\s）)]* … \s*`（前缀字符类与相邻空白量词重叠）+ 全文本 finditer，
+# 在 PaddleOCR-VL 输出的长表格行上产生指数级回溯（2026-10-15 实证：单次 scan
+# 满载 CPU 20+ 分钟不返回）。修复：①字符类合并且用 *+ 占有（不回溯）；
+# ②按行 re.match（行文本短，回溯空间受限）。
+_RE_ITEM_LINE = re.compile(
+    r"^[\s|｜、.．)）]*+(?:[（(]?\d{1,3}[）)]?)?[\s|｜、.．)）]*+"
+    r"(.{2,60}?)[\s|｜]++([\d,，]+(?:\.\d+)?)[\s|｜]++(\d{4})\s*年"
 )
 _RE_CAPITAL = re.compile(r"注册资本[：:]*人民币?([\d,，]+(?:\.\d+)?)\s*万元")
-_RE_CERT_ROW = re.compile(
-    r"^\s*" + _ROW_PREFIX + r"\s*((?:ISO\s?\d+|CMMI\s?\d?)[^\n|｜]{0,60})", re.M
+# 证书行（行级匹配）：与 _RE_ITEM_LINE 同理——占有量词消除回溯
+# （原 _ROW_PREFIX 版本在诚道 25 万字符文本上满载 CPU 不返回，2026-10-15）。
+_RE_CERT_LINE = re.compile(
+    r"^[\s|｜、.．)）]*+(?:[（(]?\d{1,3}[）)]?)?[\s|｜、.．)）]*+"
+    r"((?:ISO\s?\d+|CMMI\s?\d?)[^\n|｜]{0,60})"
 )
 # 证书行里的证书编号/有效期（用于把名称与编号切开）
 _RE_CERT_TAIL = re.compile(r"\s+[A-Z][A-Za-z]{1,8}[-–]\d|\s+\d{4}\s*年")
@@ -304,14 +309,17 @@ def extract_bid_facts(text: str, documents: list[str] | None = None) -> BidFacts
         facts.registered_capital = _money(m.group(1)) * Decimal(10_000)
 
     # 业绩（表格行：编号 名称 金额 年份；管道或空格分隔）
-    # 表头若声明"万元"单位，金额要做 ×10000 换算，否则出现 10000 倍低估
+    # 表头若声明"万元"单位，金额要做 ×10000 换算，否则出现 10000 倍低估。
+    # 行级匹配（_RE_ITEM_LINE，见定义处说明）；等价于原 re.M finditer 的行内语义。
     lines = text.split("\n")
-    for m in _RE_ITEM_ROW.finditer(text):
+    for line_no, line in enumerate(lines):
+        m = _RE_ITEM_LINE.match(line)
+        if m is None:
+            continue
         name, amount, year = m.group(1).strip(" |｜"), m.group(2), m.group(3)
         if "项目名称" in name or "合同金额" in name:
             continue
         value = _money(amount)
-        line_no = text.count("\n", 0, m.start())
         for back in range(line_no - 1, max(-1, line_no - 12), -1):
             header = lines[back] if 0 <= back < len(lines) else ""
             if "合同金额" in header or "金额" in header:
@@ -320,8 +328,11 @@ def extract_bid_facts(text: str, documents: list[str] | None = None) -> BidFacts
                 break
         facts.performance_amounts.append(value)
 
-    # 体系认证：表内（有证书）与正文声称（可能无证书）分开记
-    for m in _RE_CERT_ROW.finditer(text):
+    # 体系认证：表内（有证书）与正文声称（可能无证书）分开记（行级匹配）
+    for line in lines:
+        m = _RE_CERT_LINE.match(line)
+        if m is None:
+            continue
         raw = m.group(1)
         name = _RE_CERT_TAIL.split(raw)[0]
         name = re.sub(r"\s+", "", name)

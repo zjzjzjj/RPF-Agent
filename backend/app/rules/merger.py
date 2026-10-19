@@ -167,9 +167,10 @@ def llm_match(
         template_text="\n".join(_line(c) for c in template),
         document_text="\n".join(_line(c) for c in document),
     )
-    gateway = get_gateway() if provider is None and model is None else Gateway(get_provider(provider, model))
     result: MatchProposal | None = None
     try:
+        # 网关构建也必须在 try 内：未配置 provider 时按"LLM 辅助失败"降级为仅确定性匹配
+        gateway = get_gateway() if provider is None and model is None else Gateway(get_provider(provider, model))
         result, _ = gateway.chat_json(
             MATCH_SYSTEM_PROMPT, user, MatchProposal, data_class=data_class
         )
@@ -205,7 +206,7 @@ def generate_match_proposal(
 ) -> dict[str, Any]:
     """生成匹配提案（只读，不写业务行）。
 
-    流程：确定性匹配 → 对未匹配集合跑 LLM 辅助（mock/已配置真实模型时）→ 合并去重。
+    流程：确定性匹配 → 对未匹配集合跑 LLM 辅助（已配置真实模型时）→ 合并去重。
     返回 {merge_package_id, target_package_id, pairs, unmatched_template, unmatched_document}。
     """
     from app.db.models import RulePackage
