@@ -57,7 +57,7 @@
 # 后端（Python 3.12）
 cd backend
 pip install -r requirements.txt        # 国内镜像：-i https://pypi.tuna.tsinghua.edu.cn/simple
-python -m pytest -q                    # 174 项测试，全离线（不依赖任何模型）
+python -m pytest -q                    # 216 项测试，全离线（不依赖任何模型）
 
 # 端到端验收（二选一，按运行模式；编译/裁决走真实模型——先配置模型，见下）
 cd ..
@@ -97,7 +97,8 @@ export BID_EVAL_LLM_MODEL=deepseek-chat
 2. **规则三选一（可组合）**：
    - **编译**：LLM 从招标文件抽取评分项/档位/价格公式（超长文档按章节优先级自动选段，任务栏显示选取范围）
    - **模板实例化**：四套内置评标办法模板（综合货物/服务/工程、最低价）作为基线，之后可上传招标文件**自动合并优化**（配对自动采纳：覆盖/追加/弃用全留痕）
-   - **导入法规包**：`POST /projects/{id}/rules/import-law` 或 `scripts/import_law_rules.py`（仓库内固化的 87 条法规通则，法条逐条核验 fail-closed）
+   - **导入法规包**：规则页「导入法规包」按钮（`POST /projects/{id}/rules/import-law-pack`，按 `pack_id` 取仓库内固化包；也可用 `POST /rules/import-law` 投递制品 JSON 或 `scripts/import_law_rules.py`）——87 条法规通则，法条逐条核验 fail-closed
+   - **人工新增评分项**：规则页「新增评分项」（仅草稿包，理由必填，编号 x1/x2…，来源标「人工」）
 3. **批量处置**：「全部采纳」/「全部签批」按钮（公共理由留痕）→ 确认 → **冻结**（内容哈希，此后只读）
 4. **添加投标人** → 上传投标文件 → 抽取报价（五级兜底：总价行 → 标签窗口 → 含税合计行 → **开标一览表章节扫描（税率配对判含税价）** → 语境启发）；抽不到「人工录入」兜底
 5. **发起评分运行** → 资格/符合性（确定性原语 + LLM 裁决）+ 价格分 + 计数分 + 判断项 + 技术分（逐字引用与核验）；长标书**按评分项关键词选段**送审（尾部章节不再被盲截）
@@ -122,7 +123,8 @@ backend/app/
 ├─ api/          REST 端点（项目 CRUD / 规则 / 评分 / 报告）
 └─ jobs/         jobs 表 + 进程内 worker（进度/取消/心跳/僵尸任务回收）
 frontend/src/    React + Ant Design：项目列表（含删除）、工作台、规则（模板/编译/法规导入/
-                 全部采纳/解冻）、投标人（报价五级兜底交互）、评分矩阵、证据查看器、报告
+                 新增评分项/全部采纳/解冻）、投标人（报价五级兜底交互）、评分矩阵、
+                 证据查看器、报告
 scripts/         样例数据生成、双模式端到端验收（run_e2e / run_auto_pipeline）、
                  法规包生成（build_law_pack.py，唯一生成通道 + --check 漂移护栏）、
                  数据库迁移（migrate_rule_library / migrate_law_layer / migrate_auto_review）
@@ -150,7 +152,7 @@ python scripts/build_law_pack.py --check    # 只比对，漂移 exit 2（测试
 | 全自动收敛 | 零 need_human 残留、报告直接 final | ✅ run_auto_pipeline `--assert-final`（auto 模式结构保证） |
 | 人工回退语义 | 三态 + 复核队列 + 绝不自动否决 | ✅ pytest（conftest auto=0 守护） |
 | 端到端耗时（真实模型） | — | ✅ run_e2e 约 3-10 分钟；run_auto_pipeline 全量裁决约 30-120 分钟（并发可调） |
-| 测试 | 全部离线可重复 | ✅ 174 passed（不依赖任何模型） |
+| 测试 | 全部离线可重复 | ✅ 216 passed（不依赖任何模型） |
 
 ## 模型与超长文档处理
 
