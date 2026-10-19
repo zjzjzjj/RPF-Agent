@@ -84,7 +84,9 @@ export default function ProjectWorkbench() {
   const firstAction = data.stages.findIndex(
     (s) => s.state === "active" || s.state === "blocked",
   );
-  const firstPending = data.stages.findIndex((s) => s.state === "pending");
+  const firstPending = data.stages.findIndex(
+    (s) => s.state === "pending" && !s.optional,
+  );
   const currentIndex =
     firstAction >= 0
       ? firstAction
@@ -260,6 +262,7 @@ export default function ProjectWorkbench() {
                 {STAGE_ICON[s.key] ?? <FileProtectOutlined />}
               </span>
               <Tag color={STATE_COLOR[s.state]}>{STATE_LABEL[s.state]}</Tag>
+              {s.optional && s.state === "pending" && <Tag>可选</Tag>}
             </div>
             <div className="stage-title">
               <span>{String(i + 1).padStart(2, "0")}</span>

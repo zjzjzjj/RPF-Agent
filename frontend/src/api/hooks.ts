@@ -11,6 +11,7 @@ import type {
   LawPackSummary,
   MatchProposal,
   Matrix,
+  MergeRecord,
   ModelsOut,
   PackageDetail,
   Project,
@@ -21,6 +22,7 @@ import type {
   ScoreSummary,
   TemplateDetail,
   TemplateSummary,
+  UseDefaultTemplateResult,
   Workbench,
 } from "../types";
 
@@ -230,6 +232,57 @@ export function useMatchProposal(mergePackageId: number | null) {
     queryKey: ["matchProposal", mergePackageId],
     queryFn: () => api.get<MatchProposal>(`/rules/packages/${mergePackageId}/match-proposal`),
     enabled: mergePackageId != null && mergePackageId > 0,
+  });
+}
+
+/** 一键启用默认规则：实例化（或复用草稿模板包）→ 全部签批 → 确认 → 冻结。 */
+export function useUseDefaultTemplate(pid: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { template_id: string; reason?: string | null }) =>
+      api.post<UseDefaultTemplateResult>(`/projects/${pid}/rules/use-default-template`, body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["rules", pid] });
+      qc.invalidateQueries({ queryKey: ["workbench", pid] });
+      qc.invalidateQueries({ queryKey: ["coverage"] });
+    },
+  });
+}
+
+/** 停用评分项（仅草稿）：退出计分与冻结快照。 */
+export function useRetireCriterion(pid: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, reason }: { id: number; reason: string }) =>
+      api.post(`/rules/criteria/${id}/retire`, { reason }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["rules", pid] });
+      qc.invalidateQueries({ queryKey: ["coverage"] });
+      qc.invalidateQueries({ queryKey: ["workbench", pid] });
+    },
+  });
+}
+
+/** 恢复被停用的评分项（仅草稿）。 */
+export function useRestoreCriterion(pid: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, reason }: { id: number; reason: string }) =>
+      api.post(`/rules/criteria/${id}/restore`, { reason }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["rules", pid] });
+      qc.invalidateQueries({ queryKey: ["coverage"] });
+      qc.invalidateQueries({ queryKey: ["workbench", pid] });
+    },
+  });
+}
+
+/** 自动匹配的逐条变更（覆盖 / 弃用 / 追加）。 */
+export function useMergeRecords(packageId: number | null) {
+  return useQuery({
+    queryKey: ["mergeRecords", packageId],
+    queryFn: () => api.get<MergeRecord[]>(`/rules/packages/${packageId}/merge-records`),
+    enabled: packageId != null && packageId > 0,
   });
 }
 

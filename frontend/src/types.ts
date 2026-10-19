@@ -19,6 +19,8 @@ export interface StageState {
   state: "done" | "active" | "blocked" | "pending";
   detail: string;
   todo_count: number;
+  /** 可选阶段（如已有模板规则时的招标文件）：pending 不阻塞“下一步” */
+  optional?: boolean;
 }
 
 export interface Workbench {
@@ -134,6 +136,36 @@ export interface TemplateSummary {
   library_version: string;
   criteria_count: number;
   categories_summary: Record<string, number>;
+  applicable?: Record<string, string>;
+  notes?: string | null;
+}
+
+/** 一键启用默认规则（POST /projects/{pid}/rules/use-default-template） */
+export interface UseDefaultTemplateResult {
+  package_id: number;
+  ok: boolean;
+  frozen: boolean;
+  already_frozen: boolean;
+  created: boolean;
+  signed_off: number;
+  blockers: { code?: string; message?: string; [k: string]: unknown }[];
+  validations: { code: string; severity: string; message: string; hint?: string | null }[];
+  message?: string | null;
+}
+
+/** 自动匹配留下的逐条变更（覆盖 / 弃用 / 追加） */
+export interface MergeRecord {
+  id: number;
+  action: "override" | "keep_template" | "drop_template" | "append_document" | string;
+  match_method: string | null;
+  similarity: string | null;
+  template: { code: string | null; name: string | null };
+  document: { code: string | null; name: string | null };
+  document_page: number | null;
+  quote: string | null;
+  confirmed_by: string | null;
+  reason: string | null;
+  created_at: string | null;
 }
 
 export interface TemplateLevel {
