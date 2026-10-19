@@ -21,7 +21,7 @@
 │ 12 校验器     │ 三态/计数     │ (verified 唯一 │ 归一化         │
 │ 冻结+哈希     │ 主观分校验层  │  写入点)       │               │
 ├──────────────┴──────────────┴───────────────┴───────────────┤
-│ llm/ 网关（缓存/限速/预算/数据分级） → Mock | OpenAI 兼容      │
+│ llm/ 网关（缓存/限速/预算/数据分级） → OpenAI 兼容 provider       │
 │ jobs/ jobs 表 + 进程内 worker（进度/取消/心跳/僵尸回收）        │
 │ db/   SQLAlchemy 2.0（SQLite 起步，DATABASE_URL 可切 Postgres）│
 └─────────────────────────────────────────────────────────────┘
@@ -85,7 +85,7 @@ projects ─┬─ documents ─┬─ document_pages
 
 | 接缝 | 现在 | 将来 |
 |---|---|---|
-| `LLMProvider` + `Gateway` | Mock / OpenAI 兼容 | kuncore model_router |
+| `LLMProvider` + `Gateway` | OpenAI 兼容 provider（未配置 fail-fast） | kuncore model_router |
 | `JobRunner` | jobs 表 + 进程内 worker | kuncore workflow（含人工审批卡点） |
 | `StorageBackend` | 本地磁盘 | S3 / MinIO |
 | ORM | 纯 SQLAlchemy，无 SQLite 专有 SQL | 改 `DATABASE_URL` 即迁 Postgres |

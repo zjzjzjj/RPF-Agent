@@ -57,13 +57,15 @@
 # 后端（Python 3.12）
 cd backend
 pip install -r requirements.txt        # 国内镜像：-i https://pypi.tuna.tsinghua.edu.cn/simple
-python -m pytest -q                    # 171 项测试，全离线
+python -m pytest -q                    # 174 项测试，全离线（不依赖任何模型）
 
-# 端到端验收（二选一，按运行模式）
+# 端到端验收（二选一，按运行模式；编译/裁决走真实模型——先配置模型，见下）
 cd ..
 python scripts/generate_sample_tender.py && python scripts/generate_sample_bids.py
-python scripts/run_e2e.py --assert-expected              # 人工回退模式口径
-python scripts/run_auto_pipeline.py --assert-final       # 全自动模式口径（默认语义）
+python scripts/run_e2e.py                              # 人工回退模式口径（真实模型冒烟，约 3-10 分钟）
+python scripts/run_auto_pipeline.py --assert-final     # 全自动模式口径（默认语义；87 条法规包
+                                                       # × 5 家约 400 次裁决，约 30-120 分钟，
+                                                       # 可用 BID_EVAL_LLM_CONCURRENCY 提并发）
 
 # 启动服务
 cd backend && uvicorn app.main:app --port 8000
@@ -80,7 +82,7 @@ npm run dev                            # http://localhost:5173（/api 代理到 
 python scripts/migrate_auto_review.py     # review_status 扩 'auto_confirmed'
 ```
 
-接真实模型（OpenAI 兼容，如 DeepSeek / Qwen / 硅基流动）：
+配置模型（**必须**：编译/语义裁决/主观分都走真实模型；未配置时 fail-fast 报 `LLM_NOT_CONFIGURED`，OpenAI 兼容，如 DeepSeek / Qwen / 硅基流动）：
 
 ```bash
 export BID_EVAL_LLM_PROVIDER=openai
@@ -114,7 +116,8 @@ backend/app/
 │                规则包库（templates/ 内置模板 + law_packs/ 固化法规包，loader fail-fast）
 ├─ engine/       纯代码评分：价格公式、排名并列、资格三态原语、事实抽取（五级报价兜底）、
 │                主观分校验层、跨投标人串通信号、LLM 裁决（auto_judge）、章节约束选段
-├─ llm/          provider 抽象（Mock/OpenAI 兼容/硅基流动）、网关（缓存/限速/预算/数据分级）
+├─ llm/          provider 抽象（OpenAI 兼容：DeepSeek/Qwen/GLM/Kimi/硅基流动；未配置 fail-fast）、
+│                网关（缓存/限速/预算/数据分级）
 ├─ services/     业务编排（评分运行、规则状态机、法规导入、模板库、合并、报告、项目删除）
 ├─ api/          REST 端点（项目 CRUD / 规则 / 评分 / 报告）
 └─ jobs/         jobs 表 + 进程内 worker（进度/取消/心跳/僵尸任务回收）
@@ -140,14 +143,14 @@ python scripts/build_law_pack.py --check    # 只比对，漂移 exit 2（测试
 
 | 指标 | 目标 | 现状 |
 |---|---|---|
-| 证据核验率（Mock 引文逐字） | 100% | ✅ |
-| 客观分复算一致性 | 0 差异 | ✅ 价格分与独立真值 0 差异 |
+| 客观分复算一致性 | 0 差异 | ✅ pytest + 冒烟：价格分与独立真值 0 差异 |
+| 报价抽取（确定性五级启发） | 与生成侧真值一致 | ✅ 5 家全对（run_e2e 精确断言） |
 | 法规包导入 | 87 条全过法条核验 | ✅ error 0，快照带 law 溯源 |
 | 冻结不可变性 | 冻结后写入 409 | ✅ |
-| 全自动收敛 | 零 need_human 残留、报告直接 final | ✅ run_auto_pipeline 断言 |
-| 人工回退语义 | 三态 + 复核队列 + 绝不自动否决 | ✅ run_e2e 断言 |
-| 端到端耗时（5 家 × 13 项，离线） | < 60 秒 | ✅ 约 25 秒 |
-| 测试 | 全部离线可重复 | ✅ 171 passed |
+| 全自动收敛 | 零 need_human 残留、报告直接 final | ✅ run_auto_pipeline `--assert-final`（auto 模式结构保证） |
+| 人工回退语义 | 三态 + 复核队列 + 绝不自动否决 | ✅ pytest（conftest auto=0 守护） |
+| 端到端耗时（真实模型） | — | ✅ run_e2e 约 3-10 分钟；run_auto_pipeline 全量裁决约 30-120 分钟（并发可调） |
+| 测试 | 全部离线可重复 | ✅ 174 passed（不依赖任何模型） |
 
 ## 模型与超长文档处理
 
