@@ -352,6 +352,180 @@ export interface Ranking {
   warnings: string[];
 }
 
+// ---------------------------------------------------------------------------
+// 评分结果聚合（GET /runs/{run_id}/score-summary）
+// ---------------------------------------------------------------------------
+export type SummaryItemState = "scored" | "missing_final" | "veto" | "match" | "not_run";
+
+export interface SummaryDeduction {
+  kind: "points" | "undetermined" | "n_a";
+  points: string | null;
+  formula: string | null;
+}
+
+export interface SummaryReason {
+  ai_reasoning: string | null;
+  ai_reasoning_chars: number;
+  truncated: boolean;
+  machine_reason: string | null;
+  human_reason: string | null;
+  human_action: string | null;
+  human_actor: string | null;
+  human_at: string | null;
+  unresolved: string | null;
+}
+
+export interface SummaryCitation {
+  id: number;
+  document_id: number | null;
+  page_no: number | null;
+  node_id: string | null;
+  quote: string | null;
+  verified: boolean;
+  verify_method: string | null;
+  bbox_json: number[][] | null;
+  page_size_json: number[] | null;
+  citation_role: string;
+  created_by: string;
+}
+
+export interface CommitteeMember {
+  judge_no: number | null;
+  score: string | null;
+  level_label: string | null;
+  status: string | null;
+  insufficient: boolean;
+  dropped: boolean;
+  warnings: string[];
+  cluster_chars: number | null;
+}
+
+export interface SummarySubScore {
+  name: string;
+  score: number | string | null;
+  max: number | string | null;
+}
+
+export interface SummaryArtifact {
+  artifact: string;
+  found: boolean;
+  quote: string | null;
+}
+
+export interface SummaryItem {
+  criterion_id: number;
+  score_record_id: number | null;
+  code: string;
+  name: string;
+  category: string;
+  score_type: string;
+  is_veto: boolean;
+  bucket: string;
+  state: SummaryItemState;
+  max_score: string | null;
+  max_score_source: "snapshot" | "criterion" | null;
+  final: string | null;
+  machine_score: string | null;
+  machine_status: string | null;
+  ai_suggested: string | null;
+  ai_level_label: string | null;
+  ai_confidence: number | null;
+  human_score: string | null;
+  human_level_label: string | null;
+  review_status: string;
+  evidence_status: "verified" | "unverified" | "none";
+  verdict: string | null;
+  deduction: SummaryDeduction;
+  reason: SummaryReason;
+  ai_locked: boolean;
+  committee: CommitteeMember[];
+  sub_scores: SummarySubScore[];
+  artifacts_check: SummaryArtifact[];
+  evidence: {
+    status: string;
+    verified_count: number;
+    total_count: number;
+    citations: SummaryCitation[];
+  };
+  source: {
+    source_quote: string | null;
+    source_page: number | null;
+    source_node_id: string | null;
+    levels: { label: string; min: string; max: string; criteria: string }[];
+  };
+}
+
+export interface SummaryBucket {
+  key: string;
+  label: string;
+  kind: "score" | "verdict";
+  max: string | null;
+  score: string | null;
+  all_items_score: string | null;
+  item_count: number;
+  scored_count: number;
+  missing_count: number;
+  verdicts: Record<string, number> | null;
+  items: SummaryItem[];
+}
+
+export interface BidderSummary {
+  bidder_id: number;
+  name: string;
+  state: "scored" | "excluded";
+  excluded_reason: string | null;
+  bid_price: string | null;
+  bid_price_is_run_snapshot: boolean;
+  bidder_status: string;
+  bidder_status_is_run_snapshot: boolean;
+  rank: number | null;
+  veto_flag: boolean;
+  tie_break_level: number | null;
+  tie_explanations: string[];
+  summary: {
+    total: string;
+    price_score: string | null;
+    tech_score: string;
+    commercial_score: string;
+    other_score: string;
+    bucket_sum: string;
+    consistent: boolean;
+    total_items: number;
+    scored_items: number;
+    missing_count: number;
+    missing_criteria: string[];
+  } | null;
+  buckets: SummaryBucket[];
+}
+
+export interface SummaryRun {
+  id: number;
+  status: string;
+  ready: boolean;
+  incomplete_reason: string | null;
+  package_id: number;
+  package_version: number;
+  package_content_hash: string | null;
+  package_origin: string | null;
+  llm_provider: string | null;
+  llm_model: string | null;
+  stages: string[];
+  bidder_ids: number[];
+  auto_dropped_bidders: string[];
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+export interface ScoreSummary {
+  project_id: string;
+  run: SummaryRun;
+  generated_at: string;
+  criteria_count: number;
+  ai_gating: { rule: string; settled_statuses: string[] };
+  warnings: string[];
+  bidders: BidderSummary[];
+}
+
 /** 报告疑问条目：草稿报告把待处置项逐条标出，复核后刷新即为定稿。 */
 export interface OpenQuestion {
   kind: string;
@@ -449,6 +623,15 @@ export const CATEGORY_LABELS: Record<string, string> = {
   technical: "技术分",
   commercial: "商务分",
 };
+
+/** 矩阵与明细的固定类别顺序（评分矩阵表头按此分组）。 */
+export const CATEGORY_ORDER = [
+  "qualification",
+  "compliance",
+  "price",
+  "technical",
+  "commercial",
+] as const;
 
 export const REVIEW_STATUS_LABELS: Record<string, string> = {
   pending: "待复核",

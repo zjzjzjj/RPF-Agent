@@ -23,7 +23,6 @@ import {
   HomeOutlined,
   MenuOutlined,
   SettingOutlined,
-  TableOutlined,
   TeamOutlined,
   TrophyOutlined,
   UserOutlined,
@@ -36,8 +35,7 @@ const NAVIGATION = [
   { path: "", label: "项目工作台", icon: <HomeOutlined /> },
   { path: "/rules", label: "招标文件与规则", icon: <FileTextOutlined /> },
   { path: "/bidders", label: "投标人管理", icon: <TeamOutlined /> },
-  { path: "/matrix", label: "评分矩阵", icon: <TableOutlined /> },
-  { path: "/report", label: "排名与报告", icon: <TrophyOutlined /> },
+  { path: "/results", label: "评分结果", icon: <TrophyOutlined /> },
 ];
 
 export default function AppShell({
@@ -111,7 +109,7 @@ export default function AppShell({
         theme="dark"
         mode="inline"
         selectedKeys={
-          pid ? [isEvidence ? "/matrix" : (current?.path ?? "")] : []
+          pid ? [isEvidence ? "/results" : (current?.path ?? "")] : []
         }
         items={NAVIGATION.map((item) => ({
           key: item.path,

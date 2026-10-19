@@ -64,6 +64,18 @@ export function pageImageUrl(documentId: number, pageNo: number, scale = 2): str
   return `/api/documents/${documentId}/pages/${pageNo}/image?scale=${scale}`;
 }
 
-export function reportUrl(projectId: string): string {
-  return `/api/projects/${projectId}/report.html`;
+function withRun(path: string, runId?: number | null): string {
+  return runId != null ? `${path}${path.includes("?") ? "&" : "?"}run_id=${runId}` : path;
+}
+
+export function reportUrl(projectId: string, runId?: number | null): string {
+  return withRun(`/api/projects/${projectId}/report.html`, runId);
+}
+
+export function reportFormalUrl(projectId: string, runId?: number | null): string {
+  return withRun(`/api/projects/${projectId}/report/formal.html`, runId);
+}
+
+export function reportDocxUrl(projectId: string, runId?: number | null): string {
+  return withRun(`/api/projects/${projectId}/report/docx`, runId);
 }

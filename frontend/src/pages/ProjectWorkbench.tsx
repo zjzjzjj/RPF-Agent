@@ -44,9 +44,9 @@ const STAGE_PATH: Record<string, string> = {
   tender: "/rules",
   rules: "/rules",
   bidders: "/bidders",
-  evaluate: "/matrix",
-  review: "/report",
-  report: "/report",
+  evaluate: "/results",
+  review: "/results?tab=report",
+  report: "/results?tab=report",
 };
 const STAGE_ICON: Record<string, ReactNode> = {
   tender: <FileTextOutlined />,
@@ -146,9 +146,9 @@ export default function ProjectWorkbench() {
             </Link>
           )}
           {!nextStage && data.stages.length > 0 && (
-            <Link to={`/p/${pid}/report`}>
+            <Link to={`/p/${pid}/results?tab=report`}>
               <Button type="primary" icon={<ArrowRightOutlined />}>
-                查看排名与报告
+                查看评分结果
               </Button>
             </Link>
           )}

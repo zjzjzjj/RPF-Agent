@@ -1,5 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useSearchParams } from "react-router-dom";
 import { api } from "../api/client";
+import { pickDefaultRun } from "../utils/runs";
 import type {
   Bidder,
   Citation,
@@ -16,6 +18,7 @@ import type {
   ReportOut,
   ReviewQueueItem,
   ScoreOut,
+  ScoreSummary,
   TemplateDetail,
   TemplateSummary,
   Workbench,
@@ -96,6 +99,43 @@ export function useRuns(pid: string) {
   });
 }
 
+/**
+ * 统一的「当前运行」选择：`?run=` 持久化，缺省取最近一次成功运行。
+ *
+ * 评分结果页的矩阵 / 聚合 / 排名 / 报告必须共用同一个 runId——否则会出现
+ * 「矩阵是上一次成功的运行、排名是最新那次失败的运行」这类串台。
+ */
+export function useSelectedRun(pid: string) {
+  const { data: runs } = useRuns(pid);
+  const [params, setParams] = useSearchParams();
+  const raw = params.get("run");
+  const parsed = raw != null && raw !== "" ? Number(raw) : null;
+  const fallback = pickDefaultRun(runs);
+  const runId = parsed != null && Number.isFinite(parsed) ? parsed : (fallback?.id ?? null);
+  const setRunId = (id: number | null) => {
+    const next = new URLSearchParams(params);
+    if (id == null) next.delete("run");
+    else next.set("run", String(id));
+    setParams(next, { replace: true });
+  };
+  return {
+    runs: runs ?? [],
+    runId,
+    setRunId,
+    run: (runs ?? []).find((r) => r.id === runId) ?? null,
+  };
+}
+
+/** 评分结果聚合（排名 + 四分桶 + 逐项加减分明细与理由）。 */
+export function useScoreSummary(runId: number | null, pid: string) {
+  return useQuery({
+    queryKey: ["scoreSummary", runId],
+    queryFn: () =>
+      api.get<ScoreSummary>(`/runs/${runId}/score-summary?project_id=${encodeURIComponent(pid)}`),
+    enabled: runId != null && !!pid,
+  });
+}
+
 export function useMatrix(runId: number | null) {
   return useQuery({
     queryKey: ["matrix", runId],
@@ -128,20 +168,23 @@ export function useReviewQueue(pid: string) {
   });
 }
 
-export function useRanking(pid: string) {
+export function useRanking(pid: string, runId?: number | null) {
   return useQuery({
-    queryKey: ["ranking", pid],
-    queryFn: () => api.get<Ranking>(`/projects/${pid}/ranking`),
+    queryKey: ["ranking", pid, runId ?? null],
+    queryFn: () =>
+      api.get<Ranking>(`/projects/${pid}/ranking${runId != null ? `?run_id=${runId}` : ""}`),
     enabled: !!pid,
   });
 }
 
 /** 评标报告（草稿/定稿）。有评分运行即可取——草稿把疑问逐条标出。 */
-export function useReport(pid: string) {
+export function useReport(pid: string, runId?: number | null) {
   return useQuery({
-    queryKey: ["report", pid],
-    queryFn: () => api.get<ReportOut>(`/projects/${pid}/report`),
+    queryKey: ["report", pid, runId ?? null],
+    queryFn: () =>
+      api.get<ReportOut>(`/projects/${pid}/report${runId != null ? `?run_id=${runId}` : ""}`),
     enabled: !!pid,
+    retry: false, // 无运行时后端 404，不适合重试
   });
 }
 

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import {
   Alert,
@@ -21,16 +21,8 @@ import { EyeInvisibleOutlined, EyeOutlined, ReloadOutlined } from "@ant-design/i
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import { useScore, useScoreEvidence } from "../api/hooks";
-import PdfPageViewer, { type Highlight } from "../components/PdfPageViewer";
-import type { Citation } from "../types";
+import EvidencePanel from "../components/EvidencePanel";
 import { REVIEW_STATUS_LABELS } from "../types";
-
-const METHOD_LABEL: Record<string, string> = {
-  exact: "逐字精确命中",
-  ws_insensitive: "逐字命中（忽略排版换行）",
-  prefix_fallback: "前缀回退（部分命中，待人工核对）",
-  sentence_fallback: "句读片段命中（待人工核对）",
-};
 
 export default function EvidenceWorkbench() {
   const { pid = "", sid = "" } = useParams();
@@ -39,7 +31,6 @@ export default function EvidenceWorkbench() {
   const navigate = useNavigate();
   const { data: score, isLoading } = useScore(scoreId);
   const { data: citations } = useScoreEvidence(scoreId);
-  const [selected, setSelected] = useState<number | null>(null);
   const [humanScore, setHumanScore] = useState<number | null>(null);
   const [reason, setReason] = useState("");
   const [blindDialog, setBlindDialog] = useState(false);
@@ -51,6 +42,10 @@ export default function EvidenceWorkbench() {
     qc.invalidateQueries({ queryKey: ["score", scoreId] });
     qc.invalidateQueries({ queryKey: ["matrix"] });
     qc.invalidateQueries({ queryKey: ["reviewQueue", pid] });
+    // 评分结果页的三份数据都要跟着复核动作更新
+    qc.invalidateQueries({ queryKey: ["scoreSummary"] });
+    qc.invalidateQueries({ queryKey: ["ranking", pid] });
+    qc.invalidateQueries({ queryKey: ["report", pid] });
   };
 
   const reveal = useMutation({
@@ -75,32 +70,6 @@ export default function EvidenceWorkbench() {
     onError: (e: Error) => message.error(e.message),
   });
 
-  const highlights: Highlight[] = useMemo(() => {
-    const out: Highlight[] = [];
-    for (const cit of citations ?? []) {
-      if (!cit.bbox_json || !cit.page_no) continue;
-      out.push({
-        id: cit.id,
-        page: cit.page_no,
-        boxes: cit.bbox_json,
-        pageSize: cit.page_size_json,
-        color:
-          selected === cit.id
-            ? "rgba(250, 204, 21, 0.55)"
-            : cit.verified
-              ? "rgba(134, 239, 172, 0.35)"
-              : "rgba(252, 165, 165, 0.35)",
-        label: cit.quote.slice(0, 40),
-      });
-    }
-    return out;
-  }, [citations, selected]);
-
-  const focusPage =
-    citations?.find((c) => c.id === selected)?.page_no ??
-    citations?.find((c) => c.page_no)?.page_no ??
-    1;
-
   if (isLoading || !score) return <Spin />;
 
   const isVeto = score.score_type === "veto";
@@ -109,7 +78,7 @@ export default function EvidenceWorkbench() {
   return (
     <div>
       <Space style={{ marginBottom: 8 }}>
-        <Button onClick={() => navigate(`/p/${pid}/matrix`)}>← 返回评分矩阵</Button>
+        <Button onClick={() => navigate(`/p/${pid}/results`)}>← 返回评分结果</Button>
         <Typography.Title level={5} style={{ margin: 0 }}>
           {score.bidder_name} · {score.criterion_code} {score.criterion_name}
         </Typography.Title>
@@ -326,63 +295,16 @@ export default function EvidenceWorkbench() {
         </Col>
 
         <Col xs={24} lg={13}>
-          <Card
-            size="small"
-            title={`证据（${citations?.length ?? 0} 条）`}
-            extra={
-              <Button
-                size="small"
-                icon={<ReloadOutlined />}
-                onClick={() => qc.invalidateQueries({ queryKey: ["evidence", scoreId] })}
-              >
-                刷新
-              </Button>
-            }
-          >
-            <List
+          <div style={{ marginBottom: 8, textAlign: "right" }}>
+            <Button
               size="small"
-              dataSource={citations ?? []}
-              locale={{ emptyText: "没有证据引用——无证据不评分，该项应由人工补录证据或降级" }}
-              renderItem={(cit: Citation) => (
-                <List.Item
-                  onClick={() => setSelected(cit.id)}
-                  style={{
-                    cursor: "pointer",
-                    background: selected === cit.id ? "#e6f4ff" : undefined,
-                    borderRadius: 4,
-                  }}
-                >
-                  <Space direction="vertical" size={2} style={{ width: "100%" }}>
-                    <Space wrap>
-                      {cit.verified ? <Tag color="green">已核验</Tag> : <Tag color="red">未核验</Tag>}
-                      <Tag>{METHOD_LABEL[cit.verify_method ?? ""] ?? cit.verify_method ?? "未定位"}</Tag>
-                      <Tag>第 {cit.page_no ?? "?"} 页</Tag>
-                      {cit.node_id && <Tag color="blue">{cit.node_id}</Tag>}
-                      <Tag>{cit.created_by === "human" ? "人工补录" : cit.created_by === "engine" ? "引擎生成" : "AI 引用"}</Tag>
-                    </Space>
-                    <Typography.Text style={{ background: "#fffbe6", padding: 4, borderRadius: 4, display: "block" }}>
-                      {cit.quote}
-                    </Typography.Text>
-                    {cit.candidates_json && cit.candidates_json.length > 0 && (
-                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                        候选位置：{cit.candidates_json.map((c) => `第${c.page_no}页`).join("、")}（点击后请在右侧核对）
-                      </Typography.Text>
-                    )}
-                  </Space>
-                </List.Item>
-              )}
-            />
-          </Card>
-
-          {citations?.some((c) => c.document_id) ? (
-            <Card size="small" title="原件定位（高亮为证据所在位置）" style={{ marginTop: 12 }}>
-              <PdfPageViewer
-                documentId={citations.find((c) => c.document_id && c.page_no)!.document_id!}
-                focusPage={focusPage}
-                highlights={highlights}
-              />
-            </Card>
-          ) : null}
+              icon={<ReloadOutlined />}
+              onClick={() => qc.invalidateQueries({ queryKey: ["evidence", scoreId] })}
+            >
+              刷新证据
+            </Button>
+          </div>
+          <EvidencePanel citations={citations ?? []} />
         </Col>
       </Row>
 
