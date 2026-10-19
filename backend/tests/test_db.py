@@ -48,7 +48,7 @@ def test_health(client):
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "ok"
-    assert body["llm_provider"] == "mock"
+    assert body["llm_provider"] is None  # 测试环境不配置任何 provider（全程离线）
 
 
 def test_project_crud(client):

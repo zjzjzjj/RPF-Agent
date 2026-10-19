@@ -76,12 +76,23 @@ class Gateway:
     """对上层只暴露 chat_json；provider 可替换（将来换 kuncore model_router）。"""
 
     def __init__(self, provider: LLMProvider | None = None):
-        from app.llm.registry import get_provider
-
-        self.provider: LLMProvider = provider or get_provider()
+        self._provider = provider
         self._cache: dict[str, LLMResult] = {}
         self._cache_lock = threading.Lock()
         self._sem = threading.Semaphore(config.llm_max_concurrency())
+
+    @property
+    def provider(self) -> LLMProvider:
+        """惰性解析 provider：构造网关不触发配置校验，首次调用时才解析。
+
+        客观-only 评分链路不产生任何 LLM 调用，未配置 provider 也能全程离线；
+        解析错误（未配置/密钥缺失）在真正调用时抛出，报错信息可操作。
+        """
+        if self._provider is None:
+            from app.llm.registry import get_provider
+
+            self._provider = get_provider()
+        return self._provider
 
     # ------------------------------------------------------------------
     def _check_data_class(self, data_class: str) -> None:
