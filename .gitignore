@@ -13,9 +13,24 @@ data/*.db
 data/*.db-wal
 data/*.db-shm
 
+# 迁移前自动备份（一次性，不随仓库走）
+data/*.db.bak-*
+# 后端/前端运行日志
+data/*.log
+# OCR 逐页结果缓存（重跑代价高，仅本地保留）
+data/ocr_cache/
+# bge-m3 向量缓存（同上）
+data/embed_cache/
+# 生成的评标报告产物
+data/reports/
+# 样例招标/投标件（可由 scripts/generate_sample_*.py 重建）
+data/samples/
+
 # ---- 前端 ----
 frontend/node_modules/
 frontend/dist/
+# tsc 增量构建产物
+frontend/tsconfig.tsbuildinfo
 
 # ---- 本地环境 ----
 .env
