@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import traceback
 from contextlib import suppress
 from datetime import timedelta
@@ -45,6 +46,8 @@ class JobContext:
         self.job_id = job_id
         self._done = 0
         self._total = 0
+        self._hb_stop = threading.Event()
+        self._hb_thread: threading.Thread | None = None
 
     def start(self, total: int, message: str = "") -> None:
         self._total = max(1, total)
@@ -72,6 +75,37 @@ class JobContext:
             if message is not None:
                 job.message = message[:500]
             job.heartbeat_at = utcnow()
+
+    # -- 心跳 ---------------------------------------------------------------
+    # 进度更新只在 handler 调 advance() 时刷新 heartbeat_at，而 handler 可能长时间
+    # 卡在一次 LLM 调用上（BID_EVAL_LLM_TIMEOUT_S 已接近/超过 JOB_STALE_S）。
+    # 此时任务会被判僵尸、被另一个 worker 重复领取执行（同一任务跑两遍）。
+    # 用独立守护线程持续续期，与业务步骤解耦。
+    def start_heartbeat(self) -> None:
+        if self._hb_thread is not None:
+            return
+        self._hb_thread = threading.Thread(
+            target=self._heartbeat_loop, name=f"job-heartbeat-{self.job_id}", daemon=True
+        )
+        self._hb_thread.start()
+
+    def stop_heartbeat(self) -> None:
+        self._hb_stop.set()
+        if self._hb_thread is not None:
+            self._hb_thread.join(timeout=2.0)
+            self._hb_thread = None
+
+    def _heartbeat_loop(self) -> None:
+        interval = max(1, config.JOB_HEARTBEAT_S)
+        while not self._hb_stop.wait(interval):
+            try:
+                with session_scope() as s:
+                    job = s.get(Job, self.job_id)
+                    if job is None or job.status != "running":
+                        return
+                    job.heartbeat_at = utcnow()
+            except Exception:  # noqa: BLE001 —— 心跳失败不得影响任务本身
+                log.debug("任务 %s 心跳更新失败", self.job_id, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -114,16 +148,32 @@ def _claim_next_job() -> int | None:
     SELECT→无条件 UPDATE 的读改写在多 worker 下会把同一任务发给两个人。
     """
     stale_before = utcnow() - timedelta(seconds=config.JOB_STALE_S)
+    # 先把"僵尸且重试次数已用尽"的任务判死：否则它会每轮都被重新领取、
+    # 无限重复执行（attempts 无上限时的真实风险）。
+    with session_scope() as s:
+        s.execute(
+            update(Job)
+            .where(
+                Job.status == "running",
+                Job.heartbeat_at < stale_before,
+                Job.attempts >= config.JOB_MAX_ATTEMPTS,
+            )
+            .values(
+                status="failed",
+                error=f"任务心跳超时且重试次数已达上限（{config.JOB_MAX_ATTEMPTS} 次），已放弃",
+                finished_at=utcnow(),
+            )
+        )
+    reclaimable = (
+        (Job.status == "running")
+        & (Job.heartbeat_at < stale_before)
+        & (Job.attempts < config.JOB_MAX_ATTEMPTS)
+    )
     for _ in range(10):  # 竞争失败重试若干次后让位
         with session_scope() as s:
             candidate = s.execute(
                 select(Job.id)
-                .where(
-                    or_(
-                        Job.status == "queued",
-                        (Job.status == "running") & (Job.heartbeat_at < stale_before),
-                    )
-                )
+                .where(or_(Job.status == "queued", reclaimable))
                 .order_by(Job.id)
                 .limit(1)
             ).scalar_one_or_none()
@@ -134,10 +184,7 @@ def _claim_next_job() -> int | None:
                 update(Job)
                 .where(
                     Job.id == candidate,
-                    or_(
-                        Job.status == "queued",
-                        (Job.status == "running") & (Job.heartbeat_at < stale_before),
-                    ),
+                    or_(Job.status == "queued", reclaimable),
                 )
                 .values(
                     status="running",
@@ -162,6 +209,7 @@ def _run_job(job_id: int) -> None:
         payload = dict(job.payload_json or {})
 
     ctx = JobContext(job_id)
+    ctx.start_heartbeat()
     try:
         handler = get_handler(kind)
         result = handler(ctx, payload) or {}
@@ -191,6 +239,8 @@ def _run_job(job_id: int) -> None:
                 job.status = "failed"
                 job.error = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()[-4000:]}"
                 job.finished_at = utcnow()
+    finally:
+        ctx.stop_heartbeat()
 
 
 async def _worker_loop() -> None:

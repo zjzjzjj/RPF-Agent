@@ -114,6 +114,14 @@ def run_check(check_type: str, params: dict, facts: BidFacts) -> PrimitiveResult
         field = params.get("field") or ""
         minimum = int(params.get("min_count") or 0)
         min_amount = Decimal(str(params.get("min_amount_yuan") or 0))
+        if minimum <= 0:
+            # 门槛缺失 = 不知道要数够几个，不能按 0 个当作"永远满足"。
+            # 与 document_present 同一哲学：机器看不见 ≠ 满足，转人工/LLM 裁决。
+            return PrimitiveResult(
+                "unknown",
+                "未提供数量门槛（params.min_count 缺失，需人工核查原文要求）",
+                need_human=True,
+            )
         if field == "performance":
             qualified = [a for a in facts.performance_amounts if a >= min_amount]
             if len(facts.performance_amounts) == 0:
@@ -298,6 +306,9 @@ def recover_artifacts_from_tender(
     紧跟因素原文之后（或由相邻项共享）。用因素原文前缀（空白不敏感，长度
     阶梯回退应对表格布局插字）在招标页中定位，返回自【证明材料】起的原文段。
     找不到返回空串。
+
+    **契约**：`tender_pages` 的页文本必须已归一化（调用方 scoring_service 用
+    `normalize_no_ws` 预处理过）——本函数只归一化 quote，不归一化页文本。
     """
     from app.parsing.normalize import normalize_no_ws
 
@@ -322,25 +333,6 @@ def recover_artifacts_from_tender(
         nxt = seg.find("【", 8)
         return seg[: nxt if nxt > 0 else len(seg)][:600]
     return ""
-    prefixes = [q_full[:n] for n in (40, 28, 18, 12) if len(q_full) >= n]
-    for _page_no, ptext in tender_pages:
-        pos = -1
-        for q in prefixes:
-            pos = ptext.find(q)
-            if pos >= 0:
-                break
-        if pos < 0:
-            continue
-        window = ptext[pos : pos + 1600]
-        m = re.search(r"【证明材料】", window)
-        if not m:
-            continue
-        seg = window[m.start() :]
-        nxt = seg.find("【", 8)
-        arts = _parse_artifact_segment(seg[: nxt if nxt > 0 else len(seg)])
-        if arts:
-            return arts
-    return fallback
 
 
 def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:

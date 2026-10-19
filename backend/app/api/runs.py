@@ -215,9 +215,14 @@ def cancel_run(run_id: int, actor: str = Depends(get_actor)) -> dict:
         run = s.get(EvaluationRun, run_id)
         if run is None:
             raise NotFound("运行不存在")
+        # 必须按 payload 里的 run_id 过滤：一个项目可先后发起多次评分运行，
+        # 只按 kind+状态取最新任务会取消到别的运行（口径同 scoring_service.reconcile_stale_runs）。
         job = s.execute(
-            select(Job).where(Job.kind == "evaluate", Job.status.in_(("queued", "running")))
-            .order_by(Job.id.desc()).limit(1)
+            select(Job).where(
+                Job.kind == "evaluate",
+                Job.status.in_(("queued", "running")),
+                Job.payload_json["run_id"].as_integer() == run_id,
+            ).order_by(Job.id.desc()).limit(1)
         ).scalar_one_or_none()
     ok = queue.request_cancel(job.id) if job else False
     return {"ok": ok}

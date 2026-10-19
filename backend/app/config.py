@@ -263,7 +263,7 @@ def llm_daily_call_budget() -> int:
 
 def llm_prompt_version() -> str:
     """提示词版本号；进入缓存键与审计记录。改 prompt 必须同步改它。"""
-    return os.environ.get("BID_EVAL_PROMPT_VERSION", "2026-10-14.1")
+    return os.environ.get("BID_EVAL_PROMPT_VERSION", "2026-10-19.1")
 
 
 def local_endpoint_hosts() -> list[str]:
@@ -323,3 +323,4 @@ def llm_api_key_configured() -> bool:
 # ---------------------------------------------------------------------------
 JOB_HEARTBEAT_S = 5
 JOB_STALE_S = 300  # 心跳超时视为 worker 已死，任务可被重新拾取
+JOB_MAX_ATTEMPTS = 3  # 僵尸重领上限；超过则判 failed，不再无限重复执行

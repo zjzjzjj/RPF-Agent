@@ -607,3 +607,65 @@ def test_document_present_guarantee_regex_miss_phrase_fallback():
     assert not facts.has_guarantee  # 正则要求「缴纳投标保证金」连续出现，此处词序不同
     r = run_check("document_present", {"document": "投标保证金缴纳凭证"}, facts)
     assert r.status == "pass"
+
+
+# ---------------------------------------------------------------------------
+# count_at_least 的数量门槛（params.min_count）
+# ---------------------------------------------------------------------------
+def _facts_with_performance(n: int):
+    from decimal import Decimal
+
+    from app.engine.facts import BidFacts
+
+    return BidFacts(text="业绩见附件。", performance_amounts=[Decimal("1000000")] * n)
+
+
+def test_count_at_least_missing_min_count_is_unknown():
+    """min_count 缺失时不得按 0 个当作"永远满足"，应转人工（机器看不见 ≠ 满足）。"""
+    from app.engine.objective import run_check
+
+    r = run_check("count_at_least", {"field": "performance"}, _facts_with_performance(5))
+    assert r.status == "unknown" and r.need_human
+    assert "min_count" in r.message
+
+
+def test_count_at_least_with_min_count_judges_normally():
+    """给出 min_count 后按数量正常判定（阈值上下各验一次）。"""
+    from app.engine.objective import run_check
+
+    params = {"field": "performance", "min_count": "3", "min_amount_yuan": "600000"}
+    assert run_check("count_at_least", params, _facts_with_performance(3)).status == "pass"
+    assert run_check("count_at_least", params, _facts_with_performance(2)).status == "fail"
+
+
+def test_recover_artifacts_from_tender_extracts_segment():
+    """从招标原文定位因素原文并截出【证明材料】段（首段逻辑，非死代码）。
+
+    契约：tender_pages 的文本必须**已归一化**（调用方 scoring_service 用
+    normalize_no_ws 预处理过）——函数用归一化后的 quote 前缀去页里找。
+    """
+    from app.engine.objective import recover_artifacts_from_tender
+    from app.parsing.normalize import normalize_no_ws
+
+    criterion = {"source_quote": "投标人业绩：每提供 1 个类似项目业绩得 2 分。"}
+    pages = [
+        (1, normalize_no_ws("第一章 招标公告")),
+        (2, normalize_no_ws(
+            "投标人业绩：每提供 1 个类似项目业绩得 2 分。"
+            "【证明材料】须提供合同复印件、发票复印件。不提供不得分。【其他】无"
+        )),
+    ]
+    seg = recover_artifacts_from_tender(criterion, pages)
+    assert isinstance(seg, str)
+    assert seg.startswith("【证明材料】")
+    assert "合同复印件" in seg
+    assert "【其他】" not in seg  # 到下一个【】段为止
+
+
+def test_recover_artifacts_from_tender_returns_empty_when_absent():
+    from app.engine.objective import recover_artifacts_from_tender
+
+    assert recover_artifacts_from_tender({"source_quote": "无材料要求"}, [(1, "无关正文")]) == ""
+    assert recover_artifacts_from_tender({"source_quote": ""}, [(1, "x")]) == ""
+    assert recover_artifacts_from_tender({"source_quote": "某段"}, []) == ""
+
