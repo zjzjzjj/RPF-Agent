@@ -54,6 +54,9 @@ export default function ItemTable({ bucket, onOpenReason, onOpenEvidence }: Prop
       size="small"
       pagination={false}
       dataSource={bucket.items}
+      // 列宽合计约 1090：容器更窄时表格内部横向滚动，
+      // 否则「理由」这种弹性列会被挤成 1 字符宽，文字逐字竖排。
+      scroll={{ x: 1090 }}
       rowClassName={(item) => (item.state === "not_run" ? "row-not-run" : "")}
       onRow={(item) => ({
         style:
@@ -64,23 +67,23 @@ export default function ItemTable({ bucket, onOpenReason, onOpenEvidence }: Prop
               : undefined,
       })}
       columns={[
-        { title: "编号", dataIndex: "code", width: 84, fixed: "left" as const },
-        { title: "评分项", dataIndex: "name", width: 200, ellipsis: true },
+        { title: "编号", dataIndex: "code", width: 76, fixed: "left" as const },
+        { title: "评分项", dataIndex: "name", width: 190, ellipsis: true },
         {
           title: "满分",
-          width: 70,
+          width: 64,
           align: "right" as const,
           render: (_, item) => (isVerdictBucket ? "—" : (item.max_score ?? "—")),
         },
         {
           title: "得分",
-          width: 110,
+          width: 96,
           align: "right" as const,
-          render: (_, item) => (isVerdictBucket ? scoreCell(item) : scoreCell(item)),
+          render: (_, item) => scoreCell(item),
         },
         {
           title: "失分",
-          width: 80,
+          width: 72,
           align: "right" as const,
           render: (_, item) => {
             if (isVerdictBucket || item.deduction.kind !== "points") return "—";
@@ -97,7 +100,7 @@ export default function ItemTable({ bucket, onOpenReason, onOpenEvidence }: Prop
         },
         {
           title: "状态",
-          width: 100,
+          width: 92,
           render: (_, item) => {
             const t = STATE_TAG[item.state] ?? { color: "default", text: item.state };
             return <Tag color={t.color}>{t.text}</Tag>;
@@ -105,18 +108,32 @@ export default function ItemTable({ bucket, onOpenReason, onOpenEvidence }: Prop
         },
         {
           title: "理由",
-          render: (_, item) => (
-            <Typography.Text
-              type={item.ai_locked ? "warning" : undefined}
-              style={{ fontSize: 12 }}
-            >
-              {reasonSummary(item)}
-            </Typography.Text>
-          ),
+          width: 280,
+          render: (_, item) => {
+            const summary = reasonSummary(item);
+            const full =
+              item.reason.ai_reasoning ?? item.reason.machine_reason ?? item.reason.human_reason ?? "";
+            return (
+              <Typography.Text
+                type={item.ai_locked ? "warning" : undefined}
+                title={full || summary}
+                style={{
+                  display: "block",
+                  maxWidth: 260,
+                  overflow: "hidden",
+                  whiteSpace: "nowrap",
+                  textOverflow: "ellipsis",
+                  fontSize: 12,
+                }}
+              >
+                {summary}
+              </Typography.Text>
+            );
+          },
         },
         {
           title: "证据",
-          width: 130,
+          width: 110,
           render: (_, item) => {
             if (item.evidence.total_count === 0) {
               return (
@@ -134,9 +151,10 @@ export default function ItemTable({ bucket, onOpenReason, onOpenEvidence }: Prop
         },
         {
           title: "操作",
-          width: 150,
+          width: 110,
+          fixed: "right" as const,
           render: (_, item) => (
-            <Space size={4}>
+            <Space size={0}>
               <Button size="small" type="link" onClick={() => onOpenReason(item)}>
                 理由
               </Button>
