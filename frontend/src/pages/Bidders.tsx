@@ -214,12 +214,14 @@ export default function Bidders() {
       </Space>
 
       <Table<Bidder>
-        scroll={{ x: 1100 }}
+        scroll={{ x: 1160 }}
+        tableLayout="fixed"
         rowKey="id"
         dataSource={bidders ?? []}
         pagination={false}
         columns={[
-          { title: "投标人", dataIndex: "name" },
+          // 必须给宽：否则文件名 Tag（nowrap）会把自动列宽撑开，这一列被压成竖排
+          { title: "投标人", dataIndex: "name", width: 220, ellipsis: true },
           {
             title: "统一社会信用代码",
             dataIndex: "unified_code",
@@ -243,6 +245,15 @@ export default function Bidders() {
                             ? "orange"
                             : "blue"
                     }
+                    title={`${d.original_filename}（${d.parse_status}，${d.page_count ?? "?"} 页）`}
+                    style={{
+                      maxWidth: 236,
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                      display: "inline-block",
+                      verticalAlign: "middle",
+                    }}
                   >
                     {d.original_filename}（{d.parse_status}，{d.page_count ?? "?"} 页）
                   </Tag>
