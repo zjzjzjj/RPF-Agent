@@ -105,6 +105,20 @@ def get_workbench(project_id: str) -> WorkbenchOut:
         )
         parsed = [d for d in tender_docs if d.parse_status in ("parsed", "degraded")]
         failed = [d for d in tender_docs if d.parse_status == "failed"]
+        # 已有规则包（模板/文件/法规）时，招标文件是可选阶段：
+        # "使用默认规则直接评分"不应被工作台一直催着上传招标文件。
+        has_rules = (
+            s.execute(
+                select(RulePackage.id)
+                .where(
+                    RulePackage.project_id == project_id,
+                    RulePackage.status != "superseded",
+                    RulePackage.merge_target_id.is_(None),
+                )
+                .limit(1)
+            ).first()
+            is not None
+        )
         if failed:
             stages.append(StageState(key="tender", label="招标文件", state="blocked",
                                      detail=f"{len(failed)} 份解析被拒绝", todo_count=len(failed)))
@@ -115,15 +129,22 @@ def get_workbench(project_id: str) -> WorkbenchOut:
         elif tender_docs:
             stages.append(StageState(key="tender", label="招标文件", state="active",
                                      detail="解析中", todo_count=len(tender_docs)))
+        elif has_rules:
+            stages.append(StageState(key="tender", label="招标文件", state="pending",
+                                     detail="未上传（使用内置/模板规则）", optional=True))
         else:
             stages.append(StageState(key="tender", label="招标文件", state="pending",
                                      detail="尚未上传招标文件"))
 
-        # ② 规则包
+        # ② 规则包：与 current_package 同口径（排除 superseded 与 merge 辅助包）
         pkg = (
             s.execute(
                 select(RulePackage)
-                .where(RulePackage.project_id == project_id)
+                .where(
+                    RulePackage.project_id == project_id,
+                    RulePackage.status != "superseded",
+                    RulePackage.merge_target_id.is_(None),
+                )
                 .order_by(RulePackage.version.desc())
                 .limit(1)
             )
@@ -137,11 +158,14 @@ def get_workbench(project_id: str) -> WorkbenchOut:
                                      detail=f"已冻结 v{pkg.version}（{pkg.content_hash or ''}）"))
         else:
             total = s.execute(
-                select(func.count(Criterion.id)).where(Criterion.package_id == pkg.id)
+                select(func.count(Criterion.id)).where(
+                    Criterion.package_id == pkg.id, Criterion.status != "retired"
+                )
             ).scalar_one()
             unverified = s.execute(
                 select(func.count(Criterion.id)).where(
-                    Criterion.package_id == pkg.id, Criterion.status != "verified"
+                    Criterion.package_id == pkg.id,
+                    Criterion.status.notin_(("verified", "retired")),
                 )
             ).scalar_one()
             stages.append(StageState(key="rules", label="评分规则", state="active",

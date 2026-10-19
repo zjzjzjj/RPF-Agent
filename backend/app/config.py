@@ -88,6 +88,15 @@ def auto_mode() -> bool:
     return os.environ.get("BID_EVAL_AUTO_MODE", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
+def auto_match_enabled() -> bool:
+    """招标文件解析成功后自动匹配/更新规则（默认开）。
+
+    关闭后上传只解析、不自动编译；用户仍可在规则页手动「重新匹配」。
+    未配置 LLM 时即使开启也不会触发（见 services/auto_merge_service.py）。
+    """
+    return os.environ.get("BID_EVAL_AUTO_MATCH", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
 # ---------------------------------------------------------------------------
 # 解析
 # ---------------------------------------------------------------------------

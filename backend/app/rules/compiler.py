@@ -558,6 +558,20 @@ def compile_rules_job(ctx: JobContext, payload: dict) -> dict:
             target_id = merge_service.auto_resolve_merge(
                 package_id, actor=actor, provider=provider, model=model)
             result.update(auto_resolved=True, target_package_id=target_id)
+            # 合并后校验摘要：总分/价格公式可能被覆盖/追加破坏，
+            # 自动路径只 merge、不 confirm/freeze，由前端提示人工修正。
+            from app.services import rule_service
+
+            findings = rule_service.get_validations(target_id)
+            result["post_merge"] = {
+                "error_codes": sorted({v.code for v in findings if v.severity == "error"}),
+                "warn_codes": sorted({v.code for v in findings if v.severity != "error"}),
+                "errors": [
+                    {"code": v.code, "message": v.message}
+                    for v in findings
+                    if v.severity == "error"
+                ],
+            }
         except Exception as exc:  # noqa: BLE001 —— 人工兜底通道保留（匹配提案抽屉）
             log.warning("自动合并失败（可人工在匹配提案抽屉处置）：%s", exc)
             result.update(auto_resolved=False, auto_resolve_error=str(exc)[:300])

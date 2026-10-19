@@ -10,6 +10,7 @@ from decimal import Decimal
 
 from sqlalchemy import select
 
+from app import config
 from app.db.models import (
     Criterion,
     CriterionCheck,
@@ -20,7 +21,7 @@ from app.db.models import (
     RulePackage,
 )
 from app.db.session import session_scope
-from app.errors import Conflict, NotFound
+from app.errors import Conflict, NotFound, ValidationFailed
 from app.rules import compiler
 from app.rules.library.loader import get_template, template_content_hash
 
@@ -81,6 +82,92 @@ def instantiate_template(project_id: str, template_id: str, actor: str) -> int:
     # 明示"模板条目尚无招标文件依据、未签批不得冻结"。
     compiler.run_validations(package_id)
     return package_id
+
+
+def use_default_template(
+    project_id: str, template_id: str, actor: str, reason: str | None = None
+) -> dict:
+    """无招标文件的一键启用：实例化（或复用草稿模板包）→ 全部签批 → 确认 → 冻结。
+
+    - 无规则包：实例化 templates/{template_id}；
+    - 已有 draft 且 origin in (template, merged)：直接复用（建项目时已选模板的场景，
+      此时再实例化会 409）；
+    - 已 frozen：幂等返回 already_frozen；
+    - 其它来源（document/law）或 confirmed：409，提示先解冻创建新版本。
+    """
+    from app.services import rule_service
+
+    reason = (reason or "").strip()
+    if not reason:
+        if not config.auto_mode():
+            raise ValidationFailed("人工模式下启用默认规则必须填写理由")
+        reason = f"启用内置默认规则模板（{template_id}）"
+    pkg = rule_service.current_package(project_id)
+    created = False
+    if pkg is not None:
+        if pkg.status == "frozen":
+            return {
+                "package_id": pkg.id,
+                "ok": True,
+                "frozen": True,
+                "already_frozen": True,
+                "created": False,
+                "signed_off": 0,
+                "blockers": [],
+                "validations": _validation_dicts(pkg.id),
+            }
+        if not (pkg.status == "draft" and pkg.origin in ("template", "merged")):
+            raise Conflict(
+                "项目已有非模板规则包；如需更换默认规则，请先确认并冻结，再「解冻并创建新版本」"
+            )
+        package_id = pkg.id
+    else:
+        package_id = instantiate_template(project_id, template_id, actor)
+        created = True
+
+    signed = rule_service.signoff_all_criteria(package_id, actor, reason)
+    signed_off = int((signed or {}).get("signed_off") or 0)
+    try:
+        rule_service.confirm_package(package_id, actor)
+        rule_service.freeze_package(package_id, actor)
+    except ValidationFailed as exc:
+        blockers = (exc.detail or {}).get("blockers", []) if isinstance(exc.detail, dict) else []
+        return {
+            "package_id": package_id,
+            "ok": False,
+            "frozen": False,
+            "already_frozen": False,
+            "created": created,
+            "signed_off": signed_off,
+            "blockers": blockers,
+            "validations": _validation_dicts(package_id),
+            "message": exc.message,
+        }
+    return {
+        "package_id": package_id,
+        "ok": True,
+        "frozen": True,
+        "already_frozen": False,
+        "created": created,
+        "signed_off": signed_off,
+        "blockers": [],
+        "validations": _validation_dicts(package_id),
+    }
+
+
+def _validation_dicts(package_id: int) -> list[dict]:
+    """把包级校验结果转成可直接序列化的 dict 列表。"""
+    from app.services import rule_service
+
+    return [
+        {
+            "code": v.code,
+            "severity": v.severity,
+            "message": v.message,
+            "hint": v.hint,
+        }
+        for v in rule_service.get_validations(package_id)
+    ]
 
 
 def _persist_template_criterion(s, package_id: int, template_hash: str, tpl, c, seq: int) -> None:  # noqa: ANN001

@@ -448,9 +448,9 @@ def signoff_all_criteria(package_id: int, actor: str, reason: str) -> dict:
                 continue
             crit.status = "verified"
             crit.signoff_json = {
-                "actor": actor,
+                "by": actor,
+                "at": utcnow().isoformat(),
                 "reason": reason,
-                "time": utcnow().isoformat(),
             }
             s.add(crit)
             signed += 1
@@ -517,6 +517,7 @@ def add_criterion(package_id: int, body: dict, actor: str, reason: str) -> Crite
             veto_consequence=body.get("veto_consequence"),
             source_quote=body.get("source_quote"),
             source_node_id=body.get("source_node_id"),
+            origin="manual",  # 人工新增：覆盖率/来源标签必须与招标文件抽取区分
             status="verified",
             sort_order=900 + n,
         )
@@ -570,6 +571,87 @@ def signoff_criterion(criterion_id: int, actor: str, reason: str) -> Criterion:
     return crit
 
 
+def retire_criterion(criterion_id: int, actor: str, reason: str) -> Criterion:
+    """停用评分项（仅草稿）：退出快照、总分与权重校验，保留行与留痕。
+
+    停用是"本项目不启用该条判据"，不是删除——恢复时按原状态回滚。
+    """
+    if not reason.strip():
+        raise ValidationFailed("停用评分项必须填写理由")
+    with session_scope() as s:
+        crit = s.get(Criterion, criterion_id)
+        if crit is None:
+            raise NotFound("评分项不存在")
+        _require_draft(crit.package_id)
+        if crit.status == "retired":
+            raise Conflict("该评分项已停用")
+        old = crit.status
+        edit = dict(crit.edit_json or {}) if isinstance(crit.edit_json, dict) else {}
+        edit["retire"] = {
+            "from_status": old,
+            "by": actor,
+            "at": utcnow().isoformat(),
+            "reason": reason,
+        }
+        crit.edit_json = edit
+        crit.status = "retired"
+        s.add(crit)
+        s.add(
+            ReviewRecord(
+                subject_type="criterion", subject_id=str(criterion_id), action="retire",
+                actor=actor, reason=reason,
+                old_value_json={"status": old},
+                new_value_json={"status": "retired"},
+            )
+        )
+        s.flush()
+        s.expunge(crit)
+        package_id = crit.package_id
+    compiler.run_validations(package_id)
+    _touch_package_updated(package_id)
+    return crit
+
+
+def restore_criterion(criterion_id: int, actor: str, reason: str) -> Criterion:
+    """恢复被停用的评分项（仅草稿）：按停用前状态回滚。"""
+    if not reason.strip():
+        raise ValidationFailed("恢复评分项必须填写理由")
+    with session_scope() as s:
+        crit = s.get(Criterion, criterion_id)
+        if crit is None:
+            raise NotFound("评分项不存在")
+        _require_draft(crit.package_id)
+        if crit.status != "retired":
+            raise ValidationFailed(f"评分项状态为 {crit.status}，无需恢复")
+        edit = dict(crit.edit_json or {}) if isinstance(crit.edit_json, dict) else {}
+        prior = (edit.get("retire") or {}).get("from_status")
+        if not prior:
+            # 兜底：模板条目未签批 → needs_signoff；其余回 verified
+            prior = (
+                "needs_signoff"
+                if crit.origin == "template" and crit.signoff_json is None
+                else "verified"
+            )
+        edit.pop("retire", None)
+        crit.edit_json = edit or None
+        crit.status = prior
+        s.add(crit)
+        s.add(
+            ReviewRecord(
+                subject_type="criterion", subject_id=str(criterion_id), action="restore",
+                actor=actor, reason=reason,
+                old_value_json={"status": "retired"},
+                new_value_json={"status": prior},
+            )
+        )
+        s.flush()
+        s.expunge(crit)
+        package_id = crit.package_id
+    compiler.run_validations(package_id)
+    _touch_package_updated(package_id)
+    return crit
+
+
 def coverage_report(package_id: int) -> dict:
     """覆盖率报告（设计稿 §6.3）：文档覆盖 / 模板兜底已签批 / 待签批 / 已退休 / 人工。"""
     with session_scope() as s:
@@ -581,14 +663,14 @@ def coverage_report(package_id: int) -> dict:
         ).scalars().all()
 
     def _bucket(c: Criterion) -> str:  # noqa: ANN001
+        # retired 必须先判：否则 document/manual 来源的停用条目会被算进
+        # document_backed/manual，覆盖率与"已停用"计数全部错位。
+        if c.status == "retired":
+            return "retired"
         if c.origin == "law":
             # 法律层（P0）：权威原文 + 法条核验，免签批，自成一桶
-            if c.status == "retired":
-                return "retired"
             return "law"
         if c.origin == "template":
-            if c.status == "retired":
-                return "retired"
             if c.signoff_json is not None:
                 return "template_fallback_signed"
             return "template_fallback_pending"
@@ -659,9 +741,9 @@ def _auto_settle_blocking(package_id: int, actor: str) -> None:
             c.status = "verified"
             if c.origin == "template" and old == "needs_signoff":
                 c.signoff_json = {
-                    "actor": actor,
+                    "by": actor,
                     "reason": "全自动模式：模板兜底条目自动签批",
-                    "time": utcnow().isoformat(),
+                    "at": utcnow().isoformat(),
                 }
             c.edit_json = {
                 "auto_mode": True,

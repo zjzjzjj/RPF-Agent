@@ -260,16 +260,35 @@ class TemplateSummaryOut(BaseModel):
     library_version: str
     criteria_count: int
     categories_summary: dict[str, int]
+    applicable: dict = Field(default_factory=dict)
+    notes: str | None = None
 
 
 class TemplateDetailOut(TemplateSummaryOut):
-    applicable: dict
-    notes: str | None = None
     criteria: list[TemplateCriterionOut]
 
 
 class SignoffBody(BaseModel):
     reason: str = Field(min_length=1)
+
+
+class UseDefaultTemplateBody(BaseModel):
+    """一键启用默认规则：无包时按 template_id 实例化；已有草稿模板包则直接启用。"""
+
+    template_id: str = Field(default="comprehensive-services", min_length=1)
+    reason: str | None = None
+
+
+class UseDefaultTemplateOut(BaseModel):
+    package_id: int
+    ok: bool
+    frozen: bool
+    already_frozen: bool = False
+    created: bool = False
+    signed_off: int = 0
+    blockers: list[dict] = Field(default_factory=list)
+    validations: list[dict] = Field(default_factory=list)
+    message: str | None = None
 
 
 # ---------------------------------------------------------------------------

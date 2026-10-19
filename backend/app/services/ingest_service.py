@@ -95,6 +95,7 @@ def parse_document(ctx: JobContext, payload: dict) -> dict:
             raise ValueError(f"文档不存在：{document_id}")
         path = doc.stored_path
         prefix = f"{doc.kind}{doc.id}"
+        project_id = doc.project_id
 
     try:
         extracted = extract_document(path)
@@ -161,11 +162,16 @@ def parse_document(ctx: JobContext, payload: dict) -> dict:
             doc.warnings_json = warnings
 
     ctx.advance(message="完成")
-    return {
+    result = {
         "pages": len(extracted.pages),
         "nodes": len(nodes),
         "degraded": extracted.degraded,
     }
+    # 招标文件解析成功 → 自动匹配并更新规则（护栏见 auto_merge_service）
+    from app.services.auto_merge_service import maybe_schedule_auto_match
+
+    result.update(maybe_schedule_auto_match(project_id, document_id))
+    return result
 
 
 # ---------------------------------------------------------------------------
