@@ -114,6 +114,23 @@ class LawImportBody(BaseModel):
     criteria: list[dict] = Field(default_factory=list)
 
 
+class LawPackSummaryOut(BaseModel):
+    """仓库内固化的法规规则包（rules/library/law_packs/）目录项。"""
+
+    id: str
+    name: str
+    version: str
+    rule_count: int
+    scope: str | None = None
+    total_max: float | None = None
+
+
+class LawPackImportBody(BaseModel):
+    """按 pack_id 导入仓库内固化的法规规则包（无需前端持有 87 条 JSON）。"""
+
+    pack_id: str = Field(default="general-law", min_length=1)
+
+
 class DroppedNodeOut(BaseModel):
     code: str
     node_id: str

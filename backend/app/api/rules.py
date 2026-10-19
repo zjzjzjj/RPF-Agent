@@ -1,10 +1,12 @@
 """规则编译 / 审核 / 冻结 API。"""
 from __future__ import annotations
 
+import re
+
 from fastapi import APIRouter, Depends, Query
 
 from app.deps import get_actor
-from app.errors import NotFound
+from app.errors import NotFound, ValidationFailed
 from app.schemas.rules import (
     CompileRequest,
     CoverageOut,
@@ -15,6 +17,8 @@ from app.schemas.rules import (
     InstantiateBody,
     LawImportBody,
     LawImportOut,
+    LawPackImportBody,
+    LawPackSummaryOut,
     LevelsBody,
     LevelOut,
     MatchProposalOut,
@@ -280,6 +284,66 @@ def import_law_rules(project_id: str, body: LawImportBody, actor: str = Depends(
     result = law_import_service.import_law_package(
         project_id, {"package": body.package, "criteria": body.criteria}, actor
     )
+    return LawImportOut(
+        package_id=result["package_id"],
+        version=result["version"],
+        created=result["created"],
+        imported=result["imported"],
+        skipped_codes=result["skipped_codes"],
+        dropped_nodes=result["dropped_nodes"],
+        validations=result["validations"],
+    )
+
+
+@router.get("/rules/law-packs", response_model=list[LawPackSummaryOut])
+def list_law_packs() -> list[LawPackSummaryOut]:
+    """仓库内固化的法规规则包目录（前端「导入法规包」选择用）。
+
+    包是 `scripts/build_law_pack.py` 的生成物，禁止手改；此处只做目录展示，
+    真正的 fail-fast 校验在导入时由 load_law_pack 执行。
+    """
+    from app.rules.library.law_pack_loader import LAW_PACKS_DIR, LawPackError, load_law_pack
+
+    out: list[LawPackSummaryOut] = []
+    if not LAW_PACKS_DIR.is_dir():
+        return out
+    for d in sorted(p for p in LAW_PACKS_DIR.iterdir() if (p / "pack.json").is_file()):
+        try:
+            doc = load_law_pack(d)
+        except LawPackError:
+            continue  # 损坏的包不阻塞目录展示（导入时会给出明确报错）
+        pkg = doc["package"]
+        out.append(
+            LawPackSummaryOut(
+                id=str(pkg.get("id") or d.name),
+                name=str(pkg.get("name") or d.name),
+                version=str(pkg.get("version") or ""),
+                rule_count=len(doc["criteria"]),
+                scope=pkg.get("scope"),
+                total_max=pkg.get("total_max"),
+            )
+        )
+    return out
+
+
+@router.post("/projects/{project_id}/rules/import-law-pack", response_model=LawImportOut)
+def import_law_pack(
+    project_id: str, body: LawPackImportBody, actor: str = Depends(get_actor)
+) -> LawImportOut:
+    """按 pack_id 导入仓库内固化的法规规则包（与 import-law 同一服务、同一留痕）。"""
+    from app.rules.library.law_pack_loader import (
+        LawPackError,
+        default_pack_dir,
+        load_law_pack,
+    )
+
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", body.pack_id):
+        raise ValidationFailed(f"非法的法规包标识：{body.pack_id}")
+    try:
+        doc = load_law_pack(default_pack_dir(body.pack_id))
+    except LawPackError as exc:
+        raise ValidationFailed(f"法规规则包加载失败：{exc}") from exc
+    result = law_import_service.import_law_package(project_id, doc, actor)
     return LawImportOut(
         package_id=result["package_id"],
         version=result["version"],

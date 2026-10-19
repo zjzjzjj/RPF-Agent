@@ -6,6 +6,7 @@ import type {
   Coverage,
   DocumentOut,
   JobOut,
+  LawPackSummary,
   MatchProposal,
   Matrix,
   ModelsOut,
@@ -158,6 +159,15 @@ export function useTemplate(templateId: string | null) {
     queryKey: ["template", templateId],
     queryFn: () => api.get<TemplateDetail>(`/rules/templates/${templateId}`),
     enabled: !!templateId,
+    staleTime: 3600_000,
+  });
+}
+
+/** 仓库内固化的法规规则包目录（导入选择用） */
+export function useLawPacks() {
+  return useQuery({
+    queryKey: ["lawPacks"],
+    queryFn: () => api.get<LawPackSummary[]>("/rules/law-packs"),
     staleTime: 3600_000,
   });
 }

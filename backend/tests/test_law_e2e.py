@@ -174,3 +174,44 @@ def test_import_packed_general_law(client, monkeypatch) -> None:
     finally:
         lk.reset_cache()
         reset_law_pack_cache()
+
+
+def test_list_builtin_law_packs(client) -> None:
+    """GET /rules/law-packs：仓库内固化包目录（前端「导入法规包」选择用）。"""
+    r = client.get("/api/rules/law-packs")
+    assert r.status_code == 200, r.text
+    packs = {p["id"]: p for p in r.json()}
+    assert "general-law" in packs
+    assert packs["general-law"]["rule_count"] == 87
+    assert packs["general-law"]["version"]
+
+
+def test_import_packed_general_law_by_id(client, monkeypatch) -> None:
+    """POST /rules/import-law-pack：按 pack_id 导入固化包（前端无需持有 87 条 JSON）。"""
+    monkeypatch.setenv("BID_EVAL_LAW_KB_PATH", str(REPO_KB))
+    lk.reset_cache()
+    reset_law_pack_cache()
+    try:
+        pid = client.post("/api/projects", json={"name": "按 id 导入固化包"}).json()["id"]
+        r = client.post(f"/api/projects/{pid}/rules/import-law-pack",
+                        json={"pack_id": "general-law"})
+        assert r.status_code == 200, r.text
+        out = r.json()
+        assert out["imported"] == 87
+        assert out["created"] is True
+        assert all(v["severity"] != "error" for v in out["validations"]), out["validations"]
+
+        detail = client.get(f"/api/projects/{pid}/rules").json()
+        assert detail["origin"] == "law"
+        assert len(detail["criteria"]) == 87
+    finally:
+        lk.reset_cache()
+        reset_law_pack_cache()
+
+
+def test_import_law_pack_rejects_bad_id(client) -> None:
+    """非法 pack_id（路径穿越/不存在/大写）一律 422，不落到 load_law_pack 之外。"""
+    pid = client.post("/api/projects", json={"name": "坏 pack_id"}).json()["id"]
+    for bad in ("../etc", "no-such-pack", "General-Law"):
+        r = client.post(f"/api/projects/{pid}/rules/import-law-pack", json={"pack_id": bad})
+        assert r.status_code == 422, f"{bad} → {r.status_code}"

@@ -172,6 +172,16 @@ export interface TemplateDetail extends TemplateSummary {
   criteria: TemplateCriterion[];
 }
 
+/** 仓库内固化的法规规则包（GET /rules/law-packs） */
+export interface LawPackSummary {
+  id: string;
+  name: string;
+  version: string;
+  rule_count: number;
+  scope: string | null;
+  total_max: number | null;
+}
+
 /** 覆盖率报告（S0） */
 export interface Coverage {
   total: number;

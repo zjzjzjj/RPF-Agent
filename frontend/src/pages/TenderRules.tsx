@@ -26,10 +26,10 @@ import {
   Upload,
   message,
 } from "antd";
-import { PlayCircleOutlined, CheckOutlined, PlusOutlined, ThunderboltOutlined, ReloadOutlined, UploadOutlined, SwapOutlined } from "@ant-design/icons";
+import { PlayCircleOutlined, CheckOutlined, PlusOutlined, ThunderboltOutlined, ReloadOutlined, UploadOutlined, SwapOutlined, ImportOutlined } from "@ant-design/icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
-import { useCoverage, useDocuments, useJob, useMatchProposal, useModels, useRules } from "../api/hooks";
+import { useCoverage, useDocuments, useJob, useLawPacks, useMatchProposal, useModels, useRules } from "../api/hooks";
 import type { CriterionOut, MatchCriterionBrief, MatchPair, ValidationOut } from "../types";
 import { CATEGORY_LABELS } from "../types";
 
@@ -51,6 +51,7 @@ export default function TenderRules() {
   const { data: rules, isLoading } = useRules(pid);
   const { data: models } = useModels();
   const { data: coverage } = useCoverage(rules?.id ?? null);
+  const { data: lawPacks } = useLawPacks();
   const [jobId, setJobId] = useState<number | null>(null);
   const [selectedModel, setSelectedModel] = useState<string | undefined>(undefined);
   const { data: job } = useJob(jobId);
@@ -60,9 +61,16 @@ export default function TenderRules() {
   const [proposalOpen, setProposalOpen] = useState(false);
   const [unfreezeOpen, setUnfreezeOpen] = useState(false);
   const [unfreezeReason, setUnfreezeReason] = useState("");
+  const [lawOpen, setLawOpen] = useState(false);
+  const [lawPackId, setLawPackId] = useState("general-law");
+  const [addOpen, setAddOpen] = useState(false);
+  const [addForm] = Form.useForm();
   const mergeCompileRef = useRef(false);
   const isTemplatePackage = rules?.origin === "template";
   const canMerge = rules?.origin === "template" || rules?.origin === "merged";
+  // 法规包只能导入到草稿包（confirmed/frozen 会 409；无包时后端会新建草稿）
+  const canImportLaw = !rules || rules.status === "none" || rules.status === "draft";
+  const canAddCriterion = !!rules && rules.id > 0 && rules.status === "draft";
 
   const tenderDoc = documents?.find(
     (d) => d.kind === "tender" && (d.parse_status === "parsed" || d.parse_status === "degraded"),
@@ -212,6 +220,39 @@ export default function TenderRules() {
     onError: (e: Error) => message.error(e.message),
   });
 
+  // 导入仓库内固化的法规规则包（87 条通则，法条逐条核验 fail-closed）
+  const importLaw = useMutation({
+    mutationFn: (packId: string) =>
+      api.post<{ package_id: number; imported: number; created: boolean; skipped_codes: string[] }>(
+        `/projects/${pid}/rules/import-law-pack`,
+        { pack_id: packId },
+      ),
+    onSuccess: (r) => {
+      qc.invalidateQueries({ queryKey: ["rules", pid] });
+      qc.invalidateQueries({ queryKey: ["coverage", rules?.id] });
+      qc.invalidateQueries({ queryKey: ["workbench", pid] });
+      setLawOpen(false);
+      message.success(
+        `法规规则包已导入：新增 ${r.imported} 条${r.skipped_codes.length ? `，跳过 ${r.skipped_codes.length} 条（已存在）` : ""}（${r.created ? "新建草稿包" : "追加进现有草稿"}）`,
+      );
+    },
+    onError: (e: Error) => message.error(e.message),
+  });
+
+  // 人工新增评分项（仅草稿包；理由必填，编号自动为 x1、x2…）
+  const addCriterion = useMutation({
+    mutationFn: (values: Record<string, unknown>) =>
+      api.post<CriterionOut>(`/rules/packages/${rules!.id}/criteria`, values),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["rules", pid] });
+      qc.invalidateQueries({ queryKey: ["coverage", rules?.id] });
+      setAddOpen(false);
+      addForm.resetFields();
+      message.success("已新增评分项并留痕（编号 x 系列，主观分项可在表格里继续补档位）");
+    },
+    onError: (e: Error) => message.error(e.message),
+  });
+
   if (isLoading) return <Spin />;
 
   const criteria = rules?.criteria ?? [];
@@ -241,6 +282,13 @@ export default function TenderRules() {
                 label: `${m.label}（${m.family}）`,
               }))}
             />
+            <Button
+              icon={<ImportOutlined />}
+              disabled={!canImportLaw}
+              onClick={() => setLawOpen(true)}
+            >
+              导入法规包
+            </Button>
             <Button
               type="primary"
               icon={canMerge ? <SwapOutlined /> : <PlayCircleOutlined />}
@@ -461,6 +509,22 @@ export default function TenderRules() {
           )}
 
           <Card title="评分项（支持全部采纳 / 全部签批，逐条留痕）" style={{ marginTop: 12 }}>
+            <Space style={{ marginBottom: 8 }}>
+              <Tooltip title="仅草稿包可新增；必须说明依据（评审期不得擅自新增标准）">
+                <Button
+                  icon={<PlusOutlined />}
+                  disabled={!canAddCriterion}
+                  onClick={() => setAddOpen(true)}
+                >
+                  新增评分项
+                </Button>
+              </Tooltip>
+              {!canAddCriterion && rules && rules.status !== "none" && (
+                <Typography.Text type="secondary">
+                  当前规则包状态为「{rules.status}」，仅草稿可新增评分项
+                </Typography.Text>
+              )}
+            </Space>
             {/* 解冻弹层 */}
             <Modal
               open={unfreezeOpen}
@@ -612,6 +676,109 @@ export default function TenderRules() {
         open={proposalOpen}
         onClose={() => setProposalOpen(false)}
       />
+
+      {/* 导入法规包（仓库内固化包，87 条通则） */}
+      <Modal
+        open={lawOpen}
+        title="导入法规规则包"
+        onCancel={() => setLawOpen(false)}
+        okText="导入"
+        okButtonProps={{ loading: importLaw.isPending }}
+        onOk={() => importLaw.mutate(lawPackId)}
+      >
+        <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
+          仓库内固化的法规通用评审规则（形式 / 资格 / 响应性 / 否决四组），
+          依据《招标投标法》《实施条例》、30 号令、87 号令等编制，法条引用逐条核验
+          （核验不过直接拒绝导入）。导入后为 <Tag color="purple">法规来源</Tag>
+          <Tag color="blue">P0</Tag>，免签批；error 级校验只在确认/冻结时阻断。
+        </Typography.Paragraph>
+        <Select
+          style={{ width: "100%" }}
+          value={lawPackId}
+          onChange={setLawPackId}
+          options={(lawPacks ?? []).map((p) => ({
+            value: p.id,
+            label: `${p.name}（${p.rule_count} 条 · v${p.version}）`,
+          }))}
+        />
+        {!canImportLaw && (
+          <Alert
+            style={{ marginTop: 12 }}
+            type="warning"
+            showIcon
+            message="当前规则包已确认或冻结，不能直接导入"
+            description="请先「解冻并创建新版本」得到可编辑草稿，再导入法规包。"
+          />
+        )}
+      </Modal>
+
+      {/* 新增评分项（仅草稿包） */}
+      <Modal
+        open={addOpen}
+        title="新增评分项"
+        onCancel={() => setAddOpen(false)}
+        okText="新增并留痕"
+        okButtonProps={{ loading: addCriterion.isPending }}
+        onOk={() => addForm.submit()}
+      >
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message="仅限评审准备阶段，且必须说明依据"
+          description="新增条目编号自动为 x1、x2…，来源标为「人工」；主观分项保存后可在评分项表格里补录档位。"
+        />
+        <Form
+          form={addForm}
+          layout="vertical"
+          onFinish={(values) =>
+            addCriterion.mutate({
+              ...values,
+              max_score: values.max_score ?? null,
+              is_veto: values.is_veto ?? false,
+            })
+          }
+        >
+          <Form.Item name="category" label="类别" rules={[{ required: true }]}>
+            <Select
+              options={Object.entries(CATEGORY_LABELS).map(([value, label]) => ({ value, label }))}
+            />
+          </Form.Item>
+          <Form.Item name="name" label="名称" rules={[{ required: true, message: "请填写名称" }]}>
+            <Input placeholder="如：项目实施方案完整性" />
+          </Form.Item>
+          <Form.Item name="score_type" label="类型" rules={[{ required: true }]}>
+            <Select
+              options={[
+                { value: "subjective", label: "主观分（需档位判据）" },
+                { value: "count", label: "计数分（业绩/证书）" },
+                { value: "match", label: "判断项（满足即得，不打分）" },
+                { value: "veto", label: "否决项（资格/符合性）" },
+                { value: "formula", label: "价格分公式" },
+              ]}
+            />
+          </Form.Item>
+          <Form.Item name="max_score" label="满分">
+            <InputNumber min={0} step={0.5} style={{ width: "100%" }} />
+          </Form.Item>
+          <Form.Item name="description" label="判据描述">
+            <Input.TextArea rows={2} placeholder="原文要求或判据说明" />
+          </Form.Item>
+          <Form.Item name="is_veto" label="否决项" valuePropName="checked">
+            <Checkbox>不符合即建议否决（须评标委员会认定）</Checkbox>
+          </Form.Item>
+          <Form.Item name="source_quote" label="原文依据（逐字）">
+            <Input.TextArea rows={2} placeholder="招标文件原文；留空则该条目需人工核验来源" />
+          </Form.Item>
+          <Form.Item
+            name="reason"
+            label="新增理由（必填，记入留痕）"
+            rules={[{ required: true, message: "请填写新增依据" }]}
+          >
+            <Input.TextArea rows={2} placeholder="评审期不得擅自新增标准，须有依据" />
+          </Form.Item>
+        </Form>
+      </Modal>
     </div>
   );
 }
@@ -822,15 +989,6 @@ function CriterionModal({
             保存档位
           </Button>
         )}
-        <Tooltip title="新增评分项仅限评审准备阶段，且必须说明依据">
-          <Button
-            icon={<PlusOutlined />}
-            disabled
-            onClick={() => message.info("MVP 暂未开放：新增评分项接口已预留")}
-          >
-            新增评分项
-          </Button>
-        </Tooltip>
       </Space>
     </Modal>
   );
