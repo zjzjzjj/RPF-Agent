@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>{{ project.name }} 评审报告（AI 辅助评审）</title>
+<style>
+  body { font-family: "SimSun","Songti SC",serif; margin: 32px auto; max-width: 1100px; color: #111; line-height: 1.7; }
+  h1 { text-align: center; font-size: 22px; }
+  h2 { font-size: 17px; border-bottom: 2px solid #333; padding-bottom: 4px; margin-top: 28px; }
+  h3 { font-size: 15px; margin: 18px 0 6px; }
+  table { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 13px; }
+  th, td { border: 1px solid #666; padding: 5px 8px; text-align: center; vertical-align: top; }
+  th { background: #f0f0f0; }
+  td.left, th.left { text-align: left; }
+  .meta { text-align: center; color: #444; margin-bottom: 24px; }
+  .declaration { border: 1.5px solid #8a1f1f; background: #fdf6f6; padding: 12px 16px; margin: 16px 0; font-size: 13px; }
+  .factor { color: #444; font-size: 12.5px; margin: 4px 0; }
+  .note { color: #555; font-size: 12.5px; }
+  .dropped { color: #b00; text-decoration: line-through; }
+  .veto { color: #b00; font-weight: bold; }
+  @media print { body { margin: 12mm; } h2 { page-break-after: avoid; } table { page-break-inside: auto; } }
+</style>
+</head>
+<body>
+<h1>{{ project.name }}<br>评审报告（AI 辅助评审）</h1>
+<p class="meta">项目编号：{{ project.code or "-" }} ｜ 评分运行 #{{ run.id }} ｜ 规则包 v{{ run.package_version }}（{{ run.package_content_hash }}）<br>
+生成时间：{{ generated_at }}</p>
+
+<div class="declaration"><strong>合规声明：</strong>{{ declaration.text }}</div>
+
+<h2>一、评审结果汇总表</h2>
+<table>
+  <tr><th class="left">投标人</th><th>投标报价(含税,元)</th><th>投标报价(不含税,元)</th>
+    {% for j in judge_labels %}<th>{{ j }}</th>{% endfor %}
+    <th>最终得分</th><th>名次</th></tr>
+  {% for r in summary_rows | sort(attribute="rank") %}
+  <tr>
+    <td class="left">{{ r.bidder }}{% if r.veto_flag %} <span class="veto">〔有否决建议〕</span>{% endif %}</td>
+    <td>{{ r.bid_price or "-" }}</td><td>{{ r.price_no_tax or "-" }}</td>
+    {% for j in r.judge_totals %}<td>{{ j.total }}{% if j.missing %}*</td>{% else %}</td>{% endif %}{% endfor %}
+    <td><strong>{{ r.final or "-" }}</strong></td><td>{{ r.rank or "-" }}</td>
+  </tr>
+  {% endfor %}
+</table>
+<p class="note">注：客观项（资格/符合性/计数）与价格分由确定性引擎计算，各评委共享；主观分为各 AI 评委独立评分，按项去最高最低后取平均计入最终得分。* 表示该评委在此投标人部分主观项未给出有效分。</p>
+
+<h2>二、评审情况说明（零分/否决依据）</h2>
+{% if not review_notes %}<p>无零分或否决建议事项。</p>{% endif %}
+{% for note in review_notes %}
+<h3>{{ note.bidder }}</h3>
+<ul>
+  {% for it in note['items'] %}
+  <li><strong>{{ it.criterion }}</strong>（{{ it.category }}）{{ it.verdict }}{% if it.final is not none %}，得 {{ it.final }} 分{% endif %}——{{ it.reason }}</li>
+  {% endfor %}
+</ul>
+{% endfor %}
+
+<h2>三、评标结论</h2>
+{% set ordered = summary_rows | rejectattr("rank", "none") | sort(attribute="rank") %}
+{% if ordered %}
+<p>按最终得分排序，推荐中标候选人为：</p>
+<ol>
+{% for r in ordered[:2] %}<li><strong>{{ r.bidder }}</strong>（最终得分 {{ r.final }}）</li>{% endfor %}
+</ol>
+<p>以上排序为 AI 辅助评审结果，须经评标委员会确认后生效。</p>
+{% else %}<p>暂无可排序的评分结果。</p>{% endif %}
+
+<h2>附表 A1 资格性审查表</h2>
+{% for row in qualification_table.rows %}
+<h3>{{ row.code }} {{ row.name }}</h3>
+{% if row.factor %}<p class="factor">评审因素（招标文件原文）：{{ row.factor[:400] }}</p>{% endif %}
+<table><tr><th class="left">投标人</th><th>判定</th><th class="left">依据</th></tr>
+{% for c in row.cells %}<tr><td class="left">{{ qualification_table.judges[loop.index0] }}</td><td>{{ c.verdict }}</td><td class="left">{{ c.reason or "-" }}</td></tr>{% endfor %}
+</table>
+{% endfor %}
+
+<h2>附表 A2 符合性审查表</h2>
+{% for row in compliance_table.rows %}
+<h3>{{ row.code }} {{ row.name }}</h3>
+{% if row.factor %}<p class="factor">评审因素（招标文件原文）：{{ row.factor[:400] }}</p>{% endif %}
+<table><tr><th class="left">投标人</th><th>判定</th><th class="left">依据</th></tr>
+{% for c in row.cells %}<tr><td class="left">{{ compliance_table.judges[loop.index0] }}</td><td>{{ c.verdict }}</td><td class="left">{{ c.reason or "-" }}</td></tr>{% endfor %}
+</table>
+{% endfor %}
+
+<h2>附表 A3 分项得分表（AI 评委矩阵）</h2>
+{% for group in score_groups %}
+<h3>{{ group.category }}</h3>
+{% for item in group['items'] %}
+<h4>{{ item.code }} {{ item.name }}（满分 {{ item.max_score }}）</h4>
+{% if item.factor %}<p class="factor">评审因素（原文）：{{ item.factor[:400] }}</p>{% endif %}
+<table><tr><th class="left">投标人</th>{% for j in judge_labels %}<th>{{ j }}</th>{% endfor %}<th>最终得分(去尾)</th></tr>
+{% for p in item.per_bidder %}
+<tr><td class="left">{{ p.bidder }}</td>
+{% for s in p.judge_scores %}<td>{{ s }}</td>{% endfor %}
+<td><strong>{{ p.final }}</strong></td></tr>
+{% endfor %}
+</table>
+{% endfor %}
+{% endfor %}
+
+<h2>附表 A4 价格评审表</h2>
+<table>
+<tr><th class="left">投标人</th><th>投标报价(含税)</th><th>投标报价(不含税)</th><th>价格得分</th><th class="left">计算说明</th></tr>
+{% for p in price_rows %}
+<tr><td class="left">{{ p.bidder }}</td><td>{{ p.bid_price or "-" }}</td><td>{{ p.price_no_tax or "-" }}</td><td>{{ p.score }}</td><td class="left">{{ p.explanations | join("；") if p.explanations else "-" }}</td></tr>
+{% endfor %}
+</table>
+<p class="note">注：不含税价按 {{ tax_rate }} 增值税率换算（不含税=含税/1.06）。</p>
+
+<h2>附表 A5 AI 评审明细（主观项）</h2>
+{% for detail in ai_detail %}
+<h3>{{ detail.bidder }}</h3>
+{% for it in detail['items'] %}
+<h4>{{ it.code }} {{ it.name }}（满分 {{ it.max_score }}）→ 最终 {{ it.final }}</h4>
+<p>{% for j in it.judges %}<span {% if j.dropped %}class="dropped"{% endif %}>{{ j.judge }} {{ j.score }}{% if j.dropped %}（已弃）{% endif %}</span>{% if not loop.last %} ｜ {% endif %}{% endfor %}</p>
+{% if it.reasoning %}<p class="left">评审依据：{{ it.reasoning }}</p>{% endif %}
+{% for c in it.citations %}<p class="note">引文（p{{ c.page_no }}{% if c.verified %}✓已核验{% else %}未核验{% endif %}）：{{ c.quote }}</p>{% endfor %}
+{% endfor %}
+{% endfor %}
+
+<h2>附表 A6 围串标核查</h2>
+<table><tr><th class="left">投标人</th><th>命中信号</th><th class="left">说明</th></tr>
+{% for r in collusion_rows %}<tr><td class="left">{{ r.bidder }}</td><td>{{ r.signals | join("、") if r.signals else "未命中" }}</td><td class="left">{{ r.detail or "-" }}</td></tr>{% endfor %}
+</table>
+<p class="note">{{ collusion_note }}</p>
+</body>
+</html>

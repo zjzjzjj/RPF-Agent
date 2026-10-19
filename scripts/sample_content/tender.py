@@ -1,7 +1,7 @@
 """招标文件的结构化真源（内容与答案同源）。
 
 `build_blocks()` 渲染为中文 PDF；`EXPECTED_RULES` 是规则编译器应抽出的结构化真值，
-供离线回归断言（Mock 编译器逐字段对照）。
+供真实模型编译结果的对照参考（run_e2e.py 冒烟验收打印比对）。
 """
 from __future__ import annotations
 

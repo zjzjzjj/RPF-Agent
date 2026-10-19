@@ -123,6 +123,20 @@ def set_price_manual(bidder_id: int, body: SetPriceBody, actor: str = Depends(ge
     return BidderOut.model_validate(bidder)
 
 
+class RenameBody(BaseModel):
+    name: str = Field(min_length=1, max_length=255)
+    reason: str = Field(min_length=1)
+
+
+@router.patch("/bidders/{bidder_id}", response_model=BidderOut)
+def rename_bidder(bidder_id: int, body: RenameBody, actor: str = Depends(get_actor)) -> BidderOut:
+    """人工纠正投标人名称（按投标文件封面校准，留痕）。"""
+    bidder = bidder_service.rename_bidder(bidder_id, body.name, actor, body.reason)
+    audit_service.log(bidder.project_id, actor, "bidder.rename", "bidder", str(bidder_id),
+                      {"name": bidder.name})
+    return BidderOut.model_validate(bidder)
+
+
 @router.get("/bidders/{bidder_id}/qualification-preview")
 def qualification_preview(bidder_id: int) -> dict:
     """对当前规则包（冻结或草稿）做一次只读的资格/符合性预判。"""

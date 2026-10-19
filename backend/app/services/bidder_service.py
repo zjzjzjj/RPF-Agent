@@ -195,3 +195,32 @@ def set_price_manual(bidder_id: int, price_yuan: Decimal, actor: str, reason: st
         s.flush()
         s.expunge(bidder)
         return bidder
+
+
+def rename_bidder(bidder_id: int, name: str, actor: str, reason: str) -> Bidder:
+    """人工纠正投标人名称（上传时用占位名，评审前按投标文件封面校准，全程留痕）。"""
+    if not reason.strip():
+        raise ValidationFailed("更名必须填写理由")
+    name = name.strip()
+    if not name or len(name) > 255:
+        raise ValidationFailed("投标人名称不能为空且不超过 255 字符")
+    with session_scope() as s:
+        bidder = s.get(Bidder, bidder_id)
+        if bidder is None:
+            raise NotFound("投标人不存在")
+        old = bidder.name
+        if old == name:
+            return bidder
+        bidder.name = name
+        s.add(bidder)
+        s.add(
+            ReviewRecord(
+                subject_type="bidder", subject_id=str(bidder_id), action="rename",
+                actor=actor, reason=reason,
+                old_value_json={"name": old},
+                new_value_json={"name": name},
+            )
+        )
+        s.flush()
+        s.expunge(bidder)
+        return bidder
