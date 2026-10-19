@@ -4,7 +4,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, ConfigDict
 
 from app.deps import get_actor
@@ -231,3 +231,18 @@ def cancel_run(run_id: int, actor: str = Depends(get_actor)) -> dict:
 @router.get("/projects/{project_id}/ranking")
 def get_ranking(project_id: str, run_id: int | None = None) -> dict:
     return compute_ranking(project_id, run_id)
+
+
+@router.get("/runs/{run_id}/score-summary")
+def run_score_summary(
+    run_id: int,
+    project_id: str = Query(..., min_length=1),
+    max_reason_chars: int = Query(1200, ge=200, le=8000),
+) -> dict:
+    """评分结果单页的聚合数据：排名 + 四分桶 + 逐项加减分明细与理由。
+
+    总分/名次/各桶分值与 `/projects/{pid}/ranking` 同源（都走 compute_ranking）。
+    """
+    from app.services.score_summary_service import build_score_summary
+
+    return build_score_summary(project_id, run_id, max_reason_chars=max_reason_chars)
