@@ -222,6 +222,8 @@ export interface Coverage {
   template_fallback_pending: number;
   retired: number;
   manual: number;
+  /** 法规来源条目数（P0，免签批）——覆盖率分子必须计入，否则导入法规包后进度条纹丝不动 */
+  law: number;
   by_category: Record<string, Record<string, number>>;
   essential_uncovered: string[];
   price_covered: boolean;

@@ -373,8 +373,11 @@ export default function TenderRules() {
       qc.invalidateQueries({ queryKey: ["coverage", rules?.id] });
       qc.invalidateQueries({ queryKey: ["workbench", pid] });
       setLawOpen(false);
+      // 幂等重复导入：全部 code 已存在时后端返回 imported=0 —— 说明"已是最新"，而不是"新增 0 条"
       message.success(
-        `法规规则包已导入：新增 ${r.imported} 条${r.skipped_codes.length ? `，跳过 ${r.skipped_codes.length} 条（已存在）` : ""}（${r.created ? "新建草稿包" : "追加进现有草稿"}）`,
+        r.imported === 0 && r.skipped_codes.length > 0
+          ? `法规规则包已是最新：${r.skipped_codes.length} 条法规规则已存在，无需重复导入`
+          : `法规规则包已导入：新增 ${r.imported} 条${r.skipped_codes.length ? `，跳过 ${r.skipped_codes.length} 条（已存在）` : ""}（${r.created ? "新建草稿包" : "追加进现有草稿"}）`,
       );
     },
     onError: (e: Error) => message.error(e.message),
@@ -409,10 +412,14 @@ export default function TenderRules() {
   const unconfirmed = criteria.filter(
     (c) => c.status !== "verified" && c.status !== "retired",
   );
-  const verifiedCount = criteria.length - unconfirmed.length;
+  // 口径与后端 accept_all 一致：只认 verified（retired 不参与批量采纳，否则按钮描述会虚报条数）
+  const verifiedCount = criteria.filter((c) => c.status === "verified").length;
   const pendingSignoff = criteria.filter(
     (c) => c.origin === "template" && c.status === "needs_signoff",
   ).length;
+  // 批量动作只在草稿包生效：非草稿时按钮以禁用态保留（而不是凭空消失），并说明原因
+  const isDraft = rules?.status === "draft";
+  const draftHint = `仅草稿包可操作；当前规则包状态为「${rules?.status}」，请先「解冻并创建新版本」`;
 
   return (
     <div>
@@ -448,13 +455,20 @@ export default function TenderRules() {
                 使用默认规则
               </Button>
             </Tooltip>
-            <Button
-              icon={<ImportOutlined />}
-              disabled={!canImportLaw}
-              onClick={() => setLawOpen(true)}
+            <Tooltip
+              title={
+                canImportLaw
+                  ? "导入仓库内固化的 87 条法规通用评审规则（免签批，法条逐条核验）"
+                  : draftHint
+              }
             >
-              导入法规包
-            </Button>
+              <Button
+                icon={<ImportOutlined />}
+                onClick={() => setLawOpen(true)}
+              >
+                导入法规包
+              </Button>
+            </Tooltip>
             {canMerge && (
               <Button
                 icon={<CheckOutlined />}
@@ -544,14 +558,24 @@ export default function TenderRules() {
                   <Progress
                     size="small"
                     style={{ width: 180 }}
+                    // 分子必须含 law 桶：否则导入 87 条法规后进度条纹丝不动（纯法规包永远是 0/87）
                     percent={Math.round(
-                      ((coverage.document_backed + coverage.template_fallback_signed) /
+                      ((coverage.document_backed +
+                        coverage.template_fallback_signed +
+                        coverage.law) /
                         Math.max(1, coverage.total)) *
                         100,
                     )}
-                    format={() => `${coverage.document_backed + coverage.template_fallback_signed}/${coverage.total}`}
+                    format={() => {
+                      const covered =
+                        coverage.document_backed +
+                        coverage.template_fallback_signed +
+                        coverage.law;
+                      return `${covered}/${coverage.total}`;
+                    }}
                   />
-                  <Typography.Text type="secondary">文档覆盖</Typography.Text>
+                  <Typography.Text type="secondary">规则覆盖</Typography.Text>
+                  {coverage.law > 0 && <Tag color="purple">法规 {coverage.law}</Tag>}
                   {pendingSignoff > 0 && (
                     <Tag color="orange">签批待办 {pendingSignoff}</Tag>
                   )}
@@ -559,29 +583,47 @@ export default function TenderRules() {
               )}
               <span style={{ marginLeft: "auto" }}>
                 <Space>
-                  {rules.status === "draft" && verifiedCount > 0 && (
-                    <Popconfirm
-                      title="全部采纳？"
-                      description={`将批量确认 ${verifiedCount} 项已核验条目，理由统一记入留痕。`}
-                      okText="全部采纳"
-                      onConfirm={() => acceptAll.mutate("批量采纳：与招标文件原文核对一致")}
-                      cancelText="取消"
-                    >
-                      <Button loading={acceptAll.isPending}>全部采纳</Button>
-                    </Popconfirm>
+                  {verifiedCount > 0 && (
+                    <Tooltip title={isDraft ? "" : draftHint}>
+                      <span>
+                        <Popconfirm
+                          title="全部采纳？"
+                          description={
+                            `将为 ${verifiedCount} 项已核验条目写入复核留痕（不改变条目状态，` +
+                            `法规来源条目免签批）。理由统一记入留痕。` +
+                            (isDraft ? "" : `当前规则包不可写：${draftHint}。`)
+                          }
+                          okText="全部采纳"
+                          disabled={!isDraft}
+                          onConfirm={() => acceptAll.mutate("批量采纳：与招标文件原文核对一致")}
+                          cancelText="取消"
+                        >
+                          <Button loading={acceptAll.isPending} disabled={!isDraft}>
+                            全部采纳
+                          </Button>
+                        </Popconfirm>
+                      </span>
+                    </Tooltip>
                   )}
-                  {rules.status === "draft" && pendingSignoff > 0 && (
-                    <Popconfirm
-                      title="全部签批？"
-                      description={`将批量签批 ${pendingSignoff} 项模板兜底条目（启用须有依据，将留痕）。`}
-                      okText="全部签批"
-                      onConfirm={() =>
-                        signoffAll.mutate("批量签批：招标文件未细化该项，按通用评标惯例启用")
-                      }
-                      cancelText="取消"
-                    >
-                      <Button loading={signoffAll.isPending}>全部签批</Button>
-                    </Popconfirm>
+                  {pendingSignoff > 0 && (
+                    <Tooltip title={isDraft ? "" : draftHint}>
+                      <span>
+                        <Popconfirm
+                          title="全部签批？"
+                          description={`将批量签批 ${pendingSignoff} 项模板兜底条目（启用须有依据，将留痕）。`}
+                          okText="全部签批"
+                          disabled={!isDraft}
+                          onConfirm={() =>
+                            signoffAll.mutate("批量签批：招标文件未细化该项，按通用评标惯例启用")
+                          }
+                          cancelText="取消"
+                        >
+                          <Button loading={signoffAll.isPending} disabled={!isDraft}>
+                            全部签批
+                          </Button>
+                        </Popconfirm>
+                      </span>
+                    </Tooltip>
                   )}
                   <Button
                     disabled={rules.status !== "draft" || unconfirmed.length > 0}
@@ -798,8 +840,8 @@ export default function TenderRules() {
         title="导入法规规则包"
         onCancel={() => setLawOpen(false)}
         okText="导入"
-        okButtonProps={{ loading: importLaw.isPending }}
-        onOk={() => importLaw.mutate(lawPackId)}
+        okButtonProps={{ loading: importLaw.isPending, disabled: !canImportLaw }}
+        onOk={() => canImportLaw && importLaw.mutate(lawPackId)}
       >
         <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
           仓库内固化的法规通用评审规则（形式 / 资格 / 响应性 / 否决四组），
