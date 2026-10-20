@@ -74,6 +74,22 @@ def render_dir() -> Path:
     return Path(os.environ.get("BID_EVAL_RENDER_DIR", data_dir() / "renders"))
 
 
+def static_dir() -> Path | None:
+    """前端构建产物目录（部署模式：同源伺服 frontend/dist）。
+
+    未设置 = 纯 API 模式（本地开发默认，行为不变）；设置了但缺 index.html
+    则 fail-fast——静态配置错误必须在启动期暴露，而不是让所有页面请求
+    拿到 404 静默难查。
+    """
+    raw = os.environ.get("BID_EVAL_STATIC_DIR", "").strip()
+    if not raw:
+        return None
+    p = Path(raw)
+    if not (p / "index.html").is_file():
+        raise RuntimeError(f"BID_EVAL_STATIC_DIR={raw} 缺 index.html，拒绝启动")
+    return p
+
+
 # ---------------------------------------------------------------------------
 # 全自动模式
 # ---------------------------------------------------------------------------

@@ -1,0 +1,11 @@
+# 构建上下文瘦身（上下文 = 仓库根）；deploy/ 不能排除（Dockerfile 在其中）
+.git
+.venv
+data
+frontend/node_modules
+frontend/tsconfig.tsbuildinfo
+backend/tests
+docs
+logs
+*.log
+**/__pycache__
