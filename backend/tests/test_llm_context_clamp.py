@@ -71,3 +71,33 @@ def test_boundaries(limit: int, used: int, expected: int | None) -> None:
     )
     got = _clamp_max_tokens_for_context(msg, 8192)
     assert got == expected
+
+
+def test_compile_char_budget_shrinks_for_small_context(monkeypatch) -> None:  # noqa: ANN001
+    """配置小上下文时，按「上下文 - 输出 - 安全余量」反推输入字符预算。"""
+    from app import config
+    from app.rules.compiler import MAX_COMPILE_CHARS, compile_char_budget
+
+    monkeypatch.setattr(config, "llm_context_tokens", lambda: 24576)
+    monkeypatch.setattr(config, "llm_max_output_tokens", lambda: 8192)
+    # (24576 - 8192 - 512) * 1.4 = 22220
+    assert compile_char_budget() == int((24576 - 8192 - 512) * 1.4)
+    assert compile_char_budget() < MAX_COMPILE_CHARS
+
+
+def test_compile_char_budget_unbounded_without_context(monkeypatch) -> None:  # noqa: ANN001
+    from app import config
+    from app.rules.compiler import MAX_COMPILE_CHARS, compile_char_budget
+
+    monkeypatch.setattr(config, "llm_context_tokens", lambda: 0)
+    assert compile_char_budget() == MAX_COMPILE_CHARS
+
+
+def test_compile_char_budget_capped_by_max(monkeypatch) -> None:  # noqa: ANN001
+    """大上下文模型不额外增加预算（仍受 MAX_COMPILE_CHARS 约束）。"""
+    from app import config
+    from app.rules.compiler import MAX_COMPILE_CHARS, compile_char_budget
+
+    monkeypatch.setattr(config, "llm_context_tokens", lambda: 65536)
+    monkeypatch.setattr(config, "llm_max_output_tokens", lambda: 8192)
+    assert compile_char_budget() == MAX_COMPILE_CHARS

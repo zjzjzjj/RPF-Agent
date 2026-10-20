@@ -43,6 +43,28 @@ log = logging.getLogger("bid_eval.rules")
 
 MAX_COMPILE_CHARS = 30_000  # 送进模型的招标文件字符预算（超预算按章节优先级选取，不再盲目截头）
 
+# 中文按 ~1.4 字符/token 估算（Qwen 实测 29794 字符 ≈ 20147 tokens，即 1.48）。
+# 取更保守的 1.4：宁可多留输出空间，也不要让输入把上下文吃光。
+_CHARS_PER_TOKEN = 1.4
+_CONTEXT_SAFETY_TOKENS = 512
+
+
+def compile_char_budget() -> int:
+    """按模型上下文推导可送入的字符预算；未配置上下文时沿用 MAX_COMPILE_CHARS。
+
+    必须同时给输出留够空间：编译产物是一份完整规则 JSON（可达数千 token）。
+    只用 provider 层的 max_tokens 钳制不够——输入占满 20K 后仅剩 4K 输出，
+    JSON 必然被截断（2026-10-20 实证：本地 Qwen3-8B 24576 上下文）。
+    """
+    ctx = config.llm_context_tokens()
+    if ctx <= 0:
+        return MAX_COMPILE_CHARS
+    out = config.llm_max_output_tokens()
+    usable = ctx - out - _CONTEXT_SAFETY_TOKENS
+    if usable <= 0:
+        return MAX_COMPILE_CHARS  # 配置异常时不额外收紧，交给 provider 报错
+    return min(MAX_COMPILE_CHARS, int(usable * _CHARS_PER_TOKEN))
+
 # 章节优先级：真实招标文件的"评标办法/评分细则"通常排在最后（本文档在第 89-97 页），
 # 盲目截前 N 字符会把它整段丢掉——评分项一条都抽不出来，只剩前附表的资格与否决条款。
 # 这里按关键词给页分档，先保证评分办法进模型，再补资格与否决依据。
@@ -418,7 +440,7 @@ def compile_rules(
     from app.llm.registry import get_provider
 
     _text, doc = _load_tender_text(document_id)  # 校验 kind/parse_status 并取回 doc
-    text, sel = select_compile_text(_load_tender_pages(document_id))
+    text, sel = select_compile_text(_load_tender_pages(document_id), budget=compile_char_budget())
     if selection_meta_out is not None:
         selection_meta_out.update(sel)
     if sel["truncated"]:

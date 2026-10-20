@@ -272,6 +272,16 @@ def llm_max_output_tokens() -> int:
     return int(os.environ.get("BID_EVAL_LLM_MAX_TOKENS", 8192))
 
 
+def llm_context_tokens() -> int:
+    """模型上下文窗口（token）。0 = 未知，不做输入裁剪。
+
+    本地小上下文模型必须显式配置（如 Qwen3-8B 的 24576）：否则长招标文件的
+    输入 + max_tokens 会超窗——vLLM 直接 400（2026-10-20 实证），
+    即使 provider 层钳制 max_tokens，剩余输出预算也不足以写完规则 JSON。
+    """
+    return int(os.environ.get("BID_EVAL_LLM_CONTEXT_TOKENS", 0))
+
+
 def llm_retry_backoff_s() -> float:
     """规则抽取两次尝试之间的退避秒数（限流/超时后的第二次尝试缓冲）。"""
     return float(os.environ.get("BID_EVAL_LLM_RETRY_BACKOFF_S", 2))
