@@ -46,7 +46,7 @@ def test_templates_api_list_and_detail(client) -> None:  # noqa: ANN001
     resp = client.get("/api/rules/templates")
     assert resp.status_code == 200
     ids = {t["template_id"] for t in resp.json()}
-    assert ids == {"comprehensive-goods", "comprehensive-works",
+    assert ids == {"comprehensive-default", "comprehensive-goods", "comprehensive-works",
                    "comprehensive-services", "lowest-price"}
     g = next(t for t in resp.json() if t["template_id"] == "comprehensive-goods")
     assert g["criteria_count"] == 14

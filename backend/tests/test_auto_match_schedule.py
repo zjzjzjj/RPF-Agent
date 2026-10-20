@@ -101,16 +101,58 @@ def test_schedules_replace_when_project_has_no_package(client, monkeypatch) -> N
     assert out["merge_target_id"] is None
 
 
-def test_skips_when_package_not_draft(client, monkeypatch) -> None:  # noqa: ANN001
+def test_frozen_template_package_triggers_new_version_merge(client, monkeypatch) -> None:  # noqa: ANN001
+    """冻结的模板包：自动派生新版本草稿，并按文件 merge（2026-10-20 起的语义）。
+
+    旧冻结包保持只读且仍是评分输入；新草稿不确认/冻结就不生效。
+    """
     from app.services.auto_merge_service import maybe_schedule_auto_match
 
     pid = _make_project(client)
     r = client.post(
         f"/api/projects/{pid}/rules/use-default-template",
-        json={"template_id": "comprehensive-goods", "reason": "先冻结一个默认包"},
+        json={"template_id": "comprehensive-default", "reason": "先冻结一个默认包"},
     )
     assert r.status_code == 200, r.text
     assert r.json()["frozen"] is True
+    frozen_id = r.json()["package_id"]
+    doc_id = _make_tender_doc(pid)
+    monkeypatch.setattr(config, "llm_api_key_configured", lambda: True)
+
+    out = maybe_schedule_auto_match(pid, doc_id)
+    assert out["auto_match"] == "scheduled_after_unfreeze"
+    assert out["mode"] == "merge"
+    assert out["new_version"] == 2
+    assert out["merge_target_id"] != frozen_id
+
+    # 新版本是草稿、继承模板来源；旧冻结包原样保留
+    pkg = client.get(f"/api/rules/packages/{out['merge_target_id']}").json()
+    assert pkg["status"] == "draft"
+    assert pkg["version"] == 2
+    assert pkg["origin"] == "template"
+    old = client.get(f"/api/rules/packages/{frozen_id}").json()
+    assert old["status"] == "frozen"
+
+    jobs = _jobs()
+    assert len(jobs) == 1
+    assert jobs[0].payload_json["merge_target_id"] == out["merge_target_id"]
+
+
+def test_skips_frozen_document_package(client, monkeypatch) -> None:  # noqa: ANN001
+    """冻结的 document 包不属于默认规则产物，保持原 skip 行为。"""
+    from app.db.models import RulePackage
+    from app.db.session import session_scope
+    from app.services.auto_merge_service import maybe_schedule_auto_match
+
+    pid = _make_project(client)
+    package_id = client.post(
+        f"/api/projects/{pid}/rules/instantiate",
+        json={"template_id": "comprehensive-goods"},
+    ).json()["package_id"]
+    with session_scope() as s:
+        pkg = s.get(RulePackage, package_id)
+        pkg.origin = "document"   # 模拟「从招标文件编译出来的」冻结包
+        pkg.status = "frozen"
     doc_id = _make_tender_doc(pid)
     monkeypatch.setattr(config, "llm_api_key_configured", lambda: True)
 

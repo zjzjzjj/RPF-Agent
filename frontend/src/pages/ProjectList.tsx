@@ -572,7 +572,12 @@ export default function ProjectList() {
               maxLength={200}
             />
           </Form.Item>
-          <Form.Item name="base_template_id" label="评标办法基线模板（可选）">
+          <Form.Item
+            name="base_template_id"
+            label="评标办法基线模板（可选）"
+            initialValue="comprehensive-default"
+            extra="默认使用「综合评分法（通用·默认）」（价格 50 / 技术 40 / 商务 10）。上传招标文件后，系统会按文件条款自动覆盖重建；也可选择「暂不使用」只走招标文件编译。"
+          >
             <Select
               allowClear
               placeholder="暂不使用（仅上传招标文件编译）"

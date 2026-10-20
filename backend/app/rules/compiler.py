@@ -458,7 +458,8 @@ def compile_rules(
     if extraction is None:
         raise AppError(
             f"规则抽取失败（含修复重试）：{last_error}；"
-            "若持续失败，多为模型输出上限不足或模型上下文过小，请更换模型后重试"
+            "若持续失败，多为模型输出上限不足或模型上下文过小——"
+            "可换用上下文更大的模型、提高模型 max-model-len，或缩短招标文件后再试"
         )
 
     version = _next_version(project_id)

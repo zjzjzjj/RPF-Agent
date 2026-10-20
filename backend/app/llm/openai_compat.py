@@ -17,6 +17,30 @@ from app.llm.base import LLMError, LLMResult
 # 里，思考文本含花括号会污染下游 extract_json 的首个"{"定位——在源头剥掉。
 _THINK_RE = re.compile(r"<think>.*?</think>\s*", re.DOTALL)
 
+# 上下文窗口超限报错（vLLM/OpenAI 兼容端点的两种常见措辞）
+_CTX_LIMIT_RE = re.compile(r"maximum context length is (\d+)", re.IGNORECASE)
+_CTX_INPUT_RE = re.compile(r"request has (\d+) input tokens", re.IGNORECASE)
+_CTX_MIN_OUTPUT = 512  # 钳制后至少留这么多输出空间，否则交给上层显式失败
+
+
+def _clamp_max_tokens_for_context(message: str, current: int | None) -> int | None:
+    """从「输入 + max_tokens 超过模型上下文」的报错里算出可用输出上限。
+
+    本地小上下文模型（如 Qwen3-8B --max-model-len 24576）上，固定 max_tokens=8192
+    遇到 20K tokens 的招标文件会必然超限（2026-10-20 实证：compile 400）。
+    云端大上下文模型不会触发该分支，行为不变。
+    """
+    if current is None:
+        return None  # 未显式限制输出，无可钳制
+    limit = _CTX_LIMIT_RE.search(message)
+    used = _CTX_INPUT_RE.search(message)
+    if not limit or not used:
+        return None
+    available = int(limit.group(1)) - int(used.group(1)) - 64
+    if available < _CTX_MIN_OUTPUT or available >= current:
+        return None
+    return available
+
 
 class OpenAICompatProvider:
     def __init__(
@@ -64,7 +88,10 @@ class OpenAICompatProvider:
         attempts = 2 if config.llm_transient_retries() else 1
         result: LLMResult | None = None
         last_error: Exception | None = None
-        for attempt in range(1, attempts + 1):
+        # 上下文钳制重试用**独立预算**，不占用瞬态重试次数
+        clamp_retries = 1
+        attempt = 1
+        while attempt <= attempts:
             try:
                 resp = self._client.chat.completions.create(
                     model=self.model,
@@ -91,20 +118,33 @@ class OpenAICompatProvider:
                 break
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
-                msg = str(exc).lower()
+                raw = str(exc)
+                msg = raw.lower()
+
+                # ① 上下文窗口不足：把 max_tokens 钳到剩余空间后立即重试
+                clamped = _clamp_max_tokens_for_context(raw, max_tokens)
+                if clamped is not None and clamp_retries > 0:
+                    clamp_retries -= 1
+                    logging.getLogger("bid_eval.llm").warning(
+                        "模型上下文不足，max_tokens %s → %d 后重试", max_tokens, clamped
+                    )
+                    max_tokens = clamped
+                    continue  # 不递增 attempt，不消耗瞬态预算
+
+                # ② 瞬态失败（网络/限流/服务波动）重试——分层评审调用量大，
+                # 单次偶发超时不重试会让整项评分随机降级（2026-10-16 实证：
+                # 一次 timed out 让龙即一个评分项被兜底 0 分）
                 transient = any(
                     token in msg
                     for token in ("timeout", "timed out", "rate limit", "429", "500", "502", "503", "504", "connection")
                 )
-                # 瞬态失败（网络/限流/服务波动）重试——分层评审调用量大，
-                # 单次偶发超时不重试会让整项评分随机降级（2026-10-16 实证：
-                # 一次 timed out 让龙即一个评分项被兜底 0 分）
                 if transient and attempt < attempts:
                     delay = 5 * attempt
                     logging.getLogger("bid_eval.llm").warning(
                         "瞬态失败（第 %d 次），%ds 后重试：%s", attempt, delay, msg[:120]
                     )
                     time.sleep(delay)
+                    attempt += 1
                     continue
                 raise LLMError(f"模型调用失败：{exc}", transient=transient) from exc
         if result is None:

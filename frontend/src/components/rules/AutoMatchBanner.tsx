@@ -12,7 +12,7 @@ const ACTION_META: Record<string, { color: string; text: string }> = {
 const SKIP_REASON: Record<string, string> = {
   llm_not_configured: "未配置模型，已跳过自动匹配（可手动编译）",
   auto_match_disabled: "自动匹配开关已关闭",
-  package_not_draft: "规则包已确认/冻结，本次未自动更新；如需更新请先「解冻并创建新版本」",
+  package_not_draft: "规则包已确认，或由招标文件编译而来，本次未自动更新；如需更新请先「解冻并创建新版本」再重新匹配",
   already_in_flight: "已有编译/匹配任务在执行，本次未重复触发",
   not_tender: "该文档不是招标文件，未触发自动匹配",
   not_parsed: "文档尚未解析完成",
@@ -40,6 +40,13 @@ function skipReasonOf(job?: JobOut | null): string | null {
   const r = (job?.result_json ?? {}) as Record<string, unknown>;
   const reason = r.skip_reason;
   return typeof reason === "string" ? reason : null;
+}
+
+/** 冻结的模板/合并包遇到招标文件时，后端会自动派生新版本草稿再覆盖。 */
+function autoRebuildVersion(job?: JobOut | null): number | null {
+  const r = (job?.result_json ?? {}) as Record<string, unknown>;
+  if (r.auto_match !== "scheduled_after_unfreeze") return null;
+  return typeof r.new_version === "number" ? (r.new_version as number) : null;
 }
 
 function postMergeErrors(job?: JobOut | null): { code: string; message: string }[] {
@@ -146,6 +153,11 @@ export default function AutoMatchBanner({
               <Tag color="green">自动匹配已完成</Tag>
             )}
             {skip && <Tag color="default">{SKIP_REASON[skip] ?? skip}</Tag>}
+            {autoRebuildVersion(parseJob) != null && (
+              <Tag color="gold">
+                已自动创建 v{autoRebuildVersion(parseJob)} 草稿并按招标文件覆盖，确认并冻结后生效
+              </Tag>
+            )}
           </Space>
 
           {errors.length > 0 && (

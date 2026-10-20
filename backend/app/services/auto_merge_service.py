@@ -5,7 +5,11 @@
 - **默认开、可关**（`BID_EVAL_AUTO_MATCH=0`）；
 - **未配置 LLM 不触发**（编译必须走模型；离线测试因此完全不产生额外任务）；
 - 当前规则包必须是 **draft 且模板/合并来源** 才做 merge；无包时做一次 replace
-  编译（从招标文件直接产出规则包）；confirmed/frozen 不自动改动，提示用户解冻；
+  编译（从招标文件直接产出规则包）；
+- **frozen 的模板/合并包**：自动派生新版本草稿后再 merge（旧冻结包保持只读、
+  仍是评分输入，新草稿确认冻结后才生效）——对应「无招标文件用默认规则、有招标
+  文件则按文件覆盖重建」的使用路径；
+- confirmed 与 origin=document 的包不自动改动，返回 package_not_draft 提示解冻；
 - 同一项目已有在途 `compile_rules` 任务时跳过，防重复解析/多份上传排队多次。
 """
 from __future__ import annotations
@@ -51,10 +55,20 @@ def maybe_schedule_auto_match(project_id: str, document_id: int) -> dict:
     from app.services import rule_service
 
     pkg = rule_service.current_package(project_id)
+    unfroze_version: int | None = None
     if pkg is None:
         mode, merge_target_id = "replace", None
     elif pkg.status == "draft" and pkg.origin in ("template", "merged"):
         mode, merge_target_id = "merge", pkg.id
+    elif pkg.status == "frozen" and pkg.origin in ("template", "merged"):
+        # 默认规则已冻结：先派生新版本草稿，再按招标文件覆盖重建。
+        # 旧冻结包保持只读且仍是评分输入（latest_frozen_package），
+        # 新草稿不确认/冻结就不生效——因此自动执行是安全的。
+        new_pkg = rule_service.new_version(
+            pkg.id, "auto", "检测到招标文件，自动创建新版本用于覆盖重建"
+        )
+        mode, merge_target_id = "merge", new_pkg.id
+        unfroze_version = new_pkg.version
     else:
         return _skip("package_not_draft")
 
@@ -74,9 +88,10 @@ def maybe_schedule_auto_match(project_id: str, document_id: int) -> dict:
         project_id=project_id,
     )
     return {
-        "auto_match": "scheduled",
+        "auto_match": "scheduled_after_unfreeze" if unfroze_version else "scheduled",
         "job_id": job_id,
         "mode": mode,
         "merge_target_id": merge_target_id,
+        "new_version": unfroze_version,
         "skip_reason": None,
     }

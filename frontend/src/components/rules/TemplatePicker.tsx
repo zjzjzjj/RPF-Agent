@@ -4,10 +4,14 @@ import { useTemplate } from "../../api/hooks";
 import type { TemplateCriterion, TemplateSummary } from "../../types";
 
 const APPLICABLE: Record<string, string> = {
+  general: "通用",
   goods: "货物类",
   services: "服务类",
   works: "工程类",
 };
+
+/** 新建项目预选、模板选择器置顶的默认模板。 */
+const DEFAULT_TEMPLATE_ID = "comprehensive-default";
 
 /** 单条模板评分项的细则（分档判据 / 计分规则 / 证明材料）。 */
 function TemplateCriterionDetail({ c }: { c: TemplateCriterion }) {
@@ -112,7 +116,7 @@ interface Props {
   onPick: (templateId: string, reason: string) => void;
 }
 
-/** 无招标文件时的默认规则选择：4 套内置模板 → 一键启用并冻结。 */
+/** 无招标文件时的默认规则选择：内置模板 → 一键启用并冻结（默认模板置顶）。 */
 export default function TemplatePicker({
   open,
   loading,
@@ -124,6 +128,12 @@ export default function TemplatePicker({
 }: Props) {
   const [reason, setReason] = useState("");
   const [detail, setDetail] = useState<{ id: string; name: string } | null>(null);
+  // 默认模板排第一：列表顺序直接决定用户的默认选择
+  const ordered = [...templates].sort((a, b) => {
+    const da = a.template_id === DEFAULT_TEMPLATE_ID ? 0 : 1;
+    const db = b.template_id === DEFAULT_TEMPLATE_ID ? 0 : 1;
+    return da - db;
+  });
 
   return (
     <Modal
@@ -157,7 +167,7 @@ export default function TemplatePicker({
         <Empty description="没有可用的模板" />
       ) : (
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(380px, 1fr))", gap: 12 }}>
-          {templates.map((t) => {
+          {ordered.map((t) => {
             const procurement = (t.applicable?.procurement ?? "—") as string;
             const cats = t.categories_summary ?? {};
             return (
@@ -165,6 +175,7 @@ export default function TemplatePicker({
                 <Space direction="vertical" size={6} style={{ width: "100%" }}>
                   <Space wrap>
                     <Typography.Text strong>{t.name}</Typography.Text>
+                    {t.template_id === DEFAULT_TEMPLATE_ID && <Tag color="gold">推荐默认</Tag>}
                     <Tag color="blue">{APPLICABLE[procurement] ?? procurement}</Tag>
                     <Tag>v{t.library_version}</Tag>
                   </Space>
