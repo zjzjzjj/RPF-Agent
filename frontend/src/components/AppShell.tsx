@@ -33,7 +33,7 @@ import { useProject } from "../api/hooks";
 
 const NAVIGATION = [
   { path: "", label: "项目工作台", icon: <HomeOutlined /> },
-  { path: "/rules", label: "招标文件与规则", icon: <FileTextOutlined /> },
+  { path: "/rules", label: "规则库与招标文件", icon: <FileTextOutlined /> },
   { path: "/bidders", label: "投标人管理", icon: <TeamOutlined /> },
   { path: "/results", label: "评分结果", icon: <TrophyOutlined /> },
 ];

@@ -6,6 +6,7 @@ import {
   Card,
   Checkbox,
   Col,
+  Collapse,
   Drawer,
   Empty,
   Form,
@@ -393,11 +394,18 @@ export default function TenderRules() {
     onError: (e: Error) => message.error(e.message),
   });
 
+  // 校验结果默认折叠在全部规则下方；一旦出现 error 阻断项自动展开，避免被折叠掩盖
+  const validations = rules?.validations ?? [];
+  const errors = validations.filter((v) => v.severity === "error");
+  const warns = validations.filter((v) => v.severity !== "error");
+  const [validationsOpen, setValidationsOpen] = useState<string[]>([]);
+  useEffect(() => {
+    if (errors.length > 0) setValidationsOpen(["validations"]);
+  }, [errors.length]);
+
   if (isLoading) return <Spin />;
 
   const criteria = rules?.criteria ?? [];
-  const errors = (rules?.validations ?? []).filter((v) => v.severity === "error");
-  const warns = (rules?.validations ?? []).filter((v) => v.severity !== "error");
   const unconfirmed = criteria.filter(
     (c) => c.status !== "verified" && c.status !== "retired",
   );
@@ -410,7 +418,7 @@ export default function TenderRules() {
     <div>
       <Row justify="space-between" align="middle" gutter={[16, 12]}>
         <Col>
-          <Typography.Title level={4}>规则管理</Typography.Title>
+          <Typography.Title level={4}>规则库与招标文件</Typography.Title>
         </Col>
         <Col>
           <Space wrap>
@@ -599,30 +607,6 @@ export default function TenderRules() {
             </Space>
           </Card>
 
-          {(errors.length > 0 || warns.length > 0) && (
-            <Card size="small" title="确定性校验结果（12 条校验器）" style={{ marginTop: 12 }}>
-              {errors.map((v) => (
-                <Alert
-                  key={v.code + (v.subject_id ?? "")}
-                  type="error"
-                  showIcon
-                  style={{ marginBottom: 6 }}
-                  message={`[${v.code}] ${v.message}`}
-                  description={v.hint}
-                />
-              ))}
-              {warns.map((v) => (
-                <Alert
-                  key={v.code + (v.subject_id ?? "")}
-                  type="warning"
-                  showIcon
-                  style={{ marginBottom: 6 }}
-                  message={`[${v.code}] ${v.message}`}
-                />
-              ))}
-            </Card>
-          )}
-
           <div style={{ marginTop: 12 }}>
             <Space style={{ marginBottom: 8 }}>
               <Tooltip title="仅草稿包可新增；必须说明依据（评审期不得擅自新增标准）">
@@ -678,6 +662,63 @@ export default function TenderRules() {
               }
             />
           </div>
+
+          {/* 确定性校验结果（12 条纯代码校验器）：置于全部规则下方，默认折叠 */}
+          <Collapse
+            style={{ marginTop: 12 }}
+            activeKey={validationsOpen}
+            onChange={(keys) =>
+              setValidationsOpen(Array.isArray(keys) ? keys.map(String) : [String(keys)])
+            }
+            items={[
+              {
+                key: "validations",
+                label: (
+                  <Space size={8} wrap>
+                    <span>确定性校验结果（12 条校验器）</span>
+                    {errors.length > 0 ? (
+                      <Tag color="red">{errors.length} 项阻断</Tag>
+                    ) : (
+                      <Tag color="green">无阻断项</Tag>
+                    )}
+                    {warns.length > 0 && <Tag color="orange">{warns.length} 项提示</Tag>}
+                    {validations.length === 0 && (
+                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                        纯代码校验，不调用模型
+                      </Typography.Text>
+                    )}
+                  </Space>
+                ),
+                children:
+                  validations.length === 0 ? (
+                    <Typography.Text type="secondary">
+                      12 条确定性校验器全部通过：总分闭合、档位区间、条款引用可达、价格公式参数、
+                      权重范围、否决项设置等均无异常。
+                    </Typography.Text>
+                  ) : (
+                    <Space direction="vertical" size={6} style={{ width: "100%" }}>
+                      {errors.map((v) => (
+                        <Alert
+                          key={v.code + (v.subject_id ?? "")}
+                          type="error"
+                          showIcon
+                          message={`[${v.code}] ${v.message}`}
+                          description={v.hint}
+                        />
+                      ))}
+                      {warns.map((v) => (
+                        <Alert
+                          key={v.code + (v.subject_id ?? "")}
+                          type="warning"
+                          showIcon
+                          message={`[${v.code}] ${v.message}`}
+                        />
+                      ))}
+                    </Space>
+                  ),
+              },
+            ]}
+          />
         </>
       )}
 

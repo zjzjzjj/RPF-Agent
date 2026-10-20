@@ -223,7 +223,7 @@ export default function ScoreResults() {
           type="warning"
           showIcon
           style={{ marginBottom: 12 }}
-          message="规则包尚未冻结：请先在「招标文件与规则」页完成确认与冻结，才能发起评分"
+          message="规则包尚未冻结：请先在「规则库与招标文件」页完成确认与冻结，才能发起评分"
         />
       )}
       {summary && !summary.run.ready && (
