@@ -95,7 +95,7 @@ def get_workbench(project_id: str) -> WorkbenchOut:
         stages: list[StageState] = []
         blockers: list[str] = []
 
-        # ① 招标文件
+        # 查询：招标文件 / 规则包（与 current_package 同口径：排除 superseded 与 merge 辅助包）
         tender_docs = (
             s.execute(
                 select(Document).where(Document.project_id == project_id, Document.kind == "tender")
@@ -105,38 +105,6 @@ def get_workbench(project_id: str) -> WorkbenchOut:
         )
         parsed = [d for d in tender_docs if d.parse_status in ("parsed", "degraded")]
         failed = [d for d in tender_docs if d.parse_status == "failed"]
-        # 已有规则包（模板/文件/法规）时，招标文件是可选阶段：
-        # "使用默认规则直接评分"不应被工作台一直催着上传招标文件。
-        has_rules = (
-            s.execute(
-                select(RulePackage.id)
-                .where(
-                    RulePackage.project_id == project_id,
-                    RulePackage.status != "superseded",
-                    RulePackage.merge_target_id.is_(None),
-                )
-                .limit(1)
-            ).first()
-            is not None
-        )
-        if failed:
-            stages.append(StageState(key="tender", label="招标文件", state="blocked",
-                                     detail=f"{len(failed)} 份解析被拒绝", todo_count=len(failed)))
-            blockers.append("招标文件解析被拒绝，请更换文件或查看拒绝原因")
-        elif parsed:
-            stages.append(StageState(key="tender", label="招标文件", state="done",
-                                     detail=f"{len(parsed)} 份已解析"))
-        elif tender_docs:
-            stages.append(StageState(key="tender", label="招标文件", state="active",
-                                     detail="解析中", todo_count=len(tender_docs)))
-        elif has_rules:
-            stages.append(StageState(key="tender", label="招标文件", state="pending",
-                                     detail="未上传（使用内置/模板规则）", optional=True))
-        else:
-            stages.append(StageState(key="tender", label="招标文件", state="pending",
-                                     detail="尚未上传招标文件"))
-
-        # ② 规则包：与 current_package 同口径（排除 superseded 与 merge 辅助包）
         pkg = (
             s.execute(
                 select(RulePackage)
@@ -150,12 +118,41 @@ def get_workbench(project_id: str) -> WorkbenchOut:
             )
             .scalar_one_or_none()
         )
+        # 最新评分运行与待复核数（人工模式口径：pending/ai_suggested/conflict_flagged）
+        run = (
+            s.execute(
+                select(EvaluationRun)
+                .where(EvaluationRun.project_id == project_id)
+                .order_by(EvaluationRun.id.desc())
+                .limit(1)
+            ).scalar_one_or_none()
+        )
+        pending_review = 0
+        if run is not None:
+            pending_review = s.execute(
+                select(func.count(ScoreRecord.id)).where(
+                    ScoreRecord.run_id == run.id,
+                    ScoreRecord.review_status.in_(("pending", "ai_suggested", "conflict_flagged")),
+                )
+            ).scalar_one()
+
+        # ① 规则库与招标文件：规则页同时承载招标文件上传与规则管理，合成一个阶段。
+        # 状态优先级（首条命中）：解析失败 > 解析中 > 无规则包 > 已冻结 > 草稿待确认。
+        if failed:
+            tender_frag = f"{len(failed)} 份招标文件解析被拒绝"
+        elif parsed:
+            tender_frag = f"已解析 {len(parsed)} 份招标文件"
+        elif tender_docs:
+            tender_frag = "招标文件解析中"
+        else:
+            # 已有规则包时招标文件是可选："使用默认规则直接评分"不被一直催着上传
+            tender_frag = "未上传招标文件（使用内置/模板规则）"
+
+        unverified = 0
         if pkg is None:
-            stages.append(StageState(key="rules", label="评分规则", state="pending",
-                                     detail="尚未编译规则"))
+            rules_frag = "尚未编译规则"
         elif pkg.status == "frozen":
-            stages.append(StageState(key="rules", label="评分规则", state="done",
-                                     detail=f"已冻结 v{pkg.version}（{pkg.content_hash or ''}）"))
+            rules_frag = f"v{pkg.version} 已冻结（{(pkg.content_hash or '')[:8]}）"
         else:
             total = s.execute(
                 select(func.count(Criterion.id)).where(
@@ -168,13 +165,33 @@ def get_workbench(project_id: str) -> WorkbenchOut:
                     Criterion.status.notin_(("verified", "retired")),
                 )
             ).scalar_one()
-            stages.append(StageState(key="rules", label="评分规则", state="active",
-                                     detail=f"v{pkg.version} 草稿：{total - unverified}/{total} 已确认",
+            rules_frag = f"v{pkg.version} 草稿：{total - unverified}/{total} 已确认"
+
+        if failed:
+            stages.append(StageState(key="rules", label="规则库与招标文件", state="blocked",
+                                     detail=f"{tender_frag}；{rules_frag}", todo_count=len(failed)))
+            blockers.append("招标文件解析被拒绝，请更换文件或查看拒绝原因")
+        elif tender_docs and not parsed:
+            stages.append(StageState(key="rules", label="规则库与招标文件", state="active",
+                                     detail=f"{tender_frag}；{rules_frag}",
+                                     todo_count=len(tender_docs)))
+        elif pkg is None:
+            stages.append(StageState(
+                key="rules", label="规则库与招标文件",
+                state="active" if parsed else "pending",
+                detail=f"{tender_frag}；{rules_frag}"))
+        elif pkg.status == "frozen":
+            stages.append(StageState(key="rules", label="规则库与招标文件", state="done",
+                                     detail=f"{tender_frag}；{rules_frag}",
+                                     optional=not tender_docs))
+        else:
+            stages.append(StageState(key="rules", label="规则库与招标文件", state="active",
+                                     detail=f"{tender_frag}；{rules_frag}",
                                      todo_count=int(unverified)))
             if unverified:
                 blockers.append(f"评分规则有 {unverified} 项待确认（未确认不能冻结）")
 
-        # ③ 投标人
+        # ② 投标人
         bidder_count = s.execute(
             select(func.count(Bidder.id)).where(Bidder.project_id == project_id)
         ).scalar_one()
@@ -194,70 +211,28 @@ def get_workbench(project_id: str) -> WorkbenchOut:
             stages.append(StageState(key="bidders", label="投标人", state="done",
                                      detail=f"{bidder_count} 家，报价全部已确认"))
 
-        # ④ 评分运行
-        run = (
-            s.execute(
-                select(EvaluationRun)
-                .where(EvaluationRun.project_id == project_id)
-                .order_by(EvaluationRun.id.desc())
-                .limit(1)
-            ).scalar_one_or_none()
-        )
+        # ③ 评分结果：评分运行、复核与报告都在评分结果页，合成一个阶段。
+        # 状态优先级：无运行 > 运行中 > 运行失败 > 人工复核待办（仅人工模式）> 报告定稿 > 可查看/可生成。
         if run is None:
-            stages.append(StageState(key="evaluate", label="评分运行", state="pending",
+            stages.append(StageState(key="results", label="评分结果", state="pending",
                                      detail="尚未发起评分"))
         elif run.status in ("queued", "running"):
-            stages.append(StageState(key="evaluate", label="评分运行", state="active",
-                                     detail=f"运行中（#{run.id}）"))
+            stages.append(StageState(key="results", label="评分结果", state="active",
+                                     detail=f"评分运行中（#{run.id}）"))
         elif run.status == "failed":
-            stages.append(StageState(key="evaluate", label="评分运行", state="blocked",
+            stages.append(StageState(key="results", label="评分结果", state="blocked",
                                      detail=f"运行 #{run.id} 失败"))
             blockers.append(f"评分运行 #{run.id} 失败，请查看运行详情")
+        elif not config.auto_mode() and pending_review:
+            # 复核不阻断：报告可先出草稿（未复核项在报告内逐条标注为疑问），复核后刷新即定稿。
+            stages.append(StageState(key="results", label="评分结果", state="active",
+                                     detail=f"{pending_review} 项待复核；可生成草稿报告",
+                                     todo_count=int(pending_review)))
+        elif project.status == "completed":
+            stages.append(StageState(key="results", label="评分结果", state="done",
+                                     detail="报告已定稿"))
         else:
-            stages.append(StageState(key="evaluate", label="评分运行", state="done",
-                                     detail=f"运行 #{run.id} {run.status}"))
-
-        # ⑤ 复核
-        pending_review = 0
-        if run is not None:
-            pending_review = s.execute(
-                select(func.count(ScoreRecord.id)).where(
-                    ScoreRecord.run_id == run.id,
-                    ScoreRecord.review_status.in_(("pending", "ai_suggested", "conflict_flagged")),
-                )
-            ).scalar_one()
-        if run is None:
-            # 尚未发起评分：不能宣称"自动裁决已完成"（auto 分支必须晚于无运行判断）
-            stages.append(StageState(key="review", label="自动裁决", state="pending",
-                                     detail="发起评分后由 LLM 带原文证据自动裁决"))
-        elif config.auto_mode():
-            # 全自动模式：没有人工复核阶段，模糊项已由 LLM 裁决收敛（auto_confirmed）
-            stages.append(StageState(key="review", label="自动裁决", state="done",
-                                     detail="模糊项已由 LLM 带原文证据裁决并留痕"))
-        elif pending_review:
-            stages.append(StageState(key="review", label="人工复核", state="active",
-                                     detail=f"{pending_review} 项待复核", todo_count=int(pending_review)))
-            # 复核不再是"阻塞"：报告可以先出草稿，把疑问标出，复核后再刷新。
-            # 这里只提示"定稿前需处理"，不阻断任何后续步骤。
-        else:
-            stages.append(StageState(key="review", label="人工复核", state="done", detail="全部已复核"))
-
-        # ⑥ 报告：有评分运行即可出**草稿**（未复核项在报告内逐条标注为疑问），
-        # 全部复核完毕后同一入口即为定稿。不再要求"复核完成后可生成"。
-        if run is None:
-            stages.append(StageState(key="report", label="评标报告", state="pending",
-                                     detail="发起评分后可生成"))
-        elif run.status in ("queued", "running"):
-            stages.append(StageState(key="report", label="评标报告", state="pending",
-                                     detail="评分运行完成后可生成"))
-        elif project.status == "completed" and not pending_review:
-            stages.append(StageState(key="report", label="评标报告", state="done", detail="已定稿"))
-        elif pending_review:
-            stages.append(StageState(key="report", label="评标报告", state="active",
-                                     detail=f"可生成草稿报告（{pending_review} 项待复核）",
-                                     todo_count=0))
-        else:
-            stages.append(StageState(key="report", label="评标报告", state="active",
-                                     detail="可生成定稿报告"))
+            stages.append(StageState(key="results", label="评分结果", state="active",
+                                     detail=f"运行 #{run.id} 完成；可查看结果，可生成报告"))
 
         return WorkbenchOut(project=ProjectOut.model_validate(project), stages=stages, blockers=blockers)

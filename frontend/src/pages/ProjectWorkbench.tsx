@@ -17,7 +17,6 @@ import {
   ClockCircleOutlined,
   FileProtectOutlined,
   FileTextOutlined,
-  LockOutlined,
   SafetyCertificateOutlined,
   TableOutlined,
   TeamOutlined,
@@ -41,20 +40,14 @@ const STATE_COLOR = {
   pending: "default",
 };
 const STAGE_PATH: Record<string, string> = {
-  tender: "/rules",
   rules: "/rules",
   bidders: "/bidders",
-  evaluate: "/results",
-  review: "/results?tab=report",
-  report: "/results?tab=report",
+  results: "/results",
 };
 const STAGE_ICON: Record<string, ReactNode> = {
-  tender: <FileTextOutlined />,
-  rules: <LockOutlined />,
+  rules: <FileTextOutlined />,
   bidders: <TeamOutlined />,
-  evaluate: <TableOutlined />,
-  review: <AuditOutlined />,
-  report: <TrophyOutlined />,
+  results: <TrophyOutlined />,
 };
 
 export default function ProjectWorkbench() {
