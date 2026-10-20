@@ -222,6 +222,14 @@ def generate_match_proposal(
         document = load_criteria_for_snapshot(s, merge_package_id)
         source_doc_id = merge_pkg.source_document_id
 
+    # 法规条目（origin=law）不参与合并匹配：
+    #  - 它们是法定义务红线，不因「招标文件没写」而被弃用；
+    #  - 参与匹配还可能被同名的文档条目覆盖，破坏法条层的独立性。
+    # 此前未过滤的后果：导入法规包后再上传招标文件，合并会把 87 条法规
+    # 当作「未匹配的模板条目」提议弃用，_drop_template 拒绝后整个自动合并回滚
+    # （2026-10-20 实证：auto_resolve_error=只有模板条目可以弃用）。
+    template = [t for t in template if t.get("origin") != "law"]
+
     result = deterministic_match(template, document)
     pairs: list[dict] = result["pairs"]
     used_doc_ids = {p["document"]["id"] for p in pairs}

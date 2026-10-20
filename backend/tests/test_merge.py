@@ -253,3 +253,32 @@ def test_merge_requires_template_package(client) -> None:  # noqa: ANN001
               "mode": "merge", "merge_target_id": None},
     )
     assert resp.status_code == 422, resp.text
+
+
+def test_law_criteria_excluded_from_match_proposal(client) -> None:  # noqa: ANN001
+    """法规条目（origin=law）不参与合并匹配，也不会被提议弃用。
+
+    2026-10-20 实证回归：导入法规包后再上传招标文件，合并把 87 条法规当成
+    「未匹配的模板条目」提议 drop_template，_drop_template 拒绝后整个自动合并
+    回滚（auto_resolve_error=只有模板条目可以弃用）。
+    """
+    pid, target_id, merge_package_id = _seed_merge_context(client)
+    from app.db.models import Criterion
+    from app.db.session import session_scope
+
+    with session_scope() as s:
+        for i, code in enumerate(("FORM-001", "QUAL-001", "REJ-001"), start=1):
+            s.add(Criterion(
+                package_id=target_id, code=code, category="compliance", name=f"法规条目{code}",
+                score_type="veto", is_veto=True, veto_consequence="disqualify",
+                description="法规通用评审规则", origin="law", status="verified",
+                p_source="P0", sort_order=900 + i,
+            ))
+
+    prop = client.get(f"/api/rules/packages/{merge_package_id}/match-proposal").json()
+    assert all(t.get("origin") != "law" for t in prop["unmatched_template"]), \
+        "法规条目不应出现在待弃用列表"
+    assert all(t.get("origin") != "law" for p in prop["pairs"] for t in [p["template"]]), \
+        "法规条目不应参与配对"
+    # 模板条目仍正常参与（T1.4 未被文档覆盖 → 待弃用）
+    assert any(t["code"] == "T1.4" for t in prop["unmatched_template"])

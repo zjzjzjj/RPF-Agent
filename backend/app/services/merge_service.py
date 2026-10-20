@@ -275,12 +275,17 @@ def _append_document(s, target_package_id: int, d_id: int, actor: str, reason: s
 
 
 def _drop_template(s, target_package_id: int, t_id: int, actor: str, reason: str) -> None:  # noqa: ANN001
-    """弃用模板条目：status → retired（不进快照、不参与计分）。"""
+    """弃用模板条目：status → retired（不进快照、不参与计分）。
+
+    允许 template 与 document 两种来源：后者是上一次合并从旧招标文件追加进来的，
+    新文件不再规定时应当一并退出计分。法规条目（origin=law）不会出现在待弃用
+    列表里（merger 已过滤），如出现说明调用方绕过了提案生成，直接拒绝。
+    """
     t = s.get(Criterion, t_id)
     if t is None or t.package_id != target_package_id:
         raise NotFound("模板条目不存在")
-    if t.origin != "template":
-        raise ValidationFailed("只有模板条目（origin=template）可以弃用")
+    if t.origin not in ("template", "document"):
+        raise ValidationFailed(f"来源为 {t.origin} 的条目不能通过合并弃用")
     t.status = "retired"
     s.add(t)
     _record(s, target_package_id, "drop_template", t.id, None, "human", None,
