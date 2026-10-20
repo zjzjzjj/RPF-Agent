@@ -339,19 +339,26 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
     """count 类评分项。
 
     证书类：只计证书表内的（有复印件的）；正文声称但无证书的 → 冲突标记交人工。
+    人员级（person_scope）：只用 LLM 逐案例核验结果，不退回公司级业绩桶。
     """
     per_item = Decimal(str(params.get("per_item") or 0))
     max_items = int(params.get("max_items") or 0)
     max_score = Decimal(str(criterion.get("max_score") or 0))
     field = params.get("field") or ""
+    person_scope = str(params.get("person_scope") or "")
     inferred = ""
     unresolved: str | None = None
+    if person_scope:
+        # 人员级项：facts.performance_amounts 是公司级业绩，按它计数会让人人封顶。
+        # 强制走 verified_cases（LLM 按人核验）；无案例则 unresolved。
+        field = ""
+        unresolved = "field_missing"
     if not field:
-        guessed = _infer_count_field(criterion)
+        guessed = None if person_scope else _infer_count_field(criterion)
         if guessed:
             field = guessed
             inferred = "（计数字段由评分项名称推断，请核对）"
-        else:
+        elif not person_scope:
             unresolved = "field_missing"
 
     conflict = False
@@ -430,6 +437,44 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
     artifacts = str(criterion.get("required_artifacts") or "")
     cases = criterion.get("verified_cases") or []
     if cases:
+        # 已有逐案例核验结果 = 计数有依据；清掉"字段缺失/未抽到事实"的 unresolved
+        unresolved = None
+        # 人员级：按负责人/成员过滤；模型完全没给 role 时退回全部案例并标疑问
+        if person_scope:
+            has_role = any(str(c.get("role") or "").strip() for c in cases)
+            scoped = [
+                c for c in cases
+                if str(c.get("role") or "").strip() == person_scope
+            ]
+            if has_role:
+                cases = scoped
+                if not cases:
+                    conflict = True
+                    detail += "；未识别到人员范围内的案例"
+            else:
+                conflict = True
+                detail += "；模型未标注案例人员归属，按全部案例计（需人工核对）"
+        # 金额门槛：明确低于门槛的不计；金额缺失的照计但标疑问
+        min_amount = Decimal(str(params.get("min_amount_yuan") or 0))
+        if min_amount > 0 and cases:
+            qualified: list[dict] = []
+            unknown_amount = 0
+            for case in cases:
+                amt = case.get("amount_yuan")
+                if amt is None or amt == "":
+                    unknown_amount += 1
+                    qualified.append(case)
+                    continue
+                try:
+                    if Decimal(str(amt)) >= min_amount:
+                        qualified.append(case)
+                except Exception:  # noqa: BLE001
+                    unknown_amount += 1
+                    qualified.append(case)
+            cases = qualified
+            if unknown_amount:
+                conflict = True
+                detail += f"；{unknown_amount} 个案例金额无法确认（需人工核对）"
         required_flags = _required_flags(artifacts)
         complete = [
             c for c in cases

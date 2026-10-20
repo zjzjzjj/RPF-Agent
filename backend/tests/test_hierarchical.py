@@ -92,7 +92,11 @@ def _fail() -> SubjectiveOutput:
 CRITERION = {"name": "测试项", "max_score": "10", "score_type": "subjective", "levels": []}
 
 
-def test_hierarchical_takes_best_cluster(monkeypatch):
+def test_hierarchical_averages_clusters(monkeypatch):
+    """无原文子项时按证据簇相关性加权平均，不再取最高分簇。
+
+    旧行为取 max(6,8)=8，系统性抬高；现在两簇同权时 = 7.00。
+    """
     monkeypatch.setenv("BID_EVAL_REVIEW_CLUSTERS", "3")
     from app.engine import selection
     from app.evidence import embed_client
@@ -113,7 +117,7 @@ def test_hierarchical_takes_best_cluster(monkeypatch):
     gw = SeqGateway([_ok(6), _ok(8), _ok(5)])
     suggestion, committee = suggest_score_hierarchical(gw, CRITERION, "投标文本", k=3)
     assert suggestion.status == "ai_suggested"
-    assert suggestion.score == Decimal("8")  # 取最高分簇为主评
+    assert suggestion.score == Decimal("7.00")  # 两簇同权 → (6+8)/2，不再取最高
     assert len(committee) == 2  # 数据只有 2 个分离证据簇（k=3 为上限，实评按实有簇数）
     assert any("分层证据评审" in w for w in suggestion.warnings)
 

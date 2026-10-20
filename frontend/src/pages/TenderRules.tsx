@@ -192,7 +192,10 @@ export default function TenderRules() {
       qc.invalidateQueries({ queryKey: ["documents", pid] });
       qc.invalidateQueries({ queryKey: ["workbench", pid] });
       const r = (parseJob.result_json ?? {}) as Record<string, unknown>;
-      if (r.auto_match === "scheduled" && typeof r.job_id === "number") {
+      if (
+        (r.auto_match === "scheduled" || r.auto_match === "scheduled_after_unfreeze") &&
+        typeof r.job_id === "number"
+      ) {
         setMatchJobId(r.job_id as number);
         setFlow("matching");
       } else {
@@ -327,13 +330,17 @@ export default function TenderRules() {
       message.success("规则包已确认");
     },
     onError: (e: Error & { detail?: { blockers?: unknown[] } }) => {
-      const blockers = e.detail?.blockers as { message?: string }[] | undefined;
+      qc.invalidateQueries({ queryKey: ["rules", pid] });
+      const blockers = e.detail?.blockers as { code?: string; message?: string }[] | undefined;
       Modal.error({
         title: "存在阻塞项，不能确认",
         content: (
           <ul>
             {(blockers ?? []).map((b, i) => (
-              <li key={i}>{b.message ?? JSON.stringify(b)}</li>
+              <li key={i}>
+                {b.code ? <Tag color="red">{b.code}</Tag> : null}
+                {b.message ?? JSON.stringify(b)}
+              </li>
             ))}
           </ul>
         ),
@@ -347,7 +354,27 @@ export default function TenderRules() {
       qc.invalidateQueries({ queryKey: ["rules", pid] });
       message.success("规则包已冻结（此后只读，评分只认该版本快照）");
     },
-    onError: (e: Error) => message.error(e.message),
+    onError: (e: Error & { detail?: { blockers?: { code?: string; message?: string }[] } }) => {
+      qc.invalidateQueries({ queryKey: ["rules", pid] });
+      const blockers = e.detail?.blockers;
+      if (blockers?.length) {
+        Modal.error({
+          title: "存在阻塞项，不能冻结",
+          content: (
+            <ul>
+              {blockers.map((b, i) => (
+                <li key={i}>
+                  {b.code ? <Tag color="red">{b.code}</Tag> : null}
+                  {b.message ?? JSON.stringify(b)}
+                </li>
+              ))}
+            </ul>
+          ),
+        });
+      } else {
+        message.error(e.message);
+      }
+    },
   });
 
   const signoff = useMutation({
@@ -632,13 +659,23 @@ export default function TenderRules() {
                       </span>
                     </Tooltip>
                   )}
-                  <Button
-                    disabled={rules.status !== "draft" || unconfirmed.length > 0}
-                    loading={confirm.isPending}
-                    onClick={() => confirm.mutate()}
+                  <Tooltip
+                    title={
+                      rules.status !== "draft"
+                        ? draftHint
+                        : unconfirmed.length > 0
+                          ? `还有 ${unconfirmed.length} 项未确认：全自动模式会先自动采纳；人工模式会列出具体阻塞项`
+                          : ""
+                    }
                   >
-                    确认规则包
-                  </Button>
+                    <Button
+                      disabled={rules.status !== "draft"}
+                      loading={confirm.isPending}
+                      onClick={() => confirm.mutate()}
+                    >
+                      确认规则包
+                    </Button>
+                  </Tooltip>
                   <Button
                     type="primary"
                     disabled={rules.status !== "confirmed"}
@@ -1232,7 +1269,13 @@ function MatchProposalDrawer({
     const decisions: Record<string, unknown>[] = [];
     for (const p of proposal.pairs) {
       if (checkedPairs.has(p.pair_id)) {
-        decisions.push({ action: "override", pair_id: p.pair_id, reason: r });
+        decisions.push({
+          action: "override",
+          pair_id: p.pair_id,
+          template_criterion_id: p.template.id,
+          document_criterion_id: p.document.id,
+          reason: r,
+        });
       }
     }
     for (const id of dropIds) {

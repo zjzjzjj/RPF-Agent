@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass, field
 from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
 
@@ -28,6 +29,90 @@ from app.rules import prompts
 log = logging.getLogger("bid_eval.subjective")
 
 MAX_BID_CHARS = 20_000  # 送审预算；超长标书按评分项关键词选段（不再头部盲截）
+
+# 原文子项分值："协同办公（0-2 分）、行政管理（0-2 分）…"
+_RE_SUBITEM = re.compile(
+    r"([^、，,；;：:\n（）()]{2,24}?)\s*[（(]\s*0\s*[-~至]\s*(\d+(?:\.\d+)?)\s*分\s*[）)]"
+)
+
+
+def parse_subitems(description: str | None) -> list[tuple[str, Decimal]]:
+    """从评分项描述中提取"名称（0-X 分）"子项，去重保序。"""
+    out: list[tuple[str, Decimal]] = []
+    seen: set[str] = set()
+    for m in _RE_SUBITEM.finditer(description or ""):
+        name = re.sub(r"\s+", "", m.group(1)).strip("。；;")
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append((name, Decimal(m.group(2))))
+    return out
+
+
+def _norm_name(text: str) -> str:
+    return re.sub(r"[\s（）()：:、，,。.]+", "", text or "")
+
+
+def _match_subitem(name: str, keys: list[str]) -> str | None:
+    n = _norm_name(name)
+    if not n:
+        return None
+    best = None
+    for k in keys:
+        kn = _norm_name(k)
+        if not kn:
+            continue
+        if kn in n or n in kn:
+            if best is None or len(kn) > len(_norm_name(best)):
+                best = k
+    return best
+
+
+def aggregate_subitems(
+    criterion: dict,
+    sub_scores: list[dict],
+    model_score: Decimal | None,
+    max_score: Decimal,
+) -> tuple[Decimal | None, list[dict], list[str]]:
+    """有原文子项时，用子项分之和覆盖模型自报总分（缺失子项按 0）。
+
+    返回 (score, normalized_sub_scores, warnings)。没有任何子项能匹配时
+    返回 model_score，避免因为名称不一致把整项归零。
+    """
+    parsed = parse_subitems(criterion.get("description"))
+    if not parsed or not sub_scores:
+        return model_score, sub_scores, []
+    keys = [str(s.get("name") or "") for s in sub_scores if isinstance(s, dict)]
+    matched = 0
+    total = Decimal(0)
+    normalized: list[dict] = []
+    missing: list[str] = []
+    for name, cap in parsed:
+        hit = _match_subitem(name, keys)
+        if hit is None:
+            missing.append(name)
+            normalized.append({"name": name, "score": "0", "max": str(cap)})
+            continue
+        src = next(
+            (s for s in sub_scores if isinstance(s, dict) and str(s.get("name") or "") == hit),
+            None,
+        )
+        if src is None:
+            missing.append(name)
+            normalized.append({"name": name, "score": "0", "max": str(cap)})
+            continue
+        matched += 1
+        raw = _parse_score(src.get("score"))
+        value = min(max(raw or Decimal(0), Decimal(0)), cap)
+        total += value
+        normalized.append({"name": name, "score": str(value), "max": str(cap)})
+    if matched == 0:
+        return model_score, sub_scores, ["子项名称与原文无法对应，按模型自报总分计"]
+    total = min(total, max_score)
+    warnings = [f"按原文子项汇总 {total}/{max_score} 分"]
+    if missing:
+        warnings.append(f"未提供证据的子项按 0 计：{'、'.join(missing)}")
+    return total, normalized, warnings
 
 
 class SubjectiveOutput(BaseModel):
@@ -122,6 +207,11 @@ def suggest_score(
     user = prompts.SUBJECTIVE_USER_TEMPLATE.format(
         name=criterion.get("name") or "",
         max_score=max_score,
+        description=(
+            criterion.get("description")
+            or criterion.get("source_quote")
+            or "（原文未给出评分细则）"
+        ),
         levels_text=levels_text(levels) or "（无档位信息，请按判据在 0-满分内给分）",
         required_evidence=(
             criterion.get("required_evidence")
@@ -193,6 +283,22 @@ def suggest_score(
     if score > max_score:
         score = max_score
         warnings.append(f"分值超满分，已夹取至 {max_score}")
+
+    # 原文有"名称（0-X 分）"子项时，以子项之和为准（缺失子项按 0）。
+    # 模型容易只给整体印象分；逐子项汇总能把"漏掉某一章"体现为分数差异。
+    score, out.sub_scores, sub_warnings = aggregate_subitems(
+        criterion, out.sub_scores, score, max_score
+    )
+    warnings.extend(sub_warnings)
+    if score is None:
+        return SubjectiveSuggestion(
+            status="need_human",
+            reasoning=out.reasoning,
+            evidence=out.evidence,
+            artifacts_check=out.artifacts_check,
+            sub_scores=out.sub_scores,
+            warnings=warnings + ["无法确定子项得分，降级人工"],
+        )
 
     # 档位：信数字不信标签
     resolved = level_for_score(levels, score)
@@ -367,6 +473,7 @@ def suggest_score_hierarchical(
     from app.engine.selection import build_evidence_map, split_text_chunks
 
     k = k or config.review_clusters()
+    max_score = Decimal(str(criterion.get("max_score") or 0))
     chunks = split_text_chunks(bid_text)
     emap = build_evidence_map(chunks, criterion)
     if emap is None:
@@ -411,26 +518,81 @@ def suggest_score_hierarchical(
             warnings=[f"分层评审：{len(clusters)} 个证据簇均未给出有效分", "llm_failed"],
         ), cluster_results
 
-    # 主评 = 最高分簇
-    best_cl, best = max(
-        suggestions, key=lambda pair: pair[1].score  # type: ignore[arg-type,return-value]
-    )
-    other_scores = [str(s.score) for _cl, s in suggestions if s is not best]
+    # 聚合：有原文子项时按"子项并集"（同名取最高），否则按簇相关性加权平均。
+    # 旧实现取最高分簇——任一章节看起来不错就按该簇计分，系统性抬高并抹平差异。
+    scores = [s.score for _cl, s in suggestions if s.score is not None]
+    parsed = parse_subitems(criterion.get("description"))
+    merged_subs: list[dict] = []
+    merged_score: Decimal | None = None
+    parse_keys = [name for name, _cap in parsed]
+    sub_map: dict[str, Decimal] = {}
+    if parsed and any(s.sub_scores for _cl, s in suggestions):
+        for _cl, s in suggestions:
+            for ss in s.sub_scores or []:
+                if not isinstance(ss, dict):
+                    continue
+                hit = _match_subitem(str(ss.get("name") or ""), parse_keys)
+                if hit is None:
+                    continue
+                cap = next(cap for name, cap in parsed if name == hit)
+                val = _parse_score(ss.get("score")) or Decimal(0)
+                val = min(max(val, Decimal(0)), cap)
+                if hit not in sub_map or val > sub_map[hit]:
+                    sub_map[hit] = val
+    if sub_map:
+        merged_score = min(sum(sub_map.values(), Decimal(0)), max_score)
+        merged_subs = [
+            {"name": name, "score": str(sub_map.get(name, Decimal(0))), "max": str(cap)}
+            for name, cap in parsed
+        ]
+        # 证据/理由取"贡献子项最多"的簇
+        best_cl, best = max(
+            suggestions,
+            key=lambda pair: sum(
+                1 for ss in (pair[1].sub_scores or [])
+                if isinstance(ss, dict)
+                and _match_subitem(str(ss.get("name") or ""), parse_keys) is not None
+            ),
+        )
+        agg_note = f"按子项并集汇总 {merged_score}/{max_score} 分"
+    else:
+        # 相关性加权平均（簇 score 是证据地图的聚合相似度）
+        weights = [max(float(cl.get("score") or 0.0), 0.0) for cl, _s in suggestions]
+        if sum(weights) <= 0:
+            weights = [1.0 for _ in suggestions]
+        merged_score = (
+            sum((s.score * Decimal(str(w)) for (_cl, s), w in zip(suggestions, weights)), Decimal(0))
+            / Decimal(str(sum(weights)))
+        ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        merged_score = min(merged_score, max_score)
+        best_cl, best = max(
+            ((cl, s) for (cl, s), w in zip(suggestions, weights)),
+            key=lambda pair: float(pair[0].get("score") or 0.0),
+        )
+        agg_note = f"按证据簇相关性加权平均 {merged_score} 分"
+
     warnings = list(best.warnings)
     warnings.insert(0, (
         f"分层证据评审：全文档定位到 {min(len(clusters), k)} 个独立证据簇，"
-        f"逐簇评分 {'、'.join(other_scores + [str(best.score)])}，取最高簇（{best_cl['chars']} 字符）为主评"
+        f"逐簇评分 {'、'.join(str(x) for x in scores)}，{agg_note}"
+        f"（主依据 {best_cl['chars']} 字符）"
     ))
+    if scores and max(scores) - min(scores) >= 2:
+        warnings.append(
+            f"证据分散：各证据簇评分差异 {min(scores)}–{max(scores)}，建议人工复核"
+        )
 
     merged = SubjectiveSuggestion(
         status="ai_suggested",
-        score=best.score,
-        level_label=best.level_label,
+        score=merged_score,
+        level_label=level_for_score(criterion.get("levels") or [], merged_score)
+        if criterion.get("levels")
+        else best.level_label,
         reasoning=best.reasoning,
         confidence=best.confidence,
         evidence=best.evidence,
         artifacts_check=best.artifacts_check,
-        sub_scores=best.sub_scores,
+        sub_scores=merged_subs or best.sub_scores,
         warnings=warnings,
     )
     committee = [

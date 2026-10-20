@@ -66,6 +66,9 @@ class TemplateFormula(BaseModel):
     rounding: int = 2
     trim_ratio: Decimal | None = None
     deduct_rate: Decimal | None = None
+    # 不对称扣分率（偏离扣分型）：每低/每高 1 个百分点分别扣多少分
+    deduct_rate_down: Decimal | None = None
+    deduct_rate_up: Decimal | None = None
 
 
 class TemplateCriterion(BaseModel):

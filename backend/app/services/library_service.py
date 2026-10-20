@@ -224,6 +224,13 @@ def _persist_template_criterion(s, package_id: int, template_hash: str, tpl, c, 
         )
 
     if c.formula is not None:
+        ext: dict[str, str] = {}
+        if c.formula.deduct_rate is not None:
+            ext["deduct_rate"] = str(c.formula.deduct_rate)
+        if c.formula.deduct_rate_down is not None:
+            ext["deduct_rate_down"] = str(c.formula.deduct_rate_down)
+        if c.formula.deduct_rate_up is not None:
+            ext["deduct_rate_up"] = str(c.formula.deduct_rate_up)
         s.add(
             PriceFormula(
                 package_id=package_id,
@@ -237,6 +244,7 @@ def _persist_template_criterion(s, package_id: int, template_hash: str, tpl, c, 
                 trim_ratio=c.formula.trim_ratio,
                 deduct_rate=c.formula.deduct_rate,
                 exclude_invalid=True,
+                params_json=ext or None,
                 source_node_id=None,
                 source_quote=None,
             )

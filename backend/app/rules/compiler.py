@@ -10,8 +10,10 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from decimal import Decimal
+from typing import Any
 
 from sqlalchemy import select
 
@@ -117,6 +119,227 @@ def dedupe_extracted(items: list["ExtractedCriterion"]) -> list["ExtractedCriter
         seen.add(key)
         out.append(c)
     return out
+
+
+# ---------------------------------------------------------------------------
+# 抽取结果的确定性补全（8B 模型经常漏字段，不能把正确性押在提示词上）
+# ---------------------------------------------------------------------------
+_RE_RATE_DOWN = re.compile(
+    r"每低\s*(\d+(?:\.\d+)?)\s*个百分点[^。；\n]{0,12}?扣\s*(\d+(?:\.\d+)?)\s*分"
+)
+_RE_RATE_UP = re.compile(
+    r"每高\s*(\d+(?:\.\d+)?)\s*个百分点[^。；\n]{0,12}?扣\s*(\d+(?:\.\d+)?)\s*分"
+)
+_RE_TRIM_BOTH = re.compile(r"扣除一个最高价和一个最低价")
+_RE_ARITH_AVG = re.compile(r"算术平均")
+_RE_MAX_ITEM_SCORE = re.compile(r"最高(?:得|扣)?\s*(\d+(?:\.\d+)?)\s*分")
+_RE_AMOUNT_WAN = re.compile(r"合同金额(?:达到|≥|不低于|不少于)?\s*(\d+(?:\.\d+)?)\s*万元")
+_PRICE_HINTS = ("报价", "价格", "评标价", "基准价", "投标价")
+
+
+def _rate_per_point(match: re.Match[str]) -> Decimal:
+    """把"每低 X 个百分点扣 Y 分"换算成每 1 个百分点扣分。"""
+    points = Decimal(match.group(1))
+    deduct = Decimal(match.group(2))
+    return (deduct / points).quantize(Decimal("0.0001"))
+
+
+def parse_price_formula_text(text: str) -> dict[str, Any]:
+    """从一段招标原文解析偏离扣分参数；非偏离扣分型返回空 dict。
+
+    供编译期（enrich_extracted）与草稿自愈（normalize_package）共用。
+    """
+    m_down = _RE_RATE_DOWN.search(text or "")
+    m_up = _RE_RATE_UP.search(text or "")
+    if not m_down and not m_up:
+        return {}
+    out: dict[str, Any] = {
+        "formula_type": "deviation_deduct",
+        "k": Decimal("1"),
+    }
+    if m_down:
+        out["deduct_rate_down"] = _rate_per_point(m_down)
+    if m_up:
+        out["deduct_rate_up"] = _rate_per_point(m_up)
+    if _RE_TRIM_BOTH.search(text):
+        out["benchmark_method"] = "average_trimmed"
+        out["trim_count"] = 1
+        out["trim_threshold"] = 5
+    elif _RE_ARITH_AVG.search(text):
+        out["benchmark_method"] = "average"
+    return out
+
+
+def parse_count_params_text(
+    text: str,
+    max_score: Decimal | None,
+    per_item: Decimal | None,
+    name: str = "",
+) -> dict[str, str]:
+    """从评分项原文补 count 参数：最高项数/金额门槛/人员范围。"""
+    params: dict[str, str] = {}
+    if per_item is not None and per_item > 0 and max_score is not None:
+        derived = int(Decimal(str(max_score)) / per_item)
+        if derived > 0:
+            params["max_items"] = str(derived)
+    m = _RE_AMOUNT_WAN.search(text or "")
+    if m:
+        params["min_amount_yuan"] = str(int(Decimal(m.group(1)) * Decimal(10000)))
+    # 人员范围只看评分项名称（描述里常出现"项目负责人/团队"只是证明材料要求）
+    if "团队" in name or "成员" in name:
+        params["person_scope"] = "member"
+    elif "负责人" in name:
+        params["person_scope"] = "leader"
+    return params
+
+
+def _price_window(c: "ExtractedCriterion", tender_text: str) -> str:
+    """价格项的正则作用域：先看自身描述/quote，再看 quote 之后的窗口。
+
+    不能扫全文——正文里的工期/违约条款也会出现"每低/每高 1 个百分点扣…"。
+    """
+    own = f"{c.description or ''}\n{c.quote or ''}"
+    if _RE_RATE_DOWN.search(own) or _RE_RATE_UP.search(own):
+        return own
+    quote = (c.quote or "").strip()
+    if quote:
+        # 前 20 字里通常没有换行，直接定位；找不到再用去空白匹配
+        pos = tender_text.find(quote[:20])
+        if pos < 0:
+            q_norm = normalize_no_ws(quote)
+            t_norm = normalize_no_ws(tender_text)
+            npos = t_norm.find(q_norm[:20])
+            if npos >= 0:
+                # 归一化索引无法直接回映原文，退化为从价格关键词附近找
+                for hint in _PRICE_HINTS:
+                    pos = tender_text.find(hint)
+                    if pos >= 0:
+                        break
+        if pos >= 0:
+            return tender_text[pos : pos + 4000]
+    return own
+
+
+def enrich_extracted(
+    criteria: list["ExtractedCriterion"], tender_text: str
+) -> list["ExtractedCriterion"]:
+    """用确定性规则补齐 LLM 漏掉的公式/计数参数（就地修改并返回）。"""
+    for c in criteria:
+        if c.category == "price":
+            window = _price_window(c, tender_text)
+            parsed = parse_price_formula_text(window)
+            if parsed:
+                c.formula_type = "deviation_deduct"
+                c.k = Decimal("1")
+                if parsed.get("deduct_rate_down") is not None:
+                    c.deduct_rate_down = parsed["deduct_rate_down"]
+                if parsed.get("deduct_rate_up") is not None:
+                    c.deduct_rate_up = parsed["deduct_rate_up"]
+            # 基准法只在原文明确表述时改写，否则保留模型给出的值
+            if _RE_TRIM_BOTH.search(window):
+                c.benchmark_method = "average_trimmed"
+                c.trim_count = 1
+                c.trim_threshold = 5
+            elif _RE_ARITH_AVG.search(window) and not c.benchmark_method:
+                c.benchmark_method = "average"
+
+        if c.score_type == "count":
+            params = dict(c.params or {})
+            per_item = c.count_per_item
+            if per_item is None and params.get("per_item") is not None:
+                try:
+                    per_item = Decimal(str(params["per_item"]))
+                except Exception:  # noqa: BLE001
+                    per_item = None
+            if per_item is not None and c.count_per_item is None:
+                c.count_per_item = per_item
+            derived = parse_count_params_text(
+                f"{c.description or ''}\n{c.quote or ''}",
+                c.max_score,
+                per_item,
+                c.name,
+            )
+            for key, value in derived.items():
+                params.setdefault(key, value)
+            c.params = params
+    return criteria
+
+
+def material_block_applies(block: str, criterion_name: str) -> bool:
+    """【证明材料】块是否适用于某个计数项（按主体词匹配，避免串到别的评分项）。"""
+    name = criterion_name or ""
+    if any(k in block for k in ("负责人", "团队", "成员", "人员")):
+        return any(k in name for k in ("负责人", "团队", "成员", "人员"))
+    if any(k in block for k in ("业绩", "案例", "合同")):
+        return any(k in name for k in ("业绩", "案例", "合同"))
+    return True
+
+
+def fold_material_blocks(
+    criteria: list["ExtractedCriterion"],
+) -> list["ExtractedCriterion"]:
+    """把单独抽出来的【证明材料】块折叠进同页 count 项，避免重复计分。
+
+    真实标书里【证明材料】通常是评分项单元格的续行，模型会把它当成一条
+    score_type=veto 的独立条目（浙江中烟项目实证：c30 导致总分 106）。
+    """
+    out: list["ExtractedCriterion"] = []
+    for c in criteria:
+        text = f"{c.description or ''}\n{c.quote or ''}".strip()
+        is_material_block = text.startswith("【证明材料】")
+        if is_material_block and c.score_type in ("veto", "match") and not c.is_veto:
+            targets = [
+                t
+                for t in out
+                if t.score_type == "count"
+                and material_block_applies(text, t.name)
+                and (
+                    c.page_hint is None
+                    or t.page_hint is None
+                    or abs(int(t.page_hint) - int(c.page_hint)) <= 1
+                )
+            ]
+            for t in targets:
+                existing = (t.required_evidence or "").strip()
+                if text not in existing:
+                    t.required_evidence = (
+                        f"{existing}\n{text}".strip() if existing else text
+                    )
+            continue  # 不再作为独立评分项落库
+        out.append(c)
+    return out
+
+
+def _triage(c: ExtractedCriterion, quote_verified: bool, has_node: bool) -> str:
+    """六态分诊。"""
+    if c.score_type == "subjective" and c.levels and any(
+        lv.min is None or lv.max is None for lv in c.levels
+    ):
+        return "ambiguous"  # 原文没给分值区间——不得由系统猜
+    if not quote_verified or (c.quote is None):
+        return "needs_input"
+    # 主观项无档位不再阻断：引擎支持按 description 在 0-满分内评分，
+    # 校验器 LEVELS_MISSING 也只是 warn（ADR 0004 的口径）。
+    if c.score_type == "formula":
+        if c.max_score is None:
+            return "needs_input"
+        if c.formula_type == "deviation_deduct":
+            has_rate = bool(
+                c.deduct_rate
+                or c.deduct_rate_down
+                or c.deduct_rate_up
+                or (c.params or {}).get("deduct_rate_down")
+                or (c.params or {}).get("deduct_rate_up")
+            )
+            if not has_rate:
+                return "needs_input"
+        elif c.k is None:
+            return "needs_input"
+    if c.score_type == "veto" and not c.check_type:
+        return "needs_input"
+    if has_node:
+        return "verified"
+    return "needs_input"
 
 
 def _extract_chunk(
@@ -326,25 +549,6 @@ def find_node_for_quote(document_id: int, page_no: int | None, quote: str) -> st
     return None
 
 
-def _triage(c: ExtractedCriterion, quote_verified: bool, has_node: bool) -> str:
-    """六态分诊。"""
-    if c.score_type == "subjective" and c.levels and any(
-        lv.min is None or lv.max is None for lv in c.levels
-    ):
-        return "ambiguous"  # 原文没给分值区间——不得由系统猜
-    if not quote_verified or (c.quote is None):
-        return "needs_input"
-    if c.score_type == "subjective" and not c.levels:
-        return "needs_input"
-    if c.score_type == "formula" and (c.k is None or c.max_score is None):
-        return "needs_input"
-    if c.score_type == "veto" and not c.check_type:
-        return "needs_input"
-    if has_node:
-        return "verified"
-    return "needs_input"
-
-
 def _persist_criterion(
     s,  # noqa: ANN001
     package_id: int,
@@ -382,17 +586,20 @@ def _persist_criterion(
             n += 1
         code = f"{base}~{n}"
     used_codes.add(code)
+    is_veto = c.score_type == "veto"
     crit = Criterion(
         package_id=package_id,
         code=code,
         category=c.category,
         name=c.name,
         description=c.description,
-        max_score=c.max_score,
+        # 否决项不得同时作为评分因素给分（法规红线）——忽略模型给的分值
+        max_score=None if is_veto else c.max_score,
         weight=None,  # 权重永不来自模型
         score_type=c.score_type,
-        is_veto=bool(c.is_veto),
-        veto_consequence=c.veto_consequence if c.is_veto else None,
+        is_veto=is_veto,
+        veto_consequence=c.veto_consequence if is_veto else None,
+        required_evidence=c.required_evidence,
         source_node_id=None,  # 核验通过后回填
         source_page=c.page_hint,
         source_quote=c.quote,
@@ -416,8 +623,13 @@ def _persist_criterion(
             )
         )
 
-    # 客观检查原语（否决项与计数类评分项都需要落 params 供确定性引擎执行）
-    if c.check_type or c.params or c.count_per_item is not None:
+    # 客观检查原语（否决/匹配/计数类需要 params 供确定性引擎执行）。
+    # 价格项的参数（trim_count 等）走 PriceFormula.params_json，不能误建 human_only check。
+    wants_check = bool(c.check_type) or (
+        c.score_type in ("veto", "match", "count")
+        and (bool(c.params) or c.count_per_item is not None)
+    )
+    if wants_check:
         from app.rules.freeze import _jsonable
 
         params = dict(c.params or {})
@@ -431,13 +643,27 @@ def _persist_criterion(
                 check_type=c.check_type or ("count_at_least" if c.score_type == "count" else "human_only"),
                 field=params.get("field") if isinstance(params.get("field"), str) else None,
                 params_json=_jsonable(params),
-                on_fail="recommend_reject" if c.is_veto else "need_human",
+                on_fail="recommend_reject" if is_veto else "need_human",
                 source_quote=c.quote,
             )
         )
 
-    # 价格公式
+    # 价格公式：扣分率与基准法参数全部落盘（快照是评分唯一输入，漏一个字段
+    # 就会让偏离扣分退化成"人人满分"）
     if c.category == "price":
+        from app.rules.freeze import _jsonable
+
+        ext: dict[str, str] = {}
+        if c.deduct_rate is not None:
+            ext["deduct_rate"] = str(c.deduct_rate)
+        if c.deduct_rate_down is not None:
+            ext["deduct_rate_down"] = str(c.deduct_rate_down)
+        if c.deduct_rate_up is not None:
+            ext["deduct_rate_up"] = str(c.deduct_rate_up)
+        if c.trim_count is not None:
+            ext["trim_count"] = str(c.trim_count)
+        if c.trim_threshold is not None:
+            ext["trim_threshold"] = str(c.trim_threshold)
         s.add(
             PriceFormula(
                 package_id=package_id,
@@ -445,9 +671,13 @@ def _persist_criterion(
                 formula_type=c.formula_type or "benchmark_ratio",
                 benchmark_method=c.benchmark_method or "average",
                 k=c.k,
+                trim_ratio=c.trim_ratio,
+                deduct_rate=c.deduct_rate,
                 upper_bound=c.upper_bound,
+                lower_bound=c.lower_bound,
                 rounding=c.rounding if c.rounding is not None else 2,
                 exclude_invalid=True,
+                params_json=_jsonable(ext) if ext else None,
                 source_node_id=None,  # 核验通过后回填
                 source_quote=c.quote,
             )
@@ -489,19 +719,26 @@ def run_validations(package_id: int) -> list[dict]:
             ).first() is not None
 
     findings = run_checks(snapshot, node_exists=_node_exists)
+    # Finding.subject_id 是 criterion code（字符串）；落库列是 Integer，
+    # 解析成数据库 id，前端才能把 issue 定位到具体规则。
+    code_to_id = {c["code"]: c.get("id") for c in criteria}
     with session_scope() as s:
         from sqlalchemy import delete
 
         # 校验结果是"当前草稿"的派生数据：直接清空重写
         s.execute(delete(PackageValidation).where(PackageValidation.package_id == package_id))
         for f in findings:
+            subject_id = None
+            if f.subject_type in ("criterion", "formula") and f.subject_id:
+                resolved = code_to_id.get(str(f.subject_id))
+                subject_id = int(resolved) if isinstance(resolved, int) else None
             s.add(
                 PackageValidation(
                     package_id=package_id,
                     code=f.code,
                     severity=f.severity,
                     subject_type=f.subject_type,
-                    subject_id=None,
+                    subject_id=subject_id,
                     message=f.message,
                     hint=f.hint,
                 )
@@ -557,6 +794,9 @@ def compile_rules(
         criteria_acc.extend(extraction.criteria)
         result_model = result.model
     criteria_acc = dedupe_extracted(criteria_acc)
+    # 确定性补全：先把【证明材料】块折叠进 count 项，再补公式/计数参数
+    criteria_acc = fold_material_blocks(criteria_acc)
+    criteria_acc = enrich_extracted(criteria_acc, text)
 
     version = _next_version(project_id)
     with session_scope() as s:
@@ -568,7 +808,7 @@ def compile_rules(
             merge_target_id=merge_target_id,
             compiled_by=actor,
             model=result_model,
-            prompt_version=None,
+            prompt_version=config.llm_prompt_version(),
             created_by=actor,
         )
         s.add(pkg)
@@ -585,6 +825,8 @@ def compile_rules(
 
     # 事务已提交：核验引用（独立会话）→ 回填页码/条款节点 → 重新分诊
     _verify_and_backfill(document_id, pending)
+    # 节点已确定：把表格里被模型漏掉的子项/档位续行补进 description
+    enrich_descriptions_from_nodes(package_id)
 
     run_validations(package_id)
     return package_id
@@ -615,6 +857,96 @@ def _verify_and_backfill(
             crit.source_node_id = node_id
             crit.status = status
             s.add(crit)
+
+
+def _has_scoring_detail(text: str) -> bool:
+    """描述里是否已经有可执行的子项/档位明细。"""
+    return bool(
+        re.search(r"[（(]\s*0\s*[-~至]\s*\d", text or "")
+        or re.search(r"得\s*\d+(?:\.\d+)?\s*[-~至]\s*\d+(?:\.\d+)?\s*分", text or "")
+    )
+
+
+def _normalized_span(haystack: str, needle: str) -> tuple[int, int] | None:
+    """忽略空白/排版归一化定位 needle，返回其在 haystack 原文中的 [start, end)。"""
+    from app.parsing.normalize import normalize_no_ws_with_map
+
+    needle_n = normalize_no_ws(needle)
+    if not needle_n:
+        return None
+    norm, idx = normalize_no_ws_with_map(haystack)
+    pos = norm.find(needle_n)
+    if pos < 0:
+        return None
+    return idx[pos], idx[pos + len(needle_n) - 1] + 1
+
+
+def enrich_descriptions_from_nodes(package_id: int) -> int:
+    """把 source node 里紧跟 quote 的评分细则续行补进主观项 description。
+
+    真实招标文件的表格在 PDF 里被拆成多行：模型只抄了首句，子项分值
+    （"协同办公（0-2 分）…"）或档位文字（"得 3-4 分…"）留在同一节点后半段。
+    不补进描述，主观评分就只能按名字整体印象打分（评分趋同的直接原因）。
+    """
+    from app.db.models import Criterion
+
+    changed = 0
+    with session_scope() as s:
+        pkg = s.get(RulePackage, package_id)
+        if pkg is None or pkg.source_document_id is None:
+            return 0
+        doc_id = pkg.source_document_id
+        crits = s.execute(
+            select(Criterion).where(
+                Criterion.package_id == package_id,
+                Criterion.status != "retired",
+                Criterion.score_type == "subjective",
+            )
+        ).scalars().all()
+        groups: dict[str, list[Criterion]] = {}
+        for c in crits:
+            if c.source_node_id and (c.source_quote or "").strip():
+                groups.setdefault(c.source_node_id, []).append(c)
+        for node_id, group in groups.items():
+            node = s.execute(
+                select(DocNode).where(
+                    DocNode.document_id == doc_id, DocNode.node_id == node_id
+                )
+            ).scalar_one_or_none()
+            if node is None or not (node.text or "").strip():
+                continue
+            group.sort(key=lambda x: (x.sort_order or 0, x.id))
+            spans = [
+                (c, _normalized_span(node.text, c.source_quote or "")) for c in group
+            ]
+            # 必须按 quote 在节点中的实际位置排序：合并包的 sort_order 来自模板
+            # （T4.1/T4.2/T4.3 在前，c23… 追加项在后），与原文表格顺序不一致。
+            spans = [x for x in spans if x[1] is not None]
+            spans.sort(key=lambda x: x[1][0])  # type: ignore[index]
+            for i, (crit, span) in enumerate(spans):
+                if span is None:
+                    continue
+                if _has_scoring_detail(crit.description or ""):
+                    continue
+                start, quote_end = span
+                next_start = (
+                    spans[i + 1][1][0]  # type: ignore[index]
+                    if i + 1 < len(spans)
+                    else len(node.text)
+                )
+                segment = node.text[start:next_start].strip()
+                if not segment or not _has_scoring_detail(segment):
+                    continue
+                # 去掉 quote 本身，只保留续行
+                tail = node.text[quote_end:next_start].strip()
+                if not tail or tail in (crit.description or ""):
+                    continue
+                crit.description = (
+                    (crit.description or "").rstrip() + "\n" + tail
+                )[:4000]
+                s.add(crit)
+                changed += 1
+    return changed
 
 
 @register("compile_rules")

@@ -307,7 +307,7 @@ def llm_daily_call_budget() -> int:
 
 def llm_prompt_version() -> str:
     """提示词版本号；进入缓存键与审计记录。改 prompt 必须同步改它。"""
-    return os.environ.get("BID_EVAL_PROMPT_VERSION", "2026-10-19.1")
+    return os.environ.get("BID_EVAL_PROMPT_VERSION", "2026-10-20.1")
 
 
 def local_endpoint_hosts() -> list[str]:

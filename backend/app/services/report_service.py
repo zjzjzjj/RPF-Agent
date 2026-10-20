@@ -167,6 +167,10 @@ def _classify_question(score, crit) -> str | None:
         # 工作台/复核队列仍把这批列为待复核，两处结论直接打架。
         return "batch_confirmable"
 
+    # 计数项算不出来必须显性标出——0 分/未定分是能力缺失，不是评分结论。
+    # 必须在 conflict/no_score 之前判，否则 unresolved 会被"疑问/未定分"吞掉。
+    if crit.score_type == "count" and (problem := _count_problem(score)):
+        return problem
     if score.review_status == "conflict_flagged":
         return "conflict"
     # match 判断项：按设计不打分（final 恒 None），按机器判定三态定性——

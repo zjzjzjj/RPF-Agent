@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from typing import Any
 
 from sqlalchemy import select
@@ -17,6 +18,7 @@ from app.db.models import (
     Criterion,
     CriterionCheck,
     CriterionLevel,
+    DocNode,
     EvidenceCitation,
     PackageValidation,
     PriceFormula,
@@ -102,9 +104,20 @@ def edit_price_formula(
                "params_json"}
     with session_scope() as s:
         pkg = _require_draft(package_id)
+        # 优先修"仍在计分"的价格项；多价格项时不要再盲取第一行（可能是 retired）
         formula = s.execute(
-            select(PriceFormula).where(PriceFormula.package_id == package_id).limit(1)
+            select(PriceFormula)
+            .join(Criterion, Criterion.id == PriceFormula.criterion_id)
+            .where(
+                PriceFormula.package_id == package_id,
+                Criterion.status != "retired",
+            )
+            .limit(1)
         ).scalar_one_or_none()
+        if formula is None:
+            formula = s.execute(
+                select(PriceFormula).where(PriceFormula.package_id == package_id).limit(1)
+            ).scalar_one_or_none()
         if formula is None:
             formula = PriceFormula(
                 package_id=package_id, formula_type="benchmark_ratio", benchmark_method="average"
@@ -206,9 +219,9 @@ def load_criteria_for_snapshot(s: Session, package_id: int) -> list[dict[str, An
         select(CriterionLevel).order_by(CriterionLevel.id)
     ).scalars().all()
     check_rows = s.execute(select(CriterionCheck)).scalars().all()
-    formula_row = s.execute(
-        select(PriceFormula).where(PriceFormula.package_id == package_id).limit(1)
-    ).scalar_one_or_none()
+    formula_rows = s.execute(
+        select(PriceFormula).where(PriceFormula.package_id == package_id)
+    ).scalars().all()
 
     levels_by_crit: dict[int, list[dict]] = {}
     for lv in level_rows:
@@ -218,7 +231,7 @@ def load_criteria_for_snapshot(s: Session, package_id: int) -> list[dict[str, An
         )
     checks_by_crit: dict[int, CriterionCheck] = {c.criterion_id: c for c in check_rows}
     formula_by_crit: dict[int | None, dict] = {}
-    if formula_row is not None:
+    for formula_row in formula_rows:
         formula_by_crit[formula_row.criterion_id] = {
             "formula_type": formula_row.formula_type,
             "benchmark_method": formula_row.benchmark_method,
@@ -409,26 +422,44 @@ def set_levels(criterion_id: int, levels: list[dict], actor: str, reason: str) -
 
 
 def accept_all_criteria(package_id: int, actor: str, reason: str) -> dict:
-    """批量采纳：对全部 status=='verified' 条目逐条写 accept 留痕（单事务，全成全败）。
+    """批量采纳：把所有非模板、未退役的条目置 verified 并逐条留痕。
 
-    与逐条 accept_criterion 同语义（verified 条目的复核留痕，不改状态），
-    仅省去逐次请求；2026-10-13 应用户要求移除"故意不提供全部采纳"限制。
+    旧实现只处理已 verified 的条目，对 needs_input 完全无效（用户没有批量出口）。
+    模板 needs_signoff 仍由 signoff_all_criteria 处理。
     """
     if not reason.strip():
         raise ValidationFailed("批量采纳必须填写理由")
     _require_draft(package_id)
     accepted = 0
     with session_scope() as s:
-        for crit in list_criteria(package_id):
-            if crit.status != "verified":
+        crits = s.execute(
+            select(Criterion).where(Criterion.package_id == package_id)
+        ).scalars().all()
+        for crit in crits:
+            if crit.status == "retired":
                 continue
+            if crit.origin == "template" and crit.status == "needs_signoff":
+                continue  # 模板兜底必须走签批
+            old = crit.status
+            crit.status = "verified"
+            if old != "verified":
+                crit.edit_json = {
+                    **(crit.edit_json or {}),
+                    "accepted_from_status": old,
+                    "accepted_by": actor,
+                    "accepted_at": utcnow().isoformat(),
+                }
             accepted += 1
+            s.add(crit)
             s.add(
                 ReviewRecord(
                     subject_type="criterion", subject_id=str(crit.id), action="accept",
                     actor=actor, reason=reason,
+                    old_value_json={"status": old},
+                    new_value_json={"status": "verified"},
                 )
             )
+    compiler.run_validations(package_id)
     from app.services import audit_service
 
     audit_service.log(package_id, actor, "rules.accept_all", "package",
@@ -443,7 +474,10 @@ def signoff_all_criteria(package_id: int, actor: str, reason: str) -> dict:
     _require_draft(package_id)
     signed = 0
     with session_scope() as s:
-        for crit in list_criteria(package_id):
+        crits = s.execute(
+            select(Criterion).where(Criterion.package_id == package_id)
+        ).scalars().all()
+        for crit in crits:
             if crit.origin != "template" or crit.status != "needs_signoff":
                 continue
             crit.status = "verified"
@@ -460,6 +494,8 @@ def signoff_all_criteria(package_id: int, actor: str, reason: str) -> dict:
                     actor=actor, reason=reason,
                 )
             )
+    # 签批后必须重跑校验：否则页面继续显示旧的 TEMPLATE_FALLBACK_SIGNOFF 阻断
+    compiler.run_validations(package_id)
     from app.services import audit_service
 
     audit_service.log(package_id, actor, "rules.signoff_all", "package",
@@ -468,7 +504,11 @@ def signoff_all_criteria(package_id: int, actor: str, reason: str) -> dict:
 
 
 def accept_criterion(criterion_id: int, actor: str, reason: str) -> Criterion:
-    """逐条确认（批量采纳见 accept_all_criteria）。"""
+    """逐条确认：把 needs_input/ambiguous 等草稿条目置为 verified（留痕）。
+
+    旧实现要求条目**已经是 verified**，而前端恰好在非 verified 时显示「确认」按钮，
+    导致用户点了必然 422（真实项目 15 条 needs_input 无法收敛）。
+    """
     if not reason.strip():
         raise ValidationFailed("确认必须填写理由")
     with session_scope() as s:
@@ -476,19 +516,32 @@ def accept_criterion(criterion_id: int, actor: str, reason: str) -> Criterion:
         if crit is None:
             raise NotFound("评分项不存在")
         _require_draft(crit.package_id)
-        if crit.status != "verified":
-            raise ValidationFailed(f"评分项状态为 {crit.status}，不能确认；请先补全或修正")
+        if crit.status == "retired":
+            raise ValidationFailed("已退役的评分项不能确认")
+        if crit.origin == "template" and crit.status == "needs_signoff":
+            raise ValidationFailed("模板兜底条目请走签批流程（签批理由需单列）")
+        old = crit.status
         crit.status = "verified"
+        if old != "verified":
+            crit.edit_json = {
+                **(crit.edit_json or {}),
+                "accepted_from_status": old,
+                "accepted_by": actor,
+                "accepted_at": utcnow().isoformat(),
+            }
         s.add(crit)
         s.add(
             ReviewRecord(
                 subject_type="criterion", subject_id=str(criterion_id), action="accept",
                 actor=actor, reason=reason,
+                old_value_json={"status": old},
+                new_value_json={"status": "verified"},
             )
         )
         s.flush()
         s.expunge(crit)
         package_id = crit.package_id
+    compiler.run_validations(package_id)
     return crit
 
 
@@ -762,6 +815,317 @@ def _auto_settle_blocking(package_id: int, actor: str) -> None:
             )
 
 
+def normalize_package(package_id: int, actor: str = "auto") -> dict[str, int]:
+    """确定性自愈草稿包（幂等）。只改数据，不改 status（状态由 auto-settle/人工处置）。
+
+    处理的都是"抽取/合并造成的结构化缺陷"：
+    1. 单独的【证明材料】块 → 折叠进同页 count 项并 retired；
+    2. 表头/结论行（资格审查不通过…）→ retired；
+    3. 不闭合档位 → 删除（让引擎按 description 在 0-满分评分）；
+    4. 价格公式补 deviation_deduct + 扣分率/基准法（优先 source node 原文）；
+    5. count 项补 max_items/min_amount_yuan/person_scope；
+    6. score_type=veto 但 is_veto=false → 归一。
+    """
+    from app.rules import compiler
+
+    stats = {
+        "materials_folded": 0,
+        "summary_retired": 0,
+        "levels_dropped": 0,
+        "price_repaired": 0,
+        "count_repaired": 0,
+        "veto_normalized": 0,
+    }
+    summary_names = {
+        "资格审查不通过",
+        "符合性审查不通过",
+        "技术平均分未达到技术总分值",
+    }
+
+    with session_scope() as s:
+        pkg = s.get(RulePackage, package_id)
+        if pkg is None or pkg.status not in ("draft", "confirmed"):
+            return stats
+        crits = s.execute(
+            select(Criterion).where(Criterion.package_id == package_id)
+        ).scalars().all()
+        active = [c for c in crits if c.status != "retired"]
+
+        def record(c: Criterion, reason: str) -> None:
+            s.add(
+                ReviewRecord(
+                    subject_type="criterion", subject_id=str(c.id), action="edit",
+                    actor=actor, reason=reason,
+                )
+            )
+
+        # ① 证明材料块折叠
+        for c in list(active):
+            if c.origin not in ("template", "document"):
+                continue
+            text = f"{c.description or ''}\n{c.source_quote or ''}".strip()
+            if not text.startswith("【证明材料】"):
+                continue
+            if c.score_type not in ("veto", "match") or c.is_veto:
+                continue
+            targets = [
+                t for t in active
+                if t.id != c.id
+                and t.origin in ("template", "document")
+                and t.score_type == "count"
+                and compiler.material_block_applies(text, t.name)
+                and (
+                    c.source_page is None
+                    or t.source_page is None
+                    or abs(int(t.source_page) - int(c.source_page)) <= 1
+                )
+            ]
+            for t in targets:
+                existing = (t.required_evidence or "").strip()
+                if text not in existing:
+                    t.required_evidence = (
+                        f"{existing}\n{text}".strip() if existing else text
+                    )
+                    s.add(t)
+                    record(t, "自动修复：合并【证明材料】要求到计数项")
+            c.status = "retired"
+            s.add(c)
+            record(c, "自动修复：【证明材料】块不是独立评分项，已并入计数项")
+            stats["materials_folded"] += 1
+            active.remove(c)
+
+        # ② 表头/结论行
+        for c in list(active):
+            if c.origin in ("template", "document") and c.name.strip() in summary_names and not c.source_node_id:
+                c.status = "retired"
+                s.add(c)
+                record(c, "自动修复：表头/结论行不是独立条款，已退役")
+                stats["summary_retired"] += 1
+                active.remove(c)
+
+        # ③ 不闭合档位
+        from app.rules.validators import _check_level_closure
+
+        for c in active:
+            if c.score_type != "subjective" or c.origin not in ("template", "document"):
+                continue
+            levels = s.execute(
+                select(CriterionLevel).where(CriterionLevel.criterion_id == c.id)
+            ).scalars().all()
+            if not levels:
+                continue
+            snap_levels = [
+                {"label": lv.level_label, "min": lv.score_min, "max": lv.score_max,
+                 "criteria": lv.description}
+                for lv in levels
+            ]
+            findings = _check_level_closure({
+                "code": c.code, "name": c.name, "score_type": "subjective",
+                "levels": snap_levels, "max_score": c.max_score,
+            })
+            if not any(f.severity == "error" for f in findings):
+                continue
+            for lv in levels:
+                s.delete(lv)
+            c.edit_json = {
+                **(c.edit_json or {}),
+                "auto_dropped_levels": {
+                    "reason": "档位未闭合覆盖 0-满分，改按 description 综合评分",
+                    "by": actor,
+                    "at": utcnow().isoformat(),
+                },
+            }
+            s.add(c)
+            record(c, "自动修复：删除不闭合档位（原文未给出完整档位表）")
+            stats["levels_dropped"] += 1
+
+        # ④ 价格公式
+        for c in active:
+            if c.category != "price" or c.origin not in ("template", "document"):
+                continue
+            formula = s.execute(
+                select(PriceFormula).where(
+                    PriceFormula.package_id == package_id,
+                    PriceFormula.criterion_id == c.id,
+                )
+            ).scalar_one_or_none()
+            if formula is None:
+                # 兼容旧包的 criterion_id=NULL 单行
+                formula = s.execute(
+                    select(PriceFormula).where(
+                        PriceFormula.package_id == package_id,
+                        PriceFormula.criterion_id.is_(None),
+                    )
+                ).scalar_one_or_none()
+                if formula is not None:
+                    formula.criterion_id = c.id
+            if formula is None:
+                formula = PriceFormula(
+                    package_id=package_id,
+                    criterion_id=c.id,
+                    formula_type="benchmark_ratio",
+                    benchmark_method="average",
+                )
+                s.add(formula)
+                s.flush()
+
+            texts = [c.description or "", c.source_quote or ""]
+            if c.source_node_id and pkg.source_document_id:
+                node = s.execute(
+                    select(DocNode).where(
+                        DocNode.document_id == pkg.source_document_id,
+                        DocNode.node_id == c.source_node_id,
+                    )
+                ).scalar_one_or_none()
+                if node is not None:
+                    texts.append(node.text or "")
+            parsed = compiler.parse_price_formula_text("\n".join(texts))
+            changed_formula = False
+            if parsed:
+                formula.formula_type = "deviation_deduct"
+                formula.k = parsed.get("k") or Decimal("1")
+                ext = dict(formula.params_json or {})
+                for key in ("deduct_rate_down", "deduct_rate_up"):
+                    if parsed.get(key) is not None:
+                        ext[key] = str(parsed[key])
+                for key in ("trim_count", "trim_threshold"):
+                    if parsed.get(key) is not None:
+                        ext[key] = str(parsed[key])
+                formula.params_json = ext
+                if parsed.get("benchmark_method"):
+                    formula.benchmark_method = parsed["benchmark_method"]
+                changed_formula = True
+            else:
+                # 从同项目同 template_code 的完整公式继承缺失字段
+                inherited = _inherit_formula(s, pkg, c, formula)
+                changed_formula = inherited
+            if formula.upper_bound is None and c.max_score is not None:
+                formula.upper_bound = c.max_score
+                changed_formula = True
+            if formula.lower_bound is None:
+                formula.lower_bound = Decimal(0)
+                changed_formula = True
+            if formula.rounding is None:
+                formula.rounding = 2
+                changed_formula = True
+            if changed_formula:
+                s.add(formula)
+                record(c, "自动修复：补齐价格公式参数（偏离扣分/基准法）")
+                stats["price_repaired"] += 1
+
+        # ⑤ count 参数
+        for c in active:
+            if c.score_type != "count" or c.origin not in ("template", "document"):
+                continue
+            check = s.execute(
+                select(CriterionCheck).where(CriterionCheck.criterion_id == c.id)
+            ).scalar_one_or_none()
+            if check is None:
+                check = CriterionCheck(
+                    criterion_id=c.id,
+                    check_type="count_at_least",
+                    field=None,
+                    params_json={},
+                    on_fail="need_human",
+                    source_quote=c.source_quote,
+                )
+                s.add(check)
+                s.flush()
+            params = dict(check.params_json or {})
+            per_item = None
+            if params.get("per_item") is not None:
+                try:
+                    per_item = Decimal(str(params["per_item"]))
+                except Exception:  # noqa: BLE001
+                    per_item = None
+            derived = compiler.parse_count_params_text(
+                f"{c.description or ''}\n{c.source_quote or ''}",
+                c.max_score,
+                per_item,
+                c.name,
+            )
+            added = False
+            for key, value in derived.items():
+                if key not in params:
+                    params[key] = value
+                    added = True
+            if added:
+                check.params_json = params
+                s.add(check)
+                record(c, "自动修复：补齐计数参数（最高项数/金额门槛/人员范围）")
+                stats["count_repaired"] += 1
+
+        # ⑥ is_veto 归一
+        for c in active:
+            if c.origin not in ("template", "document"):
+                continue
+            if c.score_type == "veto" and not c.is_veto:
+                c.is_veto = True
+                c.max_score = None
+                s.add(c)
+                record(c, "自动修复：score_type=veto 与 is_veto 不一致，已归一")
+                stats["veto_normalized"] += 1
+
+    # ⑦ 描述补全（独立会话；复用编译期的节点续行逻辑）
+    compiler.enrich_descriptions_from_nodes(package_id)
+    return stats
+
+
+def _formula_complete(f: PriceFormula) -> bool:
+    if not f.formula_type or not f.benchmark_method:
+        return False
+    ext = f.params_json or {}
+    if f.formula_type == "deviation_deduct":
+        return bool(f.deduct_rate or ext.get("deduct_rate_down") or ext.get("deduct_rate_up"))
+    if f.formula_type in ("benchmark_ratio", "lowest_ratio"):
+        return f.k is not None
+    return True
+
+
+def _inherit_formula(s: Session, pkg: RulePackage, crit: Criterion, dst: PriceFormula) -> bool:  # noqa: ANN001
+    """从同项目同 template_code 的完整公式继承缺失参数。"""
+    if not crit.template_code:
+        return False
+    rows = s.execute(
+        select(PriceFormula)
+        .join(Criterion, Criterion.id == PriceFormula.criterion_id)
+        .join(RulePackage, RulePackage.id == PriceFormula.package_id)
+        .where(
+            RulePackage.project_id == pkg.project_id,
+            RulePackage.id != pkg.id,
+            Criterion.template_code == crit.template_code,
+            Criterion.category == "price",
+            Criterion.status != "retired",
+        )
+        .order_by(RulePackage.version.desc())
+    ).scalars().all()
+    changed = False
+    for src in rows:
+        if not _formula_complete(src):
+            continue
+        for field in ("formula_type", "benchmark_method", "trim_ratio", "k",
+                      "deduct_rate", "upper_bound", "lower_bound", "rounding",
+                      "exclude_invalid", "tax_basis"):
+            if getattr(dst, field) is None and getattr(src, field) is not None:
+                setattr(dst, field, getattr(src, field))
+                changed = True
+        if not (dst.params_json or {}) and src.params_json:
+            dst.params_json = src.params_json
+            changed = True
+        break
+    return changed
+
+
+
+    crits = list_criteria(package_id)
+    # retired（本项目无此项）不阻断：它已从快照/总分口径中排除
+    return [
+        f"{c.code} {c.name}（{c.status}）"
+        for c in crits
+        if c.status != "verified" and c.status != "retired"
+    ]
+
+
 def _blocking_items(package_id: int) -> list[str]:
     crits = list_criteria(package_id)
     # retired（本项目无此项）不阻断：它已从快照/总分口径中排除
@@ -775,6 +1139,8 @@ def _blocking_items(package_id: int) -> list[str]:
 def confirm_package(package_id: int, actor: str) -> RulePackage:
     pkg = _require_draft(package_id)
     if config.auto_mode():
+        # 先修数据（档位/公式/证明材料块），再收敛状态；只改数据不改 status
+        normalize_package(package_id, actor)
         _auto_settle_blocking(package_id, actor)
     findings = compiler.run_validations(package_id)
     errors = [f for f in findings if f["severity"] == "error"]
@@ -810,6 +1176,7 @@ def freeze_package(package_id: int, actor: str) -> RulePackage:
     if pkg.status != "confirmed":
         raise ValidationFailed("只有已确认的规则包可以冻结")
     if config.auto_mode():
+        normalize_package(package_id, actor)
         _auto_settle_blocking(package_id, actor)
 
     # 冻结是最后一道闸门：即使确认时校验通过，这里也必须重跑并清零 error

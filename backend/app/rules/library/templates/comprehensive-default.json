@@ -2,8 +2,10 @@
   "template_id": "comprehensive-default",
   "name": "综合评分法（通用·默认）",
   "method": "comprehensive",
-  "applicable": {"procurement": "general"},
-  "library_version": "2.0.0",
+  "applicable": {
+    "procurement": "general"
+  },
+  "library_version": "2.1.0",
   "notes": "默认评分细则：价格 50 分、技术 40 分、商务 10 分，非否决项合计 100 分。无招标文件时可直接启用本模板评分；上传招标文件后，系统会按文件条款逐条覆盖本模板（匹配项覆盖、新增项追加、未规定项弃用），并以新版本草稿等待确认。全部条目均为通用判据，分值、门槛与证明材料可在覆盖时按招标文件替换。库内不收录品牌、型号或指向唯一供应商的条目。",
   "criteria": [
     {
@@ -16,7 +18,14 @@
       "description": "投标人须为在中华人民共和国境内注册、具有独立承担民事责任能力的法人或其他组织。",
       "required_evidence": "有效的营业执照（或事业单位法人证书）副本复印件，加盖投标人公章。",
       "checks": [
-        {"check_type": "document_present", "field": null, "params": {"document": "营业执照"}, "on_fail": "recommend_reject"}
+        {
+          "check_type": "document_present",
+          "field": null,
+          "params": {
+            "document": "营业执照"
+          },
+          "on_fail": "recommend_reject"
+        }
       ],
       "max_score": null,
       "levels": [],
@@ -35,7 +44,14 @@
       "description": "投标人须具备招标文件载明的相应资质证书且在有效期内。",
       "required_evidence": "招标文件要求的资质证书复印件（须在有效期内，含年检记录）。",
       "checks": [
-        {"check_type": "document_present", "field": null, "params": {"document": "资质证书"}, "on_fail": "recommend_reject"}
+        {
+          "check_type": "document_present",
+          "field": null,
+          "params": {
+            "document": "资质证书"
+          },
+          "on_fail": "recommend_reject"
+        }
       ],
       "max_score": null,
       "levels": [],
@@ -54,7 +70,14 @@
       "description": "投标人未被列入失信被执行人名单、重大税收违法案件当事人名单及政府采购严重违法失信行为记录名单。",
       "required_evidence": "信用中国（creditchina.gov.cn）与政府采购网（ccgp.gov.cn）查询结果截图，或加盖公章的信用承诺函。",
       "checks": [
-        {"check_type": "document_present", "field": null, "params": {"document": "信用承诺函"}, "on_fail": "recommend_reject"}
+        {
+          "check_type": "document_present",
+          "field": null,
+          "params": {
+            "document": "信用承诺函"
+          },
+          "on_fail": "recommend_reject"
+        }
       ],
       "max_score": null,
       "levels": [],
@@ -73,7 +96,14 @@
       "description": "投标人须提供依法缴纳税收和社会保障资金的相关证明材料。",
       "required_evidence": "投标截止日前近六个月任一月度的纳税证明与社保缴纳凭证（加盖公章或税务/社保部门电子凭证）。",
       "checks": [
-        {"check_type": "document_present", "field": null, "params": {"document": "缴纳税收和社保证明"}, "on_fail": "recommend_reject"}
+        {
+          "check_type": "document_present",
+          "field": null,
+          "params": {
+            "document": "缴纳税收和社保证明"
+          },
+          "on_fail": "recommend_reject"
+        }
       ],
       "max_score": null,
       "levels": [],
@@ -92,7 +122,12 @@
       "description": "投标函须由法定代表人或其授权代表签署并加盖投标人公章。",
       "required_evidence": "投标函原件（法定代表人或授权代表签字，并加盖投标人公章）；授权代表签署的须附授权委托书。",
       "checks": [
-        {"check_type": "human_only", "field": null, "params": {}, "on_fail": "recommend_reject"}
+        {
+          "check_type": "human_only",
+          "field": null,
+          "params": {},
+          "on_fail": "recommend_reject"
+        }
       ],
       "max_score": null,
       "levels": [],
@@ -111,7 +146,12 @@
       "description": "投标有效期须满足招标文件载明的期限要求（自投标截止之日起算）。",
       "required_evidence": "投标函中载明的投标有效期承诺（天数不低于招标文件要求）。",
       "checks": [
-        {"check_type": "human_only", "field": null, "params": {}, "on_fail": "recommend_reject"}
+        {
+          "check_type": "human_only",
+          "field": null,
+          "params": {},
+          "on_fail": "recommend_reject"
+        }
       ],
       "max_score": null,
       "levels": [],
@@ -130,7 +170,14 @@
       "description": "投标人须按招标文件要求提交投标保证金。",
       "required_evidence": "投标保证金缴纳凭证（银行回单/保函/电子凭证），金额与形式符合招标文件。",
       "checks": [
-        {"check_type": "document_present", "field": null, "params": {"document": "投标保证金缴纳凭证"}, "on_fail": "recommend_reject"}
+        {
+          "check_type": "document_present",
+          "field": null,
+          "params": {
+            "document": "投标保证金缴纳凭证"
+          },
+          "on_fail": "recommend_reject"
+        }
       ],
       "max_score": null,
       "levels": [],
@@ -149,7 +196,12 @@
       "description": "投标人须对同一项目提交唯一报价，且报价不得高于最高投标限价。",
       "required_evidence": "开标一览表/投标报价表（报价唯一且不高于最高投标限价）。",
       "checks": [
-        {"check_type": "math_relation", "field": null, "params": {}, "on_fail": "recommend_reject"}
+        {
+          "check_type": "math_relation",
+          "field": null,
+          "params": {},
+          "on_fail": "recommend_reject"
+        }
       ],
       "max_score": null,
       "levels": [],
@@ -165,13 +217,15 @@
       "score_type": "formula",
       "is_veto": false,
       "veto_consequence": null,
-      "description": "以通过初步评审的全部有效投标报价的算术平均价为评标基准价（系数 k=1.0）；投标报价等于基准价的得满分 50 分，偏离基准价的按比例扣分，扣完为止。",
+      "description": "以通过初步评审的全部有效投标报价的算术平均价为评标基准价（系数 k=1.0）；投标报价等于基准价的得满分 50 分；报价低于基准价的，每低 1 个百分点扣 0.2 分；报价高于基准价的，每高 1 个百分点扣 0.4 分；扣完为止。招标文件另有规定的，按文件载明的公式覆盖本项。",
       "required_evidence": null,
       "checks": [],
       "formula": {
-        "formula_type": "benchmark_ratio",
+        "formula_type": "deviation_deduct",
         "benchmark_method": "average",
         "k": 1.0,
+        "deduct_rate_down": 0.2,
+        "deduct_rate_up": 0.4,
         "upper_bound": 50,
         "lower_bound": 0,
         "rounding": 2
@@ -195,10 +249,30 @@
       "formula": null,
       "max_score": 20,
       "levels": [
-        {"label": "优", "min": 17, "max": 20, "criteria": "全部需求逐项响应且无缺项；关键技术指标全部满足或优于要求并附依据；方案针对本项目难点，实施路径清晰。"},
-        {"label": "良", "min": 12, "max": 16, "criteria": "需求基本逐项响应；关键技术指标满足要求；方案较有针对性，实施路径较清晰。"},
-        {"label": "一般", "min": 6, "max": 11, "criteria": "响应主要需求，但存在缺项或关键技术指标未说明依据。"},
-        {"label": "差", "min": 0, "max": 5, "criteria": "未实质响应技术/服务需求，或方案存在重大缺陷不可行。"}
+        {
+          "label": "优",
+          "min": 17,
+          "max": 20,
+          "criteria": "全部需求逐项响应且无缺项；关键技术指标全部满足或优于要求并附依据；方案针对本项目难点，实施路径清晰。"
+        },
+        {
+          "label": "良",
+          "min": 12,
+          "max": 16,
+          "criteria": "需求基本逐项响应；关键技术指标满足要求；方案较有针对性，实施路径较清晰。"
+        },
+        {
+          "label": "一般",
+          "min": 6,
+          "max": 11,
+          "criteria": "响应主要需求，但存在缺项或关键技术指标未说明依据。"
+        },
+        {
+          "label": "差",
+          "min": 0,
+          "max": 5,
+          "criteria": "未实质响应技术/服务需求，或方案存在重大缺陷不可行。"
+        }
       ],
       "weight": null,
       "essential": true,
@@ -217,10 +291,30 @@
       "formula": null,
       "max_score": 10,
       "levels": [
-        {"label": "优", "min": 9, "max": 10, "criteria": "阶段划分完整并给出里程碑节点；进度表可核验；人员与资源投入匹配；有赶工与纠偏措施。"},
-        {"label": "良", "min": 6, "max": 8, "criteria": "阶段与节点基本完整；投入计划较合理；保障措施一般。"},
-        {"label": "一般", "min": 3, "max": 5, "criteria": "有总体计划但缺少里程碑或投入计划，进度存在明显风险。"},
-        {"label": "差", "min": 0, "max": 2, "criteria": "无实施计划或缺少关键节点安排。"}
+        {
+          "label": "优",
+          "min": 9,
+          "max": 10,
+          "criteria": "阶段划分完整并给出里程碑节点；进度表可核验；人员与资源投入匹配；有赶工与纠偏措施。"
+        },
+        {
+          "label": "良",
+          "min": 6,
+          "max": 8,
+          "criteria": "阶段与节点基本完整；投入计划较合理；保障措施一般。"
+        },
+        {
+          "label": "一般",
+          "min": 3,
+          "max": 5,
+          "criteria": "有总体计划但缺少里程碑或投入计划，进度存在明显风险。"
+        },
+        {
+          "label": "差",
+          "min": 0,
+          "max": 2,
+          "criteria": "无实施计划或缺少关键节点安排。"
+        }
       ],
       "weight": null,
       "essential": false,
@@ -239,10 +333,30 @@
       "formula": null,
       "max_score": 10,
       "levels": [
-        {"label": "优", "min": 9, "max": 10, "criteria": "有明确质量目标与考核办法；承诺响应≤2 小时、到场≤24 小时；应急预案与演练记录完整。"},
-        {"label": "良", "min": 6, "max": 8, "criteria": "有质量目标与检查制度；承诺响应≤4 小时；备件与培训方案较完整。"},
-        {"label": "一般", "min": 3, "max": 5, "criteria": "质量与售后措施表述笼统，无量化响应时限。"},
-        {"label": "差", "min": 0, "max": 2, "criteria": "无质量保障或售后安排，明显不满足招标文件要求。"}
+        {
+          "label": "优",
+          "min": 9,
+          "max": 10,
+          "criteria": "有明确质量目标与考核办法；承诺响应≤2 小时、到场≤24 小时；应急预案与演练记录完整。"
+        },
+        {
+          "label": "良",
+          "min": 6,
+          "max": 8,
+          "criteria": "有质量目标与检查制度；承诺响应≤4 小时；备件与培训方案较完整。"
+        },
+        {
+          "label": "一般",
+          "min": 3,
+          "max": 5,
+          "criteria": "质量与售后措施表述笼统，无量化响应时限。"
+        },
+        {
+          "label": "差",
+          "min": 0,
+          "max": 2,
+          "criteria": "无质量保障或售后安排，明显不满足招标文件要求。"
+        }
       ],
       "weight": null,
       "essential": false,
@@ -258,7 +372,17 @@
       "description": "近三年（以合同签订时间为准）完成的同类项目，单个合同金额不低于 80 万元，每项计 2 分，最高 6 分（最多计 3 项）。",
       "required_evidence": "合同复印件（含金额页与签署页）+ 发票复印件 + 业主验收或证明（三者缺一不得分；验收材料可替代业主证明）。",
       "checks": [
-        {"check_type": "count_at_least", "field": null, "params": {"field": "performance", "per_item": 2, "max_items": 3, "min_amount_yuan": 800000}, "on_fail": "need_human"}
+        {
+          "check_type": "count_at_least",
+          "field": null,
+          "params": {
+            "field": "performance",
+            "per_item": 2,
+            "max_items": 3,
+            "min_amount_yuan": 800000
+          },
+          "on_fail": "need_human"
+        }
       ],
       "formula": null,
       "max_score": 6,
@@ -277,7 +401,16 @@
       "description": "投标人持有有效的管理体系认证（如 ISO9001、ISO27001、ISO20000，或同等体系）或软件能力成熟度认证（如 CMMI 2 级及以上，或同等），每项计 2 分，最高 4 分。",
       "required_evidence": "有效期内的证书复印件 + 全国认证认可信息公共服务平台（cnca.cn）查询结果截图；无查询截图的不予计分。",
       "checks": [
-        {"check_type": "count_at_least", "field": null, "params": {"field": "certificates", "per_item": 2, "max_items": 2}, "on_fail": "need_human"}
+        {
+          "check_type": "count_at_least",
+          "field": null,
+          "params": {
+            "field": "certificates",
+            "per_item": 2,
+            "max_items": 2
+          },
+          "on_fail": "need_human"
+        }
       ],
       "formula": null,
       "max_score": 4,

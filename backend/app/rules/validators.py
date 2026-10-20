@@ -89,16 +89,48 @@ def run_validators(
                                         "签批理由应在报告中单列",
                                         "criterion", code))
 
-        # ⑤ 价格公式变量完备
+        # ⑤ 价格公式变量完备（按公式类型判定：ratio 要 k，deviation 要扣分率）
         if c["score_type"] == "formula":
             f = c.get("formula") or {}
-            missing = [k for k in ("formula_type", "benchmark_method", "k") if not f.get(k)]
+            ext = f.get("params_json") or {}
+            formula_type = f.get("formula_type") or ""
+            missing: list[str] = []
+            if not formula_type:
+                missing.append("formula_type")
+            if not f.get("benchmark_method"):
+                missing.append("benchmark_method")
             if c.get("max_score") is None:
                 missing.append("max_score")
+            if formula_type == "deviation_deduct":
+                if not (
+                    f.get("deduct_rate")
+                    or ext.get("deduct_rate")
+                    or ext.get("deduct_rate_down")
+                    or ext.get("deduct_rate_up")
+                ):
+                    missing.append("deduct_rate_down/up")
+            elif formula_type in ("benchmark_ratio", "lowest_ratio"):
+                if not f.get("k"):
+                    missing.append("k")
             if missing:
                 findings.append(Finding("PRICE_PARAMS_INCOMPLETE", "error",
-                                        f"价格分公式缺少参数：{('、'.join(missing))}",
+                                        f"评分项「{c['name']}」的价格公式缺少参数：{('、'.join(missing))}",
                                         "formula", code, "请人工补全公式参数后确认"))
+            upper = f.get("upper_bound")
+            if (
+                upper is not None
+                and c.get("max_score") is not None
+                and Decimal(str(upper)) > Decimal(str(c["max_score"]))
+            ):
+                findings.append(Finding("PRICE_UPPER_BOUND", "error",
+                                        f"评分项「{c['name']}」的价格分上限 {upper} 大于满分 {c['max_score']}",
+                                        "formula", code, "价格分不得超过该项满分"))
+            if formula_type == "benchmark_ratio" and f.get("benchmark_method") == "average":
+                findings.append(Finding("PRICE_FULL_MARK_RISK", "warn",
+                                        f"评分项「{c['name']}」使用 benchmark_ratio + average："
+                                        "所有低于平均基准价的报价都会被上限截成满分",
+                                        "formula", code,
+                                        "如招标文件是偏离扣分型，请改用 deviation_deduct 并填写扣分率"))
 
         # ⑦ 否决项必须有后果
         if c.get("is_veto") and not c.get("veto_consequence"):
@@ -135,8 +167,16 @@ def run_validators(
             findings.append(Finding("PRICE_WEIGHT_RANGE", "warn",
                                     f"价格分权重 {v} 分超出常规区间（{lo}–{hi}）", "package"))
 
-    # ⑨ 总分 = 各项满分之和（只统计非否决项）
-    scored = [c for c in criteria if not c.get("is_veto")]
+    # ⑨ 总分 = 各计分项满分之和（veto/match 不计分；计分项缺满分是错误，
+    # 不能像旧实现那样因为一个 None 就整段跳过校验）
+    scored = [
+        c for c in criteria
+        if c.get("score_type") in ("formula", "count", "subjective")
+    ]
+    missing_max = [c["code"] for c in scored if c.get("max_score") is None]
+    if missing_max:
+        findings.append(Finding("MAX_SCORE_MISSING", "error",
+                                f"计分项缺少满分：{'、'.join(missing_max)}", "package"))
     maxes = [c.get("max_score") for c in scored]
     if all(m is not None for m in maxes) and maxes:
         total = sum((Decimal(str(m)) for m in maxes), ZERO)

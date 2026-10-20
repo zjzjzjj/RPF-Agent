@@ -410,7 +410,13 @@ def execute_run(
                     bid_id in excluded_bidders
                     or bidder.status in ("recommend_reject", "rejected")
                 )
-                bids.append(PriceBid(bid_id, bidder.name, Decimal(str(bidder.bid_price)), excluded))
+                # 报价缺失/0 不能崩掉整个 run：价格引擎会按"无效报价"记 0 并排除基准
+                price_dec = (
+                    Decimal(str(bidder.bid_price))
+                    if bidder.bid_price is not None
+                    else Decimal(0)
+                )
+                bids.append(PriceBid(bid_id, bidder.name, price_dec, excluded))
         comp = compute_price_scores(bids, formula)
         for r in comp.results:
             _upsert_score(
@@ -507,7 +513,16 @@ def execute_run(
         facts = facts_by_bidder[bid_id]
         for c in count_items:
             params = c.get("params") or {}
-            artifacts = recover_artifacts_from_tender(c, tender_pages)
+            # 合并/折叠写入的 required_evidence 优先；旧实现只看招标页恢复结果，
+            # c30 类【证明材料】块折叠进来也不生效。
+            artifacts_raw = (c.get("required_evidence") or "").strip() or recover_artifacts_from_tender(
+                c, tender_pages
+            )
+            artifacts = (
+                artifacts_raw
+                if isinstance(artifacts_raw, str)
+                else "、".join(artifacts_raw)
+            )
             c_scoring = {**c, "required_artifacts": artifacts}
             # field 可能缺省（真实编译产物里常由名称推断）——与 score_count 用
             # 同一推断函数，避免两处口径漂移（2026-10-16 实证：params 无 field
@@ -529,7 +544,12 @@ def execute_run(
                 params.get("field") != "certificates"
                 and any(k in str(c.get("name") or "") for k in ("业绩", "案例"))
             )
-            if gateway is not None and artifacts and is_performance:
+            if (
+                config.auto_mode()
+                and gateway is not None
+                and artifacts
+                and is_performance
+            ):
                 cases = _llm_verify_cases(
                     gateway, c, facts, material_hints.get(bid_id), artifacts, data_class
                 )
@@ -538,17 +558,19 @@ def execute_run(
             result = score_count(c_scoring, params, facts)  # type: ignore[arg-type]
             # unresolved 以结构化键落库：下游（报告疑问清单）直接判读，
             # 不再靠匹配 detail 的中文措辞——那种耦合已经断过一次。
-            # conflict（如证明材料链缺失/部分缺失）→ doubt 保留疑问态转人工，
-            # 分数先行计算但复核前不得视为定稿。
+            # "机器没抽到事实"不是 0 分结论：不进总分（final=None），报告标未定分。
+            # conflict（证明材料链缺失/部分缺失）分数照算但保留疑问态。
+            unresolved = bool(result.unresolved)
+            doubt = result.conflict or unresolved
             _upsert_score(
                 run_id, bid_id, c,
                 machine_score=result.score,
                 machine_status="pass",
-                review_status="conflict_flagged" if result.conflict else "pending",
-                final_score=result.score,
+                review_status="conflict_flagged" if doubt else "pending",
+                final_score=None if unresolved else result.score,
                 warnings_json=([{"message": result.detail, "unresolved": result.unresolved}]
                                if result.unresolved else [{"message": result.detail}]),
-                doubt=result.conflict,
+                doubt=doubt,
             )
             stats["objective"] += 1
 
@@ -727,11 +749,20 @@ def _llm_verify_cases(gateway, c: dict, facts, material_pages: str | None,
             split_text_chunks(text), c, 15000
         )
         text = "\n".join(t for _i, t in picked)
+    import re as _re_art
+
+    art_list = [
+        a.strip()
+        for a in _re_art.split(r"[、，,；;\n]", artifacts)
+        if a.strip()
+    ] or [artifacts]
+    person_scope = str((c.get("params") or {}).get("person_scope") or "（不区分人员）")
     user = prompts.MATERIAL_COUNT_USER_TEMPLATE.format(
         name=c.get("name") or "",
         max_score=c.get("max_score") or "",
         source_quote=(c.get("source_quote") or "")[:800],
-        artifacts="、".join(artifacts),
+        artifacts="、".join(art_list),
+        person_scope=person_scope,
         material_pages=material_pages or "（无）",
         bid_text=text,
     )

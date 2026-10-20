@@ -29,8 +29,16 @@ def compute_benchmark(
     method: str = "average",
     k: Decimal = ONE,
     trim_ratio: Decimal = ZERO,
+    *,
+    trim_count: int = 0,
+    trim_threshold: int = 0,
 ) -> tuple[Decimal, str]:
-    """返回 (基准价, 计算说明)。prices 非空由调用方保证。"""
+    """返回 (基准价, 计算说明)。prices 非空由调用方保证。
+
+    trim_count/trim_threshold：绝对家数截尾（"有效投标人＞5 个时扣除一个最高价和
+    一个最低价"）。trim_count > 0 时优先于 trim_ratio；仅 n > trim_threshold 才截，
+    且至少保留 1 家。
+    """
     if method == "lowest":
         base = min(prices)
         return _q(base * k, 2), f"基准价=最低有效报价{_fmt(min(prices))}×{k}={_fmt(base * k)}元"
@@ -41,12 +49,22 @@ def compute_benchmark(
     if method == "average_trimmed":
         ordered = sorted(prices)
         n = len(ordered)
-        cut = int((n * trim_ratio))  # 两端各截去
+        if trim_count > 0:
+            cut = trim_count if n > trim_threshold else 0
+            cut = min(cut, max(0, (n - 1) // 2))  # 至少保留 1 家
+            note = (
+                f"有效投标人 {n} 家＞{trim_threshold}，去掉最高最低各 {cut} 家"
+                if cut
+                else f"有效投标人 {n} 家≤{trim_threshold}，不剔除最高最低"
+            )
+        else:
+            cut = int(n * trim_ratio)  # 两端各截去
+            note = f"去掉最高最低各{cut}家"
         kept = ordered[cut : n - cut] if n - 2 * cut >= 1 else ordered
         avg = sum(kept) / Decimal(len(kept))
         return (
             _q(avg * k, 2),
-            f"基准价=去掉最高最低各{cut}家后的平均值{_fmt(avg)}×{k}={_fmt(avg * k)}元",
+            f"基准价={note}后的平均值{_fmt(avg)}×{k}={_fmt(avg * k)}元",
         )
     if method == "average_below":
         avg_all = sum(prices) / Decimal(len(prices))
@@ -80,6 +98,7 @@ def compute_price_scores(bids: list[PriceBid], formula: dict) -> PriceComputatio
     k = Decimal(str(formula.get("k") or 1))
     trim_ratio = Decimal(str(formula.get("trim_ratio") or 0))
     upper = Decimal(str(formula["upper_bound"])) if formula.get("upper_bound") is not None else max_score
+    upper = min(upper, max_score)  # 评分项不得超过满分
     lower = Decimal(str(formula["lower_bound"])) if formula.get("lower_bound") is not None else ZERO
     places = int(formula.get("rounding") or 2)
     exclude_invalid = bool(formula.get("exclude_invalid", True))
@@ -92,8 +111,25 @@ def compute_price_scores(bids: list[PriceBid], formula: dict) -> PriceComputatio
     ext = formula.get("params_json") or {}
     rate_down = Decimal(str(ext.get("deduct_rate_down", deduct_rate)))
     rate_up = Decimal(str(ext.get("deduct_rate_up", deduct_rate)))
+    trim_count = int(ext.get("trim_count") or 0)
+    trim_threshold = int(ext.get("trim_threshold") or 0)
+    if formula_type == "deviation_deduct" and rate_down == ZERO and rate_up == ZERO:
+        raise ValueError(
+            "偏离扣分公式缺少扣分率（deduct_rate / deduct_rate_down / deduct_rate_up）"
+            "——继续计算会让所有人拿满分；请解冻规则包补全公式"
+        )
 
-    in_benchmark = [b.price for b in bids if not (b.excluded and exclude_invalid)]
+    invalid_price: list[PriceResult] = []
+    in_benchmark: list[Decimal] = []
+    for b in bids:
+        if b.price is None or b.price <= ZERO:
+            invalid_price.append(
+                PriceResult(b.bidder_id, b.name, b.price, ZERO, ZERO, True,
+                            "报价为空或≤0，价格分记 0（待人工复核）")
+            )
+            continue
+        if not (b.excluded and exclude_invalid):
+            in_benchmark.append(b.price)
     if not in_benchmark:
         return PriceComputation(
             benchmark=None,
@@ -105,11 +141,16 @@ def compute_price_scores(bids: list[PriceBid], formula: dict) -> PriceComputatio
             ],
         )
 
-    benchmark, bench_expl = compute_benchmark(in_benchmark, method, k, trim_ratio)
+    benchmark, bench_expl = compute_benchmark(
+        in_benchmark, method, k, trim_ratio,
+        trim_count=trim_count, trim_threshold=trim_threshold,
+    )
     parts = [bench_expl]
 
     results: list[PriceResult] = []
-    for b in sorted(bids, key=lambda x: x.price):
+    for b in sorted(bids, key=lambda x: (x.price is None, x.price or ZERO)):
+        if b.price is None or b.price <= ZERO:
+            continue  # 已在 invalid_price 中记 0，不进入基准/比值计算
         deviation = (b.price - benchmark) / benchmark * 100 if benchmark else Decimal(0)
         note = ""
         if b.excluded and exclude_invalid:
@@ -152,5 +193,5 @@ def compute_price_scores(bids: list[PriceBid], formula: dict) -> PriceComputatio
     return PriceComputation(
         benchmark=benchmark,
         formula_explanation="；".join(parts),
-        results=results,
+        results=results + invalid_price,
     )

@@ -235,6 +235,8 @@ class TemplateFormulaOut(BaseModel):
     rounding: int = 2
     trim_ratio: Decimal | None = None
     deduct_rate: Decimal | None = None
+    deduct_rate_down: Decimal | None = None
+    deduct_rate_up: Decimal | None = None
 
 
 class TemplateCriterionOut(BaseModel):

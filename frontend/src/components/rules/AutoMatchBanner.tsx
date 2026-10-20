@@ -155,7 +155,9 @@ export default function AutoMatchBanner({
             {skip && <Tag color="default">{SKIP_REASON[skip] ?? skip}</Tag>}
             {autoRebuildVersion(parseJob) != null && (
               <Tag color="gold">
-                已自动创建 v{autoRebuildVersion(parseJob)} 草稿并按招标文件覆盖，确认并冻结后生效
+                {flow === "matching"
+                  ? `已自动创建 v${autoRebuildVersion(parseJob)} 草稿，正在按招标文件覆盖规则…`
+                  : `已自动创建 v${autoRebuildVersion(parseJob)} 草稿并按招标文件覆盖，确认并冻结后生效`}
               </Tag>
             )}
           </Space>

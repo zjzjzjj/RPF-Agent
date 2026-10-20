@@ -68,6 +68,16 @@ def _snapshot_for_template(tid: str) -> dict:
                     "upper_bound": c.formula.upper_bound,
                     "lower_bound": c.formula.lower_bound,
                     "rounding": c.formula.rounding,
+                    "trim_ratio": c.formula.trim_ratio,
+                    "deduct_rate": c.formula.deduct_rate,
+                    "params_json": {
+                        key: str(value)
+                        for key, value in (
+                            ("deduct_rate_down", c.formula.deduct_rate_down),
+                            ("deduct_rate_up", c.formula.deduct_rate_up),
+                        )
+                        if value is not None
+                    },
                 }
                 if c.formula
                 else None
@@ -214,8 +224,14 @@ def test_default_template_split_50_40_10() -> None:
     assert sum(c.max_score for c in tpl.criteria if not c.is_veto) == Decimal("100")
 
     price = next(c for c in tpl.criteria if c.category == "price")
-    assert price.formula is not None and price.formula.formula_type == "benchmark_ratio"
+    # 2026-10-20：默认模板改为偏离扣分（否则低于平均价的报价全部封顶满分）
+    assert price.formula is not None
+    assert price.formula.formula_type == "deviation_deduct"
+    assert price.formula.benchmark_method == "average"
+    assert price.formula.deduct_rate_down == Decimal("0.2")
+    assert price.formula.deduct_rate_up == Decimal("0.4")
     assert price.max_score == Decimal("50")
+    assert tpl.library_version == "2.1.0"
 
     subjective = [c for c in tpl.criteria if c.score_type == "subjective"]
     assert subjective and all(len(c.levels) == 4 for c in subjective)
