@@ -17,6 +17,7 @@
   .factor { color: #444; font-size: 12.5px; margin: 4px 0; }
   .note { color: #555; font-size: 12.5px; }
   .dropped { color: #b00; text-decoration: line-through; }
+  .method { color: #555; font-size: 12.5px; font-weight: normal; }
   .veto { color: #b00; font-weight: bold; }
   @media print { body { margin: 12mm; } h2 { page-break-after: avoid; } table { page-break-inside: auto; } }
 </style>
@@ -42,7 +43,8 @@
   </tr>
   {% endfor %}
 </table>
-<p class="note">注：客观项（资格/符合性/计数）与价格分由确定性引擎计算，各评委共享；主观分为各 AI 评委独立评分，按项去最高最低后取平均计入最终得分。* 表示该评委在此投标人部分主观项未给出有效分。</p>
+<p class="note">注：客观项（资格/符合性/计数）与价格分由确定性引擎计算，各评委共享；主观分为各 AI 评委独立评分，按项去最高最低后取平均计入最终得分。* 表示该评委在此投标人部分主观项未给出有效分。<br/>
+分项口径：价格分（客观）、商务分（客观）、技术分（主观+客观）；各评分项所属口径在“附表 A3”与“附表 A5”逐项标注（主观＝AI 评委评审，客观＝公式/计数确定性计算，否决项与判断项只出结论不计分）。</p>
 
 <h2>二、评审情况说明（零分/否决依据）</h2>
 {% if not review_notes %}<p>无零分或否决建议事项。</p>{% endif %}
@@ -87,7 +89,7 @@
 {% for group in score_groups %}
 <h3>{{ group.category }}</h3>
 {% for item in group['items'] %}
-<h4>{{ item.code }} {{ item.name }}（满分 {{ item.max_score }}）</h4>
+<h4>{{ item.code }} {{ item.name }}（满分 {{ item.max_score }}）<span class="method">［{{ item.method }}］</span></h4>
 {% if item.factor %}<p class="factor">评审因素（原文）：{{ item.factor[:400] }}</p>{% endif %}
 <table><tr><th class="left">投标人</th>{% for j in judge_labels %}<th>{{ j }}</th>{% endfor %}<th>最终得分(去尾)</th></tr>
 {% for p in item.per_bidder %}
@@ -112,7 +114,7 @@
 {% for detail in ai_detail %}
 <h3>{{ detail.bidder }}</h3>
 {% for it in detail['items'] %}
-<h4>{{ it.code }} {{ it.name }}（满分 {{ it.max_score }}）→ 最终 {{ it.final }}</h4>
+<h4>{{ it.code }} {{ it.name }}（满分 {{ it.max_score }}）<span class="method">［{{ it.method }}］</span> → 最终 {{ it.final }}</h4>
 <p>{% for j in it.judges %}<span {% if j.dropped %}class="dropped"{% endif %}>{{ j.judge }} {{ j.score }}{% if j.dropped %}（已弃）{% endif %}</span>{% if not loop.last %} ｜ {% endif %}{% endfor %}</p>
 {% if it.reasoning %}<p class="left">评审依据：{{ it.reasoning }}</p>{% endif %}
 {% for c in it.citations %}<p class="note">引文（p{{ c.page_no }}{% if c.verified %}✓已核验{% else %}未核验{% endif %}）：{{ c.quote }}</p>{% endfor %}

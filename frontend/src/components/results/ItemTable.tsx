@@ -15,6 +15,13 @@ const STATE_TAG: Record<string, { color: string; text: string }> = {
   not_run: { color: "default", text: "未执行" },
 };
 
+// 主观/客观口径配色：主观=紫（AI 评委），客观=蓝（确定性计算），判定项=青（只出结论）
+const METHOD_TAG: Record<string, { color: string }> = {
+  subjective: { color: "purple" },
+  objective: { color: "blue" },
+  verdict: { color: "cyan" },
+};
+
 function verdictTag(item: SummaryItem) {
   const t = item.verdict ?? "—";
   const color =
@@ -54,9 +61,9 @@ export default function ItemTable({ bucket, onOpenReason, onOpenEvidence }: Prop
       size="small"
       pagination={false}
       dataSource={bucket.items}
-      // 列宽合计约 1090：容器更窄时表格内部横向滚动，
+      // 列宽合计约 1194：容器更窄时表格内部横向滚动，
       // 否则「理由」这种弹性列会被挤成 1 字符宽，文字逐字竖排。
-      scroll={{ x: 1090 }}
+      scroll={{ x: 1194 }}
       rowClassName={(item) => (item.state === "not_run" ? "row-not-run" : "")}
       onRow={(item) => ({
         style:
@@ -69,6 +76,14 @@ export default function ItemTable({ bucket, onOpenReason, onOpenEvidence }: Prop
       columns={[
         { title: "编号", dataIndex: "code", width: 76, fixed: "left" as const },
         { title: "评分项", dataIndex: "name", width: 190, ellipsis: true },
+        {
+          title: "评分方式",
+          width: 104,
+          render: (_, item) => {
+            const m = METHOD_TAG[item.side] ?? { color: "default" };
+            return <Tag color={m.color}>{item.scoring_method}</Tag>;
+          },
+        },
         {
           title: "满分",
           width: 64,

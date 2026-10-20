@@ -146,6 +146,7 @@ export default function ScoreResults() {
         bidder.buckets.find((b) => b.key === key) ??
         ({ key, label: BUCKET_LABEL[key] ?? key, kind: "score", max: null, score: null,
            all_items_score: null, item_count: 0, scored_count: 0, missing_count: 0,
+           subjective_count: 0, objective_count: 0,
            verdicts: null, items: [] } as SummaryBucket),
     }));
 
@@ -312,6 +313,9 @@ export default function ScoreResults() {
                                   {bucket.score ?? "—"}
                                   {bucket.max ? ` / ${bucket.max}` : ""}
                                   {`　${bucket.item_count} 项`}
+                                  {bucket.subjective_count > 0 || bucket.objective_count > 0
+                                    ? `（主观 ${bucket.subjective_count} · 客观 ${bucket.objective_count}）`
+                                    : ""}
                                   {bucket.missing_count > 0 ? `（${bucket.missing_count} 项未定分）` : ""}
                                 </Typography.Text>
                               ) : (

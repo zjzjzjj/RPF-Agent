@@ -54,6 +54,30 @@ SETTLED_STATUSES = {"human_confirmed", "human_overridden", "auto_confirmed", "no
 # 会产生最终分的类型（用于桶满分汇总）
 SCORING_TYPES = {"formula", "count", "subjective"}
 
+# 主观/客观口径（单一来源，前端与报告只消费投影结果，不各自判断）：
+#   主观 = LLM 逐项评审（engine/subjective.py）；客观 = 确定性计算（engine/price.py、objective.py）；
+#   判定项（veto/match）只出结论不计分，单列一类，避免被读成"客观计分"。
+SUBJECTIVE_SCORE_TYPES = {"subjective"}
+OBJECTIVE_SCORE_TYPES = {"formula", "count"}
+VERDICT_SCORE_TYPES = {"veto", "match"}
+SCORE_TYPE_LABELS = {
+    "subjective": "主观（AI 评审）",
+    "formula": "客观·公式",
+    "count": "客观·计数",
+    "veto": "否决项",
+    "match": "判断项",
+}
+
+
+def _score_side(score_type: str | None) -> str:
+    """score_type → 主观/客观/判定。未知类型按客观处理（宁保守：不宣称 AI 主观分）。"""
+    if score_type in SUBJECTIVE_SCORE_TYPES:
+        return "subjective"
+    if score_type in VERDICT_SCORE_TYPES:
+        return "verdict"
+    return "objective"
+
+
 MACHINE_VERDICT_LABELS = {
     "pass": "通过",
     "recommend_reject": "建议否决",
@@ -290,6 +314,8 @@ def _build_item(
         "name": crit.name,
         "category": crit.category,
         "score_type": score_type,
+        "side": _score_side(score_type),
+        "scoring_method": SCORE_TYPE_LABELS.get(score_type or "", score_type or "—"),
         "is_veto": is_veto,
         "bucket": BUCKET_BY_CATEGORY.get(crit.category, "qualification_compliance"),
         "state": state,
@@ -533,6 +559,8 @@ def build_score_summary(
 
             scored_count = sum(1 for i in items if i["state"] == "scored")
             missing_count = sum(1 for i in items if i["state"] == "missing_final")
+            subjective_count = sum(1 for i in items if i["side"] == "subjective")
+            objective_count = sum(1 for i in items if i["side"] == "objective")
             verdicts = None
             if bdef["kind"] == "verdict":
                 verdicts = {"pass": 0, "recommend_reject": 0, "need_human": 0, "fail": 0}
@@ -568,6 +596,8 @@ def build_score_summary(
                     "item_count": len(items),
                     "scored_count": scored_count,
                     "missing_count": missing_count,
+                    "subjective_count": subjective_count,
+                    "objective_count": objective_count,
                     "verdicts": verdicts,
                     "items": items,
                 }

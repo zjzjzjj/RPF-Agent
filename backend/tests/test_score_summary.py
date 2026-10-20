@@ -125,6 +125,46 @@ def test_contract_fields_complete(client, summary_chain):  # noqa: ANN001
                    for i in _all_items(b))
 
 
+def test_subjective_objective_side_projection(client, summary_chain):  # noqa: ANN001
+    """主观/客观口径投影：逐项给 side + 中文评分方式，且桶计数与条目一致。
+
+    口径：subjective=AI 评委评审；formula/count=确定性客观分；veto/match=只出结论不计分。
+    前端卡片标签与明细表「评分方式」列都消费这两个字段，所以必须逐项准确、不按桶推断。
+    """
+    d = _get(client, summary_chain).json()
+    items = [i for b in d["bidders"] for i in _all_items(b)]
+    assert items
+
+    for i in items:
+        expected = (
+            "subjective" if i["score_type"] == "subjective"
+            else "verdict" if i["score_type"] in ("veto", "match")
+            else "objective"
+        )
+        assert i["side"] == expected, i
+        assert i["scoring_method"] and i["scoring_method"] != "—", i
+
+    # comprehensive-goods 模板：价格=formula（客观）、商务=count（客观）、技术=subjective（主观）
+    by_cat: dict[str, set[str]] = {}
+    for i in items:
+        by_cat.setdefault(i["category"], set()).add(i["side"])
+    assert by_cat["price"] == {"objective"}
+    assert by_cat["commercial"] == {"objective"}
+    assert by_cat["technical"] == {"subjective"}
+    assert by_cat["qualification"] == {"verdict"}
+
+    # 桶级计数是纯投影：主观 + 客观 = 计分条目数（判定桶另有 verdicts）
+    for b in d["bidders"]:
+        for bucket in b["buckets"]:
+            sub = sum(1 for i in bucket["items"] if i["side"] == "subjective")
+            obj = sum(1 for i in bucket["items"] if i["side"] == "objective")
+            assert bucket["subjective_count"] == sub
+            assert bucket["objective_count"] == obj
+            assert sub + obj + sum(1 for i in bucket["items"] if i["side"] == "verdict") == len(
+                bucket["items"]
+            )
+
+
 def test_totals_equal_ranking(client, summary_chain):  # noqa: ANN001
     """结果页的四个分数必须与排名端点逐字相等（同一 run）。"""
     d = _get(client, summary_chain).json()

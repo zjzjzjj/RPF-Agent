@@ -67,7 +67,7 @@
   {% for w in ranking.warnings %}<div class="warn tag">提示：{{ w }}</div>{% endfor %}
 {% endif %}
 <table>
-  <tr><th>名次</th><th>投标人</th><th>投标报价（元）</th><th>总分</th><th>价格分</th><th>技术分</th><th>商务分</th><th>备注</th></tr>
+  <tr><th>名次</th><th>投标人</th><th>投标报价（元）</th><th>总分</th><th>价格分（客观）</th><th>技术分（主观+客观）</th><th>商务分（客观）</th><th>备注</th></tr>
   {% for row in ranking.rows %}
   <tr>
     <td>{{ row.rank }}</td>

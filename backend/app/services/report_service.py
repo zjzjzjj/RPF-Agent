@@ -26,15 +26,16 @@ from app.db.models import (
 from app.db.session import session_scope
 from app.errors import NotFound
 from app.services.ranking_service import compute_ranking
+from app.services.score_summary_service import SCORE_TYPE_LABELS
 
 TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "report" / "templates"
 
 CATEGORY_LABELS = {
     "qualification": "资格性审查",
     "compliance": "符合性审查",
-    "price": "价格分",
-    "technical": "技术分",
-    "commercial": "商务分",
+    "price": "价格分（客观）",
+    "technical": "技术分（主观+客观）",
+    "commercial": "商务分（客观）",
 }
 
 REVIEW_LABELS = {
@@ -688,6 +689,7 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
                 "name": crit.name,
                 "factor": crit.source_quote or crit.description or "",
                 "max_score": str(crit.max_score) if crit.max_score else None,
+                "method": SCORE_TYPE_LABELS.get(crit.score_type, crit.score_type),
                 "per_bidder": per_bidder,
             })
         score_groups.append({"category": label, "items": items})
@@ -720,6 +722,7 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
                 "code": crit.code,
                 "name": crit.name,
                 "max_score": str(crit.max_score) if crit.max_score else None,
+                "method": SCORE_TYPE_LABELS.get(crit.score_type, crit.score_type),
                 "judges": [
                     {
                         "judge": f"{JUDGE_LABEL}{m.get('judge_no')}",

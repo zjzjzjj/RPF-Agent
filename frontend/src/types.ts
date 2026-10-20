@@ -453,6 +453,10 @@ export interface SummaryItem {
   name: string;
   category: string;
   score_type: string;
+  /** 主观/客观口径：主观＝AI 评委评审，客观＝公式/计数确定性计算，verdict＝只出结论不计分 */
+  side: "subjective" | "objective" | "verdict";
+  /** 评分方式中文标签（与规则页类型措辞一致） */
+  scoring_method: string;
   is_veto: boolean;
   bucket: string;
   state: SummaryItemState;
@@ -499,6 +503,8 @@ export interface SummaryBucket {
   item_count: number;
   scored_count: number;
   missing_count: number;
+  subjective_count: number;
+  objective_count: number;
   verdicts: Record<string, number> | null;
   items: SummaryItem[];
 }
