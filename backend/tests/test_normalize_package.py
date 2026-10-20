@@ -331,6 +331,23 @@ def test_aggregate_subitems_falls_back_when_no_name_matches() -> None:
     assert score == Decimal("4")  # 不因名称不一致整项归零
 
 
+def test_quote_span_tolerates_table_columns_inside_sentence() -> None:
+    """PDF 表格列文字会插进句子中间，整句匹配失败时退回首段匹配。"""
+    from app.rules.compiler import _quote_span
+
+    node = (
+        "根据投标人对本项目重点功能模块运维服务需求的理解，提供详细完整、可行、"
+        "合理的运维服务方3 运维方案 0-8 主观分案。投标人制定运维方案应包含以下内容："
+        "运维服务目标（0-1 分）、运维服务计划（0-1 分）。"
+    )
+    quote = "根据投标人对本项目重点功能模块运维服务需求的理解，提供详细完整、可行、合理的运维服务方案"
+    span = _quote_span(node, quote)
+    assert span is not None
+    assert span[2] is False  # 只匹配到前缀
+    assert node[span[0]:].startswith("根据投标人")
+
+
+
 def test_accept_criterion_can_verify_needs_input(seeded) -> None:  # noqa: ANN001
     """逐条「确认」必须能把 needs_input 置 verified（旧实现要求已 verified，必 422）。"""
     _pid, package_id = seeded

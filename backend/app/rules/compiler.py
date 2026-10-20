@@ -881,6 +881,26 @@ def _normalized_span(haystack: str, needle: str) -> tuple[int, int] | None:
     return idx[pos], idx[pos + len(needle_n) - 1] + 1
 
 
+def _quote_span(haystack: str, quote: str) -> tuple[int, int, bool] | None:
+    """定位 quote；表格列文字插入把原句打断时退回前缀匹配。
+
+    返回 (start, end, exact)。exact=False 表示只匹配到前缀，end 不是 quote 的真实结尾。
+    """
+    full = _normalized_span(haystack, quote)
+    if full is not None:
+        return full[0], full[1], True
+    q = (quote or "").strip()
+    # 真实 PDF 表格会把"3 运维方案 0-8 主观分"插进句子中间，整句无法连续匹配；
+    # 逐步缩短前缀，取第一个能定位到开头的长度。
+    for size in (60, 40, 30, 20, 12):
+        if len(q) <= size:
+            continue
+        part = _normalized_span(haystack, q[:size])
+        if part is not None:
+            return part[0], part[1], False
+    return None
+
+
 def enrich_descriptions_from_nodes(package_id: int) -> int:
     """把 source node 里紧跟 quote 的评分细则续行补进主观项 description。
 
@@ -917,7 +937,7 @@ def enrich_descriptions_from_nodes(package_id: int) -> int:
                 continue
             group.sort(key=lambda x: (x.sort_order or 0, x.id))
             spans = [
-                (c, _normalized_span(node.text, c.source_quote or "")) for c in group
+                (c, _quote_span(node.text, c.source_quote or "")) for c in group
             ]
             # 必须按 quote 在节点中的实际位置排序：合并包的 sort_order 来自模板
             # （T4.1/T4.2/T4.3 在前，c23… 追加项在后），与原文表格顺序不一致。
@@ -926,9 +946,13 @@ def enrich_descriptions_from_nodes(package_id: int) -> int:
             for i, (crit, span) in enumerate(spans):
                 if span is None:
                     continue
-                if _has_scoring_detail(crit.description or ""):
+                desc = crit.description or ""
+                # 已带可执行细则且长度正常 → 不重复追加。
+                # 超过 800 字符的"细则"通常是上一版把整个节点都塞进了描述
+                # （表格列打断导致 next_start 找不到），需要按 quote 重建。
+                if _has_scoring_detail(desc) and len(desc) <= 800:
                     continue
-                start, quote_end = span
+                start, quote_end, exact = span
                 next_start = (
                     spans[i + 1][1][0]  # type: ignore[index]
                     if i + 1 < len(spans)
@@ -937,13 +961,27 @@ def enrich_descriptions_from_nodes(package_id: int) -> int:
                 segment = node.text[start:next_start].strip()
                 if not segment or not _has_scoring_detail(segment):
                     continue
-                # 去掉 quote 本身，只保留续行
-                tail = node.text[quote_end:next_start].strip()
-                if not tail or tail in (crit.description or ""):
+                # 整句能连续定位：去掉 quote 本身只留续行；
+                # 表格列打断只能前缀定位：保留整格文本（含被打断的原句），
+                # 否则会把 T4.2 的"运维服务方[3 运维方案 0-8 主观分]案"截断。
+                tail = (
+                    node.text[quote_end:next_start].strip()
+                    if exact
+                    else segment
+                )
+                if not tail:
                     continue
-                crit.description = (
-                    (crit.description or "").rstrip() + "\n" + tail
-                )[:4000]
+                base = (crit.source_quote or "").strip()
+                new_desc = (
+                    f"{base}\n{tail}".strip()
+                    if base and tail not in base
+                    else (desc + "\n" + tail).strip()
+                )
+                if new_desc == desc:
+                    continue
+                if tail in desc and len(desc) <= 800:
+                    continue
+                crit.description = new_desc[:4000]
                 s.add(crit)
                 changed += 1
     return changed
