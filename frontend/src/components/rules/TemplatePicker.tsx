@@ -1,12 +1,106 @@
 import { useState } from "react";
 import { Alert, Button, Card, Empty, Input, Modal, Space, Spin, Tag, Tooltip, Typography } from "antd";
-import type { TemplateSummary } from "../../types";
+import { useTemplate } from "../../api/hooks";
+import type { TemplateCriterion, TemplateSummary } from "../../types";
 
 const APPLICABLE: Record<string, string> = {
   goods: "货物类",
   services: "服务类",
   works: "工程类",
 };
+
+/** 单条模板评分项的细则（分档判据 / 计分规则 / 证明材料）。 */
+function TemplateCriterionDetail({ c }: { c: TemplateCriterion }) {
+  const params = c.checks?.[0]?.params as
+    | { per_item?: number | string; max_items?: number | string; min_amount_yuan?: number | string }
+    | undefined;
+  const countParts: string[] = [];
+  if (params?.per_item != null) {
+    countParts.push(`每项 ${params.per_item} 分`);
+    if (params.max_items != null) countParts.push(`最多 ${params.max_items} 项`);
+    if (params.min_amount_yuan != null) {
+      countParts.push(`金额≥${Number(params.min_amount_yuan) / 10000} 万元`);
+    }
+  }
+
+  return (
+    <div
+      style={{
+        padding: "8px 10px",
+        borderBottom: "1px solid #f0f0f0",
+        fontSize: 12,
+      }}
+    >
+      <Space size={6} wrap>
+        <Typography.Text strong>{c.template_code} {c.name}</Typography.Text>
+        {c.is_veto ? <Tag color="red">否决项</Tag> : <Tag color="green">{c.max_score ?? "—"} 分</Tag>}
+        <Tag>{c.category}</Tag>
+      </Space>
+      {c.description && (
+        <div style={{ color: "#666", marginTop: 4 }}>{c.description}</div>
+      )}
+      {countParts.length > 0 && (
+        <div style={{ marginTop: 4 }}>
+          <b>计分规则：</b>
+          {countParts.join("，")}
+        </div>
+      )}
+      {c.levels.length > 0 && (
+        <div style={{ marginTop: 4 }}>
+          <b>档位判据：</b>
+          {c.levels.map((lv) => (
+            <div key={lv.label} style={{ marginTop: 2, color: "#555" }}>
+              {lv.label}（{lv.min}–{lv.max} 分）：{lv.criteria}
+            </div>
+          ))}
+        </div>
+      )}
+      {c.required_evidence && (
+        <div style={{ marginTop: 4 }}>
+          <b>证明材料：</b>
+          <span style={{ color: "#555" }}>{c.required_evidence}</span>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** 启用前预览某套模板的完整评分细则。 */
+function TemplateDetailModal({
+  templateId,
+  name,
+  onClose,
+}: {
+  templateId: string | null;
+  name: string;
+  onClose: () => void;
+}) {
+  const { data, isLoading } = useTemplate(templateId);
+  return (
+    <Modal
+      open={!!templateId}
+      onCancel={onClose}
+      footer={null}
+      width={900}
+      title={`评分细则：${name}`}
+    >
+      {isLoading ? (
+        <Spin />
+      ) : (
+        <>
+          {data?.notes && (
+            <Alert type="info" showIcon style={{ marginBottom: 10 }} message={data.notes} />
+          )}
+          <div style={{ maxHeight: 520, overflowY: "auto", border: "1px solid #f0f0f0", borderRadius: 4 }}>
+            {(data?.criteria ?? []).map((c) => (
+              <TemplateCriterionDetail key={c.template_code} c={c} />
+            ))}
+          </div>
+        </>
+      )}
+    </Modal>
+  );
+}
 
 interface Props {
   open: boolean;
@@ -29,6 +123,7 @@ export default function TemplatePicker({
   onPick,
 }: Props) {
   const [reason, setReason] = useState("");
+  const [detail, setDetail] = useState<{ id: string; name: string } | null>(null);
 
   return (
     <Modal
@@ -91,6 +186,15 @@ export default function TemplatePicker({
                       </Typography.Paragraph>
                     </Tooltip>
                   )}
+                  <Space size={6} style={{ width: "100%" }}>
+                    <Button
+                      size="small"
+                      block
+                      onClick={() => setDetail({ id: t.template_id, name: t.name })}
+                    >
+                      查看评分细则
+                    </Button>
+                  </Space>
                   <Button
                     type="primary"
                     size="small"
@@ -114,6 +218,12 @@ export default function TemplatePicker({
         value={reason}
         onChange={(e) => setReason(e.target.value)}
         placeholder="启用理由（人工模式必填，将逐条记入签批留痕）"
+      />
+
+      <TemplateDetailModal
+        templateId={detail?.id ?? null}
+        name={detail?.name ?? ""}
+        onClose={() => setDetail(null)}
       />
     </Modal>
   );

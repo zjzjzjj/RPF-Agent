@@ -93,6 +93,11 @@ def list_bidder_documents(bidder_id: int) -> list[DocumentOut]:
 
 @router.get("/bidders/{bidder_id}/price")
 def get_price(bidder_id: int) -> dict:
+    """读取报价；未抽取时**同步**补抽一次。
+
+    legacy 同步路径（多处测试与脚本依赖该副作用）。前端已改用下面的
+    `POST /bidders/{id}/price/extract`（后台任务，带进度与取消）。
+    """
     bidder = bidder_service.get_bidder(bidder_id)
     if bidder.price_status == "extracted" or bidder.bid_price is None:
         bidder = bidder_service.extract_price(bidder_id)
@@ -104,6 +109,23 @@ def get_price(bidder_id: int) -> dict:
         "breakdown": bidder.price_breakdown_json,
         "evidence_id": bidder.price_evidence_id,
     }
+
+
+@router.post("/bidders/{bidder_id}/price/extract")
+def extract_price_async(bidder_id: int, actor: str = Depends(get_actor)) -> dict:
+    """后台抽取报价（带进度、可取消）：返回 job_id。
+
+    进度用 `GET /jobs/{job_id}` 或 SSE `GET /jobs/{job_id}/events`。
+    """
+    from app.jobs import queue
+
+    bidder = bidder_service.get_bidder(bidder_id)  # 不存在 → 404
+    job_id = queue.submit(
+        "extract_price", {"bidder_id": bidder_id}, project_id=bidder.project_id
+    )
+    audit_service.log(bidder.project_id, actor, "bidder.price.extract", "bidder",
+                      str(bidder_id), {"job_id": job_id})
+    return {"bidder_id": bidder_id, "job_id": job_id}
 
 
 @router.post("/bidders/{bidder_id}/price/confirm", response_model=BidderOut)
@@ -135,6 +157,13 @@ def rename_bidder(bidder_id: int, body: RenameBody, actor: str = Depends(get_act
     audit_service.log(bidder.project_id, actor, "bidder.rename", "bidder", str(bidder_id),
                       {"name": bidder.name})
     return BidderOut.model_validate(bidder)
+
+
+@router.delete("/bidders/{bidder_id}")
+def delete_bidder(bidder_id: int, actor: str = Depends(get_actor)) -> dict:
+    """删除投标人及其投标文件（已产生评分记录时 409）。审计与复核留痕保留。"""
+    counts = bidder_service.delete_bidder(bidder_id, actor)
+    return {"deleted": bidder_id, **counts}
 
 
 @router.get("/bidders/{bidder_id}/qualification-preview")

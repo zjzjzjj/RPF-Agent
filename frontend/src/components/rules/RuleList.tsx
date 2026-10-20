@@ -22,6 +22,80 @@ const ORIGIN_TAG: Record<string, { color: string; text: string }> = {
   merged: { color: "geekblue", text: "合并" },
 };
 
+/** 计数类客观项的计分规则摘要（从 checks[0].params 生成，如「每项 3 分，最多 5 项（金额≥80 万）」）。 */
+function countRuleText(c: CriterionOut): string | null {
+  const params = c.checks?.[0]?.params as
+    | { per_item?: number | string; max_items?: number | string; min_amount_yuan?: number | string }
+    | undefined;
+  if (!params || params.per_item == null) return null;
+  const parts = [`每项 ${params.per_item} 分`];
+  if (params.max_items != null) parts.push(`最多 ${params.max_items} 项`);
+  if (params.min_amount_yuan != null) {
+    parts.push(`金额≥${Number(params.min_amount_yuan) / 10000} 万元`);
+  }
+  return parts.join("，");
+}
+
+/** 评分细则展开区：档位判据 / 计分规则 / 证明材料——此前只在编辑弹窗里可见，
+ *  列表页只显示一行 description，用户「看不到细则」的根因。 */
+function RuleDetail({ criterion: c }: { criterion: CriterionOut }) {
+  const [open, setOpen] = useState(false);
+  const countText = countRuleText(c);
+  const hasDetail = c.levels.length > 0 || !!c.required_evidence || !!countText;
+  if (!hasDetail) return null;
+
+  const summary = [
+    c.levels.length > 0 ? `${c.levels.length} 档判据` : null,
+    countText ? "计分规则" : null,
+    c.required_evidence ? "证明材料" : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+
+  return (
+    <div style={{ marginTop: 4 }}>
+      <Typography.Link style={{ fontSize: 12 }} onClick={() => setOpen((v) => !v)}>
+        {open ? "收起评分细则" : `查看评分细则（${summary}）`}
+      </Typography.Link>
+      {open && (
+        <div
+          style={{
+            marginTop: 6,
+            padding: "6px 10px",
+            background: "#fafafa",
+            border: "1px solid #f0f0f0",
+            borderRadius: 4,
+            fontSize: 12,
+          }}
+        >
+          {countText && (
+            <div style={{ marginBottom: 4 }}>
+              <b>计分规则：</b>
+              {countText}
+            </div>
+          )}
+          {c.levels.length > 0 && (
+            <div style={{ marginBottom: 4 }}>
+              <b>档位判据：</b>
+              {c.levels.map((lv) => (
+                <div key={lv.id ?? lv.level_label} style={{ marginTop: 2, color: "#555" }}>
+                  {lv.level_label}（{lv.score_min}–{lv.score_max} 分）：{lv.description || "—"}
+                </div>
+              ))}
+            </div>
+          )}
+          {c.required_evidence && (
+            <div>
+              <b>证明材料：</b>
+              <span style={{ color: "#555" }}>{c.required_evidence}</span>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 interface Props {
   criteria: CriterionOut[];
   packageStatus: string;
@@ -141,6 +215,7 @@ export default function RuleList({
                   <div style={{ color: "#888", fontSize: 12, marginTop: 4 }}>
                     {c.description || "—"}
                   </div>
+                  <RuleDetail criterion={c} />
                   {(c.source_page || c.source_node_id) && (
                     <div style={{ color: "#aaa", fontSize: 11, marginTop: 2 }}>
                       依据：第 {c.source_page ?? "?"} 页

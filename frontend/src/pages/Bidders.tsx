@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useParams } from "react-router-dom";
 import {
   Alert,
@@ -9,6 +9,7 @@ import {
   InputNumber,
   List,
   Modal,
+  Popconfirm,
   Space,
   Table,
   Tag,
@@ -17,17 +18,253 @@ import {
   Upload,
   message,
 } from "antd";
-import { InboxOutlined, PlusOutlined, ReloadOutlined } from "@ant-design/icons";
+import {
+  DeleteOutlined,
+  InboxOutlined,
+  PlusOutlined,
+  ReloadOutlined,
+} from "@ant-design/icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
-import { useBidders, useDocuments, useJob } from "../api/hooks";
-import type { Bidder } from "../types";
+import { useBidders, useDocuments } from "../api/hooks";
+import { useJobProgress } from "../api/useJobStream";
+import { JobProgress } from "../components/JobProgress";
+import type { Bidder, DocumentOut } from "../types";
 
 const PRICE_TAG: Record<string, { color: string; text: string }> = {
   extracted: { color: "orange", text: "待确认" },
   confirmed: { color: "green", text: "已确认" },
   conflict: { color: "red", text: "冲突待裁决" },
 };
+
+const TERMINAL = ["succeeded", "failed", "cancelled"];
+
+interface PreviewItem {
+  code: string;
+  name: string;
+  verdict: string;
+  message: string;
+}
+
+interface PreviewState {
+  bidder: Bidder;
+  items: PreviewItem[];
+}
+
+/** 投标文件列：每行独立持有 job 状态。
+ *
+ * 单值 jobId 放在页面顶层时，并发上传会互相覆盖（只记得最后一个任务），
+ * 且进度只显示在页头、不落在对应投标人上——故收敛到行级子组件。
+ */
+function BidderFileCell({
+  bidder,
+  pid,
+  docs,
+}: {
+  bidder: Bidder;
+  pid: string;
+  docs: DocumentOut[];
+}) {
+  const qc = useQueryClient();
+  const [jobId, setJobId] = useState<number | null>(null);
+  const job = useJobProgress(jobId);
+  const running = !!job && !TERMINAL.includes(job.status);
+
+  const upload = useMutation({
+    mutationFn: async ({ bidderId, file }: { bidderId: number; file: File }) => {
+      const formData = new FormData();
+      formData.append("file", file);
+      formData.append("role", "main");
+      return api.upload<{ job_id: number }>(`/bidders/${bidderId}/documents`, formData);
+    },
+    onSuccess: (r) => {
+      setJobId(r.job_id);
+      qc.invalidateQueries({ queryKey: ["bidders", pid] });
+      qc.invalidateQueries({ queryKey: ["documents", pid] });
+    },
+    onError: (e: Error) => message.error(e.message || "上传失败"),
+  });
+
+  // 终态提示 + 刷新（与 ScoreResults 的终态 invalidate 同款）
+  useEffect(() => {
+    if (!job) return;
+    if (job.status === "succeeded") {
+      qc.invalidateQueries({ queryKey: ["documents", pid] });
+      qc.invalidateQueries({ queryKey: ["bidders", pid] });
+      message.success("投标文件解析完成");
+    } else if (job.status === "failed") {
+      message.error(job.error || "投标文件解析失败");
+    }
+  }, [job?.status]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  return (
+    <Space direction="vertical" size={2}>
+      {docs.map((d) => (
+        <Tag
+          key={d.id}
+          color={
+            d.parse_status === "parsed"
+              ? "green"
+              : d.parse_status === "failed"
+                ? "red"
+                : d.parse_status === "degraded"
+                  ? "orange"
+                  : "blue"
+          }
+          title={`${d.original_filename}（${d.parse_status}，${d.page_count ?? "?"} 页）`}
+          style={{
+            maxWidth: 236,
+            overflow: "hidden",
+            textOverflow: "ellipsis",
+            whiteSpace: "nowrap",
+            display: "inline-block",
+            verticalAlign: "middle",
+          }}
+        >
+          {d.original_filename}（{d.parse_status}，{d.page_count ?? "?"} 页）
+        </Tag>
+      ))}
+      {job && (
+        <JobProgress
+          job={job}
+          width={90}
+          onCancel={() => api.post(`/jobs/${job.id}/cancel`).catch(() => undefined)}
+        />
+      )}
+      <Upload
+        showUploadList={false}
+        beforeUpload={(file) => {
+          upload.mutate({ bidderId: bidder.id, file });
+          return false;
+        }}
+      >
+        <Tooltip title="支持 PDF（含扫描件自动 OCR）。若报价在 Excel 报价表中，请将该表页导出为 PDF 上传，或使用「人工录入」。">
+          <Button size="small" icon={<InboxOutlined />} loading={upload.isPending} disabled={running}>
+            上传投标文件
+          </Button>
+        </Tooltip>
+      </Upload>
+    </Space>
+  );
+}
+
+/** 操作列：每行独立持有报价抽取的 job 状态（原同步 GET 改为后台任务）。 */
+function BidderActionCell({
+  bidder,
+  pid,
+  onManual,
+  onConfirm,
+  onPreview,
+}: {
+  bidder: Bidder;
+  pid: string;
+  onManual: (b: Bidder) => void;
+  onConfirm: (b: Bidder) => void;
+  onPreview: (p: PreviewState) => void;
+}) {
+  const qc = useQueryClient();
+  const [jobId, setJobId] = useState<number | null>(null);
+  const job = useJobProgress(jobId);
+  const running = !!job && !TERMINAL.includes(job.status);
+
+  const extract = useMutation({
+    mutationFn: (id: number) =>
+      api.post<{ bidder_id: number; job_id: number }>(`/bidders/${id}/price/extract`),
+    onSuccess: (r) => setJobId(r.job_id),
+    onError: (e: Error) => message.error(e.message || "抽取报价失败"),
+  });
+
+  const preview = useMutation({
+    mutationFn: (b: Bidder) =>
+      api
+        .get<{ items: PreviewItem[] }>(`/bidders/${b.id}/qualification-preview`)
+        .then((r) => ({ bidder: b, items: r.items })),
+    onSuccess: (r) => onPreview(r),
+    onError: (e: Error) => message.error(e.message),
+  });
+
+  const del = useMutation({
+    mutationFn: (id: number) => api.del<{ deleted: number }>(`/bidders/${id}`),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["bidders", pid] });
+      qc.invalidateQueries({ queryKey: ["documents", pid] });
+      qc.invalidateQueries({ queryKey: ["workbench", pid] });
+      message.success("投标人已删除");
+    },
+    onError: (e: Error) => message.error(e.message || "删除投标人失败"),
+  });
+
+  useEffect(() => {
+    if (!job) return;
+    if (job.status === "succeeded") {
+      qc.invalidateQueries({ queryKey: ["bidders", pid] });
+      const st = (job.result_json as { price_status?: string } | null)?.price_status;
+      message.success(
+        `报价已抽取（${st === "conflict" ? "存在冲突，需人工裁决" : "待确认"}）`
+      );
+    } else if (job.status === "failed") {
+      message.error(job.error || "抽取报价失败");
+    }
+  }, [job?.status]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  return (
+    <Space direction="vertical" size={2} style={{ width: "100%" }}>
+      <Space wrap>
+        <Button
+          size="small"
+          icon={<ReloadOutlined />}
+          loading={extract.isPending}
+          disabled={running}
+          onClick={() => extract.mutate(bidder.id)}
+        >
+          抽取报价
+        </Button>
+        <Button
+          size="small"
+          type="primary"
+          ghost
+          disabled={!bidder.bid_price || bidder.price_status === "confirmed"}
+          onClick={() => onConfirm(bidder)}
+        >
+          确认报价
+        </Button>
+        <Button size="small" onClick={() => onManual(bidder)}>
+          人工录入
+        </Button>
+        <Button
+          size="small"
+          loading={preview.isPending}
+          onClick={() => preview.mutate(bidder)}
+        >
+          资格预判
+        </Button>
+        <Popconfirm
+          title="删除该投标人？"
+          description="其投标文件与解析数据将一并删除且不可恢复。已产生评分记录的不能删除。"
+          okText="删除"
+          okButtonProps={{ danger: true, loading: del.isPending }}
+          cancelText="取消"
+          onConfirm={() => del.mutate(bidder.id)}
+        >
+          <Button
+            danger
+            type="text"
+            size="small"
+            icon={<DeleteOutlined />}
+            aria-label={`删除投标人 ${bidder.name}`}
+          />
+        </Popconfirm>
+      </Space>
+      {job && (
+        <JobProgress
+          job={job}
+          width={90}
+          onCancel={() => api.post(`/jobs/${job.id}/cancel`).catch(() => undefined)}
+        />
+      )}
+    </Space>
+  );
+}
 
 /** 人工录入报价：受控 Modal（静态 Modal.confirm 的 okButtonProps 一次性求值，
  *  disabled 永远卡在初始态——那是"人工录入不可用"的根因，2026-10-13）。 */
@@ -144,9 +381,7 @@ export default function Bidders() {
   const { data: documents } = useDocuments(pid);
   const [open, setOpen] = useState(false);
   const [form] = Form.useForm();
-  const [jobId, setJobId] = useState<number | null>(null);
-  const { data: job } = useJob(jobId);
-  const [preview, setPreview] = useState<{ bidder: Bidder; items: { code: string; name: string; verdict: string; message: string }[] } | null>(null);
+  const [preview, setPreview] = useState<PreviewState | null>(null);
   const [manualTarget, setManualTarget] = useState<Bidder | null>(null);
   const [confirmTarget, setConfirmTarget] = useState<Bidder | null>(null);
 
@@ -158,40 +393,6 @@ export default function Bidders() {
       setOpen(false);
       form.resetFields();
     },
-  });
-
-  const extractPrice = useMutation({
-    mutationFn: (id: number) => api.get<{ price_status: string }>(`/bidders/${id}/price`),
-    onSuccess: (r) => {
-      qc.invalidateQueries({ queryKey: ["bidders", pid] });
-      message.success(`报价已抽取（${r.price_status === "conflict" ? "存在冲突，需人工裁决" : "待确认"}）`);
-    },
-    onError: (e: Error) => message.error(e.message),
-  });
-
-  const uploadDoc = useMutation({
-    mutationFn: async ({ bidderId, file }: { bidderId: number; file: File }) => {
-      const formData = new FormData();
-      formData.append("file", file);
-      formData.append("role", "main");
-      return api.upload<{ job_id: number }>(`/bidders/${bidderId}/documents`, formData);
-    },
-    onSuccess: (r) => {
-      setJobId(r.job_id);
-      qc.invalidateQueries({ queryKey: ["bidders", pid] });
-      qc.invalidateQueries({ queryKey: ["documents", pid] });
-    },
-  });
-
-  const qualificationPreview = useMutation({
-    mutationFn: (bidder: Bidder) =>
-      api
-        .get<{ items: { code: string; name: string; verdict: string; message: string }[] }>(
-          `/bidders/${bidder.id}/qualification-preview`
-        )
-        .then((r) => ({ bidder, items: r.items })),
-    onSuccess: (r) => setPreview(r),
-    onError: (e: Error) => message.error(e.message),
   });
 
   const docsByBidder = (bidderId: number) =>
@@ -206,11 +407,6 @@ export default function Bidders() {
         <Button icon={<PlusOutlined />} type="primary" onClick={() => setOpen(true)}>
           添加投标人
         </Button>
-        {job && (
-          <Tag color={job.status === "succeeded" ? "green" : job.status === "failed" ? "red" : "blue"}>
-            解析任务 {job.status} {job.message}
-          </Tag>
-        )}
       </Space>
 
       <Table<Bidder>
@@ -232,46 +428,7 @@ export default function Bidders() {
             title: "投标文件",
             width: 260,
             render: (_, row) => (
-              <Space direction="vertical" size={2}>
-                {docsByBidder(row.id).map((d) => (
-                  <Tag
-                    key={d.id}
-                    color={
-                      d.parse_status === "parsed"
-                        ? "green"
-                        : d.parse_status === "failed"
-                          ? "red"
-                          : d.parse_status === "degraded"
-                            ? "orange"
-                            : "blue"
-                    }
-                    title={`${d.original_filename}（${d.parse_status}，${d.page_count ?? "?"} 页）`}
-                    style={{
-                      maxWidth: 236,
-                      overflow: "hidden",
-                      textOverflow: "ellipsis",
-                      whiteSpace: "nowrap",
-                      display: "inline-block",
-                      verticalAlign: "middle",
-                    }}
-                  >
-                    {d.original_filename}（{d.parse_status}，{d.page_count ?? "?"} 页）
-                  </Tag>
-                ))}
-                <Upload
-                  showUploadList={false}
-                  beforeUpload={(file) => {
-                    uploadDoc.mutate({ bidderId: row.id, file });
-                    return false;
-                  }}
-                >
-                  <Tooltip title="支持 PDF（含扫描件自动 OCR）。若报价在 Excel 报价表中，请将该表页导出为 PDF 上传，或使用「人工录入」。">
-                    <Button size="small" icon={<InboxOutlined />}>
-                      上传投标文件
-                    </Button>
-                  </Tooltip>
-                </Upload>
-              </Space>
+              <BidderFileCell bidder={row} pid={pid} docs={docsByBidder(row.id)} />
             ),
           },
           {
@@ -302,30 +459,13 @@ export default function Bidders() {
             title: "操作",
             width: 260,
             render: (_, row) => (
-              <Space wrap>
-                <Button
-                  size="small"
-                  icon={<ReloadOutlined />}
-                  onClick={() => extractPrice.mutate(row.id)}
-                >
-                  抽取报价
-                </Button>
-                <Button
-                  size="small"
-                  type="primary"
-                  ghost
-                  disabled={!row.bid_price || row.price_status === "confirmed"}
-                  onClick={() => setConfirmTarget(row)}
-                >
-                  确认报价
-                </Button>
-                <Button size="small" onClick={() => setManualTarget(row)}>
-                  人工录入
-                </Button>
-                <Button size="small" onClick={() => qualificationPreview.mutate(row)}>
-                  资格预判
-                </Button>
-              </Space>
+              <BidderActionCell
+                bidder={row}
+                pid={pid}
+                onManual={setManualTarget}
+                onConfirm={setConfirmTarget}
+                onPreview={setPreview}
+              />
             ),
           },
         ]}

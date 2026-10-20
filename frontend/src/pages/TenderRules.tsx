@@ -30,10 +30,10 @@ import {
 import { CheckOutlined, PlusOutlined, ThunderboltOutlined, ReloadOutlined, UploadOutlined, SwapOutlined, ImportOutlined, SettingOutlined } from "@ant-design/icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
+import { useJobProgress } from "../api/useJobStream";
 import {
   useCoverage,
   useDocuments,
-  useJob,
   useLawPacks,
   useMatchProposal,
   useMergeRecords,
@@ -45,6 +45,7 @@ import {
   useUseDefaultTemplate,
 } from "../api/hooks";
 import AutoMatchBanner from "../components/rules/AutoMatchBanner";
+import { JobProgress } from "../components/JobProgress";
 import RuleList from "../components/rules/RuleList";
 import TemplatePicker from "../components/rules/TemplatePicker";
 import type { CriterionOut, MatchCriterionBrief, MatchPair, ValidationOut } from "../types";
@@ -64,9 +65,9 @@ export default function TenderRules() {
   const [matchJobId, setMatchJobId] = useState<number | null>(null);
   const [flow, setFlow] = useState<"idle" | "parsing" | "matching">("idle");
   const [selectedModel, setSelectedModel] = useState<string | undefined>(undefined);
-  const { data: job } = useJob(jobId);
-  const { data: parseJob } = useJob(parseJobId);
-  const { data: matchJob } = useJob(matchJobId);
+  const job = useJobProgress(jobId);
+  const parseJob = useJobProgress(parseJobId);
+  const matchJob = useJobProgress(matchJobId);
   const [detail, setDetail] = useState<CriterionOut | null>(null);
   const [signoffTarget, setSignoffTarget] = useState<CriterionOut | null>(null);
   const [toggleTarget, setToggleTarget] = useState<CriterionOut | null>(null);
@@ -500,6 +501,7 @@ export default function TenderRules() {
           parseJob={parseJob}
           matchJob={matchJob}
           uploading={uploadTender.isPending}
+          reparsePending={reparseDoc.isPending}
           canRematch={
             !!tenderDoc &&
             (canMerge || !rules || rules.id === 0 || rules.status === "none")
@@ -530,13 +532,18 @@ export default function TenderRules() {
       )}
 
       {job && (
-        <Alert
-          style={{ marginTop: 12 }}
-          type={job.status === "failed" ? "error" : job.status === "succeeded" ? "success" : "info"}
-          showIcon
-          message={`编译任务：${job.status}（${job.done_steps}/${job.total_steps}）${job.message ?? ""}`}
-          description={job.error}
-        />
+        <Card size="small" style={{ marginTop: 12 }}>
+          <JobProgress
+            job={job}
+            width={160}
+            onCancel={() => api.post(`/jobs/${job.id}/cancel`).catch(() => undefined)}
+          />
+          {job.error && (
+            <Typography.Text type="danger" style={{ display: "block", marginTop: 4 }}>
+              {job.error}
+            </Typography.Text>
+          )}
+        </Card>
       )}
 
       {rules && rules.id !== 0 && (
@@ -627,6 +634,7 @@ export default function TenderRules() {
                   )}
                   <Button
                     disabled={rules.status !== "draft" || unconfirmed.length > 0}
+                    loading={confirm.isPending}
                     onClick={() => confirm.mutate()}
                   >
                     确认规则包
@@ -634,6 +642,7 @@ export default function TenderRules() {
                   <Button
                     type="primary"
                     disabled={rules.status !== "confirmed"}
+                    loading={freeze.isPending}
                     onClick={() => freeze.mutate()}
                   >
                     冻结（进入只读）
@@ -1058,17 +1067,34 @@ function CriterionModal({
 
       <Form
         form={form}
-        layout="inline"
+        layout="vertical"
         initialValues={{
           name: criterion.name,
           max_score: criterion.max_score ? Number(criterion.max_score) : undefined,
+          description: criterion.description ?? "",
+          required_evidence: criterion.required_evidence ?? "",
         }}
       >
-        <Form.Item name="name" label="名称" rules={[{ required: true }]}>
-          <Input style={{ width: 260 }} />
+        <Space align="start" size={12}>
+          <Form.Item name="name" label="名称" rules={[{ required: true }]}>
+            <Input style={{ width: 320 }} />
+          </Form.Item>
+          <Form.Item name="max_score" label="满分">
+            <InputNumber min={0} />
+          </Form.Item>
+        </Space>
+        <Form.Item name="description" label="判据描述">
+          <Input.TextArea rows={2} placeholder="该评分项的判据说明" />
         </Form.Item>
-        <Form.Item name="max_score" label="满分">
-          <InputNumber min={0} />
+        <Form.Item
+          name="required_evidence"
+          label="证明材料要求"
+          extra="该项会注入 AI 评分的提示词，用于核验投标人是否提供了对应证明材料（材料不全将影响得分）。"
+        >
+          <Input.TextArea
+            rows={2}
+            placeholder="如：合同复印件（含金额页）+ 发票复印件 + 业主验收证明"
+          />
         </Form.Item>
       </Form>
 

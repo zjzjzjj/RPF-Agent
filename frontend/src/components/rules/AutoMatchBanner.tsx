@@ -28,6 +28,7 @@ interface Props {
   uploading: boolean;
   canRematch: boolean;
   rematchPending: boolean;
+  reparsePending: boolean;
   onUpload: (file: File) => void;
   onReparse: (docId: number) => void;
   onRematch: () => void;
@@ -57,6 +58,7 @@ export default function AutoMatchBanner({
   uploading,
   canRematch,
   rematchPending,
+  reparsePending,
   onUpload,
   onReparse,
   onRematch,
@@ -112,7 +114,7 @@ export default function AutoMatchBanner({
           description={
             <Space direction="vertical" size={4}>
               <span>{tenderFailedDoc.original_filename}（{tenderFailedDoc.parse_status}）</span>
-              <Button size="small" onClick={() => onReparse(tenderFailedDoc.id)}>
+              <Button size="small" loading={reparsePending} onClick={() => onReparse(tenderFailedDoc.id)}>
                 重新解析
               </Button>
             </Space>

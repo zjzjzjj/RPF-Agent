@@ -81,6 +81,9 @@ class TemplateCriterion(BaseModel):
     veto_consequence: VetoConsequence | None = None
     max_score: Decimal | None = None
     description: str | None = None
+    # 证明材料要求（ADR 0006 的「证明材料」列）：落库进 Criterion.required_evidence，
+    # 供主观分提示词、【证明材料】注入与证据关键词匹配使用。
+    required_evidence: str | None = None
     levels: list[TemplateLevel] = Field(default_factory=list)
     checks: list[TemplateCheck] = Field(default_factory=list)
     formula: TemplateFormula | None = None

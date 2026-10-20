@@ -3,8 +3,8 @@
   "name": "综合评分法（工程类）通用模板",
   "method": "comprehensive",
   "applicable": {"procurement": "works"},
-  "library_version": "1.0.0",
-  "notes": "工程评标惯例：价格 40、技术 40、商务 20。政采工程与招标投标工程两套制度分支的适用差异（如评标办法依据）需在覆盖时按项目核实；全部条目均为候选，未经招标文件覆盖并签批不得执行。",
+  "library_version": "2.0.0",
+  "notes": "工程评标惯例：价格 40 分、技术 40 分、商务 20 分，非否决项合计 100 分。政采工程与招标投标工程两套制度分支的适用差异（如评标办法依据）需在覆盖时按项目核实；全部条目均为通用判据候选，未经招标文件覆盖并签批不得执行。库内不收录品牌、型号或指向唯一供应商的条目。",
   "criteria": [
     {
       "template_code": "T1.1",
@@ -14,6 +14,7 @@
       "is_veto": true,
       "veto_consequence": "disqualify",
       "description": "投标人须为在中华人民共和国境内注册、具有独立承担民事责任能力的法人。",
+      "required_evidence": "有效的营业执照副本复印件，加盖投标人公章。",
       "checks": [
         {"check_type": "document_present", "field": null, "params": {"document": "营业执照"}, "on_fail": "recommend_reject"}
       ],
@@ -32,6 +33,7 @@
       "is_veto": true,
       "veto_consequence": "disqualify",
       "description": "投标人须具备招标文件载明的建筑业企业资质等级且在有效期内。",
+      "required_evidence": "建筑业企业资质证书复印件（资质类别与等级满足招标文件要求，且在有效期内）。",
       "checks": [
         {"check_type": "document_present", "field": null, "params": {"document": "资质证书"}, "on_fail": "recommend_reject"}
       ],
@@ -50,6 +52,7 @@
       "is_veto": true,
       "veto_consequence": "disqualify",
       "description": "投标人须具备有效的安全生产许可证。",
+      "required_evidence": "安全生产许可证复印件（须在有效期内）。",
       "checks": [
         {"check_type": "document_present", "field": null, "params": {"document": "安全生产许可证"}, "on_fail": "recommend_reject"}
       ],
@@ -58,7 +61,7 @@
       "formula": null,
       "weight": null,
       "essential": true,
-      "hint": "通用判据，覆盖时替换为招标文件要求"
+      "hint": "覆盖时替换为招标文件要求"
     },
     {
       "template_code": "T1.4",
@@ -68,6 +71,7 @@
       "is_veto": true,
       "veto_consequence": "disqualify",
       "description": "投标人未被列入失信被执行人名单及招投标失信行为名单。",
+      "required_evidence": "信用中国（creditchina.gov.cn）查询结果截图，或加盖公章的信用承诺函。",
       "checks": [
         {"check_type": "document_present", "field": null, "params": {"document": "信用承诺函"}, "on_fail": "recommend_reject"}
       ],
@@ -86,6 +90,7 @@
       "is_veto": true,
       "veto_consequence": "disqualify",
       "description": "投标函须由法定代表人或其授权代表签署并加盖投标人公章。",
+      "required_evidence": "投标函原件（法定代表人或授权代表签字，并加盖投标人公章）；授权代表签署的须附授权委托书。",
       "checks": [
         {"check_type": "human_only", "field": null, "params": {}, "on_fail": "recommend_reject"}
       ],
@@ -104,6 +109,7 @@
       "is_veto": true,
       "veto_consequence": "disqualify",
       "description": "投标人须按招标文件要求提交投标保证金。",
+      "required_evidence": "投标保证金缴纳凭证（银行回单/保函/电子凭证），金额与形式符合招标文件。",
       "checks": [
         {"check_type": "document_present", "field": null, "params": {"document": "投标保证金缴纳凭证"}, "on_fail": "recommend_reject"}
       ],
@@ -122,6 +128,7 @@
       "is_veto": true,
       "veto_consequence": "disqualify",
       "description": "投标人须对同一项目提交唯一报价，且报价不得高于最高投标限价。",
+      "required_evidence": "开标一览表/投标报价表（报价唯一且不高于最高投标限价）。",
       "checks": [
         {"check_type": "math_relation", "field": null, "params": {}, "on_fail": "recommend_reject"}
       ],
@@ -139,7 +146,8 @@
       "score_type": "formula",
       "is_veto": false,
       "veto_consequence": null,
-      "description": "以全部有效投标报价的算术平均价为基准价（系数 k=1.0），评标价每高于基准价一定比例扣分。",
+      "description": "以通过初步评审的全部有效投标报价的算术平均价为评标基准价（系数 k=1.0）；投标报价等于基准价的得满分，偏离基准价的按比例扣分，扣完为止。",
+      "required_evidence": null,
       "checks": [],
       "formula": {
         "formula_type": "benchmark_ratio",
@@ -162,15 +170,16 @@
       "score_type": "subjective",
       "is_veto": false,
       "veto_consequence": null,
-      "description": "对投标人施工组织设计方案的科学性、针对性及可操作性进行综合评价。",
+      "description": "评价施工组织设计对工程特点与现场条件的针对性、关键工序方案的完备性及可操作性。",
+      "required_evidence": "施工组织设计文本（含工程概况、施工部署、主要分部分项工程施工方案、关键工序技术措施）。",
       "checks": [],
       "formula": null,
       "max_score": 20,
       "levels": [
-        {"label": "优", "min": 17, "max": 20, "criteria": "方案科学、针对性强、可操作性好（通用判据，覆盖时替换）"},
-        {"label": "良", "min": 12, "max": 16, "criteria": "方案较科学、针对性较强、可操作性较好（通用判据，覆盖时替换）"},
-        {"label": "一般", "min": 6, "max": 11, "criteria": "方案基本可行、针对性一般（通用判据，覆盖时替换）"},
-        {"label": "差", "min": 0, "max": 5, "criteria": "方案不可行或存在重大缺陷（通用判据，覆盖时替换）"}
+        {"label": "优", "min": 17, "max": 20, "criteria": "针对工程特点与现场条件编制；主要分部分项方案完整；关键工序（含危大工程）有专项技术措施；可操作性强。"},
+        {"label": "良", "min": 12, "max": 16, "criteria": "施工部署与主要方案较完整；关键工序有技术措施但不够细化。"},
+        {"label": "一般", "min": 6, "max": 11, "criteria": "有总体方案但针对性不足，关键工序措施笼统。"},
+        {"label": "差", "min": 0, "max": 5, "criteria": "方案套用通用模板、缺乏针对性，或存在重大缺陷。"}
       ],
       "weight": null,
       "essential": true,
@@ -183,19 +192,20 @@
       "score_type": "subjective",
       "is_veto": false,
       "veto_consequence": null,
-      "description": "对投标人施工进度计划的合理性及保障措施的有效性进行综合评价。",
+      "description": "评价施工进度计划的合理性、工期节点安排及赶工与资源保障措施。",
+      "required_evidence": "施工进度计划（含横道图/网络图、工期节点）、资源投入计划、进度保障与赶工措施。",
       "checks": [],
       "formula": null,
       "max_score": 10,
       "levels": [
-        {"label": "优", "min": 9, "max": 10, "criteria": "进度合理、保障措施有力（通用判据，覆盖时替换）"},
-        {"label": "良", "min": 6, "max": 8, "criteria": "进度较合理、保障措施较充分（通用判据，覆盖时替换）"},
-        {"label": "一般", "min": 3, "max": 5, "criteria": "进度基本可行、保障措施一般（通用判据，覆盖时替换）"},
-        {"label": "差", "min": 0, "max": 2, "criteria": "进度不可行或缺少关键节点（通用判据，覆盖时替换）"}
+        {"label": "优", "min": 9, "max": 10, "criteria": "总工期满足要求且关键线路清晰；资源投入与工期匹配；有赶工与纠偏措施。"},
+        {"label": "良", "min": 6, "max": 8, "criteria": "进度计划合理、节点基本明确；保障措施较充分。"},
+        {"label": "一般", "min": 3, "max": 5, "criteria": "有进度计划但缺少关键节点或资源投入说明。"},
+        {"label": "差", "min": 0, "max": 2, "criteria": "进度计划不可行或不满足工期要求。"}
       ],
       "weight": null,
       "essential": false,
-      "hint": "覆盖时必须替换为招标文件的具体评分要点"
+      "hint": "覆盖时必须替换为招标文件的具体评分要点与工期要求"
     },
     {
       "template_code": "T4.3",
@@ -204,15 +214,16 @@
       "score_type": "subjective",
       "is_veto": false,
       "veto_consequence": null,
-      "description": "对投标人安全文明施工与工程质量保证措施的完善性进行综合评价。",
+      "description": "评价安全生产责任体系、文明施工措施与工程质量保证制度（含验收与隐患整改）。",
+      "required_evidence": "安全文明施工方案、质量保证体系文件（含三检制/验收标准/隐患整改流程）、安全管理人员配备说明。",
       "checks": [],
       "formula": null,
       "max_score": 10,
       "levels": [
-        {"label": "优", "min": 9, "max": 10, "criteria": "措施完善、体系健全（通用判据，覆盖时替换）"},
-        {"label": "良", "min": 6, "max": 8, "criteria": "措施较完善、体系较健全（通用判据，覆盖时替换）"},
-        {"label": "一般", "min": 3, "max": 5, "criteria": "措施基本齐全、体系一般（通用判据，覆盖时替换）"},
-        {"label": "差", "min": 0, "max": 2, "criteria": "措施缺失或明显不满足要求（通用判据，覆盖时替换）"}
+        {"label": "优", "min": 9, "max": 10, "criteria": "安全生产责任到人并配备专职安全员；文明施工措施具体；质量保证含三检制与隐患整改闭环。"},
+        {"label": "良", "min": 6, "max": 8, "criteria": "安全与质量措施较完善，制度基本健全。"},
+        {"label": "一般", "min": 3, "max": 5, "criteria": "措施表述笼统，缺少责任分工或验收标准。"},
+        {"label": "差", "min": 0, "max": 2, "criteria": "措施缺失或明显不满足要求。"}
       ],
       "weight": null,
       "essential": false,
@@ -225,9 +236,10 @@
       "score_type": "count",
       "is_veto": false,
       "veto_consequence": null,
-      "description": "按投标人提供的近年同类工程业绩数量计分，每项 2 分，最高 10 分。",
+      "description": "近三年（以竣工验收时间为准）完成的同类工程业绩，单个合同金额不低于 80 万元，每项计 2 分，最高 10 分（最多计 5 项）。",
+      "required_evidence": "中标通知书或合同复印件（含金额页）+ 竣工验收证明（缺一不得分）。",
       "checks": [
-        {"check_type": "count_at_least", "field": null, "params": {"field": "performance", "per_item": 2, "max_items": 5}, "on_fail": "need_human"}
+        {"check_type": "count_at_least", "field": null, "params": {"field": "performance", "per_item": 2, "max_items": 5, "min_amount_yuan": 800000}, "on_fail": "need_human"}
       ],
       "formula": null,
       "max_score": 10,
@@ -243,7 +255,8 @@
       "score_type": "count",
       "is_veto": false,
       "veto_consequence": null,
-      "description": "按投标人项目管理团队配置及项目经理执业资格证书情况计分，每项 2 分，最高 10 分。",
+      "description": "拟派项目经理持有注册建造师执业资格，且项目管理团队岗位配置齐全，每提供一个有效配置项计 2 分，最高 10 分。",
+      "required_evidence": "项目经理注册建造师证书 + 近六个月社保缴纳证明 + 团队岗位配置表（含技术负责人、安全员等）。",
       "checks": [
         {"check_type": "count_at_least", "field": null, "params": {"field": "certificates", "per_item": 2, "max_items": 5}, "on_fail": "need_human"}
       ],

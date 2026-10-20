@@ -24,9 +24,9 @@ import {
 } from "@ant-design/icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api, reportDocxUrl, reportFormalUrl, reportUrl } from "../api/client";
+import { useJobProgress } from "../api/useJobStream";
 import {
   useBidders,
-  useJob,
   useMatrix,
   useModels,
   useReport,
@@ -34,6 +34,7 @@ import {
   useScoreSummary,
   useSelectedRun,
 } from "../api/hooks";
+import { JobProgress } from "../components/JobProgress";
 import BucketCards from "../components/results/BucketCards";
 import BidderRankList from "../components/results/BidderRankList";
 import ItemReasonDrawer from "../components/results/ItemReasonDrawer";
@@ -68,7 +69,7 @@ export default function ScoreResults() {
   const { data: report, isError: reportError } = useReport(pid, runId);
 
   const [jobId, setJobId] = useState<number | null>(null);
-  const { data: job } = useJob(jobId);
+  const job = useJobProgress(jobId);
   const [selectedModel, setSelectedModel] = useState<string | undefined>(undefined);
   const [drawerItem, setDrawerItem] = useState<SummaryItem | null>(null);
 
@@ -191,9 +192,11 @@ export default function ScoreResults() {
           </Tag>
         )}
         {job && (
-          <Tag color={job.status === "failed" ? "red" : job.status === "succeeded" ? "green" : "blue"}>
-            {job.status} {job.message}
-          </Tag>
+          <JobProgress
+            job={job}
+            width={130}
+            onCancel={() => api.post(`/jobs/${job.id}/cancel`).catch(() => undefined)}
+          />
         )}
       </Space>
 

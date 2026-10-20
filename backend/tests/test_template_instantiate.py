@@ -68,7 +68,7 @@ def test_instantiate_chain(client) -> None:  # noqa: ANN001
     pkg = client.get(f"/api/rules/packages/{package_id}").json()
     assert pkg["origin"] == "template"
     assert pkg["template_id"] == "comprehensive-goods"
-    assert pkg["library_version"] == "1.0.0"
+    assert pkg["library_version"] == "2.0.0"
     assert pkg["source_document_id"] is None
 
     # 校验：只有 TEMPLATE_FALLBACK_SIGNOFF error（模板兜底未签批）

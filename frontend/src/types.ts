@@ -184,6 +184,7 @@ export interface TemplateCriterion {
   veto_consequence: string | null;
   max_score: string | null;
   description: string | null;
+  required_evidence: string | null;
   essential: boolean;
   hint: string | null;
   levels: TemplateLevel[];

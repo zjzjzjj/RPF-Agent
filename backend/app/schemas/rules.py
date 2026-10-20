@@ -246,6 +246,7 @@ class TemplateCriterionOut(BaseModel):
     veto_consequence: str | None = None
     max_score: Decimal | None = None
     description: str | None = None
+    required_evidence: str | None = None
     essential: bool = False
     hint: str | None = None
     levels: list[TemplateLevelOut] = []

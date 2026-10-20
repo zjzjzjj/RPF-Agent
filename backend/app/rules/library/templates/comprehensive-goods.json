@@ -3,8 +3,8 @@
   "name": "综合评分法（货物类）通用模板",
   "method": "comprehensive",
   "applicable": {"procurement": "goods"},
-  "library_version": "1.0.0",
-  "notes": "价格权重 30，符合 87 号令第 55 条货物项目价格权重≥30% 的下限；全部条目均为候选，未经招标文件覆盖并签批不得执行；判据文字为通用判据，覆盖时必须替换为招标文件原文。",
+  "library_version": "2.0.0",
+  "notes": "价格 30 分（符合《政府采购货物和服务招标投标管理办法》87 号令第 55 条：货物项目价格权重不得低于 30%），技术 50 分，商务 20 分，非否决项合计 100 分。全部条目均为通用判据候选，未经招标文件覆盖并签批不得执行；分值、门槛与证明材料可在覆盖时按招标文件替换。库内不收录品牌、型号或指向唯一供应商的条目。",
   "criteria": [
     {
       "template_code": "T1.1",
@@ -14,6 +14,7 @@
       "is_veto": true,
       "veto_consequence": "disqualify",
       "description": "投标人须为在中华人民共和国境内注册、具有独立承担民事责任能力的法人或其他组织。",
+      "required_evidence": "有效的营业执照副本复印件，加盖投标人公章。",
       "checks": [
         {"check_type": "document_present", "field": null, "params": {"document": "营业执照"}, "on_fail": "recommend_reject"}
       ],
@@ -22,7 +23,7 @@
       "formula": null,
       "weight": null,
       "essential": true,
-      "hint": "常见表述：提供有效营业执照副本复印件并加盖公章；覆盖时必须逐字引用招标文件原文"
+      "hint": "覆盖时必须逐字引用招标文件原文"
     },
     {
       "template_code": "T1.2",
@@ -32,6 +33,7 @@
       "is_veto": true,
       "veto_consequence": "disqualify",
       "description": "投标人须具备招标文件载明的相应资质证书且在有效期内。",
+      "required_evidence": "招标文件要求的资质证书复印件（须在有效期内，含年检记录）。",
       "checks": [
         {"check_type": "document_present", "field": null, "params": {"document": "资质证书"}, "on_fail": "recommend_reject"}
       ],
@@ -40,7 +42,7 @@
       "formula": null,
       "weight": null,
       "essential": true,
-      "hint": "通用判据，覆盖时替换为具体资质名称与等级要求"
+      "hint": "覆盖时替换为具体资质名称与等级要求"
     },
     {
       "template_code": "T1.3",
@@ -50,6 +52,7 @@
       "is_veto": true,
       "veto_consequence": "disqualify",
       "description": "投标人未被列入失信被执行人名单、重大税收违法案件当事人名单及政府采购严重违法失信行为记录名单。",
+      "required_evidence": "信用中国（creditchina.gov.cn）与政府采购网（ccgp.gov.cn）查询结果截图，或加盖公章的信用承诺函。",
       "checks": [
         {"check_type": "document_present", "field": null, "params": {"document": "信用承诺函"}, "on_fail": "recommend_reject"}
       ],
@@ -58,7 +61,7 @@
       "formula": null,
       "weight": null,
       "essential": true,
-      "hint": "通用判据，覆盖时替换为招标文件指定的查询渠道与证明形式"
+      "hint": "覆盖时替换为招标文件指定的查询渠道与证明形式"
     },
     {
       "template_code": "T1.4",
@@ -68,6 +71,7 @@
       "is_veto": true,
       "veto_consequence": "disqualify",
       "description": "投标人须提供依法缴纳税收和社会保障资金的相关证明材料。",
+      "required_evidence": "投标截止日前近六个月任一月度的纳税证明与社保缴纳凭证（加盖公章或税务/社保部门电子凭证）。",
       "checks": [
         {"check_type": "document_present", "field": null, "params": {"document": "缴纳税收和社保证明"}, "on_fail": "recommend_reject"}
       ],
@@ -76,7 +80,7 @@
       "formula": null,
       "weight": null,
       "essential": false,
-      "hint": "通用判据，覆盖时替换为招标文件要求的证明期限与形式"
+      "hint": "覆盖时替换为招标文件要求的证明期限与形式"
     },
     {
       "template_code": "T2.1",
@@ -86,6 +90,7 @@
       "is_veto": true,
       "veto_consequence": "disqualify",
       "description": "投标函须由法定代表人或其授权代表签署并加盖投标人公章。",
+      "required_evidence": "投标函原件（法定代表人或授权代表签字，并加盖投标人公章）；授权代表签署的须附授权委托书。",
       "checks": [
         {"check_type": "human_only", "field": null, "params": {}, "on_fail": "recommend_reject"}
       ],
@@ -103,7 +108,8 @@
       "score_type": "veto",
       "is_veto": true,
       "veto_consequence": "disqualify",
-      "description": "投标有效期须满足招标文件载明的期限要求。",
+      "description": "投标有效期须满足招标文件载明的期限要求（自投标截止之日起算）。",
+      "required_evidence": "投标函中载明的投标有效期承诺（天数不低于招标文件要求）。",
       "checks": [
         {"check_type": "human_only", "field": null, "params": {}, "on_fail": "recommend_reject"}
       ],
@@ -112,7 +118,7 @@
       "formula": null,
       "weight": null,
       "essential": true,
-      "hint": "通用判据，覆盖时替换为招标文件规定的具体天数"
+      "hint": "覆盖时替换为招标文件规定的具体天数"
     },
     {
       "template_code": "T2.3",
@@ -122,6 +128,7 @@
       "is_veto": true,
       "veto_consequence": "disqualify",
       "description": "投标人须按招标文件要求提交投标保证金。",
+      "required_evidence": "投标保证金缴纳凭证（银行回单/保函/电子凭证），金额与形式符合招标文件。",
       "checks": [
         {"check_type": "document_present", "field": null, "params": {"document": "投标保证金缴纳凭证"}, "on_fail": "recommend_reject"}
       ],
@@ -130,7 +137,7 @@
       "formula": null,
       "weight": null,
       "essential": true,
-      "hint": "通用判据，覆盖时替换为招标文件载明的保证金金额与形式"
+      "hint": "覆盖时替换为招标文件载明的保证金金额与形式"
     },
     {
       "template_code": "T2.4",
@@ -140,6 +147,7 @@
       "is_veto": true,
       "veto_consequence": "disqualify",
       "description": "投标人须对同一项目提交唯一报价，且报价不得高于最高投标限价。",
+      "required_evidence": "开标一览表/投标报价表（报价唯一且不高于最高投标限价）。",
       "checks": [
         {"check_type": "math_relation", "field": null, "params": {}, "on_fail": "recommend_reject"}
       ],
@@ -157,7 +165,8 @@
       "score_type": "formula",
       "is_veto": false,
       "veto_consequence": null,
-      "description": "以全部有效投标报价的算术平均价为基准价（系数 k=1.0），评标价每高于基准价一定比例扣分。",
+      "description": "以通过初步评审的全部有效投标报价的算术平均价为评标基准价（系数 k=1.0）；投标报价等于基准价的得满分，偏离基准价的按比例扣分，扣完为止。",
+      "required_evidence": null,
       "checks": [],
       "formula": {
         "formula_type": "benchmark_ratio",
@@ -180,19 +189,20 @@
       "score_type": "subjective",
       "is_veto": false,
       "veto_consequence": null,
-      "description": "对投标人技术方案的先进性、完整性及可实施性进行综合评价。",
+      "description": "评价技术方案对招标文件技术需求的响应完整度、技术指标的符合性以及实施可行性。",
+      "required_evidence": "技术方案文本（含技术需求逐项响应对照表、关键技术指标说明与实现路径）。",
       "checks": [],
       "formula": null,
       "max_score": 20,
       "levels": [
-        {"label": "优", "min": 17, "max": 20, "criteria": "方案先进、论证充分、可实施性强（通用判据，覆盖时替换）"},
-        {"label": "良", "min": 12, "max": 16, "criteria": "方案较合理、论证较充分、可实施性较好（通用判据，覆盖时替换）"},
-        {"label": "一般", "min": 6, "max": 11, "criteria": "方案基本可行、论证一般、可实施性一般（通用判据，覆盖时替换）"},
-        {"label": "差", "min": 0, "max": 5, "criteria": "方案不可行或存在重大缺陷（通用判据，覆盖时替换）"}
+        {"label": "优", "min": 17, "max": 20, "criteria": "技术需求逐项响应且无缺项；关键技术指标全部满足或优于要求并附依据；实现路径清晰、可实施性强。"},
+        {"label": "良", "min": 12, "max": 16, "criteria": "技术需求基本逐项响应；关键技术指标满足要求；实现路径较清晰。"},
+        {"label": "一般", "min": 6, "max": 11, "criteria": "响应主要技术需求，但存在缺项或关键技术指标未说明依据。"},
+        {"label": "差", "min": 0, "max": 5, "criteria": "未实质响应技术需求，或存在重大技术缺陷导致方案不可行。"}
       ],
       "weight": null,
       "essential": true,
-      "hint": "通用判据，覆盖时必须替换为招标文件的具体评分要点"
+      "hint": "覆盖时必须替换为招标文件的具体评分要点"
     },
     {
       "template_code": "T4.2",
@@ -201,19 +211,20 @@
       "score_type": "subjective",
       "is_veto": false,
       "veto_consequence": null,
-      "description": "对投标人项目实施计划、进度安排及保障措施的合理性进行综合评价。",
+      "description": "评价实施计划的阶段划分、进度节点与里程碑设置的合理性，以及进度保障与赶工措施。",
+      "required_evidence": "项目实施计划文本（含进度表/甘特图、里程碑节点、人员与资源投入计划、进度保障措施）。",
       "checks": [],
       "formula": null,
       "max_score": 15,
       "levels": [
-        {"label": "优", "min": 13, "max": 15, "criteria": "计划详尽、进度合理、保障有力（通用判据，覆盖时替换）"},
-        {"label": "良", "min": 9, "max": 12, "criteria": "计划较合理、进度基本可行、保障较充分（通用判据，覆盖时替换）"},
-        {"label": "一般", "min": 4, "max": 8, "criteria": "计划基本可行、进度存在风险、保障一般（通用判据，覆盖时替换）"},
-        {"label": "差", "min": 0, "max": 3, "criteria": "计划不可行或缺少关键节点安排（通用判据，覆盖时替换）"}
+        {"label": "优", "min": 13, "max": 15, "criteria": "阶段划分完整并给出里程碑节点；进度表可核验；人员与资源投入匹配；有赶工与纠偏措施。"},
+        {"label": "良", "min": 9, "max": 12, "criteria": "阶段划分与进度节点基本完整；投入计划较合理；保障措施一般。"},
+        {"label": "一般", "min": 4, "max": 8, "criteria": "有总体计划但缺少里程碑或投入计划，进度存在明显风险。"},
+        {"label": "差", "min": 0, "max": 3, "criteria": "无实施计划或缺少关键节点安排。"}
       ],
       "weight": null,
       "essential": false,
-      "hint": "通用判据，覆盖时必须替换为招标文件的具体评分要点"
+      "hint": "覆盖时必须替换为招标文件的具体评分要点"
     },
     {
       "template_code": "T4.3",
@@ -222,19 +233,20 @@
       "score_type": "subjective",
       "is_veto": false,
       "veto_consequence": null,
-      "description": "对投标人售后服务网络、响应时限、技术支持与培训方案进行综合评价。",
+      "description": "评价售后服务网点覆盖、响应时限承诺、备件供应、技术支持与培训方案。",
+      "required_evidence": "售后服务方案、服务承诺函（含响应与到场时限）、培训计划、备件供应说明或服务网点清单。",
       "checks": [],
       "formula": null,
       "max_score": 15,
       "levels": [
-        {"label": "优", "min": 13, "max": 15, "criteria": "售后体系完善、响应迅速、培训方案完整（通用判据，覆盖时替换）"},
-        {"label": "良", "min": 9, "max": 12, "criteria": "售后体系较完善、响应较及时、培训方案较完整（通用判据，覆盖时替换）"},
-        {"label": "一般", "min": 4, "max": 8, "criteria": "售后体系一般、响应时效一般、培训方案不完整（通用判据，覆盖时替换）"},
-        {"label": "差", "min": 0, "max": 3, "criteria": "无售后安排或明显不满足招标要求（通用判据，覆盖时替换）"}
+        {"label": "优", "min": 13, "max": 15, "criteria": "服务网点覆盖项目所在地；承诺响应≤2 小时、到场≤24 小时；备件供应与培训计划完整。"},
+        {"label": "良", "min": 9, "max": 12, "criteria": "有服务网点或就近服务安排；承诺响应≤4 小时；备件与培训方案较完整。"},
+        {"label": "一般", "min": 4, "max": 8, "criteria": "售后服务表述笼统，无量化响应时限或备件安排。"},
+        {"label": "差", "min": 0, "max": 3, "criteria": "无售后安排或明显不满足招标文件要求。"}
       ],
       "weight": null,
       "essential": false,
-      "hint": "通用判据，覆盖时必须替换为招标文件的具体评分要点"
+      "hint": "覆盖时必须替换为招标文件的具体评分要点与响应时限"
     },
     {
       "template_code": "T5.1",
@@ -243,16 +255,17 @@
       "score_type": "count",
       "is_veto": false,
       "veto_consequence": null,
-      "description": "按投标人提供的近三年同类项目业绩数量计分，每项 2 分，最高 10 分。",
+      "description": "近三年（以合同签订时间为准）完成的同类货物项目，单个合同金额不低于 80 万元，每项计 2 分，最高 10 分（最多计 5 项）。",
+      "required_evidence": "合同复印件（含金额页与签署页）+ 发票复印件 + 业主验收或证明（三者缺一不得分；验收材料可替代业主证明）。",
       "checks": [
-        {"check_type": "count_at_least", "field": null, "params": {"field": "performance", "per_item": 2, "max_items": 5}, "on_fail": "need_human"}
+        {"check_type": "count_at_least", "field": null, "params": {"field": "performance", "per_item": 2, "max_items": 5, "min_amount_yuan": 800000}, "on_fail": "need_human"}
       ],
       "formula": null,
       "max_score": 10,
       "levels": [],
       "weight": null,
       "essential": true,
-      "hint": "通用判据，覆盖时替换为招标文件规定的业绩时间范围与金额门槛"
+      "hint": "覆盖时替换为招标文件规定的业绩时间范围与金额门槛"
     },
     {
       "template_code": "T5.2",
@@ -261,7 +274,8 @@
       "score_type": "count",
       "is_veto": false,
       "veto_consequence": null,
-      "description": "按投标人持有的质量管理、环境管理、职业健康安全管理体系认证数量计分，每项 2 分，最高 10 分。",
+      "description": "投标人持有有效的质量管理、环境管理、职业健康安全管理体系认证（如 ISO9001、ISO14001、ISO45001，或同等体系），每项计 2 分，最高 10 分。",
+      "required_evidence": "有效期内的证书复印件 + 全国认证认可信息公共服务平台（cnca.cn）查询结果截图；无查询截图的不予计分。",
       "checks": [
         {"check_type": "count_at_least", "field": null, "params": {"field": "certificates", "per_item": 2, "max_items": 5}, "on_fail": "need_human"}
       ],
@@ -270,7 +284,7 @@
       "levels": [],
       "weight": null,
       "essential": false,
-      "hint": "通用判据，覆盖时替换为招标文件要求的认证类型"
+      "hint": "覆盖时替换为招标文件要求的认证类型；不得写入品牌或型号"
     }
   ]
 }

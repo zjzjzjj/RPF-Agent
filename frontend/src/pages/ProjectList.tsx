@@ -436,7 +436,7 @@ export default function ProjectList() {
                       title="删除该项目？"
                       description="文档、规则、评分与报告数据将一并删除且不可恢复。"
                       okText="删除"
-                      okButtonProps={{ danger: true }}
+                      okButtonProps={{ danger: true, loading: remove.isPending && remove.variables === p.id }}
                       cancelText="取消"
                       onConfirm={(e) => {
                         e?.stopPropagation();
@@ -495,7 +495,7 @@ export default function ProjectList() {
                       title="删除该项目？"
                       description="文档、规则、评分与报告数据将一并删除且不可恢复。"
                       okText="删除"
-                      okButtonProps={{ danger: true }}
+                      okButtonProps={{ danger: true, loading: remove.isPending && remove.variables === p.id }}
                       cancelText="取消"
                       onConfirm={() => remove.mutate(p.id)}
                     >

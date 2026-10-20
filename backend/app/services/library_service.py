@@ -184,7 +184,7 @@ def _persist_template_criterion(s, package_id: int, template_hash: str, tpl, c, 
         score_type=c.score_type,
         is_veto=bool(c.is_veto),
         veto_consequence=c.veto_consequence if c.is_veto else None,
-        required_evidence=None,
+        required_evidence=c.required_evidence,
         source_node_id=None,           # 模板无原文
         source_page=None,
         source_quote=None,             # 模板无原文（QUOTE_REQUIRED 按 origin 豁免）
