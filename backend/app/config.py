@@ -287,6 +287,15 @@ def llm_retry_backoff_s() -> float:
     return float(os.environ.get("BID_EVAL_LLM_RETRY_BACKOFF_S", 2))
 
 
+def compile_chunk_chars() -> int:
+    """规则抽取的分块大小（字符）。<=0 表示不分块（整份选段一次抽取）。
+
+    长招标文件的规则集合会超过单次输出上限（99 页文档实测 12000 tokens 仍被
+    截断）。分块后每块输入更小、输出空间充足，避免 JSON 中途截断。
+    """
+    return int(os.environ.get("BID_EVAL_COMPILE_CHUNK_CHARS", 12000))
+
+
 def llm_max_concurrency() -> int:
     return int(os.environ.get("BID_EVAL_LLM_CONCURRENCY", 4))
 

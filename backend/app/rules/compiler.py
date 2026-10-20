@@ -33,7 +33,7 @@ from app.errors import AppError, NotFound
 from app.evidence.verifier import verify_citation
 from app.jobs.handlers import register
 from app.jobs.queue import JobContext
-from app.llm.base import LLMError
+from app.llm.base import LLMError, LLMResult
 from app.llm.gateway import Gateway, get_gateway
 from app.parsing.normalize import normalize_no_ws
 from app.rules import prompts
@@ -64,6 +64,95 @@ def compile_char_budget() -> int:
     if usable <= 0:
         return MAX_COMPILE_CHARS  # 配置异常时不额外收紧，交给 provider 报错
     return min(MAX_COMPILE_CHARS, int(usable * _CHARS_PER_TOKEN))
+
+
+def split_for_extraction(text: str, chunk_chars: int | None = None) -> list[str]:
+    """把选段按行边界切成若干块，每块尽量不超过 chunk_chars 字符。
+
+    分块是长文档可靠抽取的前提：规则 JSON 的输出量随文档线性增长，而模型的
+    单次输出上限是固定的。按行切分保证不会在句子中间断开（条款跨块丢失）。
+    """
+    size = chunk_chars if chunk_chars is not None else config.compile_chunk_chars()
+    if size <= 0 or len(text) <= size:
+        return [text]
+
+    chunks: list[str] = []
+    buf: list[str] = []
+    used = 0
+    for line in text.split("\n"):
+        piece = line + "\n"
+        # 单行本身超长：先冲掉缓冲区，再硬切成整块
+        if len(piece) > size:
+            if buf:
+                chunks.append("".join(buf))
+                buf, used = [], 0
+            while len(piece) > size:
+                chunks.append(piece[:size])
+                piece = piece[size:]
+            if piece.strip():
+                buf.append(piece)
+                used = len(piece)
+            continue
+        if buf and used + len(piece) > size:
+            chunks.append("".join(buf))
+            buf, used = [], 0
+        buf.append(piece)
+        used += len(piece)
+    if buf:
+        chunks.append("".join(buf))
+    return [c for c in chunks if c.strip()] or [text]
+
+
+def dedupe_extracted(items: list["ExtractedCriterion"]) -> list["ExtractedCriterion"]:
+    """跨块去重：同 category + 规范化名称只保留第一条。
+
+    分块边界附近的上下文重叠会让模型在相邻两块里各抽一次同一条规则。
+    """
+    seen: set[tuple[str, str]] = set()
+    out: list["ExtractedCriterion"] = []
+    for c in items:
+        key = (c.category, normalize_no_ws(c.name or ""))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(c)
+    return out
+
+
+def _extract_chunk(
+    gateway: "Gateway", chunk: str, *, data_class: str, label: str = ""
+) -> tuple["RuleExtraction", "LLMResult"]:
+    """单块抽取（契约不符允许一次修复重试）。"""
+    user_prompt = prompts.RULE_USER_TEMPLATE.format(clause_text=chunk)
+    last_error: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            prompt = user_prompt
+            if attempt == 2 and last_error is not None:
+                prompt = (
+                    f"{user_prompt}\n\n【修复请求】你上一次的输出存在如下问题：\n{last_error}\n"
+                    "请修正后重新输出**完整**的 JSON（不要只输出差异部分）。"
+                )
+            return gateway.chat_json(
+                prompts.RULE_SYSTEM_PROMPT,
+                prompt,
+                RuleExtraction,
+                data_class=data_class,
+                max_tokens=config.llm_max_output_tokens(),
+            )
+        except LLMError as exc:
+            last_error = exc
+            log.warning(
+                "规则抽取%s第 %d 次尝试失败：%s",
+                f"[分块 {label}]" if label else "", attempt, exc,
+            )
+            if attempt == 1:
+                time.sleep(config.llm_retry_backoff_s())
+    raise AppError(
+        f"规则抽取失败（含修复重试）{f'（分块 {label}）' if label else ''}：{last_error}；"
+        "若持续失败，多为模型输出上限不足或模型上下文过小——"
+        "可换用上下文更大的模型、提高模型 max-model-len，或缩短招标文件后再试"
+    )
 
 # 章节优先级：真实招标文件的"评标办法/评分细则"通常排在最后（本文档在第 89-97 页），
 # 盲目截前 N 字符会把它整段丢掉——评分项一条都抽不出来，只剩前附表的资格与否决条款。
@@ -429,6 +518,7 @@ def compile_rules(
     merge_target_id: int | None = None,
     *,
     selection_meta_out: dict | None = None,
+    ctx: JobContext | None = None,
 ) -> int:
     """执行一次编译，返回新草稿规则包 id。
 
@@ -450,39 +540,23 @@ def compile_rules(
         )
 
     gateway = get_gateway() if provider is None and model is None else Gateway(get_provider(provider, model))
-    user_prompt = prompts.RULE_USER_TEMPLATE.format(clause_text=text)
 
-    extraction: RuleExtraction | None = None
-    result = None
-    last_error: Exception | None = None
-    for attempt in (1, 2):  # 契约不符允许一次修复重试（真实模型的常态，见 RPF 教训）
-        try:
-            prompt = user_prompt
-            if attempt == 2 and last_error is not None:
-                prompt = (
-                    f"{user_prompt}\n\n【修复请求】你上一次的输出存在如下问题：\n{last_error}\n"
-                    "请修正后重新输出**完整**的 JSON（不要只输出差异部分）。"
-                )
-            extraction, result = gateway.chat_json(
-                prompts.RULE_SYSTEM_PROMPT,
-                prompt,
-                RuleExtraction,
-                data_class=doc.data_class,
-                max_tokens=config.llm_max_output_tokens(),
-            )
-            last_error = None
-            break
-        except LLMError as exc:
-            last_error = exc
-            log.warning("规则抽取第 %d 次尝试失败：%s", attempt, exc)
-            if attempt == 1:
-                time.sleep(config.llm_retry_backoff_s())  # 超时/限流后退避再试
-    if extraction is None:
-        raise AppError(
-            f"规则抽取失败（含修复重试）：{last_error}；"
-            "若持续失败，多为模型输出上限不足或模型上下文过小——"
-            "可换用上下文更大的模型、提高模型 max-model-len，或缩短招标文件后再试"
+    # 分块抽取：长招标文件的规则集合可能远超单次输出上限（99 页文档实测 12000
+    # tokens 仍被截断）。按字符预算切块分别抽取，再合并去重——每块输入小，
+    # 输出空间充足，模型不会中途被截断。
+    chunks = split_for_extraction(text)
+    criteria_acc: list[ExtractedCriterion] = []
+    result_model: str | None = None
+    for idx, chunk in enumerate(chunks, start=1):
+        if ctx is not None and len(chunks) > 1:
+            ctx.advance(message=f"规则抽取 {idx}/{len(chunks)}")
+        extraction, result = _extract_chunk(
+            gateway, chunk, data_class=doc.data_class,
+            label=f"{idx}/{len(chunks)}" if len(chunks) > 1 else "",
         )
+        criteria_acc.extend(extraction.criteria)
+        result_model = result.model
+    criteria_acc = dedupe_extracted(criteria_acc)
 
     version = _next_version(project_id)
     with session_scope() as s:
@@ -493,7 +567,7 @@ def compile_rules(
             source_document_id=document_id,
             merge_target_id=merge_target_id,
             compiled_by=actor,
-            model=result.model,
+            model=result_model,
             prompt_version=None,
             created_by=actor,
         )
@@ -504,7 +578,7 @@ def compile_rules(
         seq = 0
         used_codes: set[str] = set()
         pending: list[tuple[int, int | None, ExtractedCriterion]] = []
-        for c in extraction.criteria:
+        for c in criteria_acc:
             seq += 1
             crit_id, cit_id = _persist_criterion(s, package_id, document_id, c, seq, used_codes)
             pending.append((crit_id, cit_id, c))
@@ -559,6 +633,7 @@ def compile_rules_job(ctx: JobContext, payload: dict) -> dict:
         project_id, document_id, actor, provider, model,
         merge_target_id=int(merge_target_id) if merge_target_id else None,
         selection_meta_out=selection_meta,
+        ctx=ctx,
     )
     if selection_meta.get("truncated"):
         ctx.advance(message=(

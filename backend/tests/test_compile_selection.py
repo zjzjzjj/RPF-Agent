@@ -127,3 +127,56 @@ def test_find_node_for_quote_tolerates_soft_line_break(app_env):
     )
     assert find_node_for_quote(doc_id, 1, quote) == "n1"
     assert find_node_for_quote(doc_id, 1, "这段原文里没有的内容") is None
+
+
+def test_split_for_extraction_respects_chunk_size() -> None:
+    """按行切块：每块不超预算、内容不丢失、不顺断句子。"""
+    from app.rules.compiler import split_for_extraction
+
+    text = "\n".join(f"第{i}条 这是招标文件的第 {i} 条内容。" for i in range(1, 61))
+    chunks = split_for_extraction(text, chunk_chars=300)
+    assert len(chunks) > 1
+    assert all(len(c) <= 300 + 200 for c in chunks)  # 行粒度允许单行溢出余量
+    # 内容完整：拼接后每条都在
+    joined = "".join(chunks)
+    for i in (1, 30, 60):
+        assert f"第{i}条" in joined
+    # 每块以行边界结束（不把一行劈成两半）
+    assert all(c.endswith("\n") or c == chunks[-1] for c in chunks[:-1])
+
+
+def test_split_for_extraction_no_split_when_short() -> None:
+    from app.rules.compiler import split_for_extraction
+
+    assert split_for_extraction("短文本", chunk_chars=1000) == ["短文本"]
+    assert split_for_extraction("任意长度", chunk_chars=0) == ["任意长度"]
+
+
+def test_split_for_extraction_hard_splits_long_line() -> None:
+    from app.rules.compiler import split_for_extraction
+
+    chunks = split_for_extraction("A" * 250, chunk_chars=100)
+    assert all(len(c) <= 100 for c in chunks)
+    # 内容不丢（切分按行处理，会补一个换行符）
+    assert sum(len(c) for c in chunks) in (250, 251)
+    assert "".join(chunks).replace("\n", "") == "A" * 250
+
+
+def test_dedupe_extracted_across_chunks() -> None:
+    """分块边界重复抽到的同一条规则只保留一次（名称规范化后比较）。"""
+    from app.rules.compiler import dedupe_extracted
+    from app.rules.model import ExtractedCriterion
+
+    def mk(name: str, category: str = "qualification") -> ExtractedCriterion:
+        return ExtractedCriterion(name=name, category=category, score_type="veto", is_veto=True)
+
+    items = [
+        mk("具有独立法人资格"),
+        mk("具有独立 法人资格"),      # 空白差异 → 视为同一条
+        mk("具有独立法人资格", "compliance"),  # 类别不同 → 保留
+        mk("未被列入失信名单"),
+    ]
+    out = dedupe_extracted(items)
+    assert len(out) == 3
+    assert out[0].name == "具有独立法人资格"
+    assert {c.category for c in out} == {"qualification", "compliance"}
