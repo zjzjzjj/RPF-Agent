@@ -55,6 +55,8 @@ export interface JobOut {
   result_json: Record<string, unknown> | null;
   error: string | null;
   attempts: number;
+  /** 前面还有几个未完成任务（0 = 正在运行或已终态） */
+  queue_position?: number;
 }
 
 export interface LevelOut {

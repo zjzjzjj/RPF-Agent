@@ -20,7 +20,8 @@ export function JobProgress({
   if (!job) return null;
   const total = job.total_steps ?? 0;
   const done = job.done_steps ?? 0;
-  const percent = total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
+  const queued = job.status === "queued";
+  const percent = queued ? 0 : total > 0 ? Math.min(100, Math.round((done / total) * 100)) : 0;
   const status =
     job.status === "failed" ? "exception" : job.status === "succeeded" ? "success" : "active";
   const color =
@@ -32,6 +33,14 @@ export function JobProgress({
       <Tag color={color} style={{ marginInlineEnd: 0 }}>
         {job.status}
       </Tag>
+      {queued && (
+        <Typography.Text type="warning" style={{ fontSize: 12 }}>
+          排队等待中
+          {job.queue_position != null && job.queue_position > 0
+            ? `（前面还有 ${job.queue_position} 个任务，单 worker 串行执行）`
+            : "（即将开始）"}
+        </Typography.Text>
+      )}
       {job.message && (
         <Typography.Text type="secondary" style={{ fontSize: 12 }}>
           {job.message}

@@ -20,7 +20,7 @@ from contextlib import suppress
 from datetime import timedelta
 from typing import Any
 
-from sqlalchemy import or_, select, update
+from sqlalchemy import func, or_, select, update
 
 from app import config
 from app.db.models import Job, utcnow
@@ -105,7 +105,9 @@ class JobContext:
                         return
                     job.heartbeat_at = utcnow()
             except Exception:  # noqa: BLE001 —— 心跳失败不得影响任务本身
-                log.debug("任务 %s 心跳更新失败", self.job_id, exc_info=True)
+                # 必须 warning 可见：心跳连续写失败会让任务被判僵尸、从头重跑乃至
+                # 重试 3 次后放弃（job 44 实证：2h40m 换一个 failed）。静默吞掉 = 事故无从排查。
+                log.warning("任务 %s 心跳更新失败", self.job_id, exc_info=True)
 
 
 # ---------------------------------------------------------------------------
@@ -121,11 +123,22 @@ def submit(kind: str, payload: dict[str, Any], project_id: str | None = None) ->
 
 
 def request_cancel(job_id: int) -> bool:
+    """请求取消任务。
+
+    queued 任务**立即置 cancelled**：它还没开始，等 worker 领取再取消既不必要、
+    也永远等不到（前面可能压着几十分钟的长任务）——此前只置标志的后果是
+    用户点取消拿到 200，任务却永远停在排队（2026-10-20 实证）。
+    running 任务只置标志，由 handler 在下一个 advance/checkpoint 处自行中断。
+    """
     with session_scope() as s:
         job = s.get(Job, job_id)
         if job is None or job.status in ("succeeded", "failed", "cancelled"):
             return False
         job.cancel_requested = True
+        if job.status == "queued":
+            job.status = "cancelled"
+            job.message = "已取消（未开始）"
+            job.finished_at = utcnow()
         return True
 
 
@@ -136,6 +149,25 @@ def get_job(job_id: int) -> Job | None:
             return None
         s.expunge(job)
         return job
+
+
+def queue_position(job_id: int) -> int:
+    """该任务前面还有几个未完成任务（running 的算 1 个）。0 = 正在跑或已终态。
+
+    供 UI 显示「排队中，前面还有 N 个任务」——单 worker 下这是用户判断
+    「任务没反应」到底是排队还是卡死的唯一线索。
+    """
+    with session_scope() as s:
+        job = s.get(Job, job_id)
+        if job is None or job.status != "queued":
+            return 0
+        ahead = s.execute(
+            select(func.count(Job.id)).where(
+                Job.status.in_(("queued", "running")),
+                Job.id < job_id,
+            )
+        ).scalar_one()
+        return int(ahead or 0)
 
 
 # ---------------------------------------------------------------------------
@@ -207,6 +239,12 @@ def _run_job(job_id: int) -> None:
             return
         kind = job.kind
         payload = dict(job.payload_json or {})
+        # 领取前已请求取消的（含竞态：排队期间取消标志残留）直接终结，不跑 handler
+        if job.cancel_requested:
+            job.status = "cancelled"
+            job.message = "已取消"
+            job.finished_at = utcnow()
+            return
 
     ctx = JobContext(job_id)
     ctx.start_heartbeat()

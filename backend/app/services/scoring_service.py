@@ -41,7 +41,7 @@ from app.engine.subjective import (
 )
 from app.errors import NotFound, ValidationFailed
 from app.jobs.handlers import register
-from app.jobs.queue import JobContext
+from app.jobs.queue import JobCancelled, JobContext
 from app.services import bidder_service
 
 log = logging.getLogger("bid_eval.scoring")
@@ -154,8 +154,18 @@ def evaluate_job(ctx: JobContext, payload: dict) -> dict:
         run_id = int(payload["run_id"])
         provider = payload.get("provider")
         model = payload.get("model")
-        ctx.start(total=4, message="加载规则快照")
         summary = execute_run(run_id, provider=provider, model=model, ctx=ctx)
+    except JobCancelled:
+        # 用户取消：运行置 cancelled（不是 failed——那是另一种结局，语义不能混）
+        if run_id is not None:
+            with session_scope() as s:
+                run = s.get(EvaluationRun, run_id)
+                if run is not None and run.status in ("queued", "running"):
+                    run.status = "cancelled"
+                    run.finished_at = utcnow()
+                    run.config_json = {**(run.config_json or {}), "error": "用户取消"}
+                    s.add(run)
+        raise
     except Exception as exc:
         # 运行状态必须与任务结局一致：失败不回写会留下"永远运行中/永远排队"的僵尸运行，
         # 工作台与报告都取最新运行，于是整个项目卡死再也出不来。
@@ -182,6 +192,9 @@ def reconcile_stale_runs(project_id: str) -> int:
     queued/running，挡住工作台与报告。**必须同时扫 queued**——create_run 先落库
     queued 再 submit，submit 失败或任务在进入 execute_run 前就抛错时，
     运行停在 queued，只扫 running 会把它漏掉。
+
+    任务是**被用户取消**的，运行同步置 cancelled（不是 failed——排队中取消是正常
+    操作，标成失败会把用户吓回去重新发起，2026-10-20 实证）。
     """
     from app.db.models import Job
 
@@ -201,15 +214,27 @@ def reconcile_stale_runs(project_id: str) -> int:
                     Job.payload_json["run_id"].as_integer() == run.id,
                 ).limit(1)
             ).first()
-            if alive is None:
-                run.status = "failed"
-                run.finished_at = utcnow()
-                run.config_json = {
-                    **(run.config_json or {}),
-                    "error": "运行中断（对应任务已结束或进程重启），已自动标记为失败",
-                }
-                s.add(run)
-                fixed += 1
+            if alive is not None:
+                continue
+            cancelled_job = s.execute(
+                select(Job.id).where(
+                    Job.kind == "evaluate",
+                    Job.status == "cancelled",
+                    Job.payload_json["run_id"].as_integer() == run.id,
+                ).limit(1)
+            ).first()
+            run.status = "cancelled" if cancelled_job else "failed"
+            run.finished_at = utcnow()
+            run.config_json = {
+                **(run.config_json or {}),
+                "error": (
+                    "用户取消"
+                    if cancelled_job
+                    else "运行中断（对应任务已结束或进程重启），已自动标记为失败"
+                ),
+            }
+            s.add(run)
+            fixed += 1
     return fixed
 
 
@@ -283,6 +308,16 @@ def execute_run(
     subjective_items = [c for c in criteria if c["score_type"] == "subjective"]
     match_items = [c for c in criteria if c["score_type"] == "match"]
 
+    # 进度按「评分项 × 投标人」粒度上报：客观审查是全链最耗时的一段（本地 8B
+    # 每条 30-90s、串行），只按阶段上报会让 UI 停在 25% 长达数十分钟
+    # （2026-10-20 实证：job 50 在「客观审查 85 项」停 20 分钟，用户以为没开始）。
+    # advance 内含取消检查——不逐项上报 = 整个客观阶段无法取消。
+    if ctx is not None:
+        obj_total = len(veto_items) * len(bidder_ids)
+        subj_total = len(subjective_items) * len(bidder_ids) if "subjective" in stages else 0
+        price_total = 1 if (price_items and "price" in stages) else 0
+        ctx.start(total=obj_total + subj_total + price_total + 1, message="客观审查准备")
+
     # ---- 事实与文本 ----
     facts_by_bidder: dict[int, object] = {}
     text_by_bidder: dict[int, str] = {}
@@ -329,13 +364,11 @@ def execute_run(
         if bid_id in facts_by_bidder:
             facts_by_bidder[bid_id].cross_bidder = sig
 
-    if ctx:
-        ctx.advance(message=f"客观审查 {len(veto_items)} 项")
-
     # ---- ① 资格/符合性（三态）----
     stats = {"objective": 0, "price": 0, "subjective": 0, "match": 0,
              "need_human": 0, "citations_verified": 0, "citations_total": 0}
     excluded_bidders: set[int] = set()  # 客观审查未通过 → 不进基准价（exclude_invalid）
+    obj_done = 0
     for bid_id in bidder_ids:
         facts = facts_by_bidder[bid_id]
         for c in veto_items:
@@ -358,6 +391,9 @@ def execute_run(
             if result["verdict"] == "recommend_reject" and review_status == "human_confirmed":
                 excluded_bidders.add(bid_id)
             stats["objective"] += 1
+            if ctx is not None:
+                obj_done += 1
+                ctx.advance(message=f"客观审查 {obj_done} 项")
 
     # ---- ② 价格分 ----
     if price_items and "price" in stages:
@@ -576,10 +612,13 @@ def execute_run(
                 person_stats[bid_id] = {"five_year": five, "social": social}
 
         use_hierarchical = config.review_mode() == "hierarchical"
-        if ctx:
-            ctx.advance(message=f"主观分评审（{config.review_mode()}） {len(subjective_items)} 项 × {len(bidder_ids)} 家")
+        subj_done = 0
+        subj_total = len(subjective_items) * len(bidder_ids)
         for bid_id in bidder_ids:
             for c in subjective_items:
+                if ctx is not None:
+                    subj_done += 1
+                    ctx.advance(message=f"主观分评审 {subj_done}/{subj_total}（{config.review_mode()}）")
                 hint = material_hints.get(bid_id)
                 if use_hierarchical:
                     suggestion, committee = suggest_score_hierarchical(

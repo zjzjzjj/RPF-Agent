@@ -29,6 +29,7 @@ class JobOut(BaseModel):
     result_json: dict | None
     error: str | None
     attempts: int
+    queue_position: int = 0
 
 
 @router.get("/jobs/{job_id}", response_model=JobOut)
@@ -36,7 +37,9 @@ def get_job(job_id: int) -> JobOut:
     job = queue.get_job(job_id)
     if job is None:
         raise NotFound("任务不存在")
-    return JobOut.model_validate(job)
+    out = JobOut.model_validate(job)
+    out.queue_position = queue.queue_position(job_id)
+    return out
 
 
 @router.post("/jobs/{job_id}/cancel")
@@ -67,6 +70,7 @@ async def job_events(job_id: int) -> EventSourceResponse:
                 "done_steps": job.done_steps,
                 "total_steps": job.total_steps,
                 "message": job.message,
+                "queue_position": queue.queue_position(job_id) if job.status == "queued" else 0,
             }
             if job.status in _TERMINAL:
                 # 终态把 error/result_json 一并送出，前端不必再补一次 GET /jobs/{id}

@@ -63,6 +63,9 @@ export default function ScoreResults() {
   const { data: bidders } = useBidders(pid);
   const { data: models } = useModels();
   const { runs, runId, setRunId, run } = useSelectedRun(pid);
+  // 单 worker 串行：已有 queued/running 的运行时再点「发起」只会堆一条永远排队的运行
+  // （2026-10-20 实证：用户连点产生 run 29/30 双双 queued，取消还不生效）
+  const hasActiveRun = runs.some((r) => r.status === "queued" || r.status === "running");
 
   const { data: summary, isLoading: summaryLoading } = useScoreSummary(runId, pid);
   const { data: matrix, isLoading: matrixLoading } = useMatrix(runId);
@@ -170,11 +173,11 @@ export default function ScoreResults() {
         <Button
           type="primary"
           icon={<PlayCircleOutlined />}
-          disabled={rules?.status !== "frozen" || !bidders?.length}
+          disabled={rules?.status !== "frozen" || !bidders?.length || hasActiveRun}
           loading={startRun.isPending}
           onClick={() => startRun.mutate()}
         >
-          发起评分运行
+          {hasActiveRun ? "已有评分在执行（单任务排队）" : "发起评分运行"}
         </Button>
         <Select
           style={{ minWidth: 190 }}
