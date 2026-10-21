@@ -103,7 +103,7 @@ class OpenAICompatProvider:
         # 推理模型的思考也算在 max_tokens 里：不给预算会被思考耗尽 → content 为空
         if max_tokens is None:
             max_tokens = config.llm_default_max_tokens()
-        attempts = 2 if config.llm_transient_retries() else 1
+        attempts = config.llm_transient_attempts() if config.llm_transient_retries() else 1
         result: LLMResult | None = None
         last_error: Exception | None = None
         # 上下文钳制重试用**独立预算**，不占用瞬态重试次数

@@ -257,10 +257,20 @@ def llm_seed() -> int | None:
 
 
 def llm_transient_retries() -> bool:
-    """瞬态失败（超时/限流/5xx）重试开关（默认开，重试 2 次）。"""
+    """瞬态失败（超时/限流/5xx）重试开关（默认开）。"""
     return os.environ.get("BID_EVAL_LLM_TRANSIENT_RETRIES", "1").strip().lower() not in (
         "0", "false", "no", "off",
     )
+
+
+def llm_transient_attempts() -> int:
+    """瞬态失败的总尝试次数（含首次），默认 4。
+
+    云端「Flash」档模型高峰期会间歇返回 503 System is too busy
+    （2026-10-21 实测 GLM-5.3-Flash：约 1/3 成功），只重试 1 次会让评分大面积
+    降级为人工。退避 5s、10s、15s（见 provider 层）。
+    """
+    return max(1, int(os.environ.get("BID_EVAL_LLM_TRANSIENT_ATTEMPTS", 4)))
 
 
 def review_clusters() -> int:

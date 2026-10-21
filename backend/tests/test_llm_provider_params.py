@@ -107,3 +107,36 @@ def test_empty_content_with_stop_is_not_an_error(monkeypatch) -> None:  # noqa: 
     p, _fake = _provider(monkeypatch, content="", finish_reason="stop")
     out = p.complete("sys", "user")
     assert out.text == ""
+
+
+def test_transient_503_retried_configured_times(monkeypatch) -> None:  # noqa: ANN001
+    """云端 Flash 模型高峰期 503 频发：按配置次数重试，而不是只重试一次。"""
+    import time as _time
+
+    import pytest as _pytest
+
+    monkeypatch.setattr(_time, "sleep", lambda _s: None)  # 不真等
+    p, fake = _provider(monkeypatch)
+    # 环境变量在调用时读取；_provider 会重置这些值，故在其后设置
+    monkeypatch.setenv("BID_EVAL_LLM_TRANSIENT_RETRIES", "1")
+    monkeypatch.setenv("BID_EVAL_LLM_TRANSIENT_ATTEMPTS", "4")
+
+    calls = {"n": 0}
+    real_create = fake.create
+
+    def flaky(**kwargs):  # noqa: ANN003
+        calls["n"] += 1
+        if calls["n"] < 4:
+            raise RuntimeError("Error code: 503 - system is too busy")
+        return real_create(**kwargs)
+
+    fake.create = flaky  # type: ignore[method-assign]
+    out = p.complete("sys", "user")
+    assert out.text == '"{}"'
+    assert calls["n"] == 4, "第 4 次才成功，说明按配置重试了 4 次"
+
+    # 次数用尽仍失败 → LLMError（不无限重试）
+    calls["n"] = 0
+    fake.create = lambda **kw: (_ for _ in ()).throw(RuntimeError("Error code: 503 - busy"))
+    with _pytest.raises(LLMError):
+        p.complete("sys", "user")
