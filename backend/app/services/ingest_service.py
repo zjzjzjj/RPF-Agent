@@ -186,9 +186,12 @@ def rescue_material_pages(document_id: int, max_pages: int | None = None) -> dic
     """
     from app.evidence.case_evidence import (
         PageRec,
+        classify_materials,
+        link_case_blocks,
         locate_section,
         material_ocr_targets,
         page_image_ratios,
+        parse_case_table,
     )
     from app.parsing.pdf_pymupdf import ocr_pages_text
 
@@ -211,7 +214,17 @@ def rescue_material_pages(document_id: int, max_pages: int | None = None) -> dic
                 "error": "pdf missing"}
     ratios = page_image_ratios(pdf_path)
     sec = locate_section(recs)
-    targets = material_ocr_targets(recs, ratios, sec)[: max(0, limit)]
+    # 先做块级分类，只救援"材料不可读"的案例页（每案 ≤2 页），避免整段扫描页
+    # 全送 OCR 打爆远程服务（2026-10-21 doc24 实证）。
+    blocks: list = []
+    if sec.found:
+        table_rows = parse_case_table(
+            pdf_path, sec.start, sec.end, config.case_table_scan_pages()
+        )
+        if table_rows:
+            blocks = link_case_blocks(table_rows, recs, sec)
+            classify_materials(blocks, recs, ratios)
+    targets = material_ocr_targets(recs, ratios, sec, blocks=blocks or None)[: max(0, limit)]
     if not targets:
         return {"document_id": document_id, "targets": 0, "rescued": 0, "pages": []}
     try:

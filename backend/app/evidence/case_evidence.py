@@ -535,26 +535,54 @@ def material_ocr_targets(
     pages: list[PageRec],
     image_ratios: dict[int, float],
     section: SectionGuess,
+    blocks: list[CaseBlock] | None = None,
+    per_block: int = 2,
 ) -> list[int]:
-    """选出"有材料标题但文本极少、且含较大图片"的页 → 需定向 OCR。"""
+    """选出需定向 OCR 的材料页。
+
+    有案例块时**只救援"材料不可读"的案例块**，且每块最多 `per_block` 页——
+    证据段里短文本+图片页可能几十页，全送 OCR 会打爆服务（2026-10-21 doc24
+    61 页断言实证：远程 OCR 熔断→整本救援失败）。
+    无块时回退为证据段内短文本+图片页（限 8 页）。
+    """
     if not section.found:
         return []
+    by_no = {p.page_no: p for p in pages}
+
+    def unreadable(no: int) -> bool:
+        p = by_no.get(no)
+        if p is None or (p.source or "") != "text":
+            return False
+        t = (p.text or "").strip()
+        return len(t) < 800 and image_ratios.get(no, 0.0) >= 0.10
+
     out: list[int] = []
+    seen: set[int] = set()
+    if blocks:
+        for b in blocks:
+            needs = any(
+                (b.status or {}).get(m) is None and (b.reasons or {}).get(m) == "unreadable"
+                for m in ("contract", "invoice", "acceptance")
+            )
+            if not needs:
+                continue
+            cnt = 0
+            for no in b.pages:
+                if no in seen or not unreadable(no):
+                    continue
+                out.append(no)
+                seen.add(no)
+                cnt += 1
+                if cnt >= max(1, per_block):
+                    break
+        return out
     for p in pages:
         if p.page_no < section.start or p.page_no > section.end:
             continue
-        if (p.source or "") != "text":
-            continue
-        text = (p.text or "").strip()
-        if len(text) >= 800:
-            continue
-        if image_ratios.get(p.page_no, 0.0) < 0.10:
-            continue
-        # 证据段内"文本极少 + 有图"的页都可能是扫描材料：短页（<300 字）或
-        # 带材料标题的页都纳入。仅靠标题会漏掉"扫描件没标题"的合同/发票页
-        # （2026-10-21 doc22 实证：合同页 43 字无标题 → 未救援 → 合同判不可读）。
-        if len(text) < 300 or _RE_MATERIAL_HEADING.search(text):
+        if unreadable(p.page_no):
             out.append(p.page_no)
+            if len(out) >= 8:
+                break
     return out
 
 

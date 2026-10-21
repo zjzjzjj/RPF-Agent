@@ -12,6 +12,7 @@ from app.evidence.case_evidence import (
     CaseBlock,
     CaseRow,
     PageRec,
+    SectionGuess,
     build_case_digest,
     classify_materials,
     link_case_blocks,
@@ -167,6 +168,21 @@ def test_classify_contract_boilerplate_not_invoice() -> None:
 # ---------------------------------------------------------------------------
 # OCR 目标
 # ---------------------------------------------------------------------------
+def test_material_ocr_targets_block_capped() -> None:
+    """块级目标：只取"材料不可读"案例块的前 N 页，避免整段扫描页全送 OCR。"""
+    pages = [PageRec(i, "短文本 - 1 -", "text") for i in range(10, 20)]
+    ratios = {i: 0.2 for i in range(10, 20)}
+    block = CaseBlock(
+        row=CaseRow(1, "某项目", None, None, 10),
+        pages=list(range(10, 15)),
+        status={"contract": True, "invoice": None, "acceptance": True},
+        reasons={"contract": "signal", "invoice": "unreadable", "acceptance": "signal"},
+    )
+    sec = SectionGuess(10, 20, "index_offset", 1.0, 0)
+    targets = material_ocr_targets(pages, ratios, sec, blocks=[block], per_block=2)
+    assert targets == [10, 11]
+
+
 def test_material_ocr_targets_select_unreadable_material_pages() -> None:
     pages = [
         PageRec(10, "序号 项目名称 合同金额", "text"),
