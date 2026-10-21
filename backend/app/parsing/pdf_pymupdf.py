@@ -384,36 +384,67 @@ def ocr_pages_text(
     available, engine = ocr_backend_available()
     if not available:
         raise RuntimeError("OCR 后端不可用")
-    state: dict = {"remote_ok": engine == "remote_paddle"}
     out: dict[int, str] = {}
     doc = fitz.open(path)
     try:
         for pno in page_nos:
             if pno < 1 or pno > doc.page_count:
                 continue
-            page = doc[pno - 1]
-            lines: list[tuple[str, tuple[float, float, float, float]]] = []
-            try:
-                blocks = _page_image_blocks(doc, page, min_ratio=min_image_ratio)
-                for rect, png in blocks:
-                    try:
-                        lines.extend(_ocr_image_lines(png, rect, engine, state))
-                    except Exception as exc:  # noqa: BLE001
-                        log.warning("第 %d 页嵌入图 OCR 失败：%s", pno, exc)
-                if not lines:
-                    pix = page.get_pixmap(
-                        matrix=fitz.Matrix(config.OCR_RENDER_SCALE, config.OCR_RENDER_SCALE)
-                    )
-                    lines = _ocr_render_lines(pix.tobytes("png"), page, engine, state)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("第 %d 页 OCR 救援失败：%s", pno, exc)
-                continue
-            text = "\n".join(t for t, _b in lines if str(t or "").strip()).strip()
-            if text:
-                out[pno] = text
+            # 每页独立：一页截断/失败不触发熔断拖累后续页
+            # （2026-10-21 doc24 实证：3 页密集扫描截断 → 熔断 → 后面能读的页也失败）
+            text = _rescue_ocr_page_text(doc, doc[pno - 1], engine, min_image_ratio)
+            if text and text.strip():
+                out[pno] = text.strip()
     finally:
         doc.close()
     return out
+
+
+def _rescue_ocr_page_text(doc, page, engine: str, min_image_ratio: float) -> str:  # noqa: ANN001
+    """单页救援 OCR：嵌入图原图（放宽阈值）优先 → 整页渲染 → 本地 rapidocr。"""
+    import pymupdf as fitz
+
+    try:
+        blocks = _page_image_blocks(doc, page, min_ratio=min_image_ratio)
+    except Exception:  # noqa: BLE001
+        blocks = []
+    for _rect, png in blocks:
+        try:
+            txt = _rescue_ocr_text(png, engine)
+            if txt and txt.strip():
+                return txt
+        except Exception as exc:  # noqa: BLE001
+            log.warning("材料页嵌入图 OCR 失败：%s", exc)
+    try:
+        pix = page.get_pixmap(
+            matrix=fitz.Matrix(config.OCR_RENDER_SCALE, config.OCR_RENDER_SCALE)
+        )
+        return _rescue_ocr_text(pix.tobytes("png"), engine)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("材料页整页 OCR 失败：%s", exc)
+        return ""
+
+
+def _rescue_ocr_text(png_bytes: bytes, engine: str) -> str:
+    from app.parsing import paddle_client
+
+    if engine == "remote_paddle":
+        try:
+            # allow_truncated：密集页接受已识别部分（材料信号通常在前半段）
+            return paddle_client.remote_ocr_page(png_bytes, allow_truncated=True)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("材料页远程 OCR 失败，回退本地：%s", exc)
+    import io
+
+    import numpy as np
+    from PIL import Image
+
+    from app.parsing import ocr as ocr_mod
+
+    if ocr_mod.get_ocr() is None:
+        raise RuntimeError("OCR 组件未安装")
+    img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    return "\n".join(t for t, _b in ocr_mod.recognize(np.array(img)[:, :, ::-1]))
 
 
 def extract_pdf(path: str) -> ExtractedDocument:

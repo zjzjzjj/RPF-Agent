@@ -84,8 +84,15 @@ def reset_probe_cache() -> None:
     _PROBE_FAILED_AT = None
 
 
-def remote_ocr_page(png_bytes: bytes, *, prompt: str | None = None) -> str:
-    """单页 PNG → PaddleOCR-VL 整页文本。失败抛 RuntimeError（调用方回退 rapidocr）。"""
+def remote_ocr_page(
+    png_bytes: bytes, *, prompt: str | None = None, allow_truncated: bool = False
+) -> str:
+    """单页 PNG → PaddleOCR-VL 整页文本。失败抛 RuntimeError（调用方回退 rapidocr）。
+
+    `allow_truncated=True`（材料页救援用）：输出被 max_tokens 截断时返回**已识别
+    部分**（发票号/甲乙方等材料信号通常在前半段），而不是丢弃。正常解析仍保持
+    严格（截断=不可信，抛错由调用方记警告）。
+    """
     try:
         answer = _post(png_bytes, prompt, config.paddle_ocr_max_tokens())
     except urllib.error.HTTPError as exc:
@@ -107,8 +114,10 @@ def remote_ocr_page(png_bytes: bytes, *, prompt: str | None = None) -> str:
     except (KeyError, IndexError, TypeError) as exc:
         raise RuntimeError(f"PaddleOCR-VL 响应缺少内容：{str(answer)[:200]}") from exc
     if choice.get("finish_reason") == "length":
-        # 旧实现忽略 finish_reason：密集扫描页被静默截断，内容丢失却无人知晓
-        raise RuntimeError("PaddleOCR-VL 输出被 max_tokens 截断")
+        # 旧实现忽略 finish_reason：密集扫描页被静默截断，内容丢失却无人知晓。
+        # 救援模式接受部分输出（材料信号通常在前半段），正常解析仍抛错。
+        if not allow_truncated:
+            raise RuntimeError("PaddleOCR-VL 输出被 max_tokens 截断")
     return text.strip()
 
 
