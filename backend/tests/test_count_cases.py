@@ -266,6 +266,33 @@ def test_sanitize_no_bid_norm_trusts_model() -> None:
     assert out["sanitized"] == "ok"
 
 
+def test_sanitize_empty_quote_uses_case_name_anchor() -> None:
+    """模型给真实案例名+金额却 quote 留空（业绩表行）→ 以回得到标书的案例名作锚 → ok。
+
+    真实回归（b13 / 运行 #35）：模型从业绩表列出 8 个真实案例名 + 金额，但把"实质
+    材料"理解成合同正文、quote 全留空 → 旧逻辑全判 quote_too_short → 整项未定分。
+    案例名回得到标书 = 案例真实存在，应放行计数（伪造名回不到标书，仍拒）。
+    """
+    from app.services.scoring_service import _sanitize_case
+
+    name = "浙江中烟一体化综合门户平台建设项目"
+    case = {"name": name, "amount_yuan": 96000000, "contract": True, "invoice": False,
+            "acceptance": False, "quote": ""}
+    out = _sanitize_case(case, ECHO_TEXT, bid_norm=_norm("某页" + name + "合同金额96,000,000元尾页"))
+    assert out["sanitized"] == "ok"
+    assert out.get("quote_source") == "case_name"
+    assert out["quote"] == name
+
+
+def test_sanitize_empty_quote_fabricated_name_rejected() -> None:
+    """案例名回不到标书（伪造）→ 仍判 quote_too_short，不得靠编名字放行。"""
+    from app.services.scoring_service import _sanitize_case
+
+    case = {"name": "华信集团某某系统集成项目", "contract": True, "quote": ""}
+    out = _sanitize_case(case, ECHO_TEXT, bid_norm=_norm("完全无关的标书内容"))
+    assert out["sanitized"] == "quote_too_short"
+
+
 # ---- 候选页剔除要求复述页 ---------------------------------------------------
 def test_case_candidate_pages_drops_echo_page_keeps_table() -> None:
     from app.services.scoring_service import _case_candidate_pages

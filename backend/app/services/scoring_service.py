@@ -579,7 +579,7 @@ def execute_run(
                             for k, v in cs.items()
                             if k in (
                                 "name", "person", "role", "quote", "sanitized",
-                                "match_tier", "page_hint", "amount_yuan",
+                                "match_tier", "quote_source", "page_hint", "amount_yuan",
                                 "contract", "invoice", "acceptance", "duplicate",
                             )
                         }
@@ -1012,6 +1012,17 @@ def _sanitize_case(
     quote_n = _nnw(quote)
     if echo_n is None:
         echo_n = _nnw(requirement_text or "")
+    # 引文缺失但案例名是可核验实体 → 以案例名作核验锚。业绩表/合同台账行常"有名有
+    # 金额、无逐字引文"（模型把实质材料理解成合同正文/发票，不愿引表格行）；2026-10-21
+    # 实证：模型给全 8 个真实案例名 + 金额却 quote 留空 → 旧逻辑全判 quote_too_short
+    # → 整项未定分。案例名回得到标书即证明案例真实存在（伪造名回不到标书，仍拒）。
+    if len(quote_n) < config.MIN_QUOTE_CHARS and bid_norm is not None:
+        _name = str(case.get("name") or "").strip()
+        _name_n = _nnw(_name)
+        if len(_name_n) >= 8 and _name_n in bid_norm:
+            case["quote"] = _name
+            case["quote_source"] = "case_name"
+            quote_n = _name_n
     cheat = True
     reason = "quote_too_short"
     tier: str | None = None
