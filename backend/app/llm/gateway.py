@@ -29,11 +29,111 @@ _BUDGET_LOCK = threading.Lock()
 _BUDGET_STATE: dict[str, object] = {"day": "", "calls": 0}
 
 
-def extract_json(text: str) -> dict:
-    """从模型输出中提取 JSON 对象：剥围栏 + 配平花括号扫描。
+_VALID_ESCAPES = frozenset('"\\/bfnrt')
+_HEX = frozenset("0123456789abcdefABCDEF")
 
-    模型输出常见三种坏形态：```json 围栏、前后缀说明文字、截断。
-    截断无法修复，直接抛 LLMError（由上层降级为 need_human，绝不猜）。
+
+def _repair_invalid_escapes(text: str) -> tuple[str, int]:
+    """把字符串内的**非法反斜杠转义**改成字面反斜杠（`\\X`）。返回 (新文本, 修复数)。
+
+    8B 模型输出的 JSON 字符串里常出现 `"C:\\Users"`、`"\\（中文"`、`"\\u-2026"`
+    这类非法转义，`json.loads` 会整段拒绝（Invalid \\escape），导致整块规则抽取
+    失败（2026-10-21 线上实证）。合法转义（`\\n` `\\\\` `\\"` `\\u4e2d`）原样保留，
+    引号外的字符一律不动——只把"本来想表达字面反斜杠"的地方补齐，不删任何字符。
+    """
+    out: list[str] = []
+    in_str = False
+    fixed = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if not in_str:
+            if ch == '"':
+                in_str = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_str = False
+            out.append(ch)
+            i += 1
+            continue
+        if ch != "\\":
+            out.append(ch)
+            i += 1
+            continue
+        nxt = text[i + 1] if i + 1 < n else ""
+        if nxt and nxt in _VALID_ESCAPES:
+            out.append(ch)
+            out.append(nxt)
+            i += 2
+            continue
+        if nxt == "u" and i + 5 < n and all(c in _HEX for c in text[i + 2 : i + 6]):
+            out.append(text[i : i + 6])
+            i += 6
+            continue
+        # 非法转义：保留反斜杠字面量（"\\" + 该字符），继续处理该字符本身
+        out.append("\\\\")
+        fixed += 1
+        i += 1
+    return "".join(out), fixed
+
+
+def _strip_trailing_commas(text: str) -> tuple[str, int]:
+    """去掉字符串外、紧跟 `}` / `]` 的尾逗号（`{"a":[1,2,],}` 这类）。"""
+    out: list[str] = []
+    in_str = False
+    fixed = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if in_str:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == ",":
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j < n and text[j] in "}]":
+                fixed += 1
+                i += 1
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out), fixed
+
+
+def _loads_lenient(candidate: str) -> dict | None:
+    """strict=True / strict=False 各试一次（后者放行字符串内的裸换行等控制字符）。"""
+    for strict in (True, False):
+        try:
+            return json.loads(candidate, strict=strict)
+        except json.JSONDecodeError:
+            continue
+    return None
+
+
+def extract_json(text: str) -> dict:
+    """从模型输出中提取 JSON 对象：剥围栏 + 配平花括号扫描 + 分级容错解析。
+
+    模型输出常见坏形态：```json 围栏、前后缀说明文字、截断、**字符串内非法转义**
+    （`\\（`、Windows 路径、`\\u` 后非 4 位十六进制）、字符串内裸换行、尾逗号。
+    前三种可容错修复；截断与"字符串内未转义的双引号"无法安全修复，仍抛 LLMError
+    （由上层降级，绝不猜）。
     """
     s = text.strip()
     if s.startswith("```"):
@@ -43,7 +143,9 @@ def extract_json(text: str) -> dict:
         s = s.strip()
     start = s.find("{")
     if start < 0:
-        raise LLMError(f"模型输出中找不到 JSON：{text[:200]}")
+        # 不回显模型原文：招标/投标内容属 confidential，异常会进日志、job.error
+        # 并经 API 返回前端（2026-10-21 合规复核）
+        raise LLMError(f"模型输出中找不到 JSON（共 {len(text)} 字符）")
     depth = 0
     in_str = False
     escape = False
@@ -65,11 +167,39 @@ def extract_json(text: str) -> dict:
             depth -= 1
             if depth == 0:
                 candidate = s[start : i + 1]
-                try:
-                    return json.loads(candidate)
-                except json.JSONDecodeError as exc:
-                    raise LLMError(f"模型输出 JSON 无法解析：{exc}") from exc
+                return _parse_candidate(candidate)
     raise LLMError("模型输出 JSON 不完整（可能被截断）")
+
+
+def _parse_candidate(candidate: str) -> dict:
+    """分级解析单个 JSON 对象文本；全部失败才抛 LLMError。"""
+    data = _loads_lenient(candidate)
+    if data is not None:
+        return data
+
+    repaired, escapes = _repair_invalid_escapes(candidate)
+    if escapes:
+        data = _loads_lenient(repaired)
+        if data is not None:
+            # 只记数量，不落原文（证据/招标原文属 confidential，日志不得出现）
+            log.warning("模型输出 JSON 含 %d 处非法转义，已按字面量自动修复", escapes)
+            return data
+
+    stripped, commas = _strip_trailing_commas(repaired)
+    if commas:
+        data = _loads_lenient(stripped)
+        if data is not None:
+            log.warning(
+                "模型输出 JSON 含 %d 处非法转义、%d 处尾逗号，已自动修复", escapes, commas
+            )
+            return data
+
+    # 仍失败：用原始 candidate 的报错信息（对用户最直观）
+    try:
+        json.loads(candidate)
+    except json.JSONDecodeError as exc:
+        raise LLMError(f"模型输出 JSON 无法解析：{exc}") from exc
+    raise LLMError("模型输出 JSON 无法解析")
 
 
 class Gateway:
@@ -198,7 +328,13 @@ class Gateway:
         try:
             return out_model.model_validate(payload), result
         except ValidationError as exc:
-            raise LLMError(f"模型输出不符合契约：{exc.errors()[:3]}") from exc
+            # 只保留 type/loc/msg：pydantic v2 的 errors() 默认带 input（字段原值），
+            # 而这段文本会被拼进 AppError → job.error → 前端/日志——招标原文
+            # 属 confidential，不得外泄（2026-10-21 合规复核）。
+            brief = [
+                {k: e.get(k) for k in ("type", "loc", "msg")} for e in exc.errors()[:3]
+            ]
+            raise LLMError(f"模型输出不符合契约：{brief}") from exc
 
 
 def _is_private_host(host: str) -> bool:

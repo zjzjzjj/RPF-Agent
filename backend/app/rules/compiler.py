@@ -373,8 +373,9 @@ def _extract_chunk(
                 time.sleep(config.llm_retry_backoff_s())
     raise AppError(
         f"规则抽取失败（含修复重试）{f'（分块 {label}）' if label else ''}：{last_error}；"
-        "若持续失败，多为模型输出上限不足或模型上下文过小——"
-        "可换用上下文更大的模型、提高模型 max-model-len，或缩短招标文件后再试"
+        "JSON 非法转义/尾逗号已尝试自动修复仍失败，常见原因是模型输出超长被截断"
+        "或输出里出现未转义的双引号——可换用上下文更大的模型、"
+        "提高模型 max-model-len，或缩短招标文件后再试"
     )
 
 # 章节优先级：真实招标文件的"评标办法/评分细则"通常排在最后（本文档在第 89-97 页），
