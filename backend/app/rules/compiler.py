@@ -220,11 +220,49 @@ def _price_window(c: "ExtractedCriterion", tender_text: str) -> str:
     return own
 
 
+# 报价修正/澄清规则：是"怎么算"，不是"什么情形否决"。
+# 2026-10-21 实证：模型把「报价错误修正原则」抽成 score_type=veto，校验器要求
+# 否决后果（VETO_CONSEQUENCE_MISSING），而该条根本没有否决语义，用户无法定义。
+_RE_CORRECTION_RULE = re.compile(
+    r"修正原则|以大写金额为准|大写金额.{0,6}为准|以单价金额|单价金额.{0,6}为准|算术错误|澄清确认"
+)
+_RE_VETO_WORD = re.compile(r"否决|无效投标|作废标|取消.{0,8}资格|不予受理|不得参加|拒绝其投标")
+
+
+def is_correction_rule(text: str) -> bool:
+    return bool(_RE_CORRECTION_RULE.search(text or ""))
+
+
+def has_veto_word(text: str) -> bool:
+    return bool(_RE_VETO_WORD.search(text or ""))
+
+
+def normalize_veto_semantics(c: "ExtractedCriterion") -> None:
+    """否决项语义纠正（就地修改）。
+
+    - 报价修正/澄清类规则被误标成 veto → 降级为 match（判断项，不计分、不否决）；
+    - 真正的否决项漏填后果 → 补 disqualify（原文写"否决/无效"的默认后果）。
+    """
+    if c.score_type != "veto":
+        return
+    text = f"{c.name or ''}\n{c.description or ''}\n{c.quote or ''}"
+    if is_correction_rule(text) and not has_veto_word(text):
+        c.score_type = "match"
+        c.is_veto = False
+        c.max_score = None
+        c.veto_consequence = None
+        c.check_type = c.check_type or "human_only"
+        return
+    if not c.veto_consequence:
+        c.veto_consequence = "disqualify"
+
+
 def enrich_extracted(
     criteria: list["ExtractedCriterion"], tender_text: str
 ) -> list["ExtractedCriterion"]:
     """用确定性规则补齐 LLM 漏掉的公式/计数参数（就地修改并返回）。"""
     for c in criteria:
+        normalize_veto_semantics(c)
         if c.category == "price":
             window = _price_window(c, tender_text)
             parsed = parse_price_formula_text(window)

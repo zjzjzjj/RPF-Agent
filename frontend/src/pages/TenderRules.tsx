@@ -1110,6 +1110,8 @@ function CriterionModal({
           max_score: criterion.max_score ? Number(criterion.max_score) : undefined,
           description: criterion.description ?? "",
           required_evidence: criterion.required_evidence ?? "",
+          score_type: criterion.score_type,
+          veto_consequence: criterion.veto_consequence,
         }}
       >
         <Space align="start" size={12}>
@@ -1133,6 +1135,42 @@ function CriterionModal({
             placeholder="如：合同复印件（含金额页）+ 发票复印件 + 业主验收证明"
           />
         </Form.Item>
+        {criterion.is_veto && (
+          <Space align="start" size={12}>
+            <Form.Item
+              name="veto_consequence"
+              label="否决后果"
+              extra="否决项必须声明后果（校验项 VETO_CONSEQUENCE_MISSING）。若该条其实不是否决条款（如「报价错误修正原则」），请把类型改为「判断项」。"
+              style={{ width: 340 }}
+            >
+              <Select
+                allowClear
+                placeholder="请选择否决后果"
+                options={[
+                  { value: "disqualify", label: "否决投标（disqualify）" },
+                  { value: "may_request", label: "可要求澄清后再定（may_request）" },
+                  { value: "discretionary", label: "评标委员会裁量（discretionary）" },
+                ]}
+              />
+            </Form.Item>
+            <Form.Item
+              name="score_type"
+              label="类型"
+              extra="把误标成否决项的规则改回判断项后，本项不再要求否决后果。"
+              style={{ width: 260 }}
+            >
+              <Select
+                options={[
+                  { value: "match", label: "判断项（满足即得，不打分）" },
+                  { value: "veto", label: "否决项（资格/符合性）" },
+                  { value: "count", label: "计数分（业绩/证书）" },
+                  { value: "subjective", label: "主观分" },
+                  { value: "formula", label: "价格分公式" },
+                ]}
+              />
+            </Form.Item>
+          </Space>
+        )}
       </Form>
 
       {isSubjective && (

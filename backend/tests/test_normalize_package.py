@@ -383,3 +383,78 @@ def test_signoff_all_refreshes_validations(client) -> None:  # noqa: ANN001
     after = client.get(f"/api/rules/packages/{package_id}/validations").json()
     assert not any(v["code"] == "TEMPLATE_FALLBACK_SIGNOFF" for v in after)
 
+
+
+def test_veto_semantics_correction_rule_downgraded() -> None:
+    """「报价错误修正原则」被误标成否决项 → 降级为判断项（2026-10-21 线上阻断）。
+
+    该条是"怎么算"的修正规则，没有否决语义；校验器 VETO_CONSEQUENCE_MISSING
+    要求它给出否决后果，而用户无从定义，confirm/freeze 被卡死。
+    """
+    from app.rules.compiler import normalize_veto_semantics
+    from app.rules.model import ExtractedCriterion
+
+    c = ExtractedCriterion(
+        category="compliance", name="报价错误修正原则", score_type="veto",
+        is_veto=True, max_score=Decimal("0"),
+        description="投标报价出现前后不一致的按照下列规定修正：以大写金额为准；以单价金额计算结果为准。",
+        quote="以大写金额为准；以单价金额计算结果为准",
+    )
+    normalize_veto_semantics(c)
+    assert c.score_type == "match"
+    assert c.is_veto is False
+    assert c.max_score is None
+    assert c.veto_consequence is None
+
+
+def test_veto_semantics_real_veto_gets_default_consequence() -> None:
+    """真正的否决条款漏填后果 → 补 disqualify（原文写"否决"的默认后果）。"""
+    from app.rules.compiler import normalize_veto_semantics
+    from app.rules.model import ExtractedCriterion
+
+    c = ExtractedCriterion(
+        category="compliance", name="投标有效期不足", score_type="veto",
+        is_veto=True, description="投标有效期少于招标文件要求的，作否决投标处理。",
+        quote="作否决投标处理",
+    )
+    normalize_veto_semantics(c)
+    assert c.score_type == "veto"
+    assert c.veto_consequence == "disqualify"
+
+
+def test_normalize_fills_missing_veto_consequence(client) -> None:  # noqa: ANN001
+    """存量草稿包：否决项缺后果由 normalize 自愈（用户无需手工定义）。"""
+    from app.db.models import Criterion, RulePackage
+    from app.db.session import session_scope
+
+    pid = client.post("/api/projects", json={"name": "否决后果自愈"}).json()["id"]
+    with session_scope() as s:
+        pkg = RulePackage(project_id=pid, version=1, status="draft",
+                          origin="document", created_by="tester")
+        s.add(pkg)
+        s.flush()
+        s.add(Criterion(package_id=pkg.id, code="c48", category="compliance",
+                        name="报价错误修正原则", description="以大写金额为准；以单价金额计算结果为准",
+                        source_quote="以大写金额为准", score_type="veto", is_veto=True,
+                        max_score=None, origin="document", status="verified",
+                        sort_order=1))
+        s.add(Criterion(package_id=pkg.id, code="c49", category="compliance",
+                        name="投标有效期不足", description="作否决投标处理",
+                        source_quote="作否决投标处理", score_type="veto", is_veto=True,
+                        max_score=None, origin="document", status="verified",
+                        sort_order=2))
+        pkg_id = pkg.id
+
+    stats = rule_service.normalize_package(pkg_id, "auto")
+    assert stats["veto_consequence_filled"] == 1
+    assert stats["veto_normalized"] == 1
+
+    with session_scope() as s:
+        by_code = {
+            c.code: c for c in s.execute(
+                select(Criterion).where(Criterion.package_id == pkg_id)
+            ).scalars().all()
+        }
+        assert by_code["c48"].score_type == "match" and by_code["c48"].is_veto is False
+        assert by_code["c49"].score_type == "veto"
+        assert by_code["c49"].veto_consequence == "disqualify"

@@ -346,6 +346,14 @@ def edit_criterion(criterion_id: int, patch: dict[str, Any], actor: str, reason:
                     quote_changed = True
                 setattr(crit, key, value)
                 _record_edit(s, crit, key, old, value, actor, reason)
+        # 类型与否决标记保持一致：改成非否决类型即不再是"否决项"，
+        # 否则校验器会继续要求否决后果（误标「报价错误修正原则」的根因）。
+        if crit.score_type != "veto" and crit.is_veto:
+            crit.is_veto = False
+            crit.veto_consequence = None
+        elif crit.score_type == "veto" and not crit.is_veto:
+            crit.is_veto = True
+            crit.max_score = None
         crit.status = "verified"  # 人工处置过即视为已确认（理由已留痕）
         s.add(crit)
         s.flush()
@@ -838,6 +846,7 @@ def normalize_package(package_id: int, actor: str = "auto") -> dict[str, int]:
         "price_repaired": 0,
         "count_repaired": 0,
         "veto_normalized": 0,
+        "veto_consequence_filled": 0,
     }
     summary_names = {
         "资格审查不通过",
@@ -1066,9 +1075,28 @@ def normalize_package(package_id: int, actor: str = "auto") -> dict[str, int]:
                 record(c, "自动修复：补齐计数参数（最高项数/金额门槛/人员范围）")
                 stats["count_repaired"] += 1
 
-        # ⑥ is_veto 归一
+        # ⑥ is_veto 归一 + 否决后果补全
         for c in active:
             if c.origin not in ("template", "document"):
+                continue
+            text = f"{c.name or ''}\n{c.description or ''}\n{c.source_quote or ''}"
+            # 报价修正/澄清类规则被误标成否决项：它没有否决语义，降级为判断项，
+            # 否则会卡在 VETO_CONSEQUENCE_MISSING 且用户无从定义（2026-10-21 实证）
+            if (
+                c.score_type == "veto"
+                and compiler.is_correction_rule(text)
+                and not compiler.has_veto_word(text)
+            ):
+                c.score_type = "match"
+                c.is_veto = False
+                c.max_score = None
+                c.veto_consequence = None
+                s.add(c)
+                record(
+                    c,
+                    "自动修复：「报价修正/澄清原则」不是否决条款，已降级为判断项（不计分、不否决）",
+                )
+                stats["veto_normalized"] += 1
                 continue
             if c.score_type == "veto" and not c.is_veto:
                 c.is_veto = True
@@ -1076,6 +1104,11 @@ def normalize_package(package_id: int, actor: str = "auto") -> dict[str, int]:
                 s.add(c)
                 record(c, "自动修复：score_type=veto 与 is_veto 不一致，已归一")
                 stats["veto_normalized"] += 1
+            if c.is_veto and not c.veto_consequence:
+                c.veto_consequence = "disqualify"
+                s.add(c)
+                record(c, "自动修复：否决项缺少否决后果，按原文默认补「否决投标」")
+                stats["veto_consequence_filled"] += 1
 
     # ⑦ 描述补全（独立会话；复用编译期的节点续行逻辑）
     compiler.enrich_descriptions_from_nodes(package_id)
