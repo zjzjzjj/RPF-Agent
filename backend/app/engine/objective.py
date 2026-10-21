@@ -16,6 +16,7 @@ import re
 from dataclasses import dataclass
 from decimal import Decimal
 
+from app import config
 from app.engine.facts import BidFacts
 from app.engine.models import PrimitiveResult
 from app.parsing.normalize import normalize_no_ws
@@ -528,7 +529,7 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
         # 不能把 0 分当成评审结论（与"机器看不见 ≠ 不符合"同一哲学）
         clean_cases = [c for c in cases if str(c.get("sanitized") or "ok") == "ok"]
         if not clean_cases:
-            unresolved = "cases_unverified"
+            unresolved = "cases_unverified"  # 诊断码（不弃评；scoring_service 一律写分）
             conflict = True
             from collections import Counter
 
@@ -536,10 +537,27 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                 str(c.get("sanitized") or "ok") for c in cases if str(c.get("sanitized") or "ok") != "ok"
             )
             _breakdown = "、".join(f"{k}={v}" for k, v in _reasons.items()) or "未知"
-            detail += (
-                f"；{len(cases)} 个案例的引文均未通过核验（{_breakdown}），"
-                "计数无依据，转人工"
-            )
+            # 级联：引文全不过 → 回退确定性业绩清单计数（事实优先于猜），避免
+            # "引文核验全毙 → 0 分"。仍无事实 → 保持当前分数（通常 0）并标疑问。
+            if field == "performance" and facts.performance_amounts:
+                _fc = (
+                    len([a for a in facts.performance_amounts if a >= min_amount])
+                    if min_amount > 0
+                    else len(facts.performance_amounts)
+                )
+                _eff = min(Decimal(_fc), Decimal(max_items)) if max_items else Decimal(_fc)
+                score = (_eff * per_item).quantize(Decimal("0.01"))
+                if max_score and score > max_score:
+                    score = max_score
+                detail = (
+                    f"逐案例引文未通过核验（{_breakdown}），回退确定性业绩清单计数"
+                    f"{_fc} 个（标疑问）"
+                )
+            else:
+                detail += (
+                    f"；{len(cases)} 个案例的引文均未通过核验（{_breakdown}），"
+                    f"按 {score} 分计入并标疑问"
+                )
         else:
             cases = clean_cases
             # 已有逐案例核验结果 = 计数有依据；清掉"字段缺失/未抽到事实"的 unresolved
@@ -581,19 +599,37 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                     conflict = True
                     detail += f"；{unknown_amount} 个案例金额无法确认（需人工核对）"
             required_flags = _required_flags(artifacts)
-            complete = [
-                c for c in cases
-                if all(bool(c.get(k)) for k in required_flags)
-            ]
+            # 三态材料：True=确认有；False=确认无（规则"不全不得分"→不计）；
+            # None=页不可读/未提供。None 不直接当 0——"机器看不见 ≠ 没有"
+            # （与确定性路径同一哲学）。仅当确定性业绩表依据 + 合同已确认 +
+            # 策略允许时计入并标疑问，避免"发票没 OCR 就整项清零"。
+            complete: list[dict] = []
+            null_counted = 0
+            null_policy = config.case_null_policy()
+            for c in cases:
+                vals = {k: c.get(k) for k in required_flags}
+                if any(v is False for v in vals.values()):
+                    continue  # 确认缺失 → 不计
+                if all(v is True for v in vals.values()):
+                    complete.append(c)  # 全部确认 → 计
+                    continue
+                if (
+                    c.get("case_source") == "table"
+                    and vals.get("contract") is True
+                    and null_policy == "count_with_contract"
+                ):
+                    complete.append(c)
+                    null_counted += 1
+                    conflict = True
             effective = min(Decimal(len(complete)), Decimal(max_items)) if max_items else Decimal(len(complete))
             score = (effective * per_item).quantize(Decimal("0.01"))
             if max_score and score > max_score:  # 封顶：真实规则"最高得 M 分"
                 score = max_score
             incomplete = len(cases) - len(complete)
             detail = (
-                f"逐案例核验：提供案例 {len(cases)} 个，其中材料齐全 {len(complete)} 个"
+                f"逐案例核验：提供案例 {len(cases)} 个，其中可计 {len(complete)} 个"
                 + (f"（{incomplete} 个缺证明材料不计分）" if incomplete else "")
-                + f"，得 {score} 分"
+                + (f"（{null_counted} 个材料页不可读，按已提供计并标疑问）" if null_counted else "")
             )
             if incomplete:
                 conflict = True

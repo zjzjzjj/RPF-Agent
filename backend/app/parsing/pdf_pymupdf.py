@@ -179,7 +179,9 @@ def _to_png(data: bytes) -> bytes | None:
         return None
 
 
-def _page_image_blocks(doc, page) -> list[tuple[tuple[float, float, float, float], bytes]]:  # noqa: ANN001
+def _page_image_blocks(
+    doc, page, min_ratio: float | None = None  # noqa: ANN001
+) -> list[tuple[tuple[float, float, float, float], bytes]]:
     """页内大幅嵌入图 → [((x0,y0,x1,y1), png_bytes)]（阅读序）。
 
     2026-10-21 服务器实证：整页渲染图送 PaddleOCR-VL **只能读回文字层**
@@ -212,7 +214,9 @@ def _page_image_blocks(doc, page) -> list[tuple[tuple[float, float, float, float
             continue
         x0, y0, x1, y1 = (float(v) for v in bbox[:4])
         w, h = max(0.0, x1 - x0), max(0.0, y1 - y0)
-        if (w * h) / page_area < config.OCR_IMAGE_MIN_RATIO:
+        if (w * h) / page_area < (
+            config.OCR_IMAGE_MIN_RATIO if min_ratio is None else float(min_ratio)
+        ):
             continue  # logo/印章/水印
         try:
             raw = doc.extract_image(xref)
@@ -359,6 +363,57 @@ def _ocr_page(
         raise
     low = len("".join(t for t, _b in lines).strip()) < config.OCR_RENDER_MIN_CHARS
     return lines, "page", low
+
+
+def ocr_pages_text(
+    path: str, page_nos: list[int], min_image_ratio: float = 0.10
+) -> dict[int, str]:
+    """对指定页做定向 OCR（材料可见性救援），返回 page_no → 文本；**不写库**。
+
+    与正常解析不同：**绕过 need_ocr 阈值**。材料页常是"标题 43 字 + 占比 0.19–0.23
+    的发票/合同扫描图"——字符数 >30、图片占比 <0.35，正常解析不触发 OCR，文本里
+    永远没有发票内容（2026-10-21 实证：doc2 发票页 132/141/… 只有
+    "8.x.2 发票 - 124 -"）。这里优先 OCR **嵌入图原图**（阈值放宽到 min_image_ratio），
+    无合适图再整页渲染。
+    """
+    import pymupdf as fitz
+
+    _check_file(path)
+    from app.parsing.ocr import ocr_backend_available
+
+    available, engine = ocr_backend_available()
+    if not available:
+        raise RuntimeError("OCR 后端不可用")
+    state: dict = {"remote_ok": engine == "remote_paddle"}
+    out: dict[int, str] = {}
+    doc = fitz.open(path)
+    try:
+        for pno in page_nos:
+            if pno < 1 or pno > doc.page_count:
+                continue
+            page = doc[pno - 1]
+            lines: list[tuple[str, tuple[float, float, float, float]]] = []
+            try:
+                blocks = _page_image_blocks(doc, page, min_ratio=min_image_ratio)
+                for rect, png in blocks:
+                    try:
+                        lines.extend(_ocr_image_lines(png, rect, engine, state))
+                    except Exception as exc:  # noqa: BLE001
+                        log.warning("第 %d 页嵌入图 OCR 失败：%s", pno, exc)
+                if not lines:
+                    pix = page.get_pixmap(
+                        matrix=fitz.Matrix(config.OCR_RENDER_SCALE, config.OCR_RENDER_SCALE)
+                    )
+                    lines = _ocr_render_lines(pix.tobytes("png"), page, engine, state)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("第 %d 页 OCR 救援失败：%s", pno, exc)
+                continue
+            text = "\n".join(t for t, _b in lines if str(t or "").strip()).strip()
+            if text:
+                out[pno] = text
+    finally:
+        doc.close()
+    return out
 
 
 def extract_pdf(path: str) -> ExtractedDocument:

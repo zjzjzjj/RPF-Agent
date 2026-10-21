@@ -397,6 +397,77 @@ def test_score_count_person_scope_overwrites_field_missing() -> None:
     assert result.unresolved == "cases_unverified"
 
 
+# ---- 三态材料计分（2026-10-21：null 不直接当 0） ---------------------------
+def _perf_crit(**kw) -> dict:
+    base = {
+        "name": "投标人业绩",
+        "max_score": Decimal("6"),
+        "required_artifacts": "合同复印件、发票复印件、业主证明",
+        "params": {"field": "performance", "per_item": "2", "max_items": "3"},
+    }
+    base.update(kw)
+    return base
+
+
+def test_score_count_null_with_contract_counts_and_flags() -> None:
+    """材料页不可读（null）+ 合同已确认 + 表依据 → 计分并标疑问，不直接清零。"""
+    from app.engine.objective import score_count
+
+    crit = _perf_crit(verified_cases=[
+        {"name": "A", "contract": True, "invoice": None, "acceptance": True,
+         "case_source": "table", "sanitized": "ok"},
+        {"name": "B", "contract": True, "invoice": True, "acceptance": True,
+         "case_source": "table", "sanitized": "ok"},
+    ])
+    res = score_count(crit, crit["params"], BidFacts(text=""))
+    assert res.score == Decimal("4.00")  # 2 案 × 2
+    assert res.unresolved is None
+    assert res.conflict is True
+    assert "1 个材料页不可读" in res.detail
+
+
+def test_score_count_null_without_contract_does_not_count() -> None:
+    """合同都不可读 → 没有正向依据，不计（防通胀）。"""
+    from app.engine.objective import score_count
+
+    crit = _perf_crit(verified_cases=[
+        {"name": "A", "contract": None, "invoice": None, "acceptance": None,
+         "case_source": "table", "sanitized": "ok"},
+    ])
+    res = score_count(crit, crit["params"], BidFacts(text=""))
+    assert res.score == Decimal("0")
+    assert res.unresolved is None  # 有 clean case（身份通过），不能整体未定分
+    assert res.conflict is True
+
+
+def test_score_count_false_material_does_not_count() -> None:
+    """确认缺失（False）→ 该案例不计（规则"不全不得分"）。"""
+    from app.engine.objective import score_count
+
+    crit = _perf_crit(verified_cases=[
+        {"name": "A", "contract": True, "invoice": False, "acceptance": True,
+         "case_source": "table", "sanitized": "ok"},
+        {"name": "B", "contract": True, "invoice": True, "acceptance": True,
+         "case_source": "table", "sanitized": "ok"},
+    ])
+    res = score_count(crit, crit["params"], BidFacts(text=""))
+    assert res.score == Decimal("2.00")  # 只有 B
+
+
+def test_score_count_table_cases_capped_at_max() -> None:
+    from app.engine.objective import score_count
+
+    cases = [
+        {"name": f"C{i}", "contract": True, "invoice": True, "acceptance": True,
+         "case_source": "table", "sanitized": "ok"}
+        for i in range(6)
+    ]
+    crit = _perf_crit(verified_cases=cases)
+    res = score_count(crit, crit["params"], BidFacts(text=""))
+    assert res.score == Decimal("6")  # 3 案封顶 × 2
+    assert res.unresolved is None
+
+
 # ---- 审计留痕：ai_raw_json 落库往返 -----------------------------------------
 def test_upsert_score_persists_ai_raw_json(app_env) -> None:  # noqa: ANN001
     """count 路径把逐案例核验结果落 ai_raw_json，判"照抄/未在标书定位"后可复盘。"""

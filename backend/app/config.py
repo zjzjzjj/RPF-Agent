@@ -289,6 +289,53 @@ def ocr_max_pages() -> int:
     return int(os.environ.get("BID_EVAL_OCR_MAX_PAGES", 60))
 
 
+# ---------------------------------------------------------------------------
+# 业绩案例证据抽取（索引+页脚定位 / PyMuPDF 表提取 / 材料三态）
+# ---------------------------------------------------------------------------
+def case_section_max_pages() -> int:
+    """无索引页时，表头页向前扩展的最大页数（章节边界优先）。"""
+    return int(os.environ.get("BID_EVAL_CASE_SECTION_MAX_PAGES", 120))
+
+
+def case_table_scan_pages() -> int:
+    """业绩表解析只扫证据段前几页（表通常在段首）。"""
+    return int(os.environ.get("BID_EVAL_CASE_TABLE_SCAN_PAGES", 4))
+
+
+def case_evidence_pages_per_material() -> int:
+    """每案例每材料送 LLM 裁决的最大页数。"""
+    return int(os.environ.get("BID_EVAL_CASE_EVIDENCE_PAGES_PER_MATERIAL", 2))
+
+
+def case_digest_chars() -> int:
+    """案例证据摘要总字符预算（送 LLM 裁决）。"""
+    return int(os.environ.get("BID_EVAL_CASE_DIGEST_CHARS", 12000))
+
+
+def case_max_batches() -> int:
+    """无表回退（section-aware LLM 选页）时的批次数上限。"""
+    return int(os.environ.get("BID_EVAL_CASE_MAX_BATCHES", 4))
+
+
+def material_ocr_max_pages() -> int:
+    """单个投标文档材料页 OCR 救援的页数上限。"""
+    return int(os.environ.get("BID_EVAL_MATERIAL_OCR_MAX_PAGES", 20))
+
+
+def case_name_prefix_min() -> int:
+    """案例名前缀锚的最短长度（交错表全名常断裂）。"""
+    return int(os.environ.get("BID_EVAL_CASE_NAME_PREFIX_MIN", 8))
+
+
+def case_null_policy() -> str:
+    """材料 null（页不可读/未提供）时的计分策略：count_with_contract | skip。
+
+    count_with_contract（默认）：仅当 案例来自确定性表 AND 合同已确认 才计分并标疑问，
+    避免"看不见就当没有"清零；skip：null 一律不计。见 objective.score_count。
+    """
+    return os.environ.get("BID_EVAL_CASE_NULL_POLICY", "count_with_contract").strip().lower()
+
+
 def max_upload_bytes() -> int:
     return int(os.environ.get("BID_EVAL_MAX_UPLOAD_MB", MAX_UPLOAD_MB)) * 1024 * 1024
 

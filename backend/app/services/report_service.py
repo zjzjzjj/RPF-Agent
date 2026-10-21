@@ -75,13 +75,14 @@ QUESTION_KINDS: dict[str, dict[str, str]] = {
     "count_field_unresolved": {
         "severity": "high",
         "label": "计分口径未确定",
-        "action": "该计数项未给出计数口径（数业绩还是数证书），系统按 0 分处理。"
-                  "请在规则包中补全该项的计数字段后重跑，勿采信当前 0 分。",
+        "action": "该计数项未给出计数口径（数业绩还是数证书），已按 0 分计入总分并标疑问。"
+                  "请在规则包中补全该项的计数字段后重跑；如系口径缺失，当前 0 分不代表投标人实际水平。",
     },
     "count_no_facts": {
         "severity": "medium",
         "label": "未提取到计数事实",
-        "action": "投标文件中未提取到业绩/证书清单，请人工翻阅原件核对后补录。",
+        "action": "投标文件中未提取到业绩/证书清单，已按 0 分计入总分并标疑问。"
+                  "请人工翻阅原件核对；如确有条目，可补录后重跑。",
     },
     "needs_judgment": {
         "severity": "medium",

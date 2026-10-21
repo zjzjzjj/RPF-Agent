@@ -431,6 +431,30 @@ def execute_run(
             )
             stats["price"] += 1
 
+    # ---- 业绩案例证据：材料页 OCR 救援（必须在读页文本之前） ----
+    # 发票/验收页常是"标题 43 字 + 占比 0.19–0.23 的扫描图"——字符数 >30、图片占比
+    # <0.35，正常解析不触发 OCR，文本里永远没有发票内容。评分前对证据段做定向救援，
+    # 否则任何"选页/摘录"策略都会判"材料缺失"（2026-10-21 doc2 实证）。
+    _has_perf = any(
+        (ci.get("params") or {}).get("field") == "performance"
+        or (ci.get("params") or {}).get("person_scope")
+        or any(k in str(ci.get("name") or "") for k in ("业绩", "案例"))
+        for ci in count_items
+    )
+    if _has_perf and config.auto_mode():
+        from app.services.ingest_service import rescue_material_pages
+
+        for bid_id in bidder_ids:
+            doc_id = main_doc_by_bidder.get(bid_id)
+            if doc_id is None:
+                continue
+            try:
+                rr = rescue_material_pages(doc_id)
+                if rr.get("rescued"):
+                    log.info("材料页 OCR 救援 doc=%s：%s 页", doc_id, rr.get("rescued"))
+            except Exception as exc:  # noqa: BLE001 —— 救援失败不阻断评分
+                log.warning("材料页 OCR 救援失败 doc=%s：%s", doc_id, exc)
+
     # ---- 证明材料页索引（count 逐案例核验与主观评审共用） ----
     _MAT_KEYWORDS = ("发票", "验收", "业主证明", "查询截图", "证书复印件", "承诺书", "营业执照")
     material_hints: dict[int, str] = {}
@@ -460,6 +484,48 @@ def execute_run(
                 for kw, nos in pages.items() if nos
             ]
             material_hints[bid_id] = "；".join(hint_parts) if hint_parts else "（未见证明材料相关内容）"
+
+    # 业绩案例证据（确定性）：索引+页脚定位证据段 → PyMuPDF 表 → 案例 → 材料三态。
+    # 每投标人只做一次，同一家所有业绩类计数项复用。
+    case_evidence_by_bidder: dict[int, dict] = {}
+    if _has_perf:
+        from app.db.models import Document as _Doc
+        from app.evidence.case_evidence import (
+            PageRec,
+            classify_materials,
+            link_case_blocks,
+            locate_section,
+            page_image_ratios,
+            parse_case_table,
+        )
+
+        for bid_id in bidder_ids:
+            rows = bid_pages.get(bid_id) or []
+            if not rows:
+                continue
+            recs = [PageRec(no, t, src) for no, t, src in rows]
+            sec = locate_section(recs)
+            if not sec.found:
+                continue
+            doc_id = main_doc_by_bidder.get(bid_id)
+            pdf_path = None
+            with session_scope() as s:
+                if doc_id is not None:
+                    pdf_path = s.execute(
+                        select(_Doc.stored_path).where(_Doc.id == doc_id)
+                    ).scalar_one_or_none()
+            if not pdf_path:
+                continue
+            table_rows = parse_case_table(
+                pdf_path, sec.start, sec.end, config.case_table_scan_pages()
+            )
+            if not table_rows:
+                continue
+            blocks = link_case_blocks(table_rows, recs, sec)
+            classify_materials(blocks, recs, page_image_ratios(pdf_path))
+            case_evidence_by_bidder[bid_id] = {
+                "section": sec, "rows": table_rows, "blocks": blocks,
+            }
 
     # 每家投标人归一化全文：count 引文核验（回标书定位）与主观分引文闸门共用一份，
     # 只归一化一次（旧行为各处重复 normalize_no_ws，浪费且口径易漂移）。
@@ -545,7 +611,18 @@ def execute_run(
                 )
             )
             case_stats: dict = {}
-            if (
+            _ce = case_evidence_by_bidder.get(bid_id)
+            if _ce and is_performance and not params.get("person_scope"):
+                # 确定性优先（业绩类）：业绩表 → 案例（名/金额/日期/表页）+ 材料三态。
+                # 这是"从标书解析评分依据"的主路径，不依赖 LLM 猜案例/金额。
+                c_scoring = {**c_scoring, "verified_cases": _cases_from_blocks(_ce["blocks"])}
+                case_stats = {
+                    "method": _ce["section"].method,
+                    "section": [_ce["section"].start, _ce["section"].end],
+                    "offset": _ce["section"].offset,
+                    "case_count": len(_ce["rows"]),
+                }
+            elif (
                 config.auto_mode()
                 and gateway is not None
                 and artifacts
@@ -579,8 +656,10 @@ def execute_run(
                             for k, v in cs.items()
                             if k in (
                                 "name", "person", "role", "quote", "sanitized",
-                                "match_tier", "quote_source", "page_hint", "amount_yuan",
-                                "contract", "invoice", "acceptance", "duplicate",
+                                "match_tier", "quote_source", "case_source", "page_hint",
+                                "amount_yuan", "sign_date", "table_page", "material_pages",
+                                "material_reasons", "contract", "invoice", "acceptance",
+                                "duplicate",
                             )
                         }
                         for cs in _vc
@@ -592,7 +671,10 @@ def execute_run(
                 machine_score=result.score,
                 machine_status="pass",
                 review_status="conflict_flagged" if doubt else "pending",
-                final_score=None if unresolved else result.score,
+                # 全自动化评分（用户要求零未定分）：计分项**一律写分**。
+                # unresolved 只作疑问标记（落 warnings 供报告判读），不再决定弃评；
+                # 依据提取不到的兜底 0 分同样进总分，并在 detail/warnings 里说明。
+                final_score=result.score,
                 warnings_json=([{"message": result.detail, "unresolved": result.unresolved}]
                                if result.unresolved else [{"message": result.detail}]),
                 doubt=doubt,
@@ -900,6 +982,33 @@ def _case_candidate_pages(
             _CASE_MAX_BATCHES, len(ordered), covered,
         )
     return batches
+
+
+def _cases_from_blocks(blocks: list) -> list[dict]:
+    """确定性案例块 → score_count 的 verified_cases（带三态材料与评分依据）。"""
+    out: list[dict] = []
+    for b in blocks:
+        r = b.row
+        st = b.status or {}
+        out.append(
+            {
+                "name": r.name,
+                "amount_yuan": str(r.amount_yuan) if r.amount_yuan is not None else None,
+                "sign_date": r.sign_date,
+                "contract": st.get("contract"),
+                "invoice": st.get("invoice"),
+                "acceptance": st.get("acceptance"),
+                "quote": r.name,  # 表行本身即评分依据
+                "quote_source": "table_row",
+                "case_source": "table",
+                "table_page": r.page,
+                "material_pages": b.pages_by_material,
+                "material_reasons": b.reasons,
+                "sanitized": "ok",
+                "page_hint": r.page,
+            }
+        )
+    return out
 
 
 def _llm_verify_cases(
@@ -1295,25 +1404,29 @@ def _persist_subjective(
                 ]
             if suggestion.status == "ai_suggested":
                 row.final_score = suggestion.score
-            elif parse_failed:
-                row.final_score = None
-                row.machine_status = "need_human"
-                row.review_status = "conflict_flagged"
-                row.warnings_json = (row.warnings_json or []) + [
-                    {"message": "全自动模式：模型调用失败/输出解析失败，按疑问处理不进总分，须人工补分"}
-                ]
-                s.add(row)
-                return
+                row.machine_status = "pass"
             else:
+                # 全自动化评分（用户要求零未定分）：模型没给有效分（parse_failed /
+                # llm_failed / 分层全簇失败 / 委员会有效分<3 / insufficient）一律按
+                # **最低档兜底**并保留疑问，不再置 final=None。
+                # 故障详情留在 warnings / ai_raw_json，供事后审计；机器状态用
+                # need_human 区分"兜底"与"正常评审"，但不阻止计分与排名。
                 mins = [Decimal(str(lv.get("min")))
                         for lv in (criterion.get("levels") or []) if lv.get("min") is not None]
                 fallback = min(mins) if mins else Decimal(0)
                 row.final_score = fallback
-                row.warnings_json = (row.warnings_json or []) + [
-                    {"message": f"全自动模式：模型未给出有效分值，按最低档兜底（{fallback} 分）"}
-                ]
-            row.machine_status = "pass"  # 终态：已定分（兜底详情在 warnings）
-            row.review_status = "conflict_flagged" if gate_not_executed else "auto_confirmed"
+                row.machine_status = "need_human" if parse_failed else "pass"
+                if parse_failed:
+                    row.warnings_json = (row.warnings_json or []) + [
+                        {"message": f"全自动模式：模型调用失败/输出解析失败，按最低档兜底（{fallback} 分），建议复核"}
+                    ]
+                else:
+                    row.warnings_json = (row.warnings_json or []) + [
+                        {"message": f"全自动模式：模型未给出有效分值，按最低档兜底（{fallback} 分）"}
+                    ]
+            row.review_status = (
+                "conflict_flagged" if (gate_not_executed or parse_failed) else "auto_confirmed"
+            )
             s.add(row)
         elif suggestion.status == "ai_suggested" and evidence_status != "verified":
             # 无已核验证据 → 建议仍记录，但降级为待人工

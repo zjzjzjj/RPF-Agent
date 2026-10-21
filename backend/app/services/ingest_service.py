@@ -177,6 +177,89 @@ def parse_document(ctx: JobContext, payload: dict) -> dict:
 # ---------------------------------------------------------------------------
 # 查询（API 层调用）
 # ---------------------------------------------------------------------------
+def rescue_material_pages(document_id: int, max_pages: int | None = None) -> dict:
+    """对投标文档做定向 OCR 救援：只 OCR 证据段内"有材料标题但文本极少 + 大图"的页。
+
+    幂等（已 OCR 页 source != "text" 跳过）、限量（`BID_EVAL_MATERIAL_OCR_MAX_PAGES`）。
+    写入页文本后**重算全文 char_start/char_end**（保持跨页偏移一致）并追加文档警告。
+    不调 LLM；不删除任何原文。
+    """
+    from app.evidence.case_evidence import (
+        PageRec,
+        locate_section,
+        material_ocr_targets,
+        page_image_ratios,
+    )
+    from app.parsing.pdf_pymupdf import ocr_pages_text
+
+    limit = max_pages if max_pages is not None else config.material_ocr_max_pages()
+    with session_scope() as s:
+        doc = s.get(Document, document_id)
+        if doc is None or doc.kind != "bid":
+            return {"document_id": document_id, "targets": 0, "rescued": 0, "pages": []}
+        pdf_path = doc.stored_path
+        recs = [
+            PageRec(int(p.page_no), p.text or "", p.source or "text")
+            for p in s.execute(
+                select(DocumentPage)
+                .where(DocumentPage.document_id == document_id)
+                .order_by(DocumentPage.page_no)
+            ).scalars()
+        ]
+    if not pdf_path or not Path(pdf_path).exists():
+        return {"document_id": document_id, "targets": 0, "rescued": 0, "pages": [],
+                "error": "pdf missing"}
+    ratios = page_image_ratios(pdf_path)
+    sec = locate_section(recs)
+    targets = material_ocr_targets(recs, ratios, sec)[: max(0, limit)]
+    if not targets:
+        return {"document_id": document_id, "targets": 0, "rescued": 0, "pages": []}
+    try:
+        ocr_text = ocr_pages_text(pdf_path, targets, min_image_ratio=0.10)
+    except Exception as exc:  # noqa: BLE001 —— 救援失败不阻断入/评分
+        log.warning("材料页 OCR 救援失败 doc=%s：%s", document_id, exc)
+        return {"document_id": document_id, "targets": len(targets), "rescued": 0,
+                "pages": [], "error": str(exc)}
+    rescued: list[int] = []
+    with session_scope() as s:
+        rows = {
+            int(p.page_no): p
+            for p in s.execute(
+                select(DocumentPage).where(DocumentPage.document_id == document_id)
+            ).scalars()
+        }
+        for pno, text in ocr_text.items():
+            row = rows.get(int(pno))
+            if row is None or not text.strip():
+                continue
+            old_lines = [ln for ln in (row.text or "").split("\n") if ln.strip()]
+            new_lines = [ln for ln in text.split("\n") if ln.strip()]
+            merged = old_lines + [ln for ln in new_lines if ln not in old_lines]
+            row.text = "\n".join(merged)
+            row.source = "ocr"
+            rescued.append(int(pno))
+        if rescued:
+            # 重算全文偏移（页文本变长，后续页 char_start 必须同步平移）
+            offset = 0
+            for p in s.execute(
+                select(DocumentPage)
+                .where(DocumentPage.document_id == document_id)
+                .order_by(DocumentPage.page_no)
+            ).scalars():
+                p.char_start = offset
+                p.char_end = offset + len(p.text or "")
+                offset = p.char_end
+            doc = s.get(Document, document_id)
+            if doc is not None:
+                warns = list(doc.warnings_json or [])
+                warns.append(
+                    "材料页 OCR 救援：第 " + "、".join(str(x) for x in rescued) + " 页"
+                )
+                doc.warnings_json = warns
+    return {"document_id": document_id, "targets": len(targets),
+            "rescued": len(rescued), "pages": rescued}
+
+
 def list_documents(project_id: str) -> list[Document]:
     with session_scope() as s:
         rows = (
