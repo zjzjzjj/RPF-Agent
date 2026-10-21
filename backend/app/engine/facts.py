@@ -34,10 +34,25 @@ _RE_ITEM_LINE = re.compile(
 _RE_CAPITAL = re.compile(r"注册资本[：:]*人民币?([\d,，]+(?:\.\d+)?)\s*万元")
 # 证书行（行级匹配）：与 _RE_ITEM_LINE 同理——占有量词消除回溯
 # （原 _ROW_PREFIX 版本在诚道 25 万字符文本上满载 CPU 不返回，2026-10-15）。
-_RE_CERT_LINE = re.compile(
-    r"^[\s|｜、.．)）]*+(?:[（(]?\d{1,3}[）)]?)?[\s|｜、.．)）]*+"
-    r"((?:ISO\s?\d+|CMMI\s?\d?)[^\n|｜]{0,60})"
+# 2026-10-21 重做：OCR 后证书文本形态是"ISO/IEC 20000-1:2018""GB/T19001-2016/
+# ISO9001:2015""信息技术服务管理体系认 证证书"（空格插进词中间），旧正则要求
+# ISO/CMMI 出现在行首，全部匹配不上 → 有证书也计 0。改为"语境 + 词素"提取：
+# 行内出现 ISO/CMMI 词素或中文证书名，且行（或相邻行）带证书语境才计入；
+# 入库直接存归一键（ISO9001/ISO27001/ISO20000/CMMI），天然去重。
+_CERT_ZH_KEYS: tuple[tuple[str, str], ...] = (
+    ("质量管理体系认证证书", "ISO9001"),
+    ("信息安全管理体系认证证书", "ISO27001"),
+    ("信息技术服务管理体系认证证书", "ISO20000"),
+    ("质量管理体系认证", "ISO9001"),
+    ("信息安全管理体系认证", "ISO27001"),
+    ("信息技术服务管理体系认证", "ISO20000"),
+    ("质量管理体系符合", "ISO9001"),
+    ("信息安全管理体系符合", "ISO27001"),
+    ("信息技术服务管理体系符合", "ISO20000"),
 )
+_RE_CERT_CONTEXT = re.compile(r"证书|认证|体系|有效期|编号|CMMI|ISO")
+_RE_ISO_TOKEN = re.compile(r"ISO(?:\s?/?\s?IEC)?\s?(\d{4,5})")
+_RE_CMMI_TOKEN = re.compile(r"CMMI\s?[1-5]?\s?级?")
 # 证书行里的证书编号/有效期（用于把名称与编号切开）
 _RE_CERT_TAIL = re.compile(r"\s+[A-Z][A-Za-z]{1,8}[-–]\d|\s+\d{4}\s*年")
 _RE_CERT_CLAIM = re.compile(r"已通过\s*((?:ISO\s?\d+|CMMI\s?\d?)[^，。；；()（）]{0,30})")
@@ -328,16 +343,32 @@ def extract_bid_facts(text: str, documents: list[str] | None = None) -> BidFacts
                 break
         facts.performance_amounts.append(value)
 
-    # 体系认证：表内（有证书）与正文声称（可能无证书）分开记（行级匹配）
-    for line in lines:
-        m = _RE_CERT_LINE.match(line)
-        if m is None:
-            continue
-        raw = m.group(1)
-        name = _RE_CERT_TAIL.split(raw)[0]
-        name = re.sub(r"\s+", "", name)
-        if name and name not in facts.certificates:
-            facts.certificates.append(name)
+    # 体系认证：表内（有证书）与正文声称（可能无证书）分开记。
+    # 行级 + 语境判定，词素提取后直接存归一键（见 _CERT_ZH_KEYS 处说明）。
+    for line_no, line in enumerate(lines):
+        if _RE_CERT_CLAIM.search(line):
+            continue  # 正文声称由 _RE_CERT_CLAIM 单独记，不冒充证书复印件
+        compact = line.replace(" ", "")
+        if not _RE_CERT_CONTEXT.search(line):
+            # OCR 常把"证书/认证"语境拆到相邻行：±1 行带语境即算
+            if not any(
+                0 <= j < len(lines) and _RE_CERT_CONTEXT.search(lines[j])
+                for j in (line_no - 1, line_no + 1)
+            ):
+                continue
+        key: str | None = None
+        for zh, mapped in _CERT_ZH_KEYS:
+            if zh in compact:
+                key = mapped
+                break
+        if key is None:
+            m_iso = _RE_ISO_TOKEN.search(line)
+            if m_iso:
+                key = f"ISO{m_iso.group(1)}"
+            elif _RE_CMMI_TOKEN.search(line):
+                key = "CMMI"
+        if key and key not in facts.certificates:
+            facts.certificates.append(key)
     for m in _RE_CERT_CLAIM.finditer(text):
         name = re.sub(r"\s+", "", m.group(1))
         if name and name not in facts.cert_claims:

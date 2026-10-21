@@ -54,6 +54,71 @@ def test_remote_ocr_page_failure_raises(monkeypatch):
         paddle_client.remote_ocr_page(b"png")
 
 
+def test_remote_ocr_truncated_output_raises(monkeypatch):
+    """finish_reason=length 必须报错——旧实现静默截断，内容丢失无人知晓。"""
+    from app.parsing import paddle_client
+
+    def fake_urlopen(request, timeout=0):
+        return _FakeResponse(json.dumps({
+            "choices": [{"message": {"content": "前半页"}, "finish_reason": "length"}],
+        }).encode("utf-8"))
+
+    monkeypatch.setattr(paddle_client.urllib.request, "urlopen", fake_urlopen)
+    with pytest.raises(RuntimeError, match="截断"):
+        paddle_client.remote_ocr_page(b"png")
+
+
+def test_remote_ocr_retries_with_smaller_budget_on_400(monkeypatch):
+    """输出预算超服务端上下文时 vLLM 返回 400：降半重试一次。"""
+    import urllib.error
+
+    from app.parsing import paddle_client
+
+    budgets: list[int] = []
+
+    def fake_urlopen(request, timeout=0):
+        body = json.loads(request.data.decode("utf-8"))
+        budgets.append(body["max_tokens"])
+        if len(budgets) == 1:
+            raise urllib.error.HTTPError(request.full_url, 400, "Bad Request", None, None)
+        return _FakeResponse(json.dumps(
+            {"choices": [{"message": {"content": "证书正文"}}]}
+        ).encode("utf-8"))
+
+    monkeypatch.setattr(paddle_client.urllib.request, "urlopen", fake_urlopen)
+    assert paddle_client.remote_ocr_page(b"png") == "证书正文"
+    assert len(budgets) == 2 and budgets[1] < budgets[0]
+
+
+def test_probe_success_cached_and_failure_ttl(monkeypatch):
+    from app.parsing import paddle_client
+
+    paddle_client.reset_probe_cache()
+    calls = {"n": 0}
+
+    def ok(request, timeout=0):
+        calls["n"] += 1
+        return _FakeResponse(json.dumps({"data": [{"id": "PaddleOCR-VL-1.6-0.9B"}]}).encode())
+
+    monkeypatch.setattr(paddle_client.urllib.request, "urlopen", ok)
+    assert paddle_client.probe() is True
+    assert paddle_client.probe() is True
+    assert calls["n"] == 1, "成功结果应永久缓存，不重复探针"
+
+    paddle_client.reset_probe_cache()
+
+    def down(request, timeout=0):
+        calls["n"] += 1
+        raise OSError("refused")
+
+    monkeypatch.setattr(paddle_client.urllib.request, "urlopen", down)
+    before = calls["n"]
+    assert paddle_client.probe() is False
+    assert paddle_client.probe() is False
+    assert calls["n"] == before + 1, "失败结果 30s 内应缓存（防一次抖动固化成本进程不可用）"
+    paddle_client.reset_probe_cache()
+
+
 # ---------------------------------------------------------------------------
 # bge-m3 嵌入客户端
 # ---------------------------------------------------------------------------

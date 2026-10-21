@@ -44,11 +44,12 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", type=int, required=True)
     ap.add_argument("--project", default="PRJ-20261014-78MT")
+    ap.add_argument("--db", default="", help="数据库路径（默认仓库 data/bid_eval.db）")
     args = ap.parse_args()
 
     import sqlite3
 
-    db = Path(__file__).resolve().parents[1] / "data" / "bid_eval.db"
+    db = Path(args.db) if args.db else Path(__file__).resolve().parents[1] / "data" / "bid_eval.db"
     con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
     cur = con.cursor()
 
@@ -60,17 +61,30 @@ def main() -> int:
         name = row["bidder_name"]
         key = next((k for k in REAL if k in name), None)
         if key:
-            price = None
-            for crit_name, val in _item_scores(cur, args.run, row["bidder_id"]):
-                if "报价" in crit_name and "分项" not in crit_name:
-                    price = float(val) if val is not None else None
+            # 价格项按 category 取（旧实现按名称找"报价"，编译产物名是"价格得分"
+            # 或"报价部分"时找不到 → price=None → tech_biz=total，MAE 无意义）
+            price = _bucket(cur, args.run, row["bidder_id"], "price")
+            biz = _bucket(cur, args.run, row["bidder_id"], "commercial")
+            total = float(row["total"]) if row["total"] is not None else 0.0
             ai[key] = {
-                "total": float(row["total"]) if row["total"] is not None else 0.0,
+                "total": total,
                 "rank": row["rank"],
-                "tech_biz": float(row["total"] or 0) - float(price or 0),
-                "price": float(price) if price is not None else None,
-                "biz": float(_biz_score(cur, args.run, row["bidder_id"])),
+                # 技+商 = 总分 - 价格 - 商务（旧实现 price 缺失时等于 total）
+                "tech_biz": total - (price or 0.0) - (biz or 0.0),
+                "price": price,
+                "biz": biz or 0.0,
+                "items": _item_scores(cur, args.run, row["bidder_id"]),
             }
+
+    # 商务桶为 0 但包内确实存在 commercial 计分项 → 类别分桶失真（2026-10-21 事故）
+    commercial_items = cur.execute(
+        """SELECT COUNT(*) FROM criteria c JOIN score_records s ON s.criterion_id=c.id
+           WHERE s.run_id=? AND c.category='commercial'""",
+        (args.run,),
+    ).fetchone()[0]
+    if commercial_items and all(abs(v["biz"]) < 1e-9 for v in ai.values()):
+        print("[!] 警告：包内有 commercial 计分项，但商务桶合计为 0——疑似类别分桶失真"
+              "（检查 criteria.category 是否被 LLM 标成 technical）\n")
 
     print(f"=== run {args.run} vs 真实评审报告 ===")
     print(f"{'公司':<6} {'真实总分':>8} {'AI总分':>8} {'Δ总分':>7} {'真实技+商':>9} {'AI技+商':>8} {'Δ技+商':>7} {'真实名次':>8} {'AI名次':>6}")
@@ -100,17 +114,43 @@ def main() -> int:
         for k in ai if k in REAL
     )
     print(f"价格分与真实逐分一致: {'是' if price_ok else '否'}")
+
+    # 商务/技术分项（真实评委口径：商务 10/10/7/1、技术主观 36.68/23.88/25.72/16.00）
+    print(f"\n{'公司':<6} {'商务分':>7} {'技术分':>7}  说明")
+    for key in ("龙即", "致成", "诚道", "先进数通"):
+        got = ai.get(key)
+        if not got:
+            continue
+        tech_rows = [v for v in got["items"] if v[1] == "technical"]
+        tech_sum = sum(float(v[3]) for v in tech_rows if v[3] is not None)
+        tech_missing = sum(1 for v in tech_rows if v[3] is None)
+        print(f"{key:<6} {got['biz']:>7.2f} {tech_sum:>7.2f}  "
+              f"技术项 {len(tech_rows)} 项，未定分 {tech_missing} 项")
     con.close()
     return 0
 
 
 def _item_scores(cur, run_id: int, bidder_id: int):
     return cur.execute(
-        """SELECT c.name, s.final_score FROM score_records s
+        """SELECT c.code, c.category, c.name, s.final_score FROM score_records s
            JOIN criteria c ON c.id=s.criterion_id
            WHERE s.run_id=? AND s.bidder_id=?""",
         (run_id, bidder_id),
     ).fetchall()
+
+
+def _bucket(cur, run_id: int, bidder_id: int, category: str) -> float | None:
+    """按 category 取分桶合计；桶内一条已定分都没有时返回 None（未定分）。"""
+    row = cur.execute(
+        """SELECT SUM(s.final_score), COUNT(s.final_score) FROM score_records s
+           JOIN criteria c ON c.id=s.criterion_id
+           WHERE s.run_id=? AND s.bidder_id=? AND c.category=?
+             AND c.score_type NOT IN ('veto','match')""",
+        (run_id, bidder_id, category),
+    ).fetchone()
+    if row is None or row[1] == 0:
+        return None
+    return float(row[0] or 0)
 
 
 def _biz_score(cur, run_id: int, bidder_id: int) -> float:

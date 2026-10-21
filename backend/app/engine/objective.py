@@ -283,18 +283,102 @@ def _infer_count_field(criterion: dict) -> str | None:
 
 
 def parse_required_artifacts(source_quote: str) -> list[str]:
-    """从评分因素原文提取【证明材料】段的要求清单（真实评委的第一道闸门）。
+    """从评分因素原文提取证明材料要求清单（真实评委的第一道闸门）。
 
     「投标人业绩…【证明材料】（1）须提供合同复印件、发票复印件和业主证明（或验收
     材料），并加盖投标人公章；（2）不提供或提供不全的不得分」→ ["合同复印件",
-    "发票复印件", "业主证明", "验收材料"]。无【证明材料】段返回空列表。
+    "发票复印件", "业主证明", "验收材料"]。
+
+    无【证明材料】标记时把全文当要求段解析——`required_evidence`（合并/折叠写入）
+    本身就是要求文本，不再依赖那个标记。
     """
     if not source_quote:
         return []
     m = re.search(r"【证明材料】(.+)", source_quote, re.S)
-    if not m:
-        return []
-    return _parse_artifact_segment(m.group(1))
+    return _parse_artifact_segment(m.group(1) if m else source_quote)
+
+
+# 常见材料名词直查（覆盖固定搭配，先于通用后缀规则）
+_ARTIFACT_WORDS = (
+    "合同复印件", "发票复印件", "验收材料", "验收报告", "业主证明", "用户证明",
+    "查询结果截图", "查询截图", "社保证明", "社保缴纳证明", "业绩证明文件",
+    "证书复印件", "营业执照复印件", "中标通知书", "验收证明", "用户报告",
+)
+# 通用后缀：以这些词结尾的 2-12 字片段视为材料名词
+_ARTIFACT_SUFFIX_RE = re.compile(r"(复印件|证明|材料|截图|报告|清单|凭证|扫描件)$")
+# 混进要求段的非名词片段
+_ARTIFACT_NOISE = ("不得分", "提供不全", "公章", "否则", "原件")
+
+
+def _parse_artifact_segment(seg: str) -> list[str]:
+    """要求文本 → 材料名词清单（去序号/动词/句式噪声）。
+
+    旧实现调用了一个不存在的 `_parse_artifact_segment`（调用即 NameError），
+    整条材料清单解析因此是死代码，`required_evidence` 只能整句当 artifacts 用。
+    """
+    out: list[str] = []
+    text = re.sub(r"[（(]\s*\d+\s*[)）]", "", seg or "")  # （1）（2）
+    for word in _ARTIFACT_WORDS:
+        if word in text and word not in out:
+            out.append(word)
+    for part in re.split(r"[、，,；;。：:\n（）()\s]", text):
+        p = part.strip()
+        if not (2 <= len(p) <= 12) or not _ARTIFACT_SUFFIX_RE.search(p):
+            continue
+        if any(k in p for k in _ARTIFACT_NOISE):
+            continue
+        if p not in out:
+            out.append(p)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# 认证"查询截图"证据判定（2026-10-21 重做）
+# ---------------------------------------------------------------------------
+# 通道 A：文本层标题行。旧实现只认整行"查询结果截图"且跳过 >300 字的页——
+# 致成写"查询网址/查询截图："（所在页约 1000 字）被整页跳过，ISO 三项被清零。
+_CERT_TITLE_RE = re.compile(r"查询(?:结果)?截图|查询网址|查询地址|证书查询|认证结果查询")
+# 通道 B：OCR 正文的**平台专有**指纹。"证书编号"这类词证书扫描件也有，不能单独用。
+_CERT_STRONG_FINGERPRINTS = ("认证认可信息公共服务平台", "认证行政监管", "证书查询结果")
+_CERT_WEAK_FINGERPRINTS = (
+    "国家市场监督管理总局", "认证结果", "公共服务平台", "证书状态",
+)
+
+
+def cert_evidence_present(pages: list[tuple[str, str]]) -> tuple[bool, str]:
+    """认证"查询截图"证据双通道判定 → (是否存在, 命中依据)。
+
+    `pages` 是 [(document_pages.source, 页文本)]。通道 A 对全部页的文本层生效；
+    通道 B 只对 OCR 页生效（防止证书扫描件的"证书编号"误触发）。
+    实证校准（浙江中烟 4 家）：龙即/致成有文本标题 → 真；诚道证书页图片就是
+    认证平台查询截图（OCR 正文含平台名）→ 真；先数只有证书扫描件 → 假（真实
+    评审也是只给先数按"无截图"计 1 分）。
+    """
+    for _source, text in pages:
+        for line in (text or "").split("\n"):
+            s = line.strip()
+            if not s or len(s) > 60 or s.count("....") >= 2:
+                continue
+            # 要求复述行（招标文件索引表常整页复述"须提供…截图，未提供不得分"）
+            # 不算投标人提供了截图：同时出现"须/应/需"与"提供/不得分"即视为要求句
+            if any(k in s for k in ("须", "应", "需")) and (
+                "提供" in s or "不得分" in s
+            ):
+                continue
+            if _CERT_TITLE_RE.search(s):
+                return True, f"文本标题：{s[:40]}"
+    for source, text in pages:
+        if source not in ("ocr", "ocr_img"):
+            continue
+        t = text or ""
+        for fp in _CERT_STRONG_FINGERPRINTS:
+            if fp in t:
+                return True, f"OCR 正文命中平台指纹：{fp}"
+        weak = [k for k in _CERT_WEAK_FINGERPRINTS if k in t]
+        if len(weak) >= 2:
+            return True, f"OCR 正文命中平台特征：{'、'.join(weak)}"
+    return False, "未见查询截图标题或认证平台指纹"
+
 
 
 def recover_artifacts_from_tender(
@@ -364,21 +448,21 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
     conflict = False
     if field == "certificates":
         # 声称了但证书表里没有 → 冲突（可能是引用造假）
-        cert_keys = [_cert_key(c) for c in facts.certificates]
+        cert_keys = [normalize_cert(c) for c in facts.certificates]
         for claim in facts.cert_claims:
-            if _cert_key(claim) not in cert_keys:
+            if normalize_cert(claim) not in cert_keys:
                 conflict = True
         # ISO 三体系与 CMMI 分开计数（本项目认证项的计分结构：
-        # ISO9001/27001/20000 每项 1 分上限 3，CMMI 二级以上 1 分）
-        iso_names = ("ISO9001", "ISO27001", "ISO20000")
+        # ISO9001/27001/20000 每项 1 分上限 3，CMMI 二级以上 1 分）。
+        # 证书名必须先归一化：OCR 形态（ISO/IEC 20000-1:2018、中文证书名）与
+        # 同一体系的两种写法（GB/T19001 与 质量管理体系）旧实现全部匹配不上。
         iso_set: set[str] = set()
         has_cmmi = False
         for cert in facts.certificates:
-            c = cert.upper().replace(" ", "")
-            for name in iso_names:
-                if name in c:
-                    iso_set.add(name)
-            if "CMMI" in c:
+            key = normalize_cert(cert)
+            if key in ("ISO9001", "ISO27001", "ISO20000"):
+                iso_set.add(key)
+            elif key == "CMMI":
                 has_cmmi = True
         count = len(iso_set) + (1 if has_cmmi else 0)
         # 一条都没抽到 ≠ 一条都不合格：前者是抽取能力问题，必须与"确实 0 项"区分开，
@@ -414,9 +498,12 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
     # 截图"，截图内容 OCR 不可得，改用**截图节存在性**判定（cert_section_present
     # 由 scoring_service 检测）。无截图节 → ISO 部分按"未按要求提供不得分"计 0，
     # CMMI 仅需证书复印件照计。实证：龙即有截en节（真实 ISO 3 分）、先数无（真实 1）。
+    _artifact_text = str(criterion.get("required_artifacts") or "")
+    _artifact_raw = str(criterion.get("required_artifacts_raw") or "")
     if (
         field == "certificates"
-        and "截图" in str(criterion.get("required_artifacts") or "")
+        # 材料清单解析可能只留下"证书复印件"这类实词，要求原文也要一起看
+        and "截图" in (_artifact_text + _artifact_raw)
         and not criterion.get("cert_section_present", True)
     ):
         iso_count = len(iso_set)
@@ -432,66 +519,78 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
         )
 
     # 证明材料链校验（LLM 逐案例核验版）：有 cases 明细时按"材料齐全的案例"计数；
-    # 因素带【证明材料】但 LLM 核验未执行 → 分数照算并标冲突转人工
+    # 因素带证明材料要求但 LLM 核验未执行 → 分数照算并标冲突转人工
     #（材料齐全性本质需翻原件核对，AI 判定只作为疑问线索，不直接扣分）
     artifacts = str(criterion.get("required_artifacts") or "")
     cases = criterion.get("verified_cases") or []
     if cases:
-        # 已有逐案例核验结果 = 计数有依据；清掉"字段缺失/未抽到事实"的 unresolved
-        unresolved = None
-        # 人员级：按负责人/成员过滤；模型完全没给 role 时退回全部案例并标疑问
-        if person_scope:
-            has_role = any(str(c.get("role") or "").strip() for c in cases)
-            scoped = [
-                c for c in cases
-                if str(c.get("role") or "").strip() == person_scope
-            ]
-            if has_role:
-                cases = scoped
-                if not cases:
-                    conflict = True
-                    detail += "；未识别到人员范围内的案例"
-            else:
-                conflict = True
-                detail += "；模型未标注案例人员归属，按全部案例计（需人工核对）"
-        # 金额门槛：明确低于门槛的不计；金额缺失的照计但标疑问
-        min_amount = Decimal(str(params.get("min_amount_yuan") or 0))
-        if min_amount > 0 and cases:
-            qualified: list[dict] = []
-            unknown_amount = 0
-            for case in cases:
-                amt = case.get("amount_yuan")
-                if amt is None or amt == "":
-                    unknown_amount += 1
-                    qualified.append(case)
-                    continue
-                try:
-                    if Decimal(str(amt)) >= min_amount:
-                        qualified.append(case)
-                except Exception:  # noqa: BLE001
-                    unknown_amount += 1
-                    qualified.append(case)
-            cases = qualified
-            if unknown_amount:
-                conflict = True
-                detail += f"；{unknown_amount} 个案例金额无法确认（需人工核对）"
-        required_flags = _required_flags(artifacts)
-        complete = [
-            c for c in cases
-            if all(bool(c.get(k)) for k in required_flags)
-        ]
-        effective = min(Decimal(len(complete)), Decimal(max_items)) if max_items else Decimal(len(complete))
-        score = (effective * per_item).quantize(Decimal("0.01"))
-        if max_score and score > max_score:  # 封顶：真实规则"最高得 M 分"
-            score = max_score
-        incomplete = len(cases) - len(complete)
-        detail = (
-            f"逐案例核验：提供案例 {len(cases)} 个，其中材料齐全 {len(complete)} 个"
-            + (f"（{incomplete} 个缺证明材料不计分）" if incomplete else "")
-            + f"，得 {score} 分"
-        )
-        if incomplete:
+        # 引文全部被 sanitize 降级（照抄要求文本/过短且无实体）→ 计数无依据，
+        # 不能把 0 分当成评审结论（与"机器看不见 ≠ 不符合"同一哲学）
+        clean_cases = [c for c in cases if str(c.get("sanitized") or "ok") == "ok"]
+        if not clean_cases:
+            unresolved = "cases_unverified"
             conflict = True
+            detail += (
+                f"；{len(cases)} 个案例的引文均未通过核验（疑似照抄要求文本），"
+                "计数无依据，转人工"
+            )
+        else:
+            cases = clean_cases
+            # 已有逐案例核验结果 = 计数有依据；清掉"字段缺失/未抽到事实"的 unresolved
+            unresolved = None
+            # 人员级：按负责人/成员过滤；模型完全没给 role 时退回全部案例并标疑问
+            if person_scope:
+                roles = [_normalize_role(c) for c in cases]
+                has_role = any(r is not None for r in roles)
+                scoped = [
+                    c for c, r in zip(cases, roles) if r == person_scope
+                ]
+                if has_role:
+                    cases = scoped
+                    if not cases:
+                        conflict = True
+                        detail += "；未识别到人员范围内的案例"
+                else:
+                    conflict = True
+                    detail += "；模型未标注案例人员归属，按全部案例计（需人工核对）"
+            # 金额门槛：明确低于门槛的不计；金额缺失的照计但标疑问
+            min_amount = Decimal(str(params.get("min_amount_yuan") or 0))
+            if min_amount > 0 and cases:
+                qualified: list[dict] = []
+                unknown_amount = 0
+                for case in cases:
+                    amt = case.get("amount_yuan")
+                    if amt is None or amt == "":
+                        unknown_amount += 1
+                        qualified.append(case)
+                        continue
+                    try:
+                        if Decimal(str(amt)) >= min_amount:
+                            qualified.append(case)
+                    except Exception:  # noqa: BLE001
+                        unknown_amount += 1
+                        qualified.append(case)
+                cases = qualified
+                if unknown_amount:
+                    conflict = True
+                    detail += f"；{unknown_amount} 个案例金额无法确认（需人工核对）"
+            required_flags = _required_flags(artifacts)
+            complete = [
+                c for c in cases
+                if all(bool(c.get(k)) for k in required_flags)
+            ]
+            effective = min(Decimal(len(complete)), Decimal(max_items)) if max_items else Decimal(len(complete))
+            score = (effective * per_item).quantize(Decimal("0.01"))
+            if max_score and score > max_score:  # 封顶：真实规则"最高得 M 分"
+                score = max_score
+            incomplete = len(cases) - len(complete)
+            detail = (
+                f"逐案例核验：提供案例 {len(cases)} 个，其中材料齐全 {len(complete)} 个"
+                + (f"（{incomplete} 个缺证明材料不计分）" if incomplete else "")
+                + f"，得 {score} 分"
+            )
+            if incomplete:
+                conflict = True
     elif artifacts:
         conflict = True
         detail += "；该评分项含证明材料要求，材料齐全性需人工核对原件（AI 逐案例核验未执行）"
@@ -512,9 +611,68 @@ def _required_flags(artifacts: str) -> tuple[str, ...]:
     return tuple(flags)
 
 
-def _cert_key(name: str) -> str:
-    """证书名归一：'ISO9001质量管理体系认证' 与 'ISO9001...' 视为同一项。"""
-    import re
+# 中文名 → 体系键（OCR 出的证书常只有中文名，完全没有 ISO 字样）
+_CERT_ZH_MAP: tuple[tuple[str, str], ...] = (
+    ("质量管理体系", "ISO9001"),
+    ("信息安全管理体系", "ISO27001"),
+    ("信息技术服务管理体系", "ISO20000"),
+)
+_CERT_GB_MAP: tuple[tuple[str, str], ...] = (
+    ("GB/T19001", "ISO9001"), ("GB/T22080", "ISO27001"), ("GB/T24405", "ISO20000"),
+)
+_RE_ISO_NUM = re.compile(r"ISO(?:/?IEC)?(\d{4,5})")
+_RE_GB_STD = re.compile(r"GB/?T(\d{4,5})")
+_RE_CMMI = re.compile(r"CMMI")
 
-    m = re.match(r"(ISO\s?\d+|CMMI\s?\d?)", name)
-    return re.sub(r"\s+", "", m.group(1)) if m else name
+
+def normalize_cert(name: str) -> str:
+    """证书名归一到稳定键。
+
+    `ISO/IEC 20000-1:2018`→ISO20000、`GB/T19001-2016/ISO9001:2015`→ISO9001、
+    `质量管理体系认证证书`→ISO9001、`CMMI 五级`→CMMI。认不出体系时返回去符号的
+    原名（供 cert_claims 与 certificates 的同一口径比对）。
+    """
+    raw = str(name or "")
+    t = re.sub(r"\s+", "", raw).upper()
+    if not t:
+        return ""
+    for zh, key in _CERT_ZH_MAP:
+        if zh in raw:
+            return key
+    for gb, key in _CERT_GB_MAP:
+        gb_n = gb.replace("/", "")
+        if gb.replace("/", "") in t or gb_n in t:
+            return key
+    m = _RE_ISO_NUM.search(t)
+    if m:
+        return f"ISO{m.group(1)}"
+    m = _RE_GB_STD.search(t)
+    if m:
+        gb = f"GB/T{m.group(1)}"
+        for pat, key in _CERT_GB_MAP:
+            if pat.replace("/", "") == gb.replace("/", ""):
+                return key
+    if _RE_CMMI.search(t):
+        return "CMMI"
+    return re.sub(r"[^0-9A-Z一-鿿]+", "", t)
+
+
+def _cert_key(name: str) -> str:
+    """兼容别名：旧调用点已全部迁移到 normalize_cert。"""
+    return normalize_cert(name)
+
+
+def _normalize_role(case: dict) -> str | None:
+    """案例的人员归属归一：leader | member | None。
+
+    模型输出形态多变（"Leader"/"项目负责人"/"leader（项目负责人）"），字符串
+    精确比较 `"leader"` 会把合法案例整项清零（2026-10-21 实证：T1.2 四家全 0）。
+    """
+    role = str(case.get("role") or "").strip().lower()
+    if not role:
+        return None
+    if "lead" in role or "负责人" in role:
+        return "leader"
+    if "member" in role or "成员" in role or "团队" in role:
+        return "member"
+    return None

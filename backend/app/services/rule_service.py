@@ -819,6 +819,7 @@ def normalize_package(package_id: int, actor: str = "auto") -> dict[str, int]:
     """确定性自愈草稿包（幂等）。只改数据，不改 status（状态由 auto-settle/人工处置）。
 
     处理的都是"抽取/合并造成的结构化缺陷"：
+    0. category 错标（商务→技术等）→ 按招标文件章节标题校正；
     1. 单独的【证明材料】块 → 折叠进同页 count 项并 retired；
     2. 表头/结论行（资格审查不通过…）→ retired；
     3. 不闭合档位 → 删除（让引擎按 description 在 0-满分评分）；
@@ -827,8 +828,10 @@ def normalize_package(package_id: int, actor: str = "auto") -> dict[str, int]:
     6. score_type=veto 但 is_veto=false → 归一。
     """
     from app.rules import compiler
+    from app.rules.category_map import apply_category_from_nodes
 
     stats = {
+        "category_corrected": 0,
         "materials_folded": 0,
         "summary_retired": 0,
         "levels_dropped": 0,
@@ -841,6 +844,14 @@ def normalize_package(package_id: int, actor: str = "auto") -> dict[str, int]:
         "符合性审查不通过",
         "技术平均分未达到技术总分值",
     }
+
+    with session_scope() as s:
+        pkg = s.get(RulePackage, package_id)
+        if pkg is None or pkg.status not in ("draft", "confirmed"):
+            return stats
+
+    # ⓪ 类别确定性校正（独立会话：内部要读 doc_nodes/doc_pages）
+    stats["category_corrected"] = apply_category_from_nodes(package_id, actor)
 
     with session_scope() as s:
         pkg = s.get(RulePackage, package_id)

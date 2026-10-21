@@ -8,6 +8,7 @@ final_score 写入权限：确定性引擎（价格分/count）、人工确认�
 from __future__ import annotations
 
 import logging
+import re
 from decimal import Decimal
 
 from sqlalchemy import func, select
@@ -26,6 +27,7 @@ from app.db.session import session_scope
 from app.engine.facts import extract_bid_facts
 from app.engine.models import PriceBid
 from app.engine.objective import (
+    cert_evidence_present,
     parse_required_artifacts,
     recover_artifacts_from_tender,
     run_check,
@@ -432,6 +434,7 @@ def execute_run(
     # ---- 证明材料页索引（count 逐案例核验与主观评审共用） ----
     _MAT_KEYWORDS = ("发票", "验收", "业主证明", "查询截图", "证书复印件", "承诺书", "营业执照")
     material_hints: dict[int, str] = {}
+    bid_pages: dict[int, list[tuple[int, str, str]]] = {}
     with session_scope() as s:
         from app.db.models import DocumentPage
 
@@ -441,14 +444,17 @@ def execute_run(
                 material_hints[bid_id] = "（无）"
                 continue
             pages: dict[str, list[int]] = {}
-            for page_no, ptext in s.execute(
-                select(DocumentPage.page_no, DocumentPage.text)
+            page_rows: list[tuple[int, str, str]] = []
+            for page_no, ptext, psrc in s.execute(
+                select(DocumentPage.page_no, DocumentPage.text, DocumentPage.source)
                 .where(DocumentPage.document_id == doc_id)
                 .order_by(DocumentPage.page_no)
             ):
+                page_rows.append((int(page_no), ptext or "", psrc or "text"))
                 for kw in _MAT_KEYWORDS:
                     if kw in (ptext or ""):
                         pages.setdefault(kw, []).append(int(page_no))
+            bid_pages[bid_id] = page_rows
             hint_parts = [
                 f"{kw}：第{'、'.join(str(p) for p in nos[:12])} 页"
                 for kw, nos in pages.items() if nos
@@ -477,53 +483,37 @@ def execute_run(
                 )
             ]
 
-    # ---- ③ 商务 count 分（带【证明材料】的走 LLM 逐案例核验） ----
-    # 认证查询截图节检测（2026-10-16 用户授权 AI 按规则裁量）：招标明文
-    # 「管理体系认证还需提供认证认可平台查询结果截图，未按要求提供不得分」。
-    # 截图内容 OCR 不可得，但"截图节"的存在性可判（正文标题页不含目录/要求页）——
-    # 龙即有 3 个截图节（真实认证 4 分），先数/致成/诚道无（真实 1/4/3 分，
-    # 先数与规则执行一致）。
-    import re as _re_cert
-
-    cert_sections: dict[int, bool] = {}
-    # 行级标题模式：截图节标题独立成行（允许节号前缀与页码后缀）
-    _cert_title_pat = _re_cert.compile(
-        r"(?m)^\s*(?:\d+(?:\.\d+){1,3}\s*)?[^\n]{0,30}查询结果截图[^\n]{0,20}$"
-    )
-    with session_scope() as s:
-        from app.db.models import DocumentPage
-
-        for bid_id in bidder_ids:
-            doc_id = main_doc_by_bidder.get(bid_id)
-            found = False
-            if doc_id is not None:
-                for ptext in s.execute(
-                    select(DocumentPage.text).where(DocumentPage.document_id == doc_id)
-                ).scalars():
-                    t = ptext or ""
-                    # 排除目录页（点线）与长要求文本页（索引表复述要求常超 300 字）
-                    if t.count("....") >= 2 or len(t) > 300:
-                        continue
-                    if _cert_title_pat.search(t):
-                        found = True
-                        break
-            cert_sections[bid_id] = found
+    # ---- ③ 商务 count 分（带证明材料要求的走 LLM 逐案例核验） ----
+    # 认证"查询截图"证据双通道检测（2026-10-21 重做）：通道 A 文本标题
+    # （致成写"查询网址/查询截图："，旧正则只认整行"查询结果截图"且跳过
+    # >300 字的页，全部漏检）；通道 B OCR 正文平台指纹（诚道的证书页图片
+    # 就是认证平台查询截图；先数只有证书扫描件 → 判无，与真实评审一致）。
+    cert_sections: dict[int, tuple[bool, str]] = {}
+    for bid_id in bidder_ids:
+        rows = bid_pages.get(bid_id) or []
+        cert_sections[bid_id] = cert_evidence_present([(src, t) for _p, t, src in rows])
 
     for bid_id in bidder_ids:
         facts = facts_by_bidder[bid_id]
         for c in count_items:
             params = c.get("params") or {}
-            # 合并/折叠写入的 required_evidence 优先；旧实现只看招标页恢复结果，
-            # c30 类【证明材料】块折叠进来也不生效。
-            artifacts_raw = (c.get("required_evidence") or "").strip() or recover_artifacts_from_tender(
-                c, tender_pages
+            # 材料要求拆成两个变量：清单（供三件套判断）与要求原文（供防作弊比对）。
+            # 旧实现把整句 required_evidence 当 artifacts——"不提供或提供不全的
+            # 不得分"这类噪声句混进关键词判断，材料门槛被静默加严。
+            requirement_text = (
+                (c.get("required_evidence") or "").strip()
+                or recover_artifacts_from_tender(c, tender_pages)
             )
-            artifacts = (
-                artifacts_raw
-                if isinstance(artifacts_raw, str)
-                else "、".join(artifacts_raw)
+            artifacts_list = (
+                parse_required_artifacts(requirement_text)
+                or parse_required_artifacts(c.get("source_quote") or "")
             )
-            c_scoring = {**c, "required_artifacts": artifacts}
+            artifacts = "、".join(artifacts_list) if artifacts_list else requirement_text
+            c_scoring = {
+                **c,
+                "required_artifacts": artifacts,
+                "required_artifacts_raw": requirement_text,
+            }
             # field 可能缺省（真实编译产物里常由名称推断）——与 score_count 用
             # 同一推断函数，避免两处口径漂移（2026-10-16 实证：params 无 field
             # 导致 cert_section_present 未传递、认证门槛静默失效）
@@ -533,16 +523,21 @@ def execute_run(
 
                 _field = _infer_count_field(c) or ""
             if _field == "certificates":
-                c_scoring = {**c_scoring, "cert_section_present": cert_sections.get(bid_id, False)}
+                c_scoring = {**c_scoring, "cert_section_present": cert_sections.get(bid_id, (True, ""))[0]}
             # LLM 逐案例核验仅用于**业绩类**（按案例核对合同/发票/验收）。
             # 证书类（认证/资质）不适用：案例核验的 contract/invoice/acceptance
             # 三标记语义与"证书复印件+查询截图"错位，会把有证书的投标人整体清零
             # （2026-10-16 实证：致成 4→0、诚道 3→0、先数 1→0）。证书类走
             # 确定性计数（facts.certificates=表内有复印件的），材料截图缺失
             # 由 doubt 标疑问转人工。
-            is_performance = (params.get("field") == "performance") or (
-                params.get("field") != "certificates"
-                and any(k in str(c.get("name") or "") for k in ("业绩", "案例"))
+            is_performance = (
+                params.get("field") == "performance"
+                # 人员级条目天然是"按案例计"（负责人/团队经验），必须走逐案例核验
+                or bool(params.get("person_scope"))
+                or (
+                    params.get("field") != "certificates"
+                    and any(k in str(c.get("name") or "") for k in ("业绩", "案例", "经验"))
+                )
             )
             if (
                 config.auto_mode()
@@ -551,7 +546,9 @@ def execute_run(
                 and is_performance
             ):
                 cases = _llm_verify_cases(
-                    gateway, c, facts, material_hints.get(bid_id), artifacts, data_class
+                    gateway, c, requirement_text, artifacts_list,
+                    material_hints.get(bid_id),
+                    bid_pages.get(bid_id) or [], data_class,
                 )
                 if cases:
                     c_scoring = {**c_scoring, "verified_cases": cases}
@@ -636,6 +633,19 @@ def execute_run(
         use_hierarchical = config.review_mode() == "hierarchical"
         subj_done = 0
         subj_total = len(subjective_items) * len(bidder_ids)
+        # 子项引文闸门的核验器：引文必须真实存在于该投标人的文档文本中
+        # （空白不敏感；<12 字不算引文）。
+        from app.parsing.normalize import normalize_no_ws as _nnw
+
+        verifiers: dict[int, object] = {}
+        for bid_id in bidder_ids:
+            norm_text = _nnw(text_by_bidder.get(bid_id) or "")
+
+            def _verify(quote: str, _norm=norm_text) -> bool:
+                q = _nnw(quote)
+                return len(q) >= 12 and q in _norm
+
+            verifiers[bid_id] = _verify
         for bid_id in bidder_ids:
             for c in subjective_items:
                 if ctx is not None:
@@ -645,18 +655,18 @@ def execute_run(
                 if use_hierarchical:
                     suggestion, committee = suggest_score_hierarchical(
                         gateway, c, text_by_bidder[bid_id], data_class=data_class,
-                        material_pages=hint,
+                        material_pages=hint, verify_quote=verifiers.get(bid_id),
                     )
                     if suggestion is None:
                         # 证据地图不可用（嵌入服务故障）→ 回退单次评审
                         suggestion, committee = suggest_score_committee(
                             gateway, c, text_by_bidder[bid_id], data_class=data_class,
-                            material_pages=hint,
+                            material_pages=hint, verify_quote=verifiers.get(bid_id),
                         )
                 else:
                     suggestion, committee = suggest_score_committee(
                         gateway, c, text_by_bidder[bid_id], data_class=data_class,
-                        material_pages=hint,
+                        material_pages=hint, verify_quote=verifiers.get(bid_id),
                     )
 
                 # 人员经验材料门槛（确定性，规则执行）：缺证明按"否则该项不得分"计 0
@@ -722,82 +732,155 @@ def execute_run(
     }
 
 
-def _llm_verify_cases(gateway, c: dict, facts, material_pages: str | None,
-                      artifacts: str, data_class: str) -> list[dict] | None:
-    """带【证明材料】的计数项：LLM 逐案例列出并核对材料齐全性。
+_CASE_BATCH_CHARS = 15000  # 单次核验调用的上下文预算
+_CASE_MAX_BATCHES = 4  # 多段调用上限（超出按锚点页优先截断并记警告）
 
-    返回案例清单（含 contract/invoice/acceptance 布尔），失败返回 None
-    （调用方退回文本级校验）。余额/配额类错误向上抛（fail-fast）。
+
+def _case_candidate_pages(
+    pages: list[tuple[int, str, str]],
+) -> list[list[tuple[int, str]]]:
+    """业绩/人员案例核验的候选页 → 按预算切批。
+
+    旧实现把 `facts.text`（全部文档拼接）关键词选段后只送 15k 字符——几百页
+    标书里案例页根本进不了上下文，团队成员经验项四家全 0（2026-10-21 实证）。
+    这里按"锚点词命中页 ±1 页"圈定候选，再按预算切批多段调用。
+    """
+    import re as _re
+
+    anchor = _re.compile(r"合同|项目名称|甲方|乙方|发票|验收|中标通知书|业绩|项目团队|负责人")
+    hits = [i for i, (_no, t, _s) in enumerate(pages) if anchor.search(t or "")]
+    idx: set[int] = set()
+    for i in hits:
+        idx.update({i - 1, i, i + 1})
+    ordered = sorted(i for i in idx if 0 <= i < len(pages))
+    batches: list[list[tuple[int, str]]] = []
+    cur: list[tuple[int, str]] = []
+    cur_chars = 0
+    for i in ordered:
+        no, text = pages[i][0], pages[i][1] or ""
+        if cur and cur_chars + len(text) > _CASE_BATCH_CHARS:
+            batches.append(cur)
+            cur, cur_chars = [], 0
+            if len(batches) >= _CASE_MAX_BATCHES:
+                break
+        cur.append((no, text))
+        cur_chars += len(text)
+    if cur and len(batches) < _CASE_MAX_BATCHES:
+        batches.append(cur)
+    covered = sum(len(b) for b in batches)
+    if len(batches) >= _CASE_MAX_BATCHES and covered < len(ordered):
+        log.warning(
+            "案例核验候选页超出 %d 批上限，已按锚点页优先截断（候选 %d 页，送审 %d 页）",
+            _CASE_MAX_BATCHES, len(ordered), covered,
+        )
+    return batches
+
+
+def _llm_verify_cases(
+    gateway,
+    c: dict,
+    requirement_text: str,
+    artifacts_list: list[str],
+    material_pages: str | None,
+    pages: list[tuple[int, str, str]],
+    data_class: str,
+) -> list[dict] | None:
+    """带证明材料要求的计数项：LLM 逐案例列出并核对材料齐全性。
+
+    返回案例清单（含 contract/invoice/acceptance 布尔与 sanitized 原因码），
+    无候选页或全部批次失败返回 None（调用方退回文本级校验）。
+    余额/配额类错误向上抛（fail-fast）。
     """
     from pydantic import BaseModel, Field
 
-    from app.engine.selection import (
-        select_chunks_for_criterion, split_text_chunks,
-    )
     from app.llm.base import LLMError
     from app.rules import prompts
 
-    if not artifacts:
+    if not artifacts_list and not (requirement_text or "").strip():
+        return None
+    batches = _case_candidate_pages(pages)
+    if not batches:
         return None
 
     class CaseList(BaseModel):
         cases: list[dict] = Field(default_factory=list)
 
-    text = facts.text
-    if len(text) > 15000:
-        picked, _meta = select_chunks_for_criterion(
-            split_text_chunks(text), c, 15000
-        )
-        text = "\n".join(t for _i, t in picked)
-    import re as _re_art
-
-    art_list = [
-        a.strip()
-        for a in _re_art.split(r"[、，,；;\n]", artifacts)
-        if a.strip()
-    ] or [artifacts]
+    art_list = [a.strip() for a in artifacts_list if a.strip()] or [requirement_text]
     person_scope = str((c.get("params") or {}).get("person_scope") or "（不区分人员）")
-    user = prompts.MATERIAL_COUNT_USER_TEMPLATE.format(
-        name=c.get("name") or "",
-        max_score=c.get("max_score") or "",
-        source_quote=(c.get("source_quote") or "")[:800],
-        artifacts="、".join(art_list),
-        person_scope=person_scope,
-        material_pages=material_pages or "（无）",
-        bid_text=text,
-    )
-    try:
-        out, _res = gateway.chat_json(
-            prompts.MATERIAL_COUNT_SYSTEM_PROMPT, user, CaseList,
-            data_class=data_class,
+    merged: list[dict] = []
+    seen: set[tuple[str, str]] = set()
+    for batch_no, batch in enumerate(batches, start=1):
+        text = "\n".join(f"【第 {no} 页】\n{t}" for no, t in batch)
+        user = prompts.MATERIAL_COUNT_USER_TEMPLATE.format(
+            name=c.get("name") or "",
+            max_score=c.get("max_score") or "",
+            source_quote=(c.get("source_quote") or "")[:800],
+            artifacts="、".join(art_list),
+            person_scope=person_scope,
+            material_pages=material_pages or "（无）",
+            bid_text=text,
         )
-        return [_sanitize_case(x, artifacts) for x in out.cases if isinstance(x, dict)]
-    except LLMError as exc:
-        msg = str(exc)
-        if any(k in msg for k in ("402", "insufficient", "quota", "30001", "arrears")):
-            raise
-        return None
+        try:
+            out, _res = gateway.chat_json(
+                prompts.MATERIAL_COUNT_SYSTEM_PROMPT, user, CaseList,
+                data_class=data_class,
+            )
+        except LLMError as exc:
+            msg = str(exc)
+            if any(k in msg for k in ("402", "insufficient", "quota", "30001", "arrears")):
+                raise
+            log.warning("案例核验第 %d/%d 批失败：%s", batch_no, len(batches), exc)
+            continue
+        for x in out.cases:
+            if not isinstance(x, dict):
+                continue
+            case = _sanitize_case(x, requirement_text)
+            key = (
+                str(case.get("name") or "").strip().lower(),
+                str(case.get("person") or "").strip(),
+            )
+            if key in seen:
+                case["duplicate"] = True
+                continue
+            seen.add(key)
+            if not case.get("page_hint"):
+                case["page_hint"] = batch[0][0]
+            merged.append(case)
+    return merged
 
 
-def _sanitize_case(case: dict, artifacts: str) -> dict:
+def _sanitize_case(case: dict, requirement_text: str) -> dict:
     """核验结果代码层校验：quote 是要求文本影子的案例，材料判定不可信 → 全部降 false。
 
     8B 模型的作弊模式（2026-10-15 实证）：拿"须提供合同复印件、发票复印件…"这句
-    **要求文本**当 quote，把四个业绩案例全判材料齐全。判据：quote 与材料要求段
-    互相包含（≥12 字重合）或 quote 空 → 该案例三件套一律 false。
+    **要求文本**当 quote，把四个业绩案例全判材料齐全。判据：quote 与要求原文
+    互相包含（≥12 字重合），或 quote 过短且无可核验实体 → 三件套一律 false。
+
+    `sanitized` 原因码：ok / requirement_shadow / quote_too_short——
+    score_count 据此区分"合法 0 分"与"计数无依据"。比对必须用**要求原文**
+    （required_artifacts_raw），不能用解析后的短清单，否则短清单会整段命中
+    任何含"合同复印件"的合法引文。
     """
     case = dict(case)
     quote = str(case.get("quote") or "").strip()
-    artifacts_n = artifacts.replace(" ", "")
+    raw_n = (requirement_text or "").replace(" ", "")
     quote_n = quote.replace(" ", "")
     cheat = True
+    reason = "quote_too_short"
     if len(quote_n) >= 12:
-        if quote_n not in artifacts_n and artifacts_n[:40] not in quote_n:
+        if raw_n and (quote_n in raw_n or raw_n[:40] in quote_n):
+            reason = "requirement_shadow"
+        else:
             cheat = False
+            reason = "ok"
+    elif bool(re.search(r"\d", quote)):
+        # 短引文但含金额/年份等实体（如"2024年6月"）仍可信
+        cheat = False
+        reason = "ok"
     if cheat:
         for key in ("contract", "invoice", "acceptance"):
             case[key] = False
-        case["sanitized"] = "quote 无效（要求文本/空引文），材料判定降为未提供"
+    case["sanitized"] = reason
     return case
 
 
@@ -966,9 +1049,18 @@ def _persist_subjective(
         row.ai_raw_json = {
             "warnings": suggestion.warnings,
             "evidence": suggestion.evidence,
-            # 评审委员会明细：每位 AI 评委的独立分与弃分标记，报告汇总表/审计直接可用
+            # 明细（评委或证据簇）：报告汇总表/审计直接可用。注意 semantic 字段——
+            # hierarchical 模式下这些条目是**证据簇**，不是独立评委；旧实现一律
+            # 写 trimmed_mean 并称作"AI 评委"，与真实聚合方式不符（审计误导）。
             "committee": committee,
-            "aggregation": f"trimmed_mean_{len(committee)}_drop_high_low" if committee else None,
+            "committee_semantic": (
+                "evidence_cluster" if config.review_mode() == "hierarchical" else "judge"
+            ),
+            "aggregation": (
+                f"trimmed_mean_{len(committee)}_drop_high_low"
+                if committee and config.review_mode() != "hierarchical"
+                else ("evidence_cluster_weighted" if committee else None)
+            ),
             # 证明材料链核对与复合因素子项得分（评分透明度）
             "artifacts_check": suggestion.artifacts_check,
             "sub_scores": suggestion.sub_scores,
@@ -1011,6 +1103,8 @@ def _persist_subjective(
     with session_scope() as s:
         row = s.get(ScoreRecord, row.id)
         row.evidence_status = evidence_status
+        # 子项引文闸门未执行（模型整体没给引文）→ 分数不可复核，标疑问
+        gate_not_executed = getattr(suggestion, "quote_gate_executed", None) is False
         if config.auto_mode():
             # 全自动模式：AI 建议直接生效；给不出分的按最低档兜底（宁严勿纵），
             # 警告与 reasoning 全部保留在 ai_raw_json / warnings 供事后审计。
@@ -1021,6 +1115,12 @@ def _persist_subjective(
                 isinstance(w, dict) and w.get("message") in ("parse_failed", "llm_failed")
                 for w in (row.warnings_json or [])
             )
+            if gate_not_executed:
+                # 保留分值（进总分，不影响排名），但标疑问进复核清单：
+                # 若整项直接判未定分，8B 偶尔不给逐子项引文就会让整份报告失效
+                row.warnings_json = (row.warnings_json or []) + [
+                    {"message": "子项引文未提供，证据闸门未执行，建议人工复核"}
+                ]
             if suggestion.status == "ai_suggested":
                 row.final_score = suggestion.score
             elif parse_failed:
@@ -1041,7 +1141,7 @@ def _persist_subjective(
                     {"message": f"全自动模式：模型未给出有效分值，按最低档兜底（{fallback} 分）"}
                 ]
             row.machine_status = "pass"  # 终态：已定分（兜底详情在 warnings）
-            row.review_status = "auto_confirmed"
+            row.review_status = "conflict_flagged" if gate_not_executed else "auto_confirmed"
             s.add(row)
         elif suggestion.status == "ai_suggested" and evidence_status != "verified":
             # 无已核验证据 → 建议仍记录，但降级为待人工

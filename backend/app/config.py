@@ -144,7 +144,11 @@ def committee_size() -> int:
 # OCR（扫描件兜底，rapidocr-onnxruntime）
 # ---------------------------------------------------------------------------
 OCR_PAGE_MIN_CHARS = 30  # 页字符数低于此值 → 该页走 OCR（低于抽样阈值，防"扫描封面+数字正文"误判）
-OCR_RENDER_SCALE = 2.0  # OCR 页渲染倍率（≈144dpi，中文 12pt 可靠）
+OCR_MIXED_PAGE_MAX_CHARS = 800  # 「标题+整页扫描件」混排页阈值（合同/发票/验收页）
+OCR_RENDER_SCALE = 3.0  # 整页渲染倍率（≈216dpi）。2.0 实测读不出扫描件里的小字
+OCR_RENDER_MIN_CHARS = 20  # 整页渲染 OCR 产出低于此值且页内有大图 → 记 degraded（防静默垃圾）
+OCR_IMAGE_MIN_RATIO = 0.35  # 页内图面积占比低于此值不单独 OCR（logo/印章/水印）
+OCR_IMAGE_MIN_SIDE = 300  # 页内图短边低于此值不单独 OCR（像素）
 
 
 def ocr_enabled() -> bool:
@@ -162,6 +166,42 @@ def ocr_engine() -> str:
 def paddle_ocr_url() -> str:
     """PaddleOCR-VL vLLM 服务地址（mwb coll-det-gpu-ocr-proxy，OpenAI 兼容协议）。"""
     return os.environ.get("BID_EVAL_PADDLE_OCR_URL", "http://100.100.30.150:16102").strip()
+
+
+def paddle_ocr_model() -> str:
+    """PaddleOCR-VL 的模型名（vLLM /v1/models 返回的 id，不匹配会被 404 拒绝）。"""
+    return os.environ.get("BID_EVAL_PADDLE_OCR_MODEL", "PaddleOCR-VL-1.6-0.9B").strip()
+
+
+def paddle_ocr_prompt() -> str:
+    """PaddleOCR-VL 的整页识别提示词。"""
+    return os.environ.get("BID_EVAL_PADDLE_OCR_PROMPT", "OCR:").strip() or "OCR:"
+
+
+def paddle_ocr_timeout_s() -> int:
+    """单页远程 OCR 超时（秒）。默认 60——几百页文档下 300s 会让任务长时间挂死。"""
+    return max(5, int(os.environ.get("BID_EVAL_PADDLE_OCR_TIMEOUT_S", 60)))
+
+
+def paddle_ocr_probe_timeout_s() -> int:
+    """远程 OCR 可用性探针超时（秒）。探针只做 /v1/models，毫秒级。"""
+    return max(1, int(os.environ.get("BID_EVAL_PADDLE_OCR_PROBE_TIMEOUT_S", 3)))
+
+
+def paddle_ocr_max_tokens() -> int:
+    """远程 OCR 单页输出上限。默认 4096。
+
+    服务端 max_model_len=8192，整页图约占 2.5-3k prompt token；取 8192 会直接
+    400（输出预算超过上下文）。4096 对单页文本足够，且真被截断时
+    `finish_reason=length` 会抛错而不是静默丢内容。
+    """
+    return max(512, int(os.environ.get("BID_EVAL_PADDLE_OCR_MAX_TOKENS", 4096)))
+
+
+def ocr_max_failures() -> int:
+    """远程 OCR 连续失败次数上限（熔断）：超过后本文档余下页不再调用远程，
+    避免"连得上但不返回"时 742 页 × 超时把任务挂死。"""
+    return max(1, int(os.environ.get("BID_EVAL_OCR_MAX_FAILURES", 3)))
 
 
 def embed_url() -> str:
@@ -307,7 +347,7 @@ def llm_daily_call_budget() -> int:
 
 def llm_prompt_version() -> str:
     """提示词版本号；进入缓存键与审计记录。改 prompt 必须同步改它。"""
-    return os.environ.get("BID_EVAL_PROMPT_VERSION", "2026-10-20.1")
+    return os.environ.get("BID_EVAL_PROMPT_VERSION", "2026-10-21.1")
 
 
 def local_endpoint_hosts() -> list[str]:

@@ -570,8 +570,20 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
     for per_crit in judges_scores.values():
         for per_judge in per_crit.values():
             committee_size = max(committee_size, max(per_judge.keys(), default=0))
+    # hierarchical 模式下的明细是**证据簇**而非独立评委：必须区分口径，
+    # 否则报告会宣称"3 个 AI 评委去尾平均"，而实际聚合是跨簇加权/子项平均。
+    cluster_mode = False
+    for score, crit, _bidder in score_rows:
+        if crit.score_type != "subjective":
+            continue
+        raw = score.ai_raw_json or {}
+        if isinstance(raw, dict) and raw.get("committee_semantic") == "evidence_cluster":
+            cluster_mode = True
+            break
     show_judges = committee_size >= 2
     judge_labels = [f"{JUDGE_LABEL}{i}" for i in range(1, committee_size + 1)] if show_judges else []
+    if cluster_mode:
+        judge_labels = [f"证据簇{i}" for i in range(1, committee_size + 1)]
 
     # ---- 评审结果汇总表（评委矩阵 + 最终得分 + 名次） ----
     summary_rows = []
@@ -783,6 +795,7 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
             "finished_at": run.finished_at.isoformat() if run.finished_at else None,
         },
         "committee_size": committee_size,
+        "committee_semantic": "evidence_cluster" if cluster_mode else "judge",
         "judge_labels": judge_labels,
         "summary_rows": summary_rows,
         "review_notes": review_notes,
@@ -799,11 +812,17 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
             "text": (
                 (
                     "本报告由 AI 辅助评审系统自动生成："
-                    f"{committee_size} 个 AI 评审 Agent 对主观评分项独立评分，"
-                    "去除一个最高分和一个最低分后取平均作为该项最终得分"
-                    if committee_size >= 2
-                    else "本报告由 AI 辅助评审系统自动生成：AI 评审 Agent 对主观评分项"
-                    "依据招标文件载明的判据独立评定分值"
+                    f"按 {committee_size} 个证据簇分层评审主观评分项"
+                    "（逐簇评分后按子项跨簇平均/证据相关性加权聚合）"
+                    if cluster_mode and committee_size >= 2
+                    else (
+                        "本报告由 AI 辅助评审系统自动生成："
+                        f"{committee_size} 个 AI 评审 Agent 对主观评分项独立评分，"
+                        "去除一个最高分和一个最低分后取平均作为该项最终得分"
+                        if committee_size >= 2
+                        else "本报告由 AI 辅助评审系统自动生成：AI 评审 Agent 对主观评分项"
+                        "依据招标文件载明的判据独立评定分值"
+                    )
                 )
                 + "；否决项、计数项与价格分由确定性引擎计算。本报告供评标委员会参考，"
                 "所有存疑事项、否决建议与最终结论须经评标委员会确认。"

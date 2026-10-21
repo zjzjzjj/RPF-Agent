@@ -796,6 +796,11 @@ def compile_rules(
     criteria_acc = dedupe_extracted(criteria_acc)
     # 确定性补全：先把【证明材料】块折叠进 count 项，再补公式/计数参数
     criteria_acc = fold_material_blocks(criteria_acc)
+    # 类别确定性校正（落库前）：category=="price" 是价格公式落盘的门槛，
+    # LLM 把商务/价格项标错类别会让对应链路整体失效（2026-10-21 实证）。
+    from app.rules.category_map import apply_category_to_extracted
+
+    apply_category_to_extracted(criteria_acc, document_id)
     criteria_acc = enrich_extracted(criteria_acc, text)
 
     version = _next_version(project_id)
@@ -825,7 +830,11 @@ def compile_rules(
 
     # 事务已提交：核验引用（独立会话）→ 回填页码/条款节点 → 重新分诊
     _verify_and_backfill(document_id, pending)
-    # 节点已确定：把表格里被模型漏掉的子项/档位续行补进 description
+    # 节点已确定：按节点标题链再校正一次类别（权威页码，留痕），
+    # 并把表格里被模型漏掉的子项/档位续行补进 description
+    from app.rules.category_map import apply_category_from_nodes
+
+    apply_category_from_nodes(package_id)
     enrich_descriptions_from_nodes(package_id)
 
     run_validations(package_id)

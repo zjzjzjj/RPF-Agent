@@ -51,6 +51,12 @@ def app_env(tmp_path, monkeypatch):
     monkeypatch.delenv("BID_EVAL_LLM_API_KEY", raising=False)
     monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.setenv("BID_EVAL_AUTO_MODE", "0")
+    # OCR 同样要密闭：.env 里配的是 remote_paddle（真实服务器），测试进程不得摸网络。
+    # 需要验证远程路径的用例自行 monkeypatch 探针与客户端（见 test_parsing_pymupdf）。
+    monkeypatch.setenv("BID_EVAL_OCR_ENGINE", "rapidocr")
+    from app.parsing import paddle_client as _paddle
+
+    _paddle.reset_probe_cache()
 
     from app.db import session as db_session
     from app.llm.gateway import reset_gateway

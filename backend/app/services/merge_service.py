@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import logging
 from decimal import Decimal
 from typing import Any
 
@@ -29,6 +30,8 @@ from app.db.models import (
 from app.db.session import session_scope
 from app.errors import NotFound, ValidationFailed
 from app.rules import compiler
+
+log = logging.getLogger("bid_eval.merge_service")
 
 
 def auto_resolve_merge(
@@ -57,7 +60,28 @@ def auto_resolve_merge(
             "reason": (f"自动合并（{p.get('match_method') or 'deterministic'}，"
                        f"相似度 {p.get('similarity')}）：招标文件条款覆盖模板条目"),
         })
+    from app.rules.merger import _norm_name
+
     for t in proposal["unmatched_template"]:
+        # 兜底：仅因类别不同而落空、但文档侧存在"同名同类型"条目时，不能弃用
+        # ——类别错标（商务→技术）曾让模板 commercial 项整条消失，商务桶恒 0。
+        # 这里选择"不处置"（模板条目原样保留在合并结果里）并记日志：正常情况下
+        # generate_match_proposal 的内存类别校正已让两者配上，走不到这里。
+        twin = next(
+            (
+                d for d in proposal["unmatched_document"]
+                if d["score_type"] == t["score_type"]
+                and d["category"] != t["category"]
+                and _norm_name(d["name"]) == _norm_name(t["name"])
+            ),
+            None,
+        )
+        if twin is not None:
+            log.warning(
+                "自动合并跳过弃用：模板条目 %s（%s）与文档条目 %s（%s）同名同类型但类别不同，保留待人工处置",
+                t["code"], t["category"], twin["code"], twin["category"],
+            )
+            continue
         decisions.append({
             "action": "drop_template",
             "template_criterion_id": t["id"],

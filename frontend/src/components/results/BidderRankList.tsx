@@ -9,13 +9,29 @@ interface Props {
 
 const RANK_COLOR = ["#d4a017", "#8c8c8c", "#a97142"];
 
-function Metric({ label, value }: { label: string; value: string | null }) {
+function Metric({
+  label,
+  value,
+  missingOnly = false,
+}: {
+  label: string;
+  value: string | null;
+  missingOnly?: boolean;
+}) {
   return (
     <div style={{ flex: 1, textAlign: "center" }}>
       <div style={{ fontSize: 11, color: "#888" }}>{label}</div>
-      <div style={{ fontSize: 13, fontWeight: 600 }}>{value ?? "—"}</div>
+      <div style={{ fontSize: 13, fontWeight: 600, color: missingOnly ? "#b26a00" : undefined }}>
+        {missingOnly ? "未定分" : (value ?? "—")}
+      </div>
     </div>
   );
+}
+
+/** 桶内条目全部"未定分"时，桶合计的 0 是聚合初值，不是评审结论。 */
+function isBucketMissingOnly(b: BidderSummary, key: string): boolean {
+  const bucket = b.buckets.find((x) => x.key === key);
+  return !!bucket && bucket.scored_count === 0 && bucket.missing_count > 0;
 }
 
 /** 左栏：排名列表。点选一家，右侧显示该家的分桶与逐项明细。 */
@@ -109,7 +125,11 @@ export default function BidderRankList({ bidders, selectedId, onSelect }: Props)
               <div style={{ display: "flex", gap: 4, marginTop: 10 }}>
                 <Metric label="价格分" value={b.summary.price_score} />
                 <Metric label="技术分" value={b.summary.tech_score} />
-                <Metric label="商务分" value={b.summary.commercial_score} />
+                <Metric
+                  label="商务分"
+                  value={b.summary.commercial_score}
+                  missingOnly={isBucketMissingOnly(b, "commercial")}
+                />
               </div>
             )}
           </Card>

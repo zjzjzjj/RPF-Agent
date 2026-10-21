@@ -83,28 +83,45 @@ export default function BucketCards({ bidder }: Props) {
 
   return (
     <Row gutter={12}>
-      {tiles.map((t) => (
-        <Col xs={12} md={6} key={t.key}>
-          <Card size="small" styles={{ body: { padding: "10px 12px" } }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-              <span style={{ fontSize: 12, color: "#888" }}>{t.label}</span>
-              <SideTag side={t.side} />
-            </div>
-            <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
-              <span
-                style={{ fontSize: t.key === "total" ? 26 : 22, fontWeight: 700, color: "#29745a" }}
-              >
-                {t.score ?? "—"}
-              </span>
-              {t.max && (
-                <Typography.Text type="secondary" style={{ fontSize: 13 }}>
-                  / {t.max}
-                </Typography.Text>
-              )}
-            </div>
-          </Card>
-        </Col>
-      ))}
+      {tiles.map((t) => {
+        // 桶内全部条目都"未定分"时，桶合计的 0 是聚合初值而不是评审结论——
+        // 显示 0 会让"机器没算出"与"真的是 0 分"混同（2026-10-21 商务桶事故）。
+        const bucket = bidder.buckets.find((x) => x.key === t.key);
+        const missingOnly =
+          !!bucket && bucket.scored_count === 0 && bucket.missing_count > 0;
+        return (
+          <Col xs={12} md={6} key={t.key}>
+            <Card size="small" styles={{ body: { padding: "10px 12px" } }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <span style={{ fontSize: 12, color: "#888" }}>{t.label}</span>
+                <SideTag side={t.side} />
+              </div>
+              <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
+                <span
+                  style={{
+                    fontSize: t.key === "total" ? 26 : 22,
+                    fontWeight: 700,
+                    color: missingOnly ? "#b26a00" : "#29745a",
+                  }}
+                >
+                  {missingOnly ? "未定分" : (t.score ?? "—")}
+                </span>
+                {missingOnly ? (
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    {bucket?.missing_count} 项待人工
+                  </Typography.Text>
+                ) : (
+                  t.max && (
+                    <Typography.Text type="secondary" style={{ fontSize: 13 }}>
+                      / {t.max}
+                    </Typography.Text>
+                  )
+                )}
+              </div>
+            </Card>
+          </Col>
+        );
+      })}
       {verdictBucket && verdictBucket.verdicts && (
         <Col xs={24}>
           <Card size="small" style={{ marginTop: 0 }} styles={{ body: { padding: "8px 12px" } }}>

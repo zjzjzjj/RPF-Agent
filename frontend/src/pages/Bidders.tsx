@@ -85,6 +85,17 @@ function BidderFileCell({
     onError: (e: Error) => message.error(e.message || "上传失败"),
   });
 
+  // 重新解析（OCR 引擎修复后重跑扫描件；幂等端点，不重跑评分）
+  const reparse = useMutation({
+    mutationFn: (documentId: number) =>
+      api.post<{ job_id: number }>(`/documents/${documentId}/reparse`),
+    onSuccess: (r) => {
+      setJobId(r.job_id);
+      message.info("已提交重新解析，扫描件内容将走 OCR");
+    },
+    onError: (e: Error) => message.error(e.message || "重新解析失败"),
+  });
+
   // 终态提示 + 刷新（与 ScoreResults 的终态 invalidate 同款）
   useEffect(() => {
     if (!job) return;
@@ -100,29 +111,40 @@ function BidderFileCell({
   return (
     <Space direction="vertical" size={2}>
       {docs.map((d) => (
-        <Tag
-          key={d.id}
-          color={
-            d.parse_status === "parsed"
-              ? "green"
-              : d.parse_status === "failed"
-                ? "red"
-                : d.parse_status === "degraded"
-                  ? "orange"
-                  : "blue"
-          }
-          title={`${d.original_filename}（${d.parse_status}，${d.page_count ?? "?"} 页）`}
-          style={{
-            maxWidth: 236,
-            overflow: "hidden",
-            textOverflow: "ellipsis",
-            whiteSpace: "nowrap",
-            display: "inline-block",
-            verticalAlign: "middle",
-          }}
-        >
-          {d.original_filename}（{d.parse_status}，{d.page_count ?? "?"} 页）
-        </Tag>
+        <Space key={d.id} size={4} align="center">
+          <Tag
+            color={
+              d.parse_status === "parsed"
+                ? "green"
+                : d.parse_status === "failed"
+                  ? "red"
+                  : d.parse_status === "degraded"
+                    ? "orange"
+                    : "blue"
+            }
+            title={`${d.original_filename}（${d.parse_status}，${d.page_count ?? "?"} 页）`}
+            style={{
+              maxWidth: 236,
+              overflow: "hidden",
+              textOverflow: "ellipsis",
+              whiteSpace: "nowrap",
+              display: "inline-block",
+              verticalAlign: "middle",
+            }}
+          >
+            {d.original_filename}（{d.parse_status}，{d.page_count ?? "?"} 页）
+          </Tag>
+          <Tooltip title="重新解析：OCR 引擎修复后重跑该文档（扫描件证书/截图/合同才会进文本）。不会重跑评分，需新发起评分。">
+            <Button
+              size="small"
+              type="link"
+              loading={reparse.isPending}
+              onClick={() => reparse.mutate(d.id)}
+            >
+              重新解析
+            </Button>
+          </Tooltip>
+        </Space>
       ))}
       {job && (
         <JobProgress

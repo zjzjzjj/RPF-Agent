@@ -77,7 +77,8 @@ def aggregate_subitems(
     """有原文子项时，用子项分之和覆盖模型自报总分（缺失子项按 0）。
 
     返回 (score, normalized_sub_scores, warnings)。没有任何子项能匹配时
-    返回 model_score，避免因为名称不一致把整项归零。
+    返回 model_score，避免因为名称不一致把整项归零。normalized 条目带 `quote`
+    （供证据闸门逐子项核验）。
     """
     parsed = parse_subitems(criterion.get("description"))
     if not parsed or not sub_scores:
@@ -91,7 +92,7 @@ def aggregate_subitems(
         hit = _match_subitem(name, keys)
         if hit is None:
             missing.append(name)
-            normalized.append({"name": name, "score": "0", "max": str(cap)})
+            normalized.append({"name": name, "score": "0", "max": str(cap), "quote": ""})
             continue
         src = next(
             (s for s in sub_scores if isinstance(s, dict) and str(s.get("name") or "") == hit),
@@ -99,13 +100,18 @@ def aggregate_subitems(
         )
         if src is None:
             missing.append(name)
-            normalized.append({"name": name, "score": "0", "max": str(cap)})
+            normalized.append({"name": name, "score": "0", "max": str(cap), "quote": ""})
             continue
         matched += 1
         raw = _parse_score(src.get("score"))
         value = min(max(raw or Decimal(0), Decimal(0)), cap)
         total += value
-        normalized.append({"name": name, "score": str(value), "max": str(cap)})
+        normalized.append({
+            "name": name,
+            "score": str(value),
+            "max": str(cap),
+            "quote": str(src.get("quote") or "").strip(),
+        })
     if matched == 0:
         return model_score, sub_scores, ["子项名称与原文无法对应，按模型自报总分计"]
     total = min(total, max_score)
@@ -113,6 +119,39 @@ def aggregate_subitems(
     if missing:
         warnings.append(f"未提供证据的子项按 0 计：{'、'.join(missing)}")
     return total, normalized, warnings
+
+
+def apply_quote_gate(
+    sub_scores: list[dict],
+    verify_quote,  # noqa: ANN001
+) -> tuple[Decimal | None, list[str], bool]:
+    """子项证据闸门：引文能在投标文件中定位 → 分数保留；否则该子项记 0。
+
+    返回 (闸门后总分, warnings, 是否执行)。模型整体没给任何引文时不执行
+    （8B 偶发不给引文，直接全零会把整项崩掉），调用方应整项标疑问转人工。
+    """
+    if verify_quote is None:
+        return None, [], False
+    has_any_quote = any(
+        isinstance(s, dict) and str(s.get("quote") or "").strip() for s in sub_scores
+    )
+    if not has_any_quote:
+        return None, ["子项引文未提供，证据闸门未执行"], False
+    warnings: list[str] = []
+    total = Decimal(0)
+    for item in sub_scores:
+        if not isinstance(item, dict):
+            continue
+        score = _parse_score(item.get("score")) or Decimal(0)
+        quote = str(item.get("quote") or "").strip()
+        if quote and verify_quote(quote):
+            total += score
+            continue
+        if score > 0:
+            reason = "引文未在投标文件中定位到" if quote else "未提供引文"
+            warnings.append(f"子项「{item.get('name')}」{reason}，按 0 计")
+        item["score"] = "0"
+    return total, warnings, True
 
 
 class SubjectiveOutput(BaseModel):
@@ -139,6 +178,8 @@ class SubjectiveSuggestion:
     warnings: list[str] = field(default_factory=list)
     artifacts_check: list[dict] = field(default_factory=list)  # 证明材料链核对
     sub_scores: list[dict] = field(default_factory=list)  # 复合因素子项得分
+    # 子项证据闸门：True=已执行且通过/扣减；False=模型没给引文未执行（应标疑问）
+    quote_gate_executed: bool | None = None
 
 
 def _parse_score(value) -> Decimal | None:  # noqa: ANN001
@@ -173,6 +214,7 @@ def suggest_score(
     bid_text: str,
     data_class: str = "synthetic",
     material_pages: str | None = None,
+    verify_quote=None,  # noqa: ANN001  (str) -> bool；子项引文闸门
 ) -> SubjectiveSuggestion:
     """对一家投标人的一个主观评分项给出建议分。
 
@@ -300,6 +342,18 @@ def suggest_score(
             warnings=warnings + ["无法确定子项得分，降级人工"],
         )
 
+    # 子项证据闸门（2026-10-21）：模型给的子项分必须能在投标文件里找到逐字依据，
+    # 定位不到按 0 计——遏制"整体印象给满分子项"。模型整体没给引文时闸门不执行
+    #（quote_gate_executed=False），由调用方标疑问转人工。
+    gate_executed: bool | None = None
+    if verify_quote is not None and out.sub_scores:
+        gated_total, gate_warnings, gate_executed = apply_quote_gate(
+            out.sub_scores, verify_quote
+        )
+        warnings.extend(gate_warnings)
+        if gate_executed:
+            score = min(gated_total or Decimal(0), max_score)
+
     # 档位：信数字不信标签
     resolved = level_for_score(levels, score)
     label = out.level_label
@@ -320,6 +374,7 @@ def suggest_score(
             artifacts_check=out.artifacts_check,
             sub_scores=out.sub_scores,
             warnings=warnings + ["模型未提供原文证据，无证据不评分"],
+            quote_gate_executed=gate_executed,
         )
 
     return SubjectiveSuggestion(
@@ -332,6 +387,7 @@ def suggest_score(
         artifacts_check=out.artifacts_check,
         sub_scores=out.sub_scores,
         warnings=warnings,
+        quote_gate_executed=gate_executed,
     )
 
 
@@ -356,6 +412,7 @@ def suggest_score_committee(
     data_class: str = "synthetic",
     size: int | None = None,
     material_pages: str | None = None,
+    verify_quote=None,  # noqa: ANN001  (str) -> bool；子项引文闸门
 ) -> tuple[SubjectiveSuggestion, list[dict]]:
     """size 个 AI 评委独立评分，去尾平均聚合。返回 (聚合建议, 评委明细)。
 
@@ -372,7 +429,7 @@ def suggest_score_committee(
     size = size if size is not None else config.committee_size()
     if size <= 1:
         s = suggest_score(gateway, criterion, bid_text, data_class=data_class,
-                          material_pages=material_pages)
+                          material_pages=material_pages, verify_quote=verify_quote)
         committee = [{
             "judge_no": 1,
             "score": str(s.score) if s.score is not None else None,
@@ -389,7 +446,8 @@ def suggest_score_committee(
     with ThreadPoolExecutor(max_workers=size) as pool:
         suggestions = list(pool.map(
             lambda _i: suggest_score(gateway, criterion, bid_text, data_class=data_class,
-                                     material_pages=material_pages),
+                                     material_pages=material_pages,
+                                     verify_quote=verify_quote),
             range(size),
         ))
 
@@ -442,6 +500,7 @@ def suggest_score_committee(
     for s in middle:
         if s.evidence:
             evidence.append(s.evidence[0])
+    gates = [s.quote_gate_executed for s in suggestions if s.quote_gate_executed is not None]
     return SubjectiveSuggestion(
         status="ai_suggested",
         score=final,
@@ -450,6 +509,7 @@ def suggest_score_committee(
         confidence=sum(s.confidence or 0 for s in middle) / len(middle),
         evidence=evidence,
         warnings=warnings,
+        quote_gate_executed=(all(gates) if gates else None),
     ), committee
 
 
@@ -463,12 +523,13 @@ def suggest_score_hierarchical(
     data_class: str = "synthetic",
     k: int | None = None,
     material_pages: str | None = None,
+    verify_quote=None,  # noqa: ANN001  (str) -> bool；子项引文闸门（对全文核验）
 ) -> tuple[SubjectiveSuggestion, list[dict]] | None:
     """分层评审：证据地图定位 K 个不相交证据簇，逐簇深评后聚合。
 
     返回 None = 证据地图不可用（嵌入服务故障），调用方回退单次评审。
-    聚合规则（质量档位型）：取最高分簇为主评；跨簇分差 ≥2 时标"证据分散"疑问。
-    评分语义为"内容在某一章成立即成立"，最高簇即代表该章证据。
+    聚合规则：有原文子项时按"子项跨簇平均"；无子项时按簇相关性加权平均；
+    跨簇分差 ≥2 时标"证据分散"疑问。
     """
     from app.engine.selection import build_evidence_map, split_text_chunks
 
@@ -484,6 +545,7 @@ def suggest_score_hierarchical(
 
     cluster_results: list[dict] = []
     suggestions: list[tuple[dict, SubjectiveSuggestion]] = []
+    sent_by_cluster: dict[int, int] = {}  # id(cluster dict) → 实际送审字符数
     for cl in clusters[: max(1, k)]:
         # 单簇截取 ≤18k 字符（按块边界累加）——保证单次调用上下文可控
         parts: list[str] = []
@@ -498,7 +560,10 @@ def suggest_score_hierarchical(
         s = suggest_score(
             gateway, criterion, cluster_text, data_class=data_class,
             material_pages=material_pages,
+            # 闸门对**全文**核验（子项证据可能落在别的簇里）
+            verify_quote=verify_quote,
         )
+        sent_by_cluster[id(cl)] = len(cluster_text)
         entry = {
             "judge_no": len(suggestions) + 1,
             "cluster_chars": cl["chars"],
@@ -518,15 +583,19 @@ def suggest_score_hierarchical(
             warnings=[f"分层评审：{len(clusters)} 个证据簇均未给出有效分", "llm_failed"],
         ), cluster_results
 
-    # 聚合：有原文子项时按"子项并集"（同名取最高），否则按簇相关性加权平均。
-    # 旧实现取最高分簇——任一章节看起来不错就按该簇计分，系统性抬高并抹平差异。
+    # 聚合：有原文子项时按"子项跨簇平均"（每个子项取给出该子项得分的簇的平均值，
+    # 全部簇都没提到的子项按 0），否则按簇相关性加权平均。
+    # 旧实现①取最高分簇、②子项同名取最高——任一章节看起来不错就按该值计分，
+    # 系统性把分数推向满分并抹平差异（2026-10-21 实证：T4.2 四家全 8/8）。
     scores = [s.score for _cl, s in suggestions if s.score is not None]
     parsed = parse_subitems(criterion.get("description"))
     merged_subs: list[dict] = []
     merged_score: Decimal | None = None
     parse_keys = [name for name, _cap in parsed]
     sub_map: dict[str, Decimal] = {}
+    sub_quotes: dict[str, str] = {}
     if parsed and any(s.sub_scores for _cl, s in suggestions):
+        vals: dict[str, list[Decimal]] = {}
         for _cl, s in suggestions:
             for ss in s.sub_scores or []:
                 if not isinstance(ss, dict):
@@ -536,13 +605,27 @@ def suggest_score_hierarchical(
                     continue
                 cap = next(cap for name, cap in parsed if name == hit)
                 val = _parse_score(ss.get("score")) or Decimal(0)
-                val = min(max(val, Decimal(0)), cap)
-                if hit not in sub_map or val > sub_map[hit]:
-                    sub_map[hit] = val
+                vals.setdefault(hit, []).append(min(max(val, Decimal(0)), cap))
+                q = str(ss.get("quote") or "").strip()
+                if q and hit not in sub_quotes:
+                    sub_quotes[hit] = q
+        for name, _cap in parsed:
+            got = vals.get(name)
+            if got:
+                # 跨簇平均：两个簇都看到了同一子项内容时，取它们的均值
+                # （ROUND_HALF_UP 2 位），而不是像旧实现那样取最高
+                sub_map[name] = (sum(got, Decimal(0)) / Decimal(len(got))).quantize(
+                    Decimal("0.01"), rounding=ROUND_HALF_UP
+                )
     if sub_map:
         merged_score = min(sum(sub_map.values(), Decimal(0)), max_score)
         merged_subs = [
-            {"name": name, "score": str(sub_map.get(name, Decimal(0))), "max": str(cap)}
+            {
+                "name": name,
+                "score": str(sub_map.get(name, Decimal(0))),
+                "max": str(cap),
+                "quote": sub_quotes.get(name, ""),
+            }
             for name, cap in parsed
         ]
         # 证据/理由取"贡献子项最多"的簇
@@ -554,7 +637,7 @@ def suggest_score_hierarchical(
                 and _match_subitem(str(ss.get("name") or ""), parse_keys) is not None
             ),
         )
-        agg_note = f"按子项并集汇总 {merged_score}/{max_score} 分"
+        agg_note = f"按子项跨簇平均汇总 {merged_score}/{max_score} 分"
     else:
         # 相关性加权平均（簇 score 是证据地图的聚合相似度）
         weights = [max(float(cl.get("score") or 0.0), 0.0) for cl, _s in suggestions]
@@ -575,7 +658,8 @@ def suggest_score_hierarchical(
     warnings.insert(0, (
         f"分层证据评审：全文档定位到 {min(len(clusters), k)} 个独立证据簇，"
         f"逐簇评分 {'、'.join(str(x) for x in scores)}，{agg_note}"
-        f"（主依据 {best_cl['chars']} 字符）"
+        f"（主依据 实际送审 {sent_by_cluster.get(id(best_cl), best_cl['chars'])}"
+        f"/簇共 {best_cl['chars']} 字符）"
     ))
     if scores and max(scores) - min(scores) >= 2:
         warnings.append(
@@ -594,6 +678,7 @@ def suggest_score_hierarchical(
         artifacts_check=best.artifacts_check,
         sub_scores=merged_subs or best.sub_scores,
         warnings=warnings,
+        quote_gate_executed=None,  # 分层路径的闸门在各簇 suggest_score 内执行
     )
     committee = [
         {

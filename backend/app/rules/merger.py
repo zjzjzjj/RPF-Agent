@@ -230,6 +230,20 @@ def generate_match_proposal(
     # （2026-10-20 实证：auto_resolve_error=只有模板条目可以弃用）。
     template = [t for t in template if t.get("origin") != "law"]
 
+    # 防御性内存校正：文档条目类别错标（商务→技术，2026-10-21 实证）会让
+    # category 硬过滤直接落空，模板的 commercial 条目因此被整条弃用。
+    # DB 的权威修复在 compile/normalize（apply_category_from_nodes）；
+    # 这里只改内存副本，保证配对不被陈旧类别卡死。
+    if source_doc_id:
+        from app.rules.category_map import in_memory_category_fixes
+
+        fixes = in_memory_category_fixes(document, int(source_doc_id))  # 一次加载，勿逐条查库
+        for e in document:
+            new_cat = fixes.get(e["id"])
+            if new_cat:
+                log.info("合并前内存校正类别：doc %s %s→%s", e["id"], e.get("category"), new_cat)
+                e["category"] = new_cat
+
     result = deterministic_match(template, document)
     pairs: list[dict] = result["pairs"]
     used_doc_ids = {p["document"]["id"] for p in pairs}
