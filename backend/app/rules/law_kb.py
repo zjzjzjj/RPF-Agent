@@ -23,6 +23,10 @@ log = logging.getLogger("bid_eval.law_kb")
 LAW_PREFIX = "法条://"
 
 _cache: dict = {"key": None, "index": None}  # key=(str(path), mtime_ns)
+# 效力元数据由 scripts/clean_law_kb.py 合并进 law_kb.json，此处只读取展示
+_meta_cache: dict = {"key": None, "data": None}
+
+VALID_STATUSES = ("现行有效", "已修订", "已废止", "草案未生效", "尚未施行", "待核实")
 
 
 def _norm(s: str) -> str:
@@ -61,6 +65,44 @@ def load_index() -> dict[str, set[str]]:
     return index
 
 
+def load_metadata() -> dict[str, dict]:
+    """法规名 → 效力元数据（status/category/docNumber/effectiveDate/…）。
+
+    元数据已由 `scripts/clean_law_kb.py` 合并进 law_kb.json 的每条目；未标注的
+    返回 `status="待核实"`。与 `load_index` 同一文件、同一 (path, mtime) 缓存策略。
+    """
+    path = config.law_kb_path()
+    try:
+        key = (str(path), path.stat().st_mtime_ns)
+    except OSError:
+        return {}
+    if _meta_cache["key"] == key and _meta_cache["data"] is not None:
+        return _meta_cache["data"]
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    out: dict[str, dict] = {}
+    for law in data if isinstance(data, list) else []:
+        # 用**原始 lawName** 作键（调用方通常拿 source_node_id 里的原始法规名来查，
+        # 与 node_exists 的 NFKC 归一口径不同，故这里不归一）
+        name = str(law.get("lawName") or "").strip()
+        if not name:
+            continue
+        out[name] = {
+            "status": law.get("status") or "待核实",
+            "category": law.get("category") or "",
+            "issuer": law.get("issuer") or "",
+            "docNumber": law.get("docNumber") or "",
+            "effectiveDate": law.get("effectiveDate") or "",
+            "repealedDate": law.get("repealedDate") or "",
+            "note": law.get("note") or "",
+        }
+    _meta_cache["key"] = key
+    _meta_cache["data"] = out
+    return out
+
+
 def node_exists(node_id: str) -> bool:
     """`法条://法规名/条号` 是否在知识库中命中。非该前缀一律 False。"""
     if not node_id or not node_id.startswith(LAW_PREFIX):
@@ -80,3 +122,5 @@ def reset_cache() -> None:
     """测试用：强制下次重新读盘。"""
     _cache["key"] = None
     _cache["index"] = None
+    _meta_cache["key"] = None
+    _meta_cache["data"] = None

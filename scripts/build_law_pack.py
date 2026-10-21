@@ -88,6 +88,16 @@ def _node_exists(index: dict[str, dict], node_id: str) -> bool:
     return article_no in index.get(law_name, {})
 
 
+def _kb_status_index(kb_doc: list) -> dict[str, str]:
+    """法名 → 效力状态（由 clean_law_kb.py 合并在 law_kb.json 每条目上）。"""
+    out: dict[str, str] = {}
+    for law in kb_doc if isinstance(kb_doc, list) else []:
+        name = str(law.get("lawName") or "").strip()
+        if name:
+            out[name] = str(law.get("status") or "待核实")
+    return out
+
+
 def _sorted_criteria(criteria: list[dict]) -> list[dict]:
     def key(raw: dict):
         m = __import__("re").match(r"^([A-Z]+)-(\d+)$", str(raw.get("code") or ""))
@@ -166,6 +176,32 @@ def main() -> int:
         for n in repo_missing:
             print(f"  - {n}", file=sys.stderr)
         return 2
+
+    # 1b. 效力校验：被引用法规不得是已废止/草案未生效/已修订（有效状态白名单）。
+    # 「尚未施行」允许（新规已公布、按施行日期适用）；「待核实」仅告警。
+    status_index = _kb_status_index(repo_kb_doc)
+    bad_status: list[tuple[str, str]] = []
+    unknown_status: list[str] = []
+    for node in dict.fromkeys(law_nodes):
+        law_name, _ = _split_node(node)
+        st = status_index.get(law_name, "待核实")
+        if st in {"已废止", "草案未生效", "已修订"}:
+            bad_status.append((law_name, st))
+        elif st == "待核实":
+            unknown_status.append(law_name)
+    if bad_status:
+        print("引用了已失效/草案法规（零写入）：", file=sys.stderr)
+        for n, st in bad_status:
+            print(f"  - {n}（{st}）", file=sys.stderr)
+        return 2
+    if unknown_status:
+        print(
+            f"注意：{len(unknown_status)} 部被引用法规效力『待核实』，"
+            "建议在 data/law_metadata.json 补全后重跑：",
+            file=sys.stderr,
+        )
+        for n in dict.fromkeys(unknown_status):
+            print(f"  - {n}", file=sys.stderr)
 
     # ------------------------------------------------------------------
     # 2. 组装三件目标内容（字段序固定；无时间戳，幂等靠 artifact_sha256_16）
