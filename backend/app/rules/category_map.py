@@ -160,14 +160,22 @@ def plan_category_fixes(
     return out
 
 
+_AUTO_REASON_PREFIX = "自动校正"
+
+
 def manual_edited_criterion_ids(package_id: int) -> set[int]:
-    """被人工（actor != "auto"）改动过的评分项——自动校正不得触碰。"""
+    """被人工改动过的评分项——自动校正不得触碰。
+
+    自动校正自身的留痕（reason 以"自动校正"开头）不算人工改动：否则在
+    confirm 时用真实用户名调用 normalize，下一次就会把自己的修正当成人工决定。
+    """
     with session_scope() as s:
         rows = s.execute(
             select(ReviewRecord.subject_id).where(
                 ReviewRecord.subject_type == "criterion",
                 ReviewRecord.actor != "auto",
                 ReviewRecord.action.in_(("edit", "override", "accept", "confirm")),
+                ~ReviewRecord.reason.startswith(_AUTO_REASON_PREFIX),
             )
         ).all()
     return {int(r[0]) for r in rows if str(r[0]).isdigit()}
