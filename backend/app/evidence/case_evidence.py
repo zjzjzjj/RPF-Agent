@@ -550,7 +550,10 @@ def material_ocr_targets(
             continue
         if image_ratios.get(p.page_no, 0.0) < 0.10:
             continue
-        if _RE_MATERIAL_HEADING.search(text):
+        # 证据段内"文本极少 + 有图"的页都可能是扫描材料：短页（<300 字）或
+        # 带材料标题的页都纳入。仅靠标题会漏掉"扫描件没标题"的合同/发票页
+        # （2026-10-21 doc22 实证：合同页 43 字无标题 → 未救援 → 合同判不可读）。
+        if len(text) < 300 or _RE_MATERIAL_HEADING.search(text):
             out.append(p.page_no)
     return out
 
