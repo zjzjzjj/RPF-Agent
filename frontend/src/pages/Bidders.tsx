@@ -86,14 +86,19 @@ function BidderFileCell({
   });
 
   // 重新解析（OCR 引擎修复后重跑扫描件；幂等端点，不重跑评分）
+  // 逐文档记录进行中的 id：单值 isPending 会让所有行的图标一起转圈
+  const [reparseDocId, setReparseDocId] = useState<number | null>(null);
   const reparse = useMutation({
-    mutationFn: (documentId: number) =>
-      api.post<{ job_id: number }>(`/documents/${documentId}/reparse`),
+    mutationFn: (documentId: number) => {
+      setReparseDocId(documentId);
+      return api.post<{ job_id: number }>(`/documents/${documentId}/reparse`);
+    },
     onSuccess: (r) => {
       setJobId(r.job_id);
       message.info("已提交重新解析，扫描件内容将走 OCR");
     },
     onError: (e: Error) => message.error(e.message || "重新解析失败"),
+    onSettled: () => setReparseDocId(null),
   });
 
   // 终态提示 + 刷新（与 ScoreResults 的终态 invalidate 同款）
@@ -109,9 +114,15 @@ function BidderFileCell({
   }, [job?.status]); // eslint-disable-line react-hooks/exhaustive-deps
 
   return (
-    <Space direction="vertical" size={2}>
+    <Space direction="vertical" size={2} style={{ width: "100%" }}>
       {docs.map((d) => (
-        <Space key={d.id} size={4} align="center">
+        // 列宽 260：文件名 Tag 可收缩省略，图标按钮固定宽度不参与挤压
+        //（旧实现用 inline-flex + 文字链接按钮，260 宽装不下 → 按钮被压扁、
+        //  hover 时 antd 给链接底色，看起来"字消失"）
+        <div
+          key={d.id}
+          style={{ display: "flex", alignItems: "center", gap: 2, minWidth: 0 }}
+        >
           <Tag
             color={
               d.parse_status === "parsed"
@@ -124,12 +135,14 @@ function BidderFileCell({
             }
             title={`${d.original_filename}（${d.parse_status}，${d.page_count ?? "?"} 页）`}
             style={{
-              maxWidth: 236,
+              flex: "0 1 auto",
+              minWidth: 0,
+              maxWidth: 208,
+              marginRight: 0,
               overflow: "hidden",
               textOverflow: "ellipsis",
               whiteSpace: "nowrap",
               display: "inline-block",
-              verticalAlign: "middle",
             }}
           >
             {d.original_filename}（{d.parse_status}，{d.page_count ?? "?"} 页）
@@ -137,14 +150,15 @@ function BidderFileCell({
           <Tooltip title="重新解析：OCR 引擎修复后重跑该文档（扫描件证书/截图/合同才会进文本）。不会重跑评分，需新发起评分。">
             <Button
               size="small"
-              type="link"
-              loading={reparse.isPending}
+              type="text"
+              icon={<ReloadOutlined />}
+              aria-label="重新解析"
+              style={{ flexShrink: 0 }}
+              loading={reparse.isPending && reparseDocId === d.id}
               onClick={() => reparse.mutate(d.id)}
-            >
-              重新解析
-            </Button>
+            />
           </Tooltip>
-        </Space>
+        </div>
       ))}
       {job && (
         <JobProgress
