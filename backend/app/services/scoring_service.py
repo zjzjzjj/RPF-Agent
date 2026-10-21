@@ -461,11 +461,16 @@ def execute_run(
             ]
             material_hints[bid_id] = "；".join(hint_parts) if hint_parts else "（未见证明材料相关内容）"
 
+    # 每家投标人归一化全文：count 引文核验（回标书定位）与主观分引文闸门共用一份，
+    # 只归一化一次（旧行为各处重复 normalize_no_ws，浪费且口径易漂移）。
+    bid_norm_by_bidder: dict[int, str] = {
+        bid_id: _nnw(text_by_bidder.get(bid_id) or "") for bid_id in bidder_ids
+    }
+
     # 招标文件原文页（归一化）：恢复评分项的【证明材料】要求段
     tender_pages: list[tuple[int, str]] = []
     with session_scope() as s:
         from app.db.models import DocumentPage
-        from app.parsing.normalize import normalize_no_ws as _nnw
 
         tender_doc = s.execute(
             select(Document.id).where(
@@ -539,6 +544,7 @@ def execute_run(
                     and any(k in str(c.get("name") or "") for k in ("业绩", "案例", "经验"))
                 )
             )
+            case_stats: dict = {}
             if (
                 config.auto_mode()
                 and gateway is not None
@@ -549,6 +555,8 @@ def execute_run(
                     gateway, c, requirement_text, artifacts_list,
                     material_hints.get(bid_id),
                     bid_pages.get(bid_id) or [], data_class,
+                    bid_norm=bid_norm_by_bidder.get(bid_id),
+                    stats_out=case_stats,
                 )
                 if cases:
                     c_scoring = {**c_scoring, "verified_cases": cases}
@@ -559,6 +567,26 @@ def execute_run(
             # conflict（证明材料链缺失/部分缺失）分数照算但保留疑问态。
             unresolved = bool(result.unresolved)
             doubt = result.conflict or unresolved
+            # 审计留痕：把逐案例核验结果 + 候选页统计落 ai_raw_json，否则判"照抄/
+            # 未在标书定位"后无法复盘是抽取错还是闸门误杀（2026-10-21 实证为空）。
+            audit = None
+            _vc = c_scoring.get("verified_cases")
+            if _vc:
+                audit = {
+                    "verified_cases": [
+                        {
+                            k: (str(v)[:160] if isinstance(v, str) else v)
+                            for k, v in cs.items()
+                            if k in (
+                                "name", "person", "role", "quote", "sanitized",
+                                "match_tier", "page_hint", "amount_yuan",
+                                "contract", "invoice", "acceptance", "duplicate",
+                            )
+                        }
+                        for cs in _vc
+                    ],
+                    "meta": case_stats,
+                }
             _upsert_score(
                 run_id, bid_id, c,
                 machine_score=result.score,
@@ -568,6 +596,7 @@ def execute_run(
                 warnings_json=([{"message": result.detail, "unresolved": result.unresolved}]
                                if result.unresolved else [{"message": result.detail}]),
                 doubt=doubt,
+                ai_raw_json=audit,
             )
             stats["objective"] += 1
 
@@ -634,12 +663,10 @@ def execute_run(
         subj_done = 0
         subj_total = len(subjective_items) * len(bidder_ids)
         # 子项引文闸门的核验器：引文必须真实存在于该投标人的文档文本中
-        # （空白不敏感；<12 字不算引文）。
-        from app.parsing.normalize import normalize_no_ws as _nnw
-
+        # （空白不敏感；<12 字不算引文）。复用上面预计算的 bid_norm_by_bidder。
         verifiers: dict[int, object] = {}
         for bid_id in bidder_ids:
-            norm_text = _nnw(text_by_bidder.get(bid_id) or "")
+            norm_text = bid_norm_by_bidder.get(bid_id) or ""
 
             def _verify(quote: str, _norm=norm_text) -> bool:
                 q = _nnw(quote)
@@ -734,16 +761,100 @@ def execute_run(
 
 _CASE_BATCH_CHARS = 15000  # 单次核验调用的上下文预算
 _CASE_MAX_BATCHES = 4  # 多段调用上限（超出按锚点页优先截断并记警告）
+_ECHO_NGRAM_W = 12  # 判"要求复述"的 n-gram 窗口（与 MIN_QUOTE_CHARS 同阶）
+_ECHO_SHADOW_FRACTION = 0.6  # 引文被判"照抄要求"的覆盖率阈值
+_ECHO_PAGE_FRACTION = 0.4  # 整页被判"要求复述页"的覆盖率阈值
+_ECHO_PAGE_SHORT_CHARS = 300  # 短页另用"最长连续 echo 段"判活的字符上限
+_ECHO_PAGE_MIN_RUN = 60  # 短页最长连续 echo 段阈值
+
+
+def _nnw(text: str) -> str:
+    from app.parsing.normalize import normalize_no_ws
+
+    return normalize_no_ws(text)
+
+
+def _ngram_fraction(text_n: str, ref_n: str, w: int = _ECHO_NGRAM_W) -> float:
+    """`text_n` 里有多大比例的 w-gram 也出现在 `ref_n` 中。
+
+    用于把"引文是不是要求文本的影子"从**包含方向**（旧实现 `quote in req or
+    req[:40] in quote`，会误杀"要求头 + 真证据尾"的合法引文）改为**覆盖率**：
+    纯照抄要求/整条规则复述 → 覆盖率≈1；真业绩表引文 → ≈0；要求头+证据尾 → 居中。
+    """
+    if not ref_n:
+        return 0.0
+    if len(text_n) < w:
+        return 1.0 if text_n in ref_n else 0.0
+    ref_grams = {ref_n[i:i + w] for i in range(len(ref_n) - w + 1)}
+    total = len(text_n) - w + 1
+    hit = sum(1 for i in range(total) if text_n[i:i + w] in ref_grams)
+    return hit / total
+
+
+def _has_long_echo_run(page_n: str, ref_n: str, run_len: int = _ECHO_PAGE_MIN_RUN) -> bool:
+    """短页里是否存在 ≥run_len 的连续片段完全落在 `ref_n` 中（整段抄要求）。"""
+    if not ref_n or len(page_n) < run_len:
+        return False
+    return any(page_n[i:i + run_len] in ref_n for i in range(len(page_n) - run_len + 1))
+
+
+def _is_echo_page(page_text: str, echo_n: str) -> bool:
+    """整页是"要求复述页"（投标人把评分规则抄进标书的索引/响应对照表）→ 应剔除。
+
+    判据①（主力）：页面内嵌 ≥60 字**连续**的要求复述段。真实标书里「详细评审索引表 /
+    响应对照表」逐字抄评分规则，但同页还含其它评分项、封面噪声——整页覆盖率反而低
+    （2026-10-21 实证：b13 第 95 页覆盖率仅 0.20，但内嵌 68 字连续规则段；真业绩表
+    第 126 页连续段仅 10 字）。故用"连续段"而非"覆盖率"判活。
+    判据②（兜底）：短页（≤300 字）且整页几乎都是要求（覆盖率高）——纯要求碎片页。
+    真业绩表页即便带一行【证明材料】头（≈40 字 < 60）→ 保留。
+    """
+    page_n = _nnw(page_text)
+    if not page_n or not echo_n:
+        return False
+    if _has_long_echo_run(page_n, echo_n, _ECHO_PAGE_MIN_RUN):
+        return True
+    if len(page_n) <= _ECHO_PAGE_SHORT_CHARS and _ngram_fraction(page_n, echo_n) >= _ECHO_PAGE_FRACTION:
+        return True
+    return False
+
+
+def _locate_in_bid(quote_n: str, bid_norm: str) -> str | None:
+    """引文回投标文件定位：精确 → 前缀梯（含去逗号数字变体）。返回命中层级或 None。
+
+    与主观分闸门同一语义（引文必须真实存在于标书）。OCR 表格串行/货币符号差异会让
+    逐字匹配失败，故退 60/40/25/15 前缀梯兜住改写；15 字前缀偶然伪造的概率极低。
+    """
+    if not quote_n or not bid_norm:
+        return None
+    variants = [quote_n]
+    stripped = quote_n.replace(",", "").replace("，", "")
+    if stripped != quote_n:
+        variants.append(stripped)
+    for v in variants:
+        if v in bid_norm:
+            return "exact"
+    for L in config.PREFIX_FALLBACK_LENGTHS:
+        for v in variants:
+            if len(v) >= L and v[:L] in bid_norm:
+                return f"prefix{L}"
+    return None
 
 
 def _case_candidate_pages(
     pages: list[tuple[int, str, str]],
+    echo_n: str | None = None,
+    stats_out: dict | None = None,
 ) -> list[list[tuple[int, str]]]:
-    """业绩/人员案例核验的候选页 → 按预算切批。
+    """业绩/人员案例核验的候选页 → 剔除"要求复述页" → 按预算切批。
 
     旧实现把 `facts.text`（全部文档拼接）关键词选段后只送 15k 字符——几百页
     标书里案例页根本进不了上下文，团队成员经验项四家全 0（2026-10-21 实证）。
     这里按"锚点词命中页 ±1 页"圈定候选，再按预算切批多段调用。
+
+    `echo_n`（归一化的 要求原文 source_quote + required_evidence）非空时，逐页
+    剔除"要求复述页"：投标人常把评分规则整段抄进标书的索引/响应对照表页，模型
+    会被它带偏、拿要求文本当引文（2026-10-21 实证：b13 第 95 页复述规则、真业绩
+    在第 126 页，两页同送 → 引文全被判照抄 → 未定分）。剔除后模型只看真证据页。
     """
     import re as _re
 
@@ -753,6 +864,16 @@ def _case_candidate_pages(
     for i in hits:
         idx.update({i - 1, i, i + 1})
     ordered = sorted(i for i in idx if 0 <= i < len(pages))
+    n_candidates = len(ordered)
+    dropped_nos: list[int] = []
+    if echo_n:
+        kept = []
+        for i in ordered:
+            if _is_echo_page(pages[i][1] or "", echo_n):
+                dropped_nos.append(pages[i][0])
+            else:
+                kept.append(i)
+        ordered = kept
     batches: list[list[tuple[int, str]]] = []
     cur: list[tuple[int, str]] = []
     cur_chars = 0
@@ -768,6 +889,11 @@ def _case_candidate_pages(
     if cur and len(batches) < _CASE_MAX_BATCHES:
         batches.append(cur)
     covered = sum(len(b) for b in batches)
+    if stats_out is not None:
+        stats_out["pages_candidates"] = n_candidates
+        stats_out["pages_sent"] = covered
+        stats_out["pages_dropped_echo"] = dropped_nos
+        stats_out["batches_sent"] = len(batches)
     if len(batches) >= _CASE_MAX_BATCHES and covered < len(ordered):
         log.warning(
             "案例核验候选页超出 %d 批上限，已按锚点页优先截断（候选 %d 页，送审 %d 页）",
@@ -784,12 +910,17 @@ def _llm_verify_cases(
     material_pages: str | None,
     pages: list[tuple[int, str, str]],
     data_class: str,
+    bid_norm: str | None = None,
+    stats_out: dict | None = None,
 ) -> list[dict] | None:
     """带证明材料要求的计数项：LLM 逐案例列出并核对材料齐全性。
 
     返回案例清单（含 contract/invoice/acceptance 布尔与 sanitized 原因码），
     无候选页或全部批次失败返回 None（调用方退回文本级校验）。
     余额/配额类错误向上抛（fail-fast）。
+
+    `bid_norm`（该投标人归一化全文）非空时，`_sanitize_case` 会把引文回标书
+    定位（与主观分闸门同一语义）；`echo_n` 用于剔除要求复述页 + 判照抄。
     """
     from pydantic import BaseModel, Field
 
@@ -798,7 +929,10 @@ def _llm_verify_cases(
 
     if not artifacts_list and not (requirement_text or "").strip():
         return None
-    batches = _case_candidate_pages(pages)
+    # 要求复述文本 = 完整评分规则（source_quote）+【证明材料】块：索引表复述的是
+    # 规则本身，必须含 source_quote 才能识别（只比 required_evidence 会漏掉大部分）。
+    echo_n = _nnw((c.get("source_quote") or "") + (requirement_text or ""))
+    batches = _case_candidate_pages(pages, echo_n=echo_n, stats_out=stats_out)
     if not batches:
         return None
 
@@ -834,7 +968,7 @@ def _llm_verify_cases(
         for x in out.cases:
             if not isinstance(x, dict):
                 continue
-            case = _sanitize_case(x, requirement_text)
+            case = _sanitize_case(x, requirement_text, bid_norm=bid_norm, echo_n=echo_n)
             key = (
                 str(case.get("name") or "").strip().lower(),
                 str(case.get("person") or "").strip(),
@@ -849,30 +983,52 @@ def _llm_verify_cases(
     return merged
 
 
-def _sanitize_case(case: dict, requirement_text: str) -> dict:
+def _sanitize_case(
+    case: dict,
+    requirement_text: str,
+    bid_norm: str | None = None,
+    echo_n: str | None = None,
+) -> dict:
     """核验结果代码层校验：quote 是要求文本影子的案例，材料判定不可信 → 全部降 false。
 
     8B 模型的作弊模式（2026-10-15 实证）：拿"须提供合同复印件、发票复印件…"这句
-    **要求文本**当 quote，把四个业绩案例全判材料齐全。判据：quote 与要求原文
-    互相包含（≥12 字重合），或 quote 过短且无可核验实体 → 三件套一律 false。
+    **要求文本**当 quote，把四个业绩案例全判材料齐全。
 
-    `sanitized` 原因码：ok / requirement_shadow / quote_too_short——
-    score_count 据此区分"合法 0 分"与"计数无依据"。比对必须用**要求原文**
-    （required_artifacts_raw），不能用解析后的短清单，否则短清单会整段命中
-    任何含"合同复印件"的合法引文。
+    判据（2026-10-21 重做）：
+    - `requirement_shadow`：引文的 n-gram 覆盖率在要求复述文本（source_quote +
+      required_evidence）中 ≥ `_ECHO_SHADOW_FRACTION`。用覆盖率取代旧的包含方向判据，
+      同时正确处理三种形状——纯要求块 ⊂ 引文、整条规则 ⊃ 引文（索引表复述）、
+      要求头 + 真证据尾（旧 `req[:40] in quote` 会误杀最后这种，现放行）。
+    - `quote_not_in_bid`：给了 `bid_norm` 且引文（精确/前缀梯）回不到标书 → 判伪造。
+      与主观分引文闸门同一语义；失败态是"未定分转人工"（安全态）而非错分。
+    - `bid_norm is None`：无法回标书核验时维持旧的宽松语义（不误杀未接线的调用方）。
+    - `quote_too_short`：过短且无金额/年份等实体。
+
+    非 `ok` 一律把 contract/invoice/acceptance 三件套降 false。
+    `sanitized` 原因码：ok / requirement_shadow / quote_not_in_bid / quote_too_short。
     """
     case = dict(case)
     quote = str(case.get("quote") or "").strip()
-    raw_n = (requirement_text or "").replace(" ", "")
-    quote_n = quote.replace(" ", "")
+    quote_n = _nnw(quote)
+    if echo_n is None:
+        echo_n = _nnw(requirement_text or "")
     cheat = True
     reason = "quote_too_short"
-    if len(quote_n) >= 12:
-        if raw_n and (quote_n in raw_n or raw_n[:40] in quote_n):
-            reason = "requirement_shadow"
+    tier: str | None = None
+    if len(quote_n) >= config.MIN_QUOTE_CHARS:
+        frac = _ngram_fraction(quote_n, echo_n) if echo_n else 0.0
+        if echo_n and frac >= _ECHO_SHADOW_FRACTION:
+            reason = "requirement_shadow"  # 照抄要求/整条规则复述
+        elif bid_norm is not None:
+            tier = _locate_in_bid(quote_n, bid_norm)
+            if tier is not None:
+                cheat = False
+                reason = "ok"  # 引文真实存在于标书 = 真证据
+            else:
+                reason = "quote_not_in_bid"
         else:
             cheat = False
-            reason = "ok"
+            reason = "ok"  # 旧行为：无标书可核验时信任模型
     elif bool(re.search(r"\d", quote)):
         # 短引文但含金额/年份等实体（如"2024年6月"）仍可信
         cheat = False
@@ -881,6 +1037,8 @@ def _sanitize_case(case: dict, requirement_text: str) -> dict:
         for key in ("contract", "invoice", "acceptance"):
             case[key] = False
     case["sanitized"] = reason
+    if tier is not None:
+        case["match_tier"] = tier
     return case
 
 
@@ -946,6 +1104,7 @@ def _upsert_score(
     final_score: Decimal | None = None,
     warnings_json: list | None = None,
     doubt: bool = False,
+    ai_raw_json: dict | None = None,
 ) -> ScoreRecord:
     # 全自动模式：复核态收敛为终态；但 AI 存疑项（need_human）与人工核验项
     # （doubt，如 count 的证明材料链冲突）保留 conflict_flagged 进疑问清单——
@@ -994,6 +1153,8 @@ def _upsert_score(
             row.final_score = None  # 机器结果变化时清掉旧 final（人工结论除外）
         if warnings_json:
             row.warnings_json = warnings_json
+        if ai_raw_json is not None:
+            row.ai_raw_json = ai_raw_json
         s.add(row)
         s.flush()
         s.expunge(row)

@@ -530,8 +530,14 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
         if not clean_cases:
             unresolved = "cases_unverified"
             conflict = True
+            from collections import Counter
+
+            _reasons = Counter(
+                str(c.get("sanitized") or "ok") for c in cases if str(c.get("sanitized") or "ok") != "ok"
+            )
+            _breakdown = "、".join(f"{k}={v}" for k, v in _reasons.items()) or "未知"
             detail += (
-                f"；{len(cases)} 个案例的引文均未通过核验（疑似照抄要求文本），"
+                f"；{len(cases)} 个案例的引文均未通过核验（{_breakdown}），"
                 "计数无依据，转人工"
             )
         else:
