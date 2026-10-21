@@ -28,6 +28,10 @@ _CACHE_LIMIT = 512
 _BUDGET_LOCK = threading.Lock()
 _BUDGET_STATE: dict[str, object] = {"day": "", "calls": 0}
 
+# 涉密数据发往外部端点的一次性告警去重（provider/host）；跨实例共享
+_REMOTE_CONFIDENTIAL_WARNED_LOCK = threading.Lock()
+_REMOTE_CONFIDENTIAL_WARNED: set[str] = set()
+
 
 _VALID_ESCAPES = frozenset('"\\/bfnrt')
 _HEX = frozenset("0123456789abcdefABCDEF")
@@ -230,6 +234,21 @@ class Gateway:
             host = (self.provider.host or "").lower()
             allowed = [h.lower() for h in config.local_endpoint_hosts()]
             if host not in allowed and not _is_private_host(host):
+                if config.allow_remote_confidential():
+                    # 部署方显式接受"招标/投标原文会离开本机"（文件只有本地端点
+                    # 可读时唯一的云端方案）。每个端点只告警一次，避免刷屏；
+                    # 日志不含任何文件内容。
+                    key = f"{self.provider.name}/{host}"
+                    with _REMOTE_CONFIDENTIAL_WARNED_LOCK:
+                        first = key not in _REMOTE_CONFIDENTIAL_WARNED
+                        _REMOTE_CONFIDENTIAL_WARNED.add(key)
+                    if first:
+                        log.warning(
+                            "涉密数据将发往非本地端点 %s（provider=%s）："
+                            "已通过 BID_EVAL_ALLOW_REMOTE_CONFIDENTIAL 显式放开",
+                            host, self.provider.name,
+                        )
+                    return
                 raise DataClassDenied(
                     f"涉密数据（confidential）不允许发往 {host or '未知端点'}；"
                     f"仅允许本地端点：{allowed}",

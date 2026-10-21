@@ -91,6 +91,33 @@ export BID_EVAL_LLM_API_KEY=sk-...
 export BID_EVAL_LLM_MODEL=deepseek-chat
 ```
 
+### 切到硅基流动 / GLM-5.3-Flash（推理模型）
+
+```bash
+export BID_EVAL_LLM_PROVIDER=siliconflow
+export BID_EVAL_LLM_BASE_URL=https://api.siliconflow.cn/v1
+export BID_EVAL_LLM_API_KEY=sk-...
+export BID_EVAL_LLM_MODEL=zai-org/GLM-5.3-Flash
+export BID_EVAL_LLM_THINKING=disabled            # auto|disabled|enabled
+export BID_EVAL_LLM_DEFAULT_MAX_TOKENS=8192      # 推理模型的思考也算输出预算
+export BID_EVAL_LLM_MAX_TOKENS=20000             # 规则抽取
+export BID_EVAL_LLM_CONTEXT_TOKENS=65536
+```
+
+要点：
+
+- **推理模型的思考计入 `max_tokens`**：预算太小会出现 `finish_reason=length` 且
+  `content` 为空。系统默认给每次调用兜底 `BID_EVAL_LLM_DEFAULT_MAX_TOKENS`，
+  并在"空输出 + length"时抛出可操作错误。
+- `BID_EVAL_LLM_DISABLE_THINKING=1` 走的是 **vLLM 专用** `chat_template_kwargs`，
+  云端不认；云端请用 `BID_EVAL_LLM_THINKING=disabled`（`thinking:{"type":"disabled"}`）。
+- **真实招标/投标文件属 `confidential`，默认只准本地端点**。要让云端模型处理这些
+  文件，必须显式设置 `BID_EVAL_ALLOW_REMOTE_CONFIDENTIAL=1`（默认 0）；开启后网关
+  会按端点记一次性告警，`GET /api/health` 的 `allow_remote_confidential` 字段
+  可随时确认当前状态。这等于接受"文件原文会离开本机发往第三方 API"。
+- 切换后 `GET /api/health` 应显示 `llm_model` 为新模型；前端模型下拉来自
+  `BID_EVAL_MODEL_PRESETS`（默认预设已含 GLM-5.3-Flash）。
+
 ## 使用流程
 
 **规则有两条一等路径**：有招标文件时上传后自动匹配更新；没有招标文件时用内置默认规则直接评分。

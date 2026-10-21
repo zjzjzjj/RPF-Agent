@@ -71,6 +71,25 @@ class OpenAICompatProvider:
         self.host = (urlparse(url).hostname or "").lower()
         self._client = OpenAI(api_key=key, base_url=url, timeout=timeout or config.llm_timeout_s())
 
+    @staticmethod
+    def _extra_body() -> dict:
+        """服务商扩展参数：思考开关（云端通用）+ vLLM 专用开关 + seed。
+
+        - `thinking: {"type": "disabled"}`：硅基流动等云端对推理模型（GLM-5.3-Flash）
+          的通用写法，实测有效（2026-10-21）；`enable_thinking`/
+          `chat_template_kwargs` 在云端**无效**。
+        - `chat_template_kwargs` 只对本地 vLLM 有用，保留以兼容既有部署。
+        """
+        extra: dict = {}
+        thinking = config.llm_thinking()
+        if thinking in ("disabled", "enabled"):
+            extra["thinking"] = {"type": thinking}
+        if config.llm_disable_thinking():
+            extra["chat_template_kwargs"] = {"enable_thinking": False}
+        if config.llm_seed() is not None:
+            extra["seed"] = config.llm_seed()
+        return extra
+
     def complete(
         self,
         system: str,
@@ -80,11 +99,10 @@ class OpenAICompatProvider:
         max_tokens: int | None = None,
     ) -> LLMResult:
         started = time.time()
-        extra_body: dict = {}
-        if config.llm_disable_thinking():
-            extra_body["chat_template_kwargs"] = {"enable_thinking": False}
-        if config.llm_seed() is not None:
-            extra_body["seed"] = config.llm_seed()
+        extra_body = self._extra_body()
+        # 推理模型的思考也算在 max_tokens 里：不给预算会被思考耗尽 → content 为空
+        if max_tokens is None:
+            max_tokens = config.llm_default_max_tokens()
         attempts = 2 if config.llm_transient_retries() else 1
         result: LLMResult | None = None
         last_error: Exception | None = None
@@ -106,6 +124,14 @@ class OpenAICompatProvider:
                 choice = resp.choices[0] if resp.choices else None
                 text = (choice.message.content if choice and choice.message else "") or ""
                 text = _THINK_RE.sub("", text).strip()
+                if not text and getattr(choice, "finish_reason", None) == "length":
+                    # 推理模型把输出预算耗在思考上：content 为空但 token 已用尽。
+                    # 直接说清楚，避免上层报"找不到 JSON（共 0 字符）"这种误导信息。
+                    raise LLMError(
+                        "模型输出被截断：推理过程耗尽了 max_tokens（content 为空）；"
+                        "请调大 BID_EVAL_LLM_DEFAULT_MAX_TOKENS / BID_EVAL_LLM_MAX_TOKENS，"
+                        "或设置 BID_EVAL_LLM_THINKING=disabled"
+                    )
                 usage = getattr(resp, "usage", None)
                 result = LLMResult(
                     text=text,

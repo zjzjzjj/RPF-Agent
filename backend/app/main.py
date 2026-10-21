@@ -65,6 +65,7 @@ def create_app() -> FastAPI:
             "db": "ok",
             "llm_provider": config.llm_provider(),
             "llm_model": config.llm_model(),
+            "allow_remote_confidential": config.allow_remote_confidential(),
             "prompt_version": config.llm_prompt_version(),
         }
 

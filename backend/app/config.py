@@ -218,11 +218,33 @@ def llm_disable_thinking() -> bool:
     """关闭 Qwen3 等推理模型的 <think> 输出（经 chat_template_kwargs 下发）。
 
     本地 vLLM 部署 Qwen3 默认思考模式：回答前生成大段推理，拖慢且曾把长题
-    顶到 max_tokens 截断。硅基流动等云端端点不识别该参数——默认关。
+    顶到 max_tokens 截断。**该参数只对 vLLM 有效**——云端端点不识别
+    （2026-10-21 实测：硅基流动不认），云端请用 `llm_thinking()`。
     """
     return os.environ.get("BID_EVAL_LLM_DISABLE_THINKING", "0").strip().lower() in (
         "1", "true", "yes", "on",
     )
+
+
+def llm_thinking() -> str:
+    """推理模型的思考开关：auto（默认，不下发）| disabled | enabled。
+
+    部分模型（如硅基流动的 zai-org/GLM-5.3-Flash）是推理模型：先输出
+    reasoning_content 再给 content，思考会吃掉 max_tokens，预算不足时
+    **content 直接为空**。`thinking: {"type": "disabled"}` 是该服务商支持的
+    通用写法（实测有效），与 vLLM 专用的 chat_template_kwargs 互不干扰。
+    """
+    raw = os.environ.get("BID_EVAL_LLM_THINKING", "auto").strip().lower()
+    return raw if raw in ("auto", "disabled", "enabled") else "auto"
+
+
+def llm_default_max_tokens() -> int:
+    """调用方未显式指定 max_tokens 时的输出预算（默认 8192）。
+
+    推理模型的思考也算在 max_tokens 里：不给预算会被思考耗尽 → content 为空
+    （2026-10-21 实测 GLM-5.3-Flash：max_tokens=16 时 content 为空）。
+    """
+    return max(256, int(os.environ.get("BID_EVAL_LLM_DEFAULT_MAX_TOKENS", 8192)))
 
 
 def llm_seed() -> int | None:
@@ -356,6 +378,18 @@ def local_endpoint_hosts() -> list[str]:
     return [h.strip() for h in raw.split(",") if h.strip()]
 
 
+def allow_remote_confidential() -> bool:
+    """显式放开"涉密数据只准本地端点"的硬约束（默认关）。
+
+    开启后 confidential 数据可以发往任意外部模型端点（例如硅基流动），
+    网关会记一次性告警。这是**合规决策**而不是技术开关：默认必须关，
+    由部署方在明确接受"招标/投标原文会离开本机"之后才置 1。
+    """
+    return os.environ.get("BID_EVAL_ALLOW_REMOTE_CONFIDENTIAL", "0").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 # ---------------------------------------------------------------------------
 # 模型目录（硅基流动，OpenAI 兼容）
 # ---------------------------------------------------------------------------
@@ -365,6 +399,12 @@ DEFAULT_MODEL_PRESETS: list[dict] = [
         "label": "DeepSeek V4 Flash",
         "family": "DeepSeek",
         "note": "均衡之选，JSON 抽取稳定（默认）",
+    },
+    {
+        "id": "zai-org/GLM-5.3-Flash",
+        "label": "GLM 5.3 Flash",
+        "family": "GLM",
+        "note": "推理模型，中文理解强（评标默认）",
     },
     {
         "id": "zai-org/GLM-5.2",
