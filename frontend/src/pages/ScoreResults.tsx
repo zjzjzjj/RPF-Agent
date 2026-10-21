@@ -6,6 +6,7 @@ import {
   Card,
   Col,
   Empty,
+  Popconfirm,
   Row,
   Select,
   Space,
@@ -20,6 +21,7 @@ import {
   FileWordOutlined,
   PlayCircleOutlined,
   ReloadOutlined,
+  StopOutlined,
   TrophyOutlined,
 } from "@ant-design/icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
@@ -66,6 +68,12 @@ export default function ScoreResults() {
   // 单 worker 串行：已有 queued/running 的运行时再点「发起」只会堆一条永远排队的运行
   // （2026-10-20 实证：用户连点产生 run 29/30 双双 queued，取消还不生效）
   const hasActiveRun = runs.some((r) => r.status === "queued" || r.status === "running");
+  // 当前选中的运行是否仍在执行：取消按钮必须独立于"本会话是否持有 jobId"——
+  // 旧实现只有刚发起评分的那一页才有 JobProgress 的取消入口，刷新/换页后
+  // 运行卡在 running 就再也点不到取消（2026-10-21 实证）。
+  const currentRun = runs.find((r) => r.id === runId) ?? null;
+  const currentRunActive =
+    currentRun?.status === "queued" || currentRun?.status === "running";
 
   const { data: summary, isLoading: summaryLoading } = useScoreSummary(runId, pid);
   const { data: matrix, isLoading: matrixLoading } = useMatrix(runId);
@@ -122,6 +130,22 @@ export default function ScoreResults() {
       message.success("评分运行已发起");
     },
     onError: (e: Error) => message.error(e.message),
+  });
+
+  // 取消当前运行（与是否在本页发起无关）：后端 POST /runs/{id}/cancel 会找到
+  // 对应 evaluate 任务并置 cancel_requested，任务在下一个检查点退出。
+  const cancelRun = useMutation({
+    mutationFn: (id: number) => api.post<{ ok: boolean }>(`/runs/${id}/cancel`),
+    onSuccess: (r) => {
+      if (r.ok) {
+        message.info("已请求取消：当前这次模型调用结束后生效，未完成项会标记为未定分");
+      } else {
+        message.warning("该运行已不在执行中（可能刚结束），请刷新");
+      }
+      qc.invalidateQueries({ queryKey: ["runs", pid] });
+      invalidateResults();
+    },
+    onError: (e: Error) => message.error(e.message || "取消失败"),
   });
 
   // 任务进入终态后自动刷新结果（此前必须手点「刷新」）
@@ -189,6 +213,20 @@ export default function ScoreResults() {
         <Button icon={<ReloadOutlined />} onClick={invalidateResults}>
           刷新
         </Button>
+        {currentRunActive && runId != null && (
+          <Popconfirm
+            title="取消这次评分运行？"
+            description="已写入的评分保留；未完成项标记为未定分。取消后即可重新发起。"
+            okText="取消运行"
+            cancelText="继续等待"
+            okButtonProps={{ danger: true }}
+            onConfirm={() => cancelRun.mutate(runId)}
+          >
+            <Button danger icon={<StopOutlined />} loading={cancelRun.isPending}>
+              取消运行
+            </Button>
+          </Popconfirm>
+        )}
         {report && (
           <Tag color={report.status === "draft" ? "red" : "green"} style={{ fontSize: 13, padding: "2px 10px" }}>
             {report.status_label}
