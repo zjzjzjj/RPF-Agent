@@ -91,18 +91,23 @@ export BID_EVAL_LLM_API_KEY=sk-...
 export BID_EVAL_LLM_MODEL=deepseek-chat
 ```
 
-### 切到硅基流动 / GLM-5.3-Flash（推理模型）
+### 切到硅基流动（云端模型）
 
 ```bash
 export BID_EVAL_LLM_PROVIDER=siliconflow
 export BID_EVAL_LLM_BASE_URL=https://api.siliconflow.cn/v1
 export BID_EVAL_LLM_API_KEY=sk-...
-export BID_EVAL_LLM_MODEL=zai-org/GLM-5.3-Flash
-export BID_EVAL_LLM_THINKING=disabled            # auto|disabled|enabled
+export BID_EVAL_LLM_MODEL=deepseek-ai/DeepSeek-V4.1-Flash   # 或 zai-org/GLM-5.3-Flash
+export BID_EVAL_LLM_THINKING=auto                # auto|disabled|enabled
 export BID_EVAL_LLM_DEFAULT_MAX_TOKENS=8192      # 推理模型的思考也算输出预算
 export BID_EVAL_LLM_MAX_TOKENS=20000             # 规则抽取
 export BID_EVAL_LLM_CONTEXT_TOKENS=65536
+export BID_EVAL_LLM_TRANSIENT_ATTEMPTS=4         # 云端高峰期 503 重试次数
 ```
+
+> 2026-10-21 实测：`zai-org/GLM-5.3-Flash` 高峰期间歇甚至持续返回
+> `503 System is too busy`（同账户 GLM-5.2 / DeepSeek-V4.1-Flash 正常），
+> 故默认改用 `deepseek-ai/DeepSeek-V4.1-Flash`。
 
 要点：
 

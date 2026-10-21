@@ -411,10 +411,16 @@ DEFAULT_MODEL_PRESETS: list[dict] = [
         "note": "均衡之选，JSON 抽取稳定（默认）",
     },
     {
+        "id": "deepseek-ai/DeepSeek-V4.1-Flash",
+        "label": "DeepSeek V4.1 Flash",
+        "family": "DeepSeek",
+        "note": "云端主用：可用性稳定、轻推理、JSON 稳定",
+    },
+    {
         "id": "zai-org/GLM-5.3-Flash",
         "label": "GLM 5.3 Flash",
         "family": "GLM",
-        "note": "推理模型，中文理解强（评标默认）",
+        "note": "推理模型，中文强（高峰期常 503）",
     },
     {
         "id": "zai-org/GLM-5.2",
