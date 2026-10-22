@@ -1004,6 +1004,10 @@ def _case_candidate_pages(
         idx.update({i - 1, i, i + 1})
     ordered = sorted(i for i in idx if 0 <= i < len(pages))
     n_candidates = len(ordered)
+    # 人员级优先：含"角色：姓名"模式的页排在前面（如"项目经理：蒋立华"），
+    # 让 LLM 优先看到人员证据而不是项目合同头。
+    _person_re = _re.compile(r"(?:项目经理|运维负责人|主要实施|项目总监|团队成员|人员名单)[：:]\s*[一-鿿]{2,4}")
+    ordered.sort(key=lambda i: (0 if _person_re.search(pages[i][1] or "") else 1, i))
     dropped_nos: list[int] = []
     if echo_n:
         kept = []
@@ -1109,8 +1113,15 @@ def _llm_verify_cases(
     person_scope = str((c.get("params") or {}).get("person_scope") or "（不区分人员）")
     merged: list[dict] = []
     seen: set[tuple[str, str]] = set()
+    # OCR 格式清理：去掉 <fcel>/<lcel>/<nl> 等标签（PaddleOCR-VL 表格输出格式），
+    # 否则 LLM 无法正确解析人员姓名（"项目经理：蒋立华"被标签打断）。
+    _RE_OCR_TAGS = re.compile(r"</?(?:fcel|lcel|nl|fcel/|lcel/|nl/)>")
+
+    def _clean_ocr(text: str) -> str:
+        return _RE_OCR_TAGS.sub(" ", text)
+
     for batch_no, batch in enumerate(batches, start=1):
-        text = "\n".join(f"【第 {no} 页】\n{t}" for no, t in batch)
+        text = "\n".join(f"【第 {no} 页】\n{_clean_ocr(t)}" for no, t in batch)
         user = prompts.MATERIAL_COUNT_USER_TEMPLATE.format(
             name=c.get("name") or "",
             max_score=c.get("max_score") or "",
@@ -1192,7 +1203,11 @@ def _sanitize_case(
     cheat = True
     reason = "quote_too_short"
     tier: str | None = None
-    if len(quote_n) >= config.MIN_QUOTE_CHARS:
+    # 人员级引文可以很短（"项目经理：蒋立华"只有 8 字），放宽到 6 字。
+    # 同时检测"角色：姓名"模式——这是人员证据的典型形态。
+    _person_quote = bool(re.search(r"(?:项目经理|运维负责人|主要实施|项目总监|团队成员|人员名单|身份证)[：:]", quote))
+    _min_len = 6 if _person_quote else config.MIN_QUOTE_CHARS
+    if len(quote_n) >= _min_len:
         frac = _ngram_fraction(quote_n, echo_n) if echo_n else 0.0
         if echo_n and frac >= _ECHO_SHADOW_FRACTION:
             reason = "requirement_shadow"  # 照抄要求/整条规则复述
