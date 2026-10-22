@@ -24,6 +24,14 @@ REAL = {
     "先进数通": {"total": 66.80, "price": 49.80, "biz": 1.0, "tech_biz": 17.00, "rank": 4},
 }
 
+# 逐评分项 ground truth（PDF 评审报告，代码按包内序号）
+REAL_ITEMS = {
+    "c18": {"龙即": 6, "致成": 6, "诚道": 4, "先进数通": 0},   # 业绩
+    "c19": {"龙即": 4, "致成": 4, "诚道": 3, "先进数通": 1},   # 认证
+    "c26": {"龙即": 4, "致成": 2, "诚道": 0, "先进数通": 0},   # 负责人经验（=c59）
+    "c27": {"龙即": 6, "致成": 0, "诚道": 6, "先进数通": 0},   # 团队经验（=c60）
+}
+
 
 def kendall_tau(a: list, b: list) -> float:
     n = len(a)
@@ -43,6 +51,7 @@ def kendall_tau(a: list, b: list) -> float:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--run", type=int, required=True)
+    ap.add_argument("--detailed", action="store_true", help="逐评分项对比")
     ap.add_argument("--project", default="PRJ-20261014-78MT")
     ap.add_argument("--db", default="", help="数据库路径（默认仓库 data/bid_eval.db）")
     args = ap.parse_args()
@@ -126,6 +135,36 @@ def main() -> int:
         tech_missing = sum(1 for v in tech_rows if v[3] is None)
         print(f"{key:<6} {got['biz']:>7.2f} {tech_sum:>7.2f}  "
               f"技术项 {len(tech_rows)} 项，未定分 {tech_missing} 项")
+
+    # D1: 逐评分项对比
+    if args.detailed:
+        print(f"\n=== 逐评分项对比 ===")
+        print(f"{'评分项':<6} {'公司':<6} {'真实':>6} {'AI':>6} {'Δ':>6}  {'状态':<10}")
+        total_abs_err = 0
+        total_items = 0
+        for code, real_scores in REAL_ITEMS.items():
+            for key in ("龙即", "致成", "诚道", "先进数通"):
+                got = ai.get(key)
+                if not got:
+                    continue
+                real_val = real_scores.get(key, 0)
+                # find AI score for this criterion
+                ai_val = None
+                for item in got.get("items", []):
+                    if item[0] == code:
+                        ai_val = float(item[3]) if item[3] is not None else 0.0
+                        break
+                if ai_val is None:
+                    print(f"{code:<6} {key:<6} {real_val:>6.1f} {'—':>6} {'—':>6}  未找到")
+                    continue
+                delta = ai_val - real_val
+                status = "✓" if abs(delta) < 0.5 else ("高" if delta > 0 else "低")
+                print(f"{code:<6} {key:<6} {real_val:>6.1f} {ai_val:>6.1f} {delta:>+6.1f}  {status}")
+                total_abs_err += abs(delta)
+                total_items += 1
+        if total_items:
+            print(f"\n逐项 MAE: {total_abs_err / total_items:.2f} 分")
+
     con.close()
     return 0
 

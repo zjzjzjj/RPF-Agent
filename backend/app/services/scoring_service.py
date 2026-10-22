@@ -531,8 +531,9 @@ def execute_run(
 
     # 每家投标人归一化全文：count 引文核验（回标书定位）与主观分引文闸门共用一份，
     # 只归一化一次（旧行为各处重复 normalize_no_ws，浪费且口径易漂移）。
+    # OCR 标签必须先清再归一——否则引文"项目经理：蒋立华"回不到含标签的原文。
     bid_norm_by_bidder: dict[int, str] = {
-        bid_id: _nnw(text_by_bidder.get(bid_id) or "") for bid_id in bidder_ids
+        bid_id: _nnw(_clean_ocr(text_by_bidder.get(bid_id) or "")) for bid_id in bidder_ids
     }
 
     # 招标文件原文页（归一化）：恢复评分项的【证明材料】要求段
@@ -661,7 +662,8 @@ def execute_run(
                                 "match_tier", "quote_source", "case_source", "page_hint",
                                 "amount_yuan", "sign_date", "table_page", "material_pages",
                                 "material_reasons", "contract", "invoice", "acceptance",
-                                "duplicate",
+                                "work_proof", "experience_proof", "social_security",
+                                "person_name", "duplicate",
                             )
                         }
                         for cs in _vc
@@ -906,6 +908,16 @@ _ECHO_PAGE_FRACTION = 0.4  # 整页被判"要求复述页"的覆盖率阈值
 _ECHO_PAGE_SHORT_CHARS = 300  # 短页另用"最长连续 echo 段"判活的字符上限
 _ECHO_PAGE_MIN_RUN = 60  # 短页最长连续 echo 段阈值
 
+# OCR 格式标签（PaddleOCR-VL 表格输出：<fcel>/<lcel>/<nl>/<ucel> 等）。
+# 必须在**所有**文本处理前清理——bid_norm 引文匹配、候选页锚点、_person_re
+# 排序、送 LLM 上下文——否则"项目经理：蒋立华"被标签打断 → 引文定位失败 → 0 分。
+_RE_OCR_TAGS = re.compile(r"</?(?:fcel|lcel|nl|ucel)[^>]*>")
+
+
+def _clean_ocr(text: str) -> str:
+    """去掉 OCR 格式标签，保留文本内容。"""
+    return _RE_OCR_TAGS.sub(" ", text)
+
 
 def _nnw(text: str) -> str:
     from app.parsing.normalize import normalize_no_ws
@@ -983,6 +995,7 @@ def _case_candidate_pages(
     pages: list[tuple[int, str, str]],
     echo_n: str | None = None,
     stats_out: dict | None = None,
+    person_scope: str = "",
 ) -> list[list[tuple[int, str]]]:
     """业绩/人员案例核验的候选页 → 剔除"要求复述页" → 按预算切批。
 
@@ -994,20 +1007,52 @@ def _case_candidate_pages(
     剔除"要求复述页"：投标人常把评分规则整段抄进标书的索引/响应对照表页，模型
     会被它带偏、拿要求文本当引文（2026-10-21 实证：b13 第 95 页复述规则、真业绩
     在第 126 页，两页同送 → 引文全被判照抄 → 未定分）。剔除后模型只看真证据页。
+
+    `person_scope` 非空（leader/member）时：排除项目合同页（含"合同金额+甲方/乙方"
+    但无人员姓名的页），只保留人员证据页（含"项目经理：/运维负责人：/人员名单"等），
+    避免 LLM 被项目合同头带偏（2026-10-22 实证：c59/c60 全 0 分）。
     """
     import re as _re
 
     anchor = _re.compile(r"合同|项目名称|甲方|乙方|发票|验收|中标通知书|业绩|项目团队|负责人|简历|工作证明|社保|职称|人员名单|经验证明|项目经理|运维负责人|主要实施|项目总监|团队成员")
-    hits = [i for i, (_no, t, _s) in enumerate(pages) if anchor.search(t or "")]
+
+    # 人员证据模式（清理 OCR 标签后匹配）："角色：姓名"或"角色 姓名"
+    _person_re = _re.compile(
+        r"(?:项目经理|运维负责人|主要实施|项目总监|团队成员|人员名单|项目负责人)"
+        r"[：:\s]*(?:[一-鿿]{2,5})"
+    )
+    # 项目合同页特征（清理后）：合同金额 + 甲方/乙方
+    _contract_re = _re.compile(r"(?:合同金额|合同价款|中标金额)[：:：]?\s*[\d,.万元]+")
+    _parties_re = _re.compile(r"(?:甲方|乙方|发包方|承包方|采购人|供应商)")
+
+    def _cleaned(t: str) -> str:
+        return _clean_ocr(t or "")
+
+    hits = [i for i, (_no, t, _s) in enumerate(pages) if anchor.search(_cleaned(t))]
     idx: set[int] = set()
     for i in hits:
         idx.update({i - 1, i, i + 1})
     ordered = sorted(i for i in idx if 0 <= i < len(pages))
     n_candidates = len(ordered)
-    # 人员级优先：含"角色：姓名"模式的页排在前面（如"项目经理：蒋立华"），
-    # 让 LLM 优先看到人员证据而不是项目合同头。
-    _person_re = _re.compile(r"(?:项目经理|运维负责人|主要实施|项目总监|团队成员|人员名单)[：:]\s*[一-鿿]{2,4}")
-    ordered.sort(key=lambda i: (0 if _person_re.search(pages[i][1] or "") else 1, i))
+
+    if person_scope:
+        # 人员级：只保留含人员证据的页 + 社保/工作证明/经验证明/简历页
+        _person_evidence = _re.compile(
+            r"项目经理|运维负责人|主要实施|项目总监|团队成员|人员名单|项目负责人"
+            r"|社保|社会保险|参保|缴费|工作证明|经验证明|简历|职称"
+        )
+        kept = []
+        for i in ordered:
+            t = _cleaned(pages[i][1])
+            if not _person_evidence.search(t):
+                continue  # 无人物证据 → 排除（项目合同页、发票页等）
+            # 有人员证据的页保留；如果同时含合同头（签署页可能两者都有）也保留
+            kept.append(i)
+        ordered = kept
+    else:
+        # 项目级：人员证据页优先排序（让 LLM 优先看到人员表）
+        ordered.sort(key=lambda i: (0 if _person_re.search(_cleaned(pages[i][1])) else 1, i))
+
     dropped_nos: list[int] = []
     if echo_n:
         kept = []
@@ -1102,7 +1147,8 @@ def _llm_verify_cases(
     # 要求复述文本 = 完整评分规则（source_quote）+【证明材料】块：索引表复述的是
     # 规则本身，必须含 source_quote 才能识别（只比 required_evidence 会漏掉大部分）。
     echo_n = _nnw((c.get("source_quote") or "") + (requirement_text or ""))
-    batches = _case_candidate_pages(pages, echo_n=echo_n, stats_out=stats_out)
+    person_scope_raw = str((c.get("params") or {}).get("person_scope") or "")
+    batches = _case_candidate_pages(pages, echo_n=echo_n, stats_out=stats_out, person_scope=person_scope_raw)
     if not batches:
         return None
 
@@ -1110,15 +1156,9 @@ def _llm_verify_cases(
         cases: list[dict] = Field(default_factory=list)
 
     art_list = [a.strip() for a in artifacts_list if a.strip()] or [requirement_text]
-    person_scope = str((c.get("params") or {}).get("person_scope") or "（不区分人员）")
+    person_scope = person_scope_raw or "（不区分人员）"
     merged: list[dict] = []
     seen: set[tuple[str, str]] = set()
-    # OCR 格式清理：去掉 <fcel>/<lcel>/<nl> 等标签（PaddleOCR-VL 表格输出格式），
-    # 否则 LLM 无法正确解析人员姓名（"项目经理：蒋立华"被标签打断）。
-    _RE_OCR_TAGS = re.compile(r"</?(?:fcel|lcel|nl|fcel/|lcel/|nl/)>")
-
-    def _clean_ocr(text: str) -> str:
-        return _RE_OCR_TAGS.sub(" ", text)
 
     for batch_no, batch in enumerate(batches, start=1):
         text = "\n".join(f"【第 {no} 页】\n{_clean_ocr(t)}" for no, t in batch)
@@ -1225,12 +1265,26 @@ def _sanitize_case(
         # 短引文但含金额/年份等实体（如"2024年6月"）仍可信
         cheat = False
         reason = "ok"
+
+    # A4: 人员级引文校验——quote 必须含人员姓名/角色模式，不能只含项目合同头
+    _is_person_scope = any(k in case for k in ("work_proof", "experience_proof", "social_security", "person_name"))
+    if not cheat and _is_person_scope:
+        _has_person = bool(re.search(
+            r"(?:项目经理|运维负责人|主要实施|项目总监|团队成员|人员名单|项目负责人|身份证)[：:\s]*[一-鿿]{2,5}"
+            r"|[一-鿿]{2,4}[：:\s]*(?:项目经理|运维负责人|主要实施|项目总监)",
+            quote,
+        ))
+        _has_contract_header = bool(re.search(r"甲方|乙方|合同金额|合同价款|中标金额|发包方|承包方", quote))
+        if not _has_person and _has_contract_header:
+            reason = "project_header_not_person"
+            cheat = True
+
     if cheat:
         # 按人员/项目级降级对应材料键
         _person_keys = ("work_proof", "experience_proof", "social_security")
         _project_keys = ("contract", "invoice", "acceptance")
         # 有 person 键存在 → 人员级；否则项目级
-        _is_person = any(k in case for k in _person_keys)
+        _is_person = any(k in case for k in _person_keys) or _is_person_scope
         for key in (_person_keys if _is_person else _project_keys):
             case[key] = False
     case["sanitized"] = reason

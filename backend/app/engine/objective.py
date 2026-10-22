@@ -642,9 +642,14 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                 if all(v is True for v in vals.values()):
                     complete.append(c)  # 全部确认 → 计
                     continue
+                # B2 材料闸门校准：null_policy 从"仅 contract=True 即救"收紧为
+                # "至少 2 项确认 True"——先进数通只有合同无发票/验收（真实 0 分），
+                # 旧逻辑 count_with_contract 误放行 1 案得 2 分。
+                _confirmed = sum(1 for v in vals.values() if v is True)
                 if (
                     c.get("case_source") == "table"
                     and vals.get("contract") is True
+                    and _confirmed >= 2
                     and null_policy == "count_with_contract"
                 ):
                     complete.append(c)

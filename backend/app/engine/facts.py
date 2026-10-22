@@ -49,6 +49,12 @@ _CERT_ZH_KEYS: tuple[tuple[str, str], ...] = (
     ("质量管理体系符合", "ISO9001"),
     ("信息安全管理体系符合", "ISO27001"),
     ("信息技术服务管理体系符合", "ISO20000"),
+    # B3: OCR 变体（空格插进词中间、简称）
+    ("质量管理体系", "ISO9001"),
+    ("信息安全管理体系", "ISO27001"),
+    ("信息技术服务管理体系", "ISO20000"),
+    ("IT服务管理体系", "ISO20000"),
+    ("ITSS", "ISO20000"),
 )
 _RE_CERT_CONTEXT = re.compile(r"证书|认证|体系|有效期|编号|CMMI|ISO")
 _RE_ISO_TOKEN = re.compile(r"ISO(?:\s?/?\s?IEC)?\s?(\d{4,5})")
