@@ -338,7 +338,17 @@ def _parse_artifact_segment(seg: str) -> list[str]:
 # ---------------------------------------------------------------------------
 # 通道 A：文本层标题行。旧实现只认整行"查询结果截图"且跳过 >300 字的页——
 # 致成写"查询网址/查询截图："（所在页约 1000 字）被整页跳过，ISO 三项被清零。
+#
+# 2026-10-22 修复：旧正则 `查询(?:结果)?截图|查询网址` 太宽泛，"行贿犯罪记录
+# 查询结果截图"也命中 → cert_section_present=True 对四家都成立 → ISO 全满分。
+# 修复：保留原始正则（裸标签"查询截图"仍需匹配），但加两层过滤：
+#   ① 排除非认证查询（行贿/犯罪记录/信用中国/无犯罪）
+#   ② 排除证书免责声明（"可在官方网站查询"）
+#   ③ 平台 URL（cx.cnca.cn）强信号，在行长度检查之前命中
 _CERT_TITLE_RE = re.compile(r"查询(?:结果)?截图|查询网址|查询地址|证书查询|认证结果查询")
+_CERT_EXCLUDE = re.compile(r"行贿|犯罪记录|信用中国|无犯罪")
+_CERT_DISCLAIMER = re.compile(r"官方网站上?查询|可查询")
+_CERT_PLATFORM_URL = re.compile(r"cx\.cnca\.cn|cnca\.cn")
 # 通道 B：OCR 正文的**平台专有**指纹。"证书编号"这类词证书扫描件也有，不能单独用。
 _CERT_STRONG_FINGERPRINTS = ("认证认可信息公共服务平台", "认证行政监管", "证书查询结果")
 _CERT_WEAK_FINGERPRINTS = (
@@ -358,13 +368,24 @@ def cert_evidence_present(pages: list[tuple[str, str]]) -> tuple[bool, str]:
     for _source, text in pages:
         for line in (text or "").split("\n"):
             s = line.strip()
-            if not s or len(s) > 60 or s.count("....") >= 2:
+            if not s or s.count("....") >= 2:
+                continue
+            # 平台 URL 强信号（在行长度检查之前——URL 行可能很长）
+            if _CERT_PLATFORM_URL.search(s):
+                return True, f"平台 URL：{s[:40]}"
+            if len(s) > 60:
                 continue
             # 要求复述行（招标文件索引表常整页复述"须提供…截图，未提供不得分"）
             # 不算投标人提供了截图：同时出现"须/应/需"与"提供/不得分"即视为要求句
             if any(k in s for k in ("须", "应", "需")) and (
                 "提供" in s or "不得分" in s
             ):
+                continue
+            # 证书上的免责声明（"可在官方网站查询"）不是截图证据
+            if _CERT_DISCLAIMER.search(s):
+                continue
+            # 排除非认证查询截图（行贿犯罪记录/信用中国等——这些是其他资质要求）
+            if _CERT_EXCLUDE.search(s):
                 continue
             if _CERT_TITLE_RE.search(s):
                 return True, f"文本标题：{s[:40]}"

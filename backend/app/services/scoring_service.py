@@ -751,23 +751,49 @@ def execute_run(
             norm_text = bid_norm_by_bidder.get(bid_id) or ""
 
             def _verify(quote: str, _norm=norm_text) -> bool:
+                # 引文核验：与计数路径同一语义——精确 → 前缀梯 → 去逗号变体。
+                # 旧实现只做精确子串匹配，OCR 表格串行/货币符号差异会把真实子项
+                # 引文误判为 0（2026-10-22 实证：主观分多项子项分被误杀归 0）。
+                if not quote or not _norm:
+                    return False
                 q = _nnw(quote)
-                return len(q) >= 12 and q in _norm
+                if len(q) < 12:
+                    return False
+                if q in _norm:
+                    return True
+                for _L in config.PREFIX_FALLBACK_LENGTHS:
+                    if len(q) >= _L and q[:_L] in _norm:
+                        return True
+                stripped = q.replace(",", "").replace("，", "")
+                if stripped != q:
+                    if stripped in _norm:
+                        return True
+                    for _L in config.PREFIX_FALLBACK_LENGTHS:
+                        if len(stripped) >= _L and stripped[:_L] in _norm:
+                            return True
+                return False
 
             verifiers[bid_id] = _verify
-        for bid_id in bidder_ids:
-            for c in subjective_items:
-                if ctx is not None:
-                    subj_done += 1
-                    ctx.advance(message=f"主观分评审 {subj_done}/{subj_total}（{config.review_mode()}）")
-                hint = material_hints.get(bid_id)
+
+        # Phase 1：并行 LLM 调用（ThreadPoolExecutor，参照 subjective.py:446 committee 模式）。
+        # 旧实现 for bid_id: for c: 严格串行，288 次调用（4家×24项×3簇）排队 ~2.5h。
+        # 并行化后 4 并发 × 每格 1 次簇调用 ≈ 36 分钟（网关信号量 BID_EVAL_LLM_CONCURRENCY 控并发）。
+        from concurrent.futures import ThreadPoolExecutor
+        import threading as _threading
+
+        _prog_lock = _threading.Lock()
+        _prog_done = [0]
+
+        def _score_cell(args):  # noqa: ANN001
+            bid_id, c = args
+            hint = material_hints.get(bid_id)
+            try:
                 if use_hierarchical:
                     suggestion, committee = suggest_score_hierarchical(
                         gateway, c, text_by_bidder[bid_id], data_class=data_class,
                         material_pages=hint, verify_quote=verifiers.get(bid_id),
                     )
                     if suggestion is None:
-                        # 证据地图不可用（嵌入服务故障）→ 回退单次评审
                         suggestion, committee = suggest_score_committee(
                             gateway, c, text_by_bidder[bid_id], data_class=data_class,
                             material_pages=hint, verify_quote=verifiers.get(bid_id),
@@ -777,6 +803,35 @@ def execute_run(
                         gateway, c, text_by_bidder[bid_id], data_class=data_class,
                         material_pages=hint, verify_quote=verifiers.get(bid_id),
                     )
+            except Exception as exc:  # noqa: BLE001 —— 单格失败不让整场失败
+                log.warning("主观分单元格失败 bid=%s criterion=%s：%s", bid_id, c.get("code"), exc)
+                suggestion, committee = SubjectiveSuggestion(
+                    status="need_human", warnings=[f"llm_failed: {exc}"],
+                ), None
+            with _prog_lock:
+                _prog_done[0] += 1
+                if ctx is not None:
+                    ctx.advance(
+                        message=f"主观分评审 {_prog_done[0]}/{subj_total}（{config.review_mode()}）"
+                    )
+            return bid_id, c.get("code"), suggestion, committee
+
+        # 4 并发是安全边界：网关信号量（默认 4，服务器已提到 8）+ SQLite 单写者。
+        # 每格内部 K=3 簇仍串行（suggest_score_hierarchical 自身逻辑不变）。
+        _cell_workers = min(4, max(1, config.llm_max_concurrency()))
+        _cells = [(bid_id, c) for bid_id in bidder_ids for c in subjective_items]
+        _results: dict[tuple[int, str], tuple] = {}
+        with ThreadPoolExecutor(max_workers=_cell_workers) as _pool:
+            for bid_id, c_code, suggestion, committee in _pool.map(_score_cell, _cells):
+                _results[(bid_id, c_code)] = (suggestion, committee)
+
+        # Phase 2：串行后处理（forced_zero + DB 写入——SQLite 单写者）
+        for bid_id in bidder_ids:
+            for c in subjective_items:
+                suggestion, committee = _results.get(
+                    (bid_id, c.get("code")),
+                    (SubjectiveSuggestion(status="need_human", warnings=["llm_failed"]), None),
+                )
 
                 # 人员经验材料门槛（确定性，规则执行）：缺证明按"否则该项不得分"计 0
                 cname = str(c.get("name") or "")
