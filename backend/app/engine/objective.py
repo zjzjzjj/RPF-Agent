@@ -627,7 +627,7 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                 if unknown_amount:
                     conflict = True
                     detail += f"；{unknown_amount} 个案例金额无法确认（需人工核对）"
-            required_flags = _required_flags(artifacts, person_scope=person_scope)
+            required_flags = _required_flags(artifacts, person_scope=person_scope, criterion_name=str(criterion.get("name") or ""))
             # 三态材料：True=确认有；False=确认无（规则"不全不得分"→不计）；
             # None=页不可读/未提供。None 不直接当 0——"机器看不见 ≠ 没有"
             # （与确定性路径同一哲学）。仅当确定性业绩表依据 + 合同已确认 +
@@ -672,23 +672,24 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
     )
 
 
-def _required_flags(artifacts: str, person_scope: str = "") -> tuple[str, ...]:
+def _required_flags(artifacts: str, person_scope: str = "", criterion_name: str = "") -> tuple[str, ...]:
     """材料要求段 → 案例核验布尔键。
 
     项目级：合同恒查；见"发票"查发票；见"验收/业主证明"查验收。
-    人员级（person_scope 非空）：检查人员证据（工作证明/社保），不查合同/发票/验收。
-    2026-10-22 修复：旧实现对人员级也硬编码 contract，导致简历/工作证明/社保
-    被判 contract:false → 全部"缺证明材料不计分" → 0 分。
+    人员级（person_scope 非空）：
+      - work_proof（合同/业绩证明中人员姓名+角色）恒查。
+      - experience_proof（五年工作经验证明）仅项目负责人经验（c59）要求。
+      - social_security（社保缴纳证明）恒查。
+    2026-10-22 修复：旧实现对人员级硬编码 contract → 全部"缺证明材料"→ 0 分。
     """
     if person_scope:
-        flags: list[str] = []
-        if "经验" in artifacts or "工作" in artifacts or "五年" in artifacts or "5年" in artifacts:
-            flags.append("work_proof")
-        if "社保" in artifacts or "社会保险" in artifacts or "缴纳" in artifacts:
+        flags: list[str] = ["work_proof"]
+        # 项目负责人经验要求"五年及以上工作经验证明"（独立文档）
+        if "负责人" in criterion_name or "五年" in artifacts or "5年" in artifacts:
+            flags.append("experience_proof")
+        # 社保缴纳证明（规则恒要求）
+        if "社保" in artifacts or "社会保险" in artifacts or "缴纳" in artifacts or not artifacts:
             flags.append("social_security")
-        if not flags:
-            # 默认要求两项人员证据（规则常见"业绩证明+社保"）
-            flags = ["work_proof", "social_security"]
         return tuple(flags)
     flags = ["contract"]
     if "发票" in artifacts:
