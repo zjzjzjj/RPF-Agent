@@ -370,16 +370,24 @@ def cert_evidence_present(pages: list[tuple[str, str]]) -> tuple[bool, str]:
             s = line.strip()
             if not s or s.count("....") >= 2:
                 continue
-            # 平台 URL 强信号（在行长度检查之前——URL 行可能很长）
-            if _CERT_PLATFORM_URL.search(s):
+            # 平台 URL 强信号（在行长度检查之前——URL 行可能很长）。
+            # 但要求文本也含 cx.cnca.cn（"查询结果截图并加盖公章，未按要求提供不得分"），
+            # 需排除要求特征词，只匹配投标人自己的标签/标题行。
+            if _CERT_PLATFORM_URL.search(s) and not any(
+                k in s for k in ("不得分", "加盖公章", "未按要求", "须提供", "应提供")
+            ):
                 return True, f"平台 URL：{s[:40]}"
             if len(s) > 60:
                 continue
             # 要求复述行（招标文件索引表常整页复述"须提供…截图，未提供不得分"）
-            # 不算投标人提供了截图：同时出现"须/应/需"与"提供/不得分"即视为要求句
-            if any(k in s for k in ("须", "应", "需")) and (
-                "提供" in s or "不得分" in s
+            # 不算投标人提供了截图：同时出现"须/应/需"与"提供/不得分"即视为要求句。
+            # 2026-10-22 扩展：要求文本也含"加盖公章/未按要求"等特征词，一并排除。
+            if any(k in s for k in ("须", "应", "需", "加盖公章", "未按要求")) and (
+                "提供" in s or "不得分" in s or "公章" in s or "要求" in s
             ):
+                continue
+            # 纯要求句（无"须/应/需"但含"不得分"——如"…并加盖公章，未按要求提供不得分"）
+            if "不得分" in s or "加盖公章" in s:
                 continue
             # 证书上的免责声明（"可在官方网站查询"）不是截图证据
             if _CERT_DISCLAIMER.search(s):
