@@ -184,10 +184,24 @@ MATERIAL_COUNT_SYSTEM_PROMPT = """你是一名严谨的评标核查助手。
   这类行不同于目录/标题页，不要因它是汇总表就留空 quote。合同/发票/验收三材料是否
   另附，仍按上面的判定标准分别给 contract/invoice/acceptance 布尔。
 
+【人员级评分项判定（项目负责人/团队成员经验）】
+人员级评分项的证明材料是**人员证据**（工作经验证明、社保缴纳证明、人员简历、职称证书），
+不是合同/发票/验收。判定标准：
+- `work_proof`（工作经验证明）：须见"工作证明"、"经验证明"、"简历"、"职称证书"、
+  "人员简历表"等实质内容（含姓名、工作年限、项目经验描述），不是仅仅提到"经验"。
+- `social_security`（社保缴纳证明）：须见"社会保险"、"社保缴纳"、"参保缴费"、
+  "缴费明细"等实质内容（含缴纳单位、缴纳月份），不是仅提到"社保"。
+- `resume`（人员简历）：须见人员简历表/人员名单（含姓名、岗位、资质、经验年限）。
+- `person_name`：从证据中提取的人员姓名（如"张三"），无法确认填 null。
+- 人员级评分项时，contract/invoice/acceptance 填 null（不适用）。
+
 【输出】
 只输出 JSON：{"cases":[{"name":"案例/证书名","amount_yuan":数字或null,
-"person":"项目负责人/团队成员姓名或null","role":"leader|member|null",
-"contract":布尔,"invoice":布尔,"acceptance":布尔,"quote":"材料实质内容逐字摘录或空串"}]}
+"person":"项目负责人/团队成员姓名或null","person_name":"从证据中提取的姓名或null",
+"role":"leader|member|null",
+"contract":布尔|null,"invoice":布尔|null,"acceptance":布尔|null,
+"work_proof":布尔|null,"social_security":布尔|null,"resume":布尔|null,
+"quote":"材料实质内容逐字摘录或空串"}]}
 人员级评分项（项目负责人/团队成员）：role=leader 表示项目负责人本人案例，role=member 表示除负责人外的团队成员案例；姓名无法确认时 person/role 填 null。
 案例要逐个列出（不要合并）；确实没有可辨识案例时输出空数组。只输出 JSON。"""
 

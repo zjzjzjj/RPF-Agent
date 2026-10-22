@@ -627,7 +627,7 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                 if unknown_amount:
                     conflict = True
                     detail += f"；{unknown_amount} 个案例金额无法确认（需人工核对）"
-            required_flags = _required_flags(artifacts)
+            required_flags = _required_flags(artifacts, person_scope=person_scope)
             # 三态材料：True=确认有；False=确认无（规则"不全不得分"→不计）；
             # None=页不可读/未提供。None 不直接当 0——"机器看不见 ≠ 没有"
             # （与确定性路径同一哲学）。仅当确定性业绩表依据 + 合同已确认 +
@@ -672,9 +672,25 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
     )
 
 
-def _required_flags(artifacts: str) -> tuple[str, ...]:
-    """材料要求段 → 案例核验布尔键：合同恒查；见"发票"查发票；见"验收/业主证明"查验收。"""
-    flags: list[str] = ["contract"]
+def _required_flags(artifacts: str, person_scope: str = "") -> tuple[str, ...]:
+    """材料要求段 → 案例核验布尔键。
+
+    项目级：合同恒查；见"发票"查发票；见"验收/业主证明"查验收。
+    人员级（person_scope 非空）：检查人员证据（工作证明/社保），不查合同/发票/验收。
+    2026-10-22 修复：旧实现对人员级也硬编码 contract，导致简历/工作证明/社保
+    被判 contract:false → 全部"缺证明材料不计分" → 0 分。
+    """
+    if person_scope:
+        flags: list[str] = []
+        if "经验" in artifacts or "工作" in artifacts or "五年" in artifacts or "5年" in artifacts:
+            flags.append("work_proof")
+        if "社保" in artifacts or "社会保险" in artifacts or "缴纳" in artifacts:
+            flags.append("social_security")
+        if not flags:
+            # 默认要求两项人员证据（规则常见"业绩证明+社保"）
+            flags = ["work_proof", "social_security"]
+        return tuple(flags)
+    flags = ["contract"]
     if "发票" in artifacts:
         flags.append("invoice")
     if "验收" in artifacts or "业主证明" in artifacts:

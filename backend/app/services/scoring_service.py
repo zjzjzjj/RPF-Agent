@@ -456,7 +456,8 @@ def execute_run(
                 log.warning("材料页 OCR 救援失败 doc=%s：%s", doc_id, exc)
 
     # ---- 证明材料页索引（count 逐案例核验与主观评审共用） ----
-    _MAT_KEYWORDS = ("发票", "验收", "业主证明", "查询截图", "证书复印件", "承诺书", "营业执照")
+    _MAT_KEYWORDS = ("发票", "验收", "业主证明", "查询截图", "证书复印件", "承诺书", "营业执照",
+                     "社保证明", "工作证明", "简历", "职称", "人员名单", "经验证明")
     material_hints: dict[int, str] = {}
     bid_pages: dict[int, list[tuple[int, str, str]]] = {}
     with session_scope() as s:
@@ -995,7 +996,7 @@ def _case_candidate_pages(
     """
     import re as _re
 
-    anchor = _re.compile(r"合同|项目名称|甲方|乙方|发票|验收|中标通知书|业绩|项目团队|负责人")
+    anchor = _re.compile(r"合同|项目名称|甲方|乙方|发票|验收|中标通知书|业绩|项目团队|负责人|简历|工作证明|社保|职称|人员名单|经验证明")
     hits = [i for i, (_no, t, _s) in enumerate(pages) if anchor.search(t or "")]
     idx: set[int] = set()
     for i in hits:
@@ -1209,7 +1210,12 @@ def _sanitize_case(
         cheat = False
         reason = "ok"
     if cheat:
-        for key in ("contract", "invoice", "acceptance"):
+        # 按人员/项目级降级对应材料键
+        _person_keys = ("work_proof", "social_security", "resume")
+        _project_keys = ("contract", "invoice", "acceptance")
+        # 有 person 键存在 → 人员级；否则项目级
+        _is_person = any(k in case for k in _person_keys)
+        for key in (_person_keys if _is_person else _project_keys):
             case[key] = False
     case["sanitized"] = reason
     if tier is not None:

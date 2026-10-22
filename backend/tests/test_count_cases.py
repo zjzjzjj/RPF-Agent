@@ -143,8 +143,8 @@ def test_score_count_role_variants_not_zeroed() -> None:
 
     facts = BidFacts(text="")
     crit = _count_crit(verified_cases=[
-        {"name": "A", "role": "团队成员", "contract": True, "invoice": True,
-         "acceptance": True, "quote": "2023年合同，金额800000元", "sanitized": "ok"},
+        {"name": "A", "role": "团队成员", "work_proof": True, "social_security": True,
+         "resume": True, "quote": "张三 三年运维经验 社保已缴", "sanitized": "ok"},
     ])
     result = score_count(crit, crit["params"], facts)
     assert result.score == Decimal("1.5")
@@ -355,12 +355,12 @@ def test_score_count_mixed_reasons_scores_clean_case() -> None:
     from app.engine.objective import score_count
 
     crit = _count_crit(verified_cases=[
-        {"name": "A", "role": "member", "contract": True, "invoice": True,
-         "acceptance": True, "quote": "2023年合同金额80万元", "sanitized": "ok"},
-        {"name": "B", "role": "member", "contract": False, "invoice": False,
-         "acceptance": False, "quote": "须提供合同复印件", "sanitized": "requirement_shadow"},
-        {"name": "C", "role": "member", "contract": False, "invoice": False,
-         "acceptance": False, "quote": "长伪造引文内容在此", "sanitized": "quote_not_in_bid"},
+        {"name": "A", "role": "member", "work_proof": True, "social_security": True,
+         "resume": True, "quote": "张三 项目团队成员 三年运维经验", "sanitized": "ok"},
+        {"name": "B", "role": "member", "work_proof": False, "social_security": False,
+         "resume": False, "quote": "须提供工作证明", "sanitized": "requirement_shadow"},
+        {"name": "C", "role": "member", "work_proof": False, "social_security": False,
+         "resume": False, "quote": "长伪造引文内容在此", "sanitized": "quote_not_in_bid"},
     ])
     result = score_count(crit, crit["params"], _facts())
     assert result.unresolved is None
