@@ -219,6 +219,67 @@ def test_score_count_member_scope_no_type_gate() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 确定性社保覆盖（2026-10-23 run 49：LLM 判社保方差 0↔6 来回摆）
+# ---------------------------------------------------------------------------
+def test_overlay_social_security_name_in_list() -> None:
+    from app.services.scoring_service import _overlay_social_security
+
+    pages = [
+        (1, "社会保险缴费记录 序号 姓名 社会保障号\n1 王耘 330102", "ocr"),
+    ]
+    cases = [
+        {"person_name": "王耘", "social_security": False},
+        {"person_name": "宋宏", "social_security": True},
+        {"person_name": "", "social_security": True},
+    ]
+    _overlay_social_security(cases, pages)
+    assert cases[0]["social_security"] is True   # 名单内
+    assert cases[1]["social_security"] is False  # 逐人名单不含 → False
+    assert cases[2]["social_security"] is None   # 无法对应到人
+
+
+def test_overlay_social_security_unit_wide_covers_all() -> None:
+    """单位专用参保证明（截断名单）→ 全员覆盖 True（龙即/诚道/致成形态）。"""
+    from app.services.scoring_service import _overlay_social_security
+
+    pages = [
+        (1, "社会保险参保证明（单位专用）单位名称：杭州龙即\n当前参保缴费总人数 156", "ocr"),
+    ]
+    cases = [{"person_name": "杨兰兰", "social_security": False}]
+    _overlay_social_security(cases, pages)
+    assert cases[0]["social_security"] is True
+
+
+def test_overlay_social_security_annual_report_ignored() -> None:
+    """企业年报公示的'社保信息（企业选择不公示）'不是缴纳证明。"""
+    from app.services.scoring_service import _overlay_social_security
+
+    pages = [
+        (1, "2022年度报告 社保信息 城镇职工基本养老保险 1 人\n单位缴费基数 企业选择不公示", "ocr_img"),
+    ]
+    cases = [{"person_name": "郑峪嘉", "social_security": True}]
+    _overlay_social_security(cases, pages)
+    assert cases[0]["social_security"] is False  # 无真社保材料
+
+
+def test_overlay_social_security_per_person_list() -> None:
+    """逐人缴费名单（无单位级表述）：在名单 → True，不在 → False（先数形态）。"""
+    from app.services.scoring_service import _overlay_social_security
+
+    pages = [
+        (1, "序号 姓名 社会保障号码 险种 缴费情况 本单位实际缴费月数\n"
+            "1 郑峪嘉 130302196605151414 养老保险 2024年10月 2025年04月 7", "ocr"),
+    ]
+    cases = [
+        {"person_name": "郑峪嘉", "social_security": False},
+        {"person_name": "宋宏", "social_security": True},
+    ]
+    _overlay_social_security(cases, pages)
+    assert cases[0]["social_security"] is True
+    assert cases[1]["social_security"] is False
+
+
+# ---------------------------------------------------------------------------
 # 材料清单解析（required_evidence 整句 → 清单）
 # ---------------------------------------------------------------------------
 def test_parse_required_artifacts_splits_clause() -> None:

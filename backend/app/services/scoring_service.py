@@ -650,6 +650,14 @@ def execute_run(
                 )
                 if cases:
                     c_scoring = {**c_scoring, "verified_cases": cases}
+            # 人员级社保判定确定性覆盖（2026-10-23 run 49 实证：LLM 方差让
+            # 先数 c60 0→6、龙即 6→4.5 来回摆）。名单/单位参保证明是可机械
+            # 判定的：person_name 在社保材料页 → True；单位专用参保证明覆盖
+            # 全员 → True；逐人缴费名单不含该人 → False。
+            if params.get("person_scope") and c_scoring.get("verified_cases"):
+                _overlay_social_security(
+                    c_scoring["verified_cases"], bid_pages.get(bid_id) or []
+                )
             result = score_count(c_scoring, params, facts)  # type: ignore[arg-type]
             # unresolved 以结构化键落库：下游（报告疑问清单）直接判读，
             # 不再靠匹配 detail 的中文措辞——那种耦合已经断过一次。
@@ -1336,6 +1344,50 @@ def _sanitize_case(
     if tier is not None:
         case["match_tier"] = tier
     return case
+
+
+# 单位级参保证明（"单位专用"+参保总人数/人员信息表 → 覆盖本单位全员）
+_SS_UNIT_WIDE = re.compile(r"单位专用|参保缴费总人数|参保人员信息如下")
+# 企业年报公示噪声（"企业选择不公示"的缴费基数/人数不是缴纳证明）
+_SS_ANNUAL_REPORT = re.compile(r"企业选择不公示|年度报告|企业年度报告")
+
+
+def _overlay_social_security(cases: list[dict], pages: list[tuple[int, str, str]]) -> None:
+    """人员级社保判定确定性覆盖（就地修改 social_security 布尔）。
+
+    LLM 判社保在 run 间来回摆（run 48 全对，run 49 先数 0→6 龙即 6→4.5）。
+    社保名单/参保证明是结构化材料，可机械判定：
+    - 该人员姓名出现在社保材料页 → True；
+    - 社保材料含单位级参保证明（"单位专用"/参保总人数/人员信息表）→ True
+      （本单位员工全员覆盖，截断名单找不到姓名不因此判 False）；
+    - 逐人缴费名单（无单位级表述）且姓名不在其中 → False；
+    - 完全无社保材料 → False。
+    """
+    ss_parts: list[str] = []
+    for _no, t, _src in pages:
+        t = t or ""
+        if not re.search(r"社保|参保|缴费|社会保险|养老|医疗", t):
+            continue
+        if _SS_ANNUAL_REPORT.search(t) and not re.search(r"社会保障号|缴费月数", t):
+            continue  # 企业年报公示的"社保信息"节不算缴纳证明
+        ss_parts.append(t)
+    ss_text = "\n".join(ss_parts)
+    if not ss_text.strip():
+        for c in cases:
+            c["social_security"] = False
+        return
+    unit_wide = bool(_SS_UNIT_WIDE.search(ss_text))
+    for c in cases:
+        person = str(c.get("person_name") or c.get("person") or "").strip()
+        if not person or len(person) < 2:
+            c["social_security"] = None  # 无法对应到人 → 留待严格闸门处置
+            continue
+        if person in ss_text:
+            c["social_security"] = True
+        elif unit_wide:
+            c["social_security"] = True  # 单位参保证明覆盖全员
+        else:
+            c["social_security"] = False
 
 
 def _eval_veto(  # noqa: ANN001
