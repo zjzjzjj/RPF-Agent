@@ -508,7 +508,7 @@ def _perf_crit(**kw) -> dict:
 
 
 def test_score_count_null_with_contract_counts_and_flags() -> None:
-    """材料页不可读（null）+ 合同已确认 + 表依据 → 计分并标疑问，不直接清零。"""
+    """点名材料(invoice)不可读(None) → 硬闸门不计（真实评审口径，2026-10-23）。"""
     from app.engine.objective import score_count
 
     crit = _perf_crit(verified_cases=[
@@ -518,10 +518,9 @@ def test_score_count_null_with_contract_counts_and_flags() -> None:
          "case_source": "table", "sanitized": "ok"},
     ])
     res = score_count(crit, crit["params"], BidFacts(text=""))
-    assert res.score == Decimal("4.00")  # 2 案 × 2
+    assert res.score == Decimal("2.00")  # 只有 B（A 的发票不可读 → 不全不得分）
     assert res.unresolved is None
     assert res.conflict is True
-    assert "1 个材料页不可读" in res.detail
 
 
 def test_score_count_null_without_contract_does_not_count() -> None:

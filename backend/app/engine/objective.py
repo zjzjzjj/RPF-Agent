@@ -650,6 +650,17 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                     conflict = True
                     detail += f"；{unknown_amount} 个案例金额无法确认（需人工核对）"
             required_flags = _required_flags(artifacts, person_scope=person_scope, criterion_name=str(criterion.get("name") or ""))
+            # 硬闸门（2026-10-23 按真实评审校准）：因素明确列出的材料（发票/验收/
+            # 业主证明）**不可读(None)也不计**——真实评审"不提供或提供不全的不得分"
+            # 是逐材料硬执行（run 48 实证：诚道 2 个 inv=None 案例被 null_policy
+            # 放行 → 6 分，真实 4 分；先数 1 个同样放行 → 4 分，真实 0）。
+            # null 救援仅保留在**未明确点名**的材料键上。
+            _strict_none: set[str] = set()
+            if not person_scope:
+                if "发票" in artifacts:
+                    _strict_none.add("invoice")
+                if "验收" in artifacts or "业主证明" in artifacts:
+                    _strict_none.add("acceptance")
             # 三态材料：True=确认有；False=确认无（规则"不全不得分"→不计）；
             # None=页不可读/未提供。None 不直接当 0——"机器看不见 ≠ 没有"
             # （与确定性路径同一哲学）。仅当确定性业绩表依据 + 合同已确认 +
@@ -661,6 +672,8 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                 vals = {k: c.get(k) for k in required_flags}
                 if any(v is False for v in vals.values()):
                     continue  # 确认缺失 → 不计
+                if any(v is None and k in _strict_none for k, v in vals.items()):
+                    continue  # 明确要求的材料不可读 → 按"不全不得分"不计
                 if all(v is True for v in vals.values()):
                     complete.append(c)  # 全部确认 → 计
                     continue
