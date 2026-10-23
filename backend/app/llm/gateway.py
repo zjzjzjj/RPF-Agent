@@ -121,6 +121,92 @@ def _strip_trailing_commas(text: str) -> tuple[str, int]:
     return "".join(out), fixed
 
 
+def _repair_missing_commas(text: str) -> tuple[str, int]:
+    """字符串感知地补缺失逗号（`}`/`]`/数字/字面量后直接跟新 token 的形态）。
+
+    实证（2026-10-23 run 44 客观审查 173 项中断）：DeepSeek 输出在数组元素/键值
+    对之间漏一个逗号 → `Expecting ',' delimiter` → 整场评分失败。不能安全修复
+    字符串内未转义引号，但"值后缺逗号"是确定性结构错误，可机械修复。
+    """
+    out: list[str] = []
+    in_str = False
+    escape = False
+    fixed = 0
+    last_sig = ""  # 字符串外最近一个"值结束"信号：} ] " #(数字) A(字面量)
+    i = 0
+    n = len(text)
+    _DIGITS = "0123456789"
+    _NUM_EXTRA = "+-.eE"
+    while i < n:
+        ch = text[i]
+        if in_str:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+                last_sig = '"'
+            i += 1
+            continue
+        if ch == '"':
+            if last_sig in ('}', ']', '"', '#', 'A'):
+                out.append(",")
+                fixed += 1
+            in_str = True
+            out.append(ch)
+            last_sig = ""
+            i += 1
+            continue
+        if ch in "{[":
+            if last_sig in ('}', ']', '"', '#', 'A'):
+                out.append(",")
+                fixed += 1
+            out.append(ch)
+            last_sig = ""
+            i += 1
+            continue
+        if ch in ":,":
+            out.append(ch)
+            last_sig = ch
+            i += 1
+            continue
+        if ch in "}]":
+            out.append(ch)
+            last_sig = ch
+            i += 1
+            continue
+        if ch in _DIGITS or (ch == "-" and i + 1 < n and text[i + 1] in _DIGITS):
+            # 数字 token：整段消费后再判下一个 token
+            if last_sig in ('}', ']', '"', '#', 'A'):
+                out.append(",")
+                fixed += 1
+            j = i
+            while j < n and (text[j] in _DIGITS or text[j] in _NUM_EXTRA):
+                j += 1
+            out.append(text[i:j])
+            last_sig = "#"
+            i = j
+            continue
+        if ch.isalpha():
+            # true/false/null 字面量（或未知裸词）整词消费
+            if last_sig in ('}', ']', '"', '#', 'A'):
+                out.append(",")
+                fixed += 1
+            j = i
+            while j < n and text[j].isalnum():
+                j += 1
+            out.append(text[i:j])
+            last_sig = "A"
+            i = j
+            continue
+        # 空白与其它符号原样输出（不改变 last_sig：逗号后的空白后跟值仍能判对）
+        out.append(ch)
+        i += 1
+    return "".join(out), fixed
+
+
 def _loads_lenient(candidate: str) -> dict | None:
     """strict=True / strict=False 各试一次（后者放行字符串内的裸换行等控制字符）。"""
     for strict in (True, False):
@@ -195,6 +281,18 @@ def _parse_candidate(candidate: str) -> dict:
         if data is not None:
             log.warning(
                 "模型输出 JSON 含 %d 处非法转义、%d 处尾逗号，已自动修复", escapes, commas
+            )
+            return data
+
+    # 第三级：缺失逗号（值后直接跟新 token）——2026-10-23 run 44 客观审查
+    # 173 项因一个漏逗号整场失败；结构错误可机械补。
+    nocommas, inserted = _repair_missing_commas(stripped)
+    if inserted:
+        data = _loads_lenient(nocommas)
+        if data is not None:
+            log.warning(
+                "模型输出 JSON 含 %d 处非法转义、%d 处尾逗号、%d 处缺失逗号，已自动修复",
+                escapes, commas, inserted,
             )
             return data
 
@@ -334,26 +432,45 @@ class Gateway:
         temperature: float = 0.0,
         max_tokens: int | None = None,
     ) -> tuple[T, LLMResult]:
-        """调用并解析为 Pydantic 模型。解析失败抛 LLMError（上层降级为待人工，不猜）。"""
-        result = self.chat(
-            system,
-            user,
-            data_class=data_class,
-            prompt_version=prompt_version,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-        payload = extract_json(result.text)
-        try:
-            return out_model.model_validate(payload), result
-        except ValidationError as exc:
-            # 只保留 type/loc/msg：pydantic v2 的 errors() 默认带 input（字段原值），
-            # 而这段文本会被拼进 AppError → job.error → 前端/日志——招标原文
-            # 属 confidential，不得外泄（2026-10-21 合规复核）。
-            brief = [
-                {k: e.get(k) for k in ("type", "loc", "msg")} for e in exc.errors()[:3]
-            ]
-            raise LLMError(f"模型输出不符合契约：{brief}") from exc
+        """调用并解析为 Pydantic 模型。解析失败抛 LLMError（上层降级为待人工，不猜）。
+
+        JSON 解析/契约失败重试 2 次（采样偶发缺逗号/截断，换一次生成大概率就好；
+        余额/配额类错误不重试——上层按 fail-fast 处理）。
+        """
+        last_exc: LLMError | None = None
+        result = None
+        for attempt in range(3):
+            result = self.chat(
+                system,
+                user,
+                data_class=data_class,
+                prompt_version=prompt_version,
+                temperature=temperature,
+                max_tokens=max_tokens,
+            )
+            try:
+                payload = extract_json(result.text)
+                return out_model.model_validate(payload), result
+            except ValidationError as exc:
+                # 只保留 type/loc/msg：pydantic v2 的 errors() 默认带 input（字段原值），
+                # 而这段文本会被拼进 AppError → job.error → 前端/日志——招标原文
+                # 属 confidential，不得外泄（2026-10-21 合规复核）。
+                brief = [
+                    {k: e.get(k) for k in ("type", "loc", "msg")} for e in exc.errors()[:3]
+                ]
+                last_exc = LLMError(f"模型输出不符合契约：{brief}")
+                last_exc.__cause__ = exc
+            except LLMError as exc:
+                msg = str(exc)
+                if any(k in msg for k in ("402", "insufficient", "quota", "30001", "arrears")):
+                    raise  # 余额/配额：fail-fast，不重试
+                last_exc = exc
+            if attempt < 2:
+                log.warning(
+                    "chat_json 第 %d 次输出解析失败，重试：%s", attempt + 1, last_exc
+                )
+        assert last_exc is not None and result is not None
+        raise last_exc
 
 
 def _is_private_host(host: str) -> bool:
