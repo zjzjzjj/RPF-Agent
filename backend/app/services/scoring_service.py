@@ -442,8 +442,9 @@ def execute_run(
         for ci in count_items
     )
     if _has_perf and config.auto_mode():
-        from app.services.ingest_service import rescue_material_pages
+        from app.services.ingest_service import rescue_material_pages, rescue_person_material_pages
 
+        _has_person = any((ci.get("params") or {}).get("person_scope") for ci in count_items)
         for bid_id in bidder_ids:
             doc_id = main_doc_by_bidder.get(bid_id)
             if doc_id is None:
@@ -454,6 +455,15 @@ def execute_run(
                     log.info("材料页 OCR 救援 doc=%s：%s 页", doc_id, rr.get("rescued"))
             except Exception as exc:  # noqa: BLE001 —— 救援失败不阻断评分
                 log.warning("材料页 OCR 救援失败 doc=%s：%s", doc_id, exc)
+            if _has_person:
+                # 人员级：社保证明/经验证明章节的嵌入扫描图救援——个人参保证明
+                # 常是"48 字标题 + 大图"同页，文本层看不到 → social_security 恒 False。
+                try:
+                    pr = rescue_person_material_pages(doc_id)
+                    if pr.get("rescued"):
+                        log.info("人员材料页 OCR 救援 doc=%s：%s 页", doc_id, pr.get("rescued"))
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("人员材料页 OCR 救援失败 doc=%s：%s", doc_id, exc)
 
     # ---- 证明材料页索引（count 逐案例核验与主观评审共用） ----
     _MAT_KEYWORDS = ("发票", "验收", "业主证明", "查询截图", "证书复印件", "承诺书", "营业执照",
@@ -1041,13 +1051,18 @@ def _case_candidate_pages(
             r"项目经理|运维负责人|主要实施|项目总监|团队成员|人员名单|项目负责人"
             r"|社保|社会保险|参保|缴费|工作证明|经验证明|简历|职称"
         )
+        # 社保/经验证明/劳动合同材料页优先（真实社保在 200+ 页的人员资料区，
+        # 按文档顺序填预算会把它挤出送审窗口）
+        _person_mat = _re.compile(
+            r"社保|参保|缴纳|经验证明|工作经验证明|劳动合同|社会保障号|缴费明细"
+        )
         kept = []
         for i in ordered:
             t = _cleaned(pages[i][1])
             if not _person_evidence.search(t):
                 continue  # 无人物证据 → 排除（项目合同页、发票页等）
-            # 有人员证据的页保留；如果同时含合同头（签署页可能两者都有）也保留
             kept.append(i)
+        kept.sort(key=lambda i: (0 if _person_mat.search(_cleaned(pages[i][1])) else 1, i))
         ordered = kept
     else:
         # 项目级：人员证据页优先排序（让 LLM 优先看到人员表）
@@ -1236,10 +1251,24 @@ def _sanitize_case(
     if len(quote_n) < config.MIN_QUOTE_CHARS and bid_norm is not None:
         _name = str(case.get("name") or "").strip()
         _name_n = _nnw(_name)
+        # 案例名回标书：全名 → 剥尾部（日期/括号注记）→ 前缀（跨页表格行的
+        # 案例名常含"（2019年4月1日-…）"日期尾，全名回不到任何一页）。
+        _name_hit: str | None = None
         if len(_name_n) >= 8 and _name_n in bid_norm:
-            case["quote"] = _name
+            _name_hit = _name_n
+        else:
+            _cut = re.split(r"[（(]", _name_n, maxsplit=1)[0]
+            if len(_cut) >= 8 and _cut in bid_norm:
+                _name_hit = _cut
+            else:
+                for _plen in (24, 16, 12):
+                    if len(_name_n) > _plen and _name_n[:_plen] in bid_norm:
+                        _name_hit = _name_n[:_plen]
+                        break
+        if _name_hit:
+            case["quote"] = _name if _name_hit == _name_n else _name_hit
             case["quote_source"] = "case_name"
-            quote_n = _name_n
+            quote_n = _name_hit
     cheat = True
     reason = "quote_too_short"
     tier: str | None = None

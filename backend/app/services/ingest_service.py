@@ -273,6 +273,112 @@ def rescue_material_pages(document_id: int, max_pages: int | None = None) -> dic
             "rescued": len(rescued), "pages": rescued}
 
 
+# 人员级材料章节标题（社保证明/经验证明/劳动合同…）——标题页本身或紧随的空白
+# 扫描页常承载嵌入图（2026-10-23 实证：龙即 p247"社保证明"48 字 + 1.4MB 参保证
+# 明扫描图、致成 p169 标题+参保证明同页、先数 p186 空白页即参保证明），文本层
+# 永远看不到内容 → c59/c60 的 social_security/experience_proof 全 False → 0 分。
+_PERSON_MAT_HEADER = re.compile(
+    r"社保证明|社保代缴|社会保险参保证明|参保人员|缴纳证明"
+    r"|工作经验证明|年以上工作经验证明|经验证明|劳动合同|职称"
+)
+
+
+def rescue_person_material_pages(document_id: int, max_pages: int = 60) -> dict:
+    """人员级评分项的材料页定向 OCR 救援。
+
+    目标页：①含人员材料章节标题且文本 <250 字的页（标题+嵌入扫描图同页）；
+    ②标题页之后文本 <100 字的连续空白扫描页（内容在后一页的形态，最多 6 页）。
+    幂等（已 OCR 页跳过）、限量。写入后重算 char_start/char_end。
+    """
+    from app.evidence.case_evidence import page_image_ratios
+    from app.parsing.pdf_pymupdf import ocr_pages_text
+
+    with session_scope() as s:
+        doc = s.get(Document, document_id)
+        if doc is None or doc.kind != "bid":
+            return {"document_id": document_id, "targets": 0, "rescued": 0, "pages": []}
+        pdf_path = doc.stored_path
+        rows = [
+            (int(p.page_no), p.text or "", p.source or "text")
+            for p in s.execute(
+                select(DocumentPage)
+                .where(DocumentPage.document_id == document_id)
+                .order_by(DocumentPage.page_no)
+            ).scalars()
+        ]
+    if not pdf_path or not Path(pdf_path).exists():
+        return {"document_id": document_id, "targets": 0, "rescued": 0, "pages": [],
+                "error": "pdf missing"}
+    ratios = page_image_ratios(pdf_path)
+    targets: list[int] = []
+    by_no = {no: (t, src) for no, t, src in rows}
+    ordered_nos = [no for no, _t, _s in rows]
+    for i, no in enumerate(ordered_nos):
+        t, src = by_no[no]
+        if src != "text":
+            continue  # 已 OCR/救援过
+        if not _PERSON_MAT_HEADER.search(t or ""):
+            continue
+        if len((t or "").strip()) >= 250:
+            continue
+        if ratios.get(no, 0.0) >= 0.03 or len((t or "").strip()) < 120:
+            targets.append(no)
+        # 标题页后的连续空白扫描页（内容在下一页的形态）
+        for j in range(i + 1, min(i + 7, len(ordered_nos))):
+            nxt = ordered_nos[j]
+            nt, nsrc = by_no[nxt]
+            if nsrc != "text" or len((nt or "").strip()) >= 100:
+                break
+            if ratios.get(nxt, 0.0) >= 0.03 or len((nt or "").strip()) < 60:
+                targets.append(nxt)
+    targets = sorted(set(targets))[: max(0, max_pages)]
+    if not targets:
+        return {"document_id": document_id, "targets": 0, "rescued": 0, "pages": []}
+    try:
+        ocr_text = ocr_pages_text(pdf_path, targets, min_image_ratio=0.03)
+    except Exception as exc:  # noqa: BLE001 —— 救援失败不阻断评分
+        log.warning("人员材料页 OCR 救援失败 doc=%s：%s", document_id, exc)
+        return {"document_id": document_id, "targets": len(targets), "rescued": 0,
+                "pages": [], "error": str(exc)}
+    rescued: list[int] = []
+    with session_scope() as s:
+        page_rows = {
+            int(p.page_no): p
+            for p in s.execute(
+                select(DocumentPage).where(DocumentPage.document_id == document_id)
+            ).scalars()
+        }
+        for pno, text in ocr_text.items():
+            row = page_rows.get(int(pno))
+            if row is None or not text.strip():
+                continue
+            old_lines = [ln for ln in (row.text or "").split("\n") if ln.strip()]
+            new_lines = [ln for ln in text.split("\n") if ln.strip()]
+            merged = old_lines + [ln for ln in new_lines if ln not in old_lines]
+            row.text = "\n".join(merged)
+            row.source = "ocr"
+            rescued.append(int(pno))
+        if rescued:
+            offset = 0
+            for p in s.execute(
+                select(DocumentPage)
+                .where(DocumentPage.document_id == document_id)
+                .order_by(DocumentPage.page_no)
+            ).scalars():
+                p.char_start = offset
+                p.char_end = offset + len(p.text or "")
+                offset = p.char_end
+            doc = s.get(Document, document_id)
+            if doc is not None:
+                warns = list(doc.warnings_json or [])
+                warns.append(
+                    "人员材料页 OCR 救援：第 " + "、".join(str(x) for x in rescued) + " 页"
+                )
+                doc.warnings_json = warns
+    return {"document_id": document_id, "targets": len(targets),
+            "rescued": len(rescued), "pages": rescued}
+
+
 def list_documents(project_id: str) -> list[Document]:
     with session_scope() as s:
         rows = (
