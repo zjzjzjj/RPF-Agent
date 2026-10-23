@@ -296,6 +296,23 @@ def test_price_fallback_requires_context():
     assert facts2.bid_price == D("7000000.00")
 
 
+def test_money_fullwidth_digits_not_crash():
+    """全角数字金额（OCR 噪声）不得让整场评分崩溃（2026-10-23 run 46 实证）。
+
+    人员救援 OCR 后新文本含全角数字行，旧 _money 直接 Decimal() 抛
+    ConversionSyntax → extract_bid_facts 崩 → 整个 job failed 0/226。
+    """
+    from app.engine.facts import _money
+
+    assert _money("４４６２") == D("4462")
+    assert _money("２，５８７，２４８.００") == D("2587248.00")
+    assert _money("") is None
+    assert _money("abc") is None
+    # 全角金额出现在文本中：extract_bid_facts 不得抛异常
+    facts = extract_bid_facts("某运维项目 ４４６２ 2024年 签订合同")
+    assert isinstance(facts.performance_amounts, list)  # 至少不崩
+
+
 # ---- 真实标书格式（浙江中烟项目实测）------------------------------------------
 # 样例数据里的 "投标总价：金额" 同行写法在真实标书中很少见；金额通常落在
 # 表头**下一行**，且小写前常夹货币符号。以下四种形态均取自真实开标一览表。

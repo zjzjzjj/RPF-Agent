@@ -8,6 +8,7 @@ objective/primitives 做；事实与判定分离才能保证"客观分可复算�
 """
 from __future__ import annotations
 
+import decimal
 import re
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -120,8 +121,23 @@ def parse_upper_amount(text: str) -> Decimal | None:
     return Decimal(value) + fraction
 
 
-def _money(s: str) -> Decimal:
-    return Decimal(s.replace(",", "").replace("，", ""))
+# 全角数字/标点 → ASCII（OCR 常把金额读成"４４６２""．"）
+_FW_NUM_TRANS = str.maketrans("０１２３４５６７８９．，－＋％", "0123456789.,-+%")
+
+
+def _money(s: str) -> Decimal | None:
+    """OCR 金额 → Decimal。全角归一；非法输入返回 None（调用方跳过/换策略）。
+
+    2026-10-23 实证：人员救援 OCR 后新文本含全角数字行，`Decimal("４４６２")`
+    抛 ConversionSyntax → 整场评分在 extract_bid_facts 崩掉。
+    """
+    t = (s or "").translate(_FW_NUM_TRANS).replace(",", "").replace("，", "")
+    if not t or not any(ch.isdigit() for ch in t):
+        return None
+    try:
+        return Decimal(t)
+    except (decimal.InvalidOperation, ValueError):
+        return None
 
 
 def _contextual_price(text: str) -> Decimal | None:
@@ -135,6 +151,8 @@ def _contextual_price(text: str) -> Decimal | None:
     first_non_deposit: Decimal | None = None
     for m in _RE_PRICE_SYMBOL.finditer(text):
         value = _money(m.group(1))
+        if value is None:
+            continue
         context = text[max(0, m.start() - 40) : m.start()]
         if any(k in context for k in ("投标总价", "投标报价", "总报价", "报价")):
             return value
@@ -269,10 +287,14 @@ def _price_near_total_label(text: str) -> Decimal | None:
     for m in _RE_TOTAL_LABEL.finditer(text):
         tail = text[m.end() : m.end() + _PRICE_LABEL_WINDOW]
         if lm := _RE_PRICE_LOWER_LABEL.search(tail):
-            return _money(lm.group(1))
+            v = _money(lm.group(1))
+            if v is not None:
+                return v
         for line in tail.split("\n")[:3]:
             if lm := _RE_PRICE_LOWER_LABEL.search(line):
-                return _money(lm.group(1))
+                v = _money(lm.group(1))
+                if v is not None:
+                    return v
             if um := _RUN_UPPER.search(line):
                 if value := parse_upper_amount(um.group(0)):
                     return value
@@ -306,17 +328,19 @@ def extract_bid_facts(text: str, documents: list[str] | None = None) -> BidFacts
     # 报价：多级策略（宁缺勿错，都取不到就留 None，由人工在报价确认卡点录入）：
     # ① "投标总价：金额" 同行 → ② 标签后窗口内的小写/大写金额（真实标书的换行表格）
     # → ③ "投标价（含增值税…）" 合计行 → ④ 带语境的 ¥。
+    price: Decimal | None = None
     if m := _RE_PRICE_TOTAL_ROW.search(text):
-        facts.bid_price = _money(m.group(1))
-    elif (near := _price_near_total_label(text)) is not None:
-        facts.bid_price = near
-    elif m := _RE_PRICE_INCL_VAT.search(text):
-        facts.bid_price = _money(m.group(1))
-    elif (ob := _price_from_open_bid_section(text)) is not None:
+        price = _money(m.group(1))
+    if price is None and (near := _price_near_total_label(text)) is not None:
+        price = near
+    if price is None and (m := _RE_PRICE_INCL_VAT.search(text)):
+        price = _money(m.group(1))
+    if price is None and (ob := _price_from_open_bid_section(text)) is not None:
         # ⑤ 结构锚点兜底（强于④的全局弱启发）：开标一览表跨行断裂表单
-        facts.bid_price = ob
-    else:
-        facts.bid_price = _contextual_price(text)
+        price = ob
+    if price is None:
+        price = _contextual_price(text)
+    facts.bid_price = price
     # 大写金额
     if m := _RE_PRICE_TOTAL_CN.search(text):
         facts.bid_price_upper = m.group(1)
@@ -327,7 +351,9 @@ def extract_bid_facts(text: str, documents: list[str] | None = None) -> BidFacts
 
     # 注册资本
     if m := _RE_CAPITAL.search(text):
-        facts.registered_capital = _money(m.group(1)) * Decimal(10_000)
+        cap = _money(m.group(1))
+        if cap is not None:
+            facts.registered_capital = cap * Decimal(10_000)
 
     # 业绩（表格行：编号 名称 金额 年份；管道或空格分隔）
     # 表头若声明"万元"单位，金额要做 ×10000 换算，否则出现 10000 倍低估。
@@ -341,6 +367,8 @@ def extract_bid_facts(text: str, documents: list[str] | None = None) -> BidFacts
         if "项目名称" in name or "合同金额" in name:
             continue
         value = _money(amount)
+        if value is None:
+            continue  # 全角/非法金额（OCR 噪声）→ 跳过该行，不崩整场
         for back in range(line_no - 1, max(-1, line_no - 12), -1):
             header = lines[back] if 0 <= back < len(lines) else ""
             if "合同金额" in header or "金额" in header:
