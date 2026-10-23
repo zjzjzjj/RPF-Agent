@@ -165,6 +165,27 @@ def test_classify_contract_boilerplate_not_invoice() -> None:
     assert b.status["invoice"] is False
 
 
+def test_classify_vat_clause_not_invoice() -> None:
+    """合同付款条款含'增值税专用发票'→ 不算发票（2026-10-23 先数假信号实证）。
+
+    真实故障：先数全文无一张真发票，合同条款'收到乙方出具的…发票类型
+    增值税专用发票…'与报价表'增值税'列被 _RE_INVOICE 误判 invoice=True
+    → 业绩案例计分（真实评审 0）。
+    """
+    pages = [PageRec(10, "第2种方式支付合同价款：收到乙方出具的相应金额的合法发票"
+                        "（发票类型增值税专用发票，货物或应税劳务，税率6%）后付款", "text")]
+    b = _run_classify(pages, {}, [10])
+    assert b.status["invoice"] is False
+
+
+def test_classify_real_invoice_form_page_is_true() -> None:
+    """真发票表单（购买方/发票号码字段）→ invoice=True 不误伤。"""
+    pages = [PageRec(10, "浙江增值税专用发票 购买方：杭州诚道科技股份有限公司 "
+                        "发票号码 3300241130 开票日期 2024年6月 价税合计 58000", "ocr")]
+    b = _run_classify(pages, {}, [10])
+    assert b.status["invoice"] is True
+
+
 # ---------------------------------------------------------------------------
 # OCR 目标
 # ---------------------------------------------------------------------------

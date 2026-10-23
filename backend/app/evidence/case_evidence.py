@@ -20,9 +20,24 @@ log = logging.getLogger(__name__)
 # ---- 材料强信号（宁可漏判也不要把合同付款条款里的"发票"字样当发票）----
 _RE_CONTRACT_PARTY = re.compile(r"甲方|乙方|发包人|承包人|买受人|出卖人")
 _RE_CONTRACT_HEAD = re.compile(r"合同扫描件|项目合同|采购合同|运维合同|服务合同|合同协议书|合同书")
-_RE_INVOICE = re.compile(
-    r"发票代码|发票号码|开票日期|价税合计|校验码|电子发票|增值税专用发票|发票专用章|购买方"
+# 发票：只认表单字段级强信号。"增值税专用发票"单独出现是合同付款条款
+# （"收到乙方出具的…发票类型增值税专用发票…"）或报价表税率列——先数
+# 全文无一张真发票却靠此误判 invoice=True（2026-10-23 run 48-50 实证）。
+_RE_INVOICE_STRONG = re.compile(
+    r"发票代码|发票号码|开票日期|价税合计|校验码|发票专用章|购买方[：:]|纳税人识别号"
 )
+
+
+def _is_invoice_page(text: str) -> bool:
+    """真发票页判定：表单字段强信号，或"增值税专用发票"+购买方/纳税人字段。"""
+    if _RE_INVOICE_STRONG.search(text):
+        return True
+    return "增值税专用发票" in text and bool(
+        re.search(r"购买方|销售方|纳税人识别号|发票专用章", text)
+    )
+
+
+_RE_INVOICE = _RE_INVOICE_STRONG  # 兼容旧引用
 _RE_ACCEPTANCE = re.compile(
     r"验收报告|验收结论|验收意见|验收日期|验收合格|验收单|业主证明|用户证明|使用证明|项目评价"
 )
@@ -514,6 +529,8 @@ def classify_materials(
                         _RE_CONTRACT_PARTY.search(text)
                         and ("合同" in text or _RE_CONTRACT_HEAD.search(text))
                     ) or bool(_RE_CONTRACT_HEAD.search(text) and len(text) >= 200)
+                elif mat == "invoice":
+                    ok = _is_invoice_page(text)
                 else:
                     ok = bool(pat.search(text)) if pat else False
                 if ok:
