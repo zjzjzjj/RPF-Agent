@@ -279,6 +279,32 @@ def test_overlay_social_security_per_person_list() -> None:
     assert cases[1]["social_security"] is False
 
 
+def test_overlay_work_proof_requires_evidence_page() -> None:
+    """成员级 work_proof 确定性覆盖：姓名须出现在业绩证明材料页。
+
+    2026-10-23 实证：先数成员只在简历表页出现（ev_pages=[] → 真实 0），
+    龙即/诚道成员有合同/用户证明/经验证明页（真实 6）。
+    """
+    from app.services.scoring_service import _overlay_work_proof
+
+    pages = [
+        (1, "59 宋宏 男 硕士研 行业专家，高级运维工程师 建行分行基础设施资源整合工作", "text"),
+        (2, "用户证明 兹证明吴奇钢参与2022年浙江中烟企务系统运维服务项目 业主单位盖章", "ocr"),
+        (3, "项目经验证明详见5.1 我司团队人员中李卓敏深度参与了杭州交警项目", "ocr"),
+    ]
+    cases = [
+        {"person_name": "宋宏", "work_proof": True},    # 仅简历行 → False
+        {"person_name": "吴奇钢", "work_proof": False},  # 用户证明页 → True
+        {"person_name": "李卓敏", "work_proof": False},  # 经验证明页 → True
+        {"person_name": "", "work_proof": True},         # 无法对应 → None
+    ]
+    _overlay_work_proof(cases, pages)
+    assert cases[0]["work_proof"] is False
+    assert cases[1]["work_proof"] is True
+    assert cases[2]["work_proof"] is True
+    assert cases[3]["work_proof"] is None
+
+
 # ---------------------------------------------------------------------------
 # 材料清单解析（required_evidence 整句 → 清单）
 # ---------------------------------------------------------------------------

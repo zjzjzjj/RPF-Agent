@@ -658,6 +658,11 @@ def execute_run(
                 _overlay_social_security(
                     c_scoring["verified_cases"], bid_pages.get(bid_id) or []
                 )
+                # 成员级 work_proof 确定性覆盖（简历表行不算业绩证明）
+                if str(params.get("person_scope")) == "member":
+                    _overlay_work_proof(
+                        c_scoring["verified_cases"], bid_pages.get(bid_id) or []
+                    )
             result = score_count(c_scoring, params, facts)  # type: ignore[arg-type]
             # unresolved 以结构化键落库：下游（报告疑问清单）直接判读，
             # 不再靠匹配 detail 的中文措辞——那种耦合已经断过一次。
@@ -1388,6 +1393,31 @@ def _overlay_social_security(cases: list[dict], pages: list[tuple[int, str, str]
             c["social_security"] = True  # 单位参保证明覆盖全员
         else:
             c["social_security"] = False
+
+
+# 业绩证明材料页标记（work_proof 的实体证据：合同/用户证明/经验证明小节）
+_WP_EV_PAGE = re.compile(
+    r"合同扫描件|合同编号|技术服务合同|项目合同|委托方|用户证明|业主证明"
+    r"|使用证明|经验证明|案例证明|合同复印件|验收报告"
+)
+
+
+def _overlay_work_proof(cases: list[dict], pages: list[tuple[int, str, str]]) -> None:
+    """成员级 work_proof 确定性覆盖：人员姓名须出现在业绩证明材料页上。
+
+    2026-10-23 实证：先数 c60 的 12 个案例全部来自技术方案简历表
+    （"59 宋宏 男 硕士研 行业专家…"），其姓名在任何合同/用户证明/经验证明
+    页上都不出现（ev_pages=[]）→ 真实评审 0 分；龙即/诚道成员均有证明
+    材料页（吴奇钢 p253 用户证明、李卓敏 p211 经验证明）→ 真实 6 分。
+    LLM 三轮 prompt 引导均放行简历行，故对 member 级做机械判定。
+    """
+    ev_pages_text = [t for _n, t, _s in pages if t and _WP_EV_PAGE.search(t)]
+    for c in cases:
+        person = str(c.get("person_name") or c.get("person") or "").strip()
+        if not person or len(person) < 2:
+            c["work_proof"] = None  # 无法对应到人 → 留待闸门处置
+            continue
+        c["work_proof"] = any(person in t for t in ev_pages_text)
 
 
 def _eval_veto(  # noqa: ANN001

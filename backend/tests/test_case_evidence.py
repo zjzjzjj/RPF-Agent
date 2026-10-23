@@ -178,6 +178,14 @@ def test_classify_vat_clause_not_invoice() -> None:
     assert b.status["invoice"] is False
 
 
+def test_classify_contract_account_block_not_invoice() -> None:
+    """合同乙方账户信息含'纳税人识别号'→ 不算发票（先数 p165 实证）。"""
+    pages = [PageRec(10, "纳税人识别号：91630000698540235A 税务开户银行：青海银行 "
+                        "开户银行账号：400074673105017 4.6 甲方按约定向乙方支付合同款", "text")]
+    b = _run_classify(pages, {}, [10])
+    assert b.status["invoice"] is False
+
+
 def test_classify_real_invoice_form_page_is_true() -> None:
     """真发票表单（购买方/发票号码字段）→ invoice=True 不误伤。"""
     pages = [PageRec(10, "浙江增值税专用发票 购买方：杭州诚道科技股份有限公司 "
