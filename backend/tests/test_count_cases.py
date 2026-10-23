@@ -159,6 +159,65 @@ def test_score_count_no_cases_stays_unresolved() -> None:
     assert result.unresolved == "field_missing"
 
 
+def test_score_count_leader_type_gate_drops_non_ops_cases() -> None:
+    """负责人经验 + 因素含"运维"：集成/维保/建设类案例确定性剔除（真实评审口径）。
+
+    2026-10-23 run 47 实证：prompt 类型门槛被 LLM 无视，先数设备维保/网络
+    建设类案例仍计 4 分（真实 0）；运维类案例必须保留（龙即香溢运维合同）。
+    """
+    from app.engine.objective import score_count
+
+    def _leader_crit(cases):
+        return {
+            "name": "项目负责人经验",
+            "description": "项目负责人具有五年及以上工作经验且作为项目负责人具有"
+                           "类似系统运维项目的实施/服务经验的，每提供一个案例得2分",
+            "max_score": Decimal("4"),
+            "required_artifacts": "合同复印件、社保证明",
+            "params": {"person_scope": "leader", "per_item": "2", "max_items": "2"},
+            "verified_cases": cases,
+        }
+
+    facts = BidFacts(text="")
+    # 先数形态：设备维保/网络建设/集成服务 → 全剔 → 0
+    crit = _leader_crit([
+        {"name": "建行北京分行华为设备维保项目", "role": "leader",
+         "work_proof": True, "experience_proof": True, "social_security": True,
+         "quote": "郑峪嘉 曾担任项目经理", "sanitized": "ok"},
+        {"name": "再保险集团核心网络系统建设", "role": "leader",
+         "work_proof": True, "experience_proof": True, "social_security": True,
+         "quote": "郑峪嘉 曾担任项目经理", "sanitized": "ok"},
+    ])
+    res = score_count(crit, crit["params"], facts)
+    assert res.score == Decimal("0")
+    assert "类型门槛" in res.detail
+    # 龙即形态：运维服务类 → 保留计满
+    crit2 = _leader_crit([
+        {"name": "浙江香溢控股有限公司全省协同办公系统运维服务维护合同", "role": "leader",
+         "work_proof": True, "experience_proof": True, "social_security": True,
+         "quote": "王耘 曾担任项目负责人", "sanitized": "ok"},
+        {"name": "2021年浙江中烟企务系统运维服务项目", "role": "leader",
+         "work_proof": True, "experience_proof": True, "social_security": True,
+         "quote": "蒋立华 担任项目经理", "sanitized": "ok"},
+    ])
+    res2 = score_count(crit2, crit2["params"], facts)
+    assert res2.score == Decimal("4")
+
+
+def test_score_count_member_scope_no_type_gate() -> None:
+    """团队成员项因素无"运维"字样 → 不做类型过滤（诚道交警项目得计）。"""
+    from app.engine.objective import score_count
+
+    crit = _count_crit(verified_cases=[
+        {"name": "2022年杭州交警业务系统使用服务项目", "role": "成员",
+         "work_proof": True, "social_security": True, "experience_proof": True,
+         "person_name": "李卓敏", "quote": "李卓敏 项目经理 2022年杭州交警项目",
+         "sanitized": "ok"},
+    ])
+    res = score_count(crit, crit["params"], BidFacts(text=""))
+    assert res.score == Decimal("1.5")
+
+
 # ---------------------------------------------------------------------------
 # 材料清单解析（required_evidence 整句 → 清单）
 # ---------------------------------------------------------------------------

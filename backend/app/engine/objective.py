@@ -591,6 +591,7 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
             cases = clean_cases
             # 已有逐案例核验结果 = 计数有依据；清掉"字段缺失/未抽到事实"的 unresolved
             unresolved = None
+            _type_gate_note = ""
             # 人员级：按负责人/成员过滤；模型完全没给 role 时退回全部案例并标疑问
             if person_scope:
                 roles = [_normalize_role(c) for c in cases]
@@ -606,6 +607,27 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                 else:
                     conflict = True
                     detail += "；模型未标注案例人员归属，按全部案例计（需人工核对）"
+                # 负责人经验"类似运维项目"类型确定性过滤：prompt 门槛 LLM 会无视
+                # （2026-10-23 run 47 实证：先数设备维保/网络建设类案例仍计 4 分，
+                # 真实评审 0）。因素含"运维"时案例名须含 运维/维护 才计。
+                if person_scope == "leader" and cases:
+                    _factor_text = (
+                        str(criterion.get("name") or "")
+                        + str(criterion.get("description") or "")
+                    )
+                    if "运维" in _factor_text:
+                        _typed = [
+                            c for c in cases
+                            if re.search(r"运维|维护", str(c.get("name") or ""))
+                        ]
+                        if len(_typed) < len(cases):
+                            _ntype = len(cases) - len(_typed)
+                            cases = _typed
+                            conflict = True
+                            # detail 在本分支末尾整体重建 → 用 note 变量传递
+                            _type_gate_note = (
+                                f"（按'类似运维项目'类型门槛剔除 {_ntype} 个集成/维保/建设类案例）"
+                            )
             # 金额门槛：明确低于门槛的不计；金额缺失的照计但标疑问
             min_amount = Decimal(str(params.get("min_amount_yuan") or 0))
             if min_amount > 0 and cases:
@@ -664,6 +686,7 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                 f"逐案例核验：提供案例 {len(cases)} 个，其中可计 {len(complete)} 个"
                 + (f"（{incomplete} 个缺证明材料不计分）" if incomplete else "")
                 + (f"（{null_counted} 个材料页不可读，按已提供计并标疑问）" if null_counted else "")
+                + _type_gate_note
             )
             if incomplete:
                 conflict = True
