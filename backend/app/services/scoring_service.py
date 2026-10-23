@@ -1244,31 +1244,34 @@ def _sanitize_case(
     quote_n = _nnw(quote)
     if echo_n is None:
         echo_n = _nnw(requirement_text or "")
+
+    def _case_name_hit() -> tuple[str, str] | None:
+        """案例名回标书：全名 → 剥尾部（日期/括号注记）→ 前缀（跨页表格行的
+        案例名常含"（2019年4月1日-…）"日期尾，全名回不到任何一页）。"""
+        _name = str(case.get("name") or "").strip()
+        _name_n = _nnw(_name)
+        if len(_name_n) < 8 or bid_norm is None:
+            return None
+        if _name_n in bid_norm:
+            return _name, _name_n
+        _cut = re.split(r"[（(]", _name_n, maxsplit=1)[0]
+        if len(_cut) >= 8 and _cut in bid_norm:
+            return _cut, _cut
+        for _plen in (24, 16, 12):
+            if len(_name_n) > _plen and _name_n[:_plen] in bid_norm:
+                return _name_n[:_plen], _name_n[:_plen]
+        return None
+
     # 引文缺失但案例名是可核验实体 → 以案例名作核验锚。业绩表/合同台账行常"有名有
     # 金额、无逐字引文"（模型把实质材料理解成合同正文/发票，不愿引表格行）；2026-10-21
     # 实证：模型给全 8 个真实案例名 + 金额却 quote 留空 → 旧逻辑全判 quote_too_short
     # → 整项未定分。案例名回得到标书即证明案例真实存在（伪造名回不到标书，仍拒）。
     if len(quote_n) < config.MIN_QUOTE_CHARS and bid_norm is not None:
-        _name = str(case.get("name") or "").strip()
-        _name_n = _nnw(_name)
-        # 案例名回标书：全名 → 剥尾部（日期/括号注记）→ 前缀（跨页表格行的
-        # 案例名常含"（2019年4月1日-…）"日期尾，全名回不到任何一页）。
-        _name_hit: str | None = None
-        if len(_name_n) >= 8 and _name_n in bid_norm:
-            _name_hit = _name_n
-        else:
-            _cut = re.split(r"[（(]", _name_n, maxsplit=1)[0]
-            if len(_cut) >= 8 and _cut in bid_norm:
-                _name_hit = _cut
-            else:
-                for _plen in (24, 16, 12):
-                    if len(_name_n) > _plen and _name_n[:_plen] in bid_norm:
-                        _name_hit = _name_n[:_plen]
-                        break
-        if _name_hit:
-            case["quote"] = _name if _name_hit == _name_n else _name_hit
+        hit = _case_name_hit()
+        if hit:
+            case["quote"] = hit[0]
             case["quote_source"] = "case_name"
-            quote_n = _name_hit
+            quote_n = hit[1]
     cheat = True
     reason = "quote_too_short"
     tier: str | None = None
@@ -1286,7 +1289,20 @@ def _sanitize_case(
                 cheat = False
                 reason = "ok"  # 引文真实存在于标书 = 真证据
             else:
-                reason = "quote_not_in_bid"
+                # 引文回不到标书（OCR 表格串行重排，模型重写成通顺句）但案例名
+                # 是可定位实体 → 以案例名为锚放行（案例存在性由名称保证）。
+                # 2026-10-23 实证：致成王兆君案例引文重排后定位失败 → 整项 0 分，
+                # 真实评审给 2 分；名称"国网陕西渭南…运维服务项目"逐字在 p143。
+                hit = _case_name_hit()
+                if hit:
+                    case["quote"] = hit[0]
+                    case["quote_source"] = "case_name"
+                    quote_n = hit[1]
+                    cheat = False
+                    reason = "ok"
+                    tier = "case_name"
+                else:
+                    reason = "quote_not_in_bid"
         else:
             cheat = False
             reason = "ok"  # 旧行为：无标书可核验时信任模型

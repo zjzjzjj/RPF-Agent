@@ -260,6 +260,45 @@ def test_sanitize_paraphrase_head_matches_prefix_ladder() -> None:
     assert out.get("match_tier", "").startswith("prefix") or out.get("match_tier") == "exact"
 
 
+def test_sanitize_unlocatable_quote_falls_back_to_case_name() -> None:
+    """引文被重排回不到标书，但案例名逐字在标书里 → 以案例名为锚放行。
+
+    2026-10-23 实证（run 45 / 致成 c59）：OCR 表格串行重排后模型把引文写成
+    通顺句，逐字定位失败；案例名"国网陕西渭南…运维服务项目"在 p143 逐字存在。
+    旧逻辑整案例判 quote_not_in_bid → 归零，真实评审给 2 分。
+    """
+    from app.services.scoring_service import _sanitize_case
+
+    name = "国网陕西渭南供电公司2024年信息系统运维服务项目"
+    case = {
+        "name": name,
+        "person": "王兆君", "person_name": "王兆君",
+        "work_proof": True, "experience_proof": True, "social_security": True,
+        # 重排引文：内容真实但顺序与标书不同，回不到 bid_norm
+        "quote": "担任国网陕西渭南供电公司2024年信息系统运维服务项目的一年期运维项目经理",
+    }
+    bid_norm = _norm("前文 项目名称：" + name + " 委托方：国网陕西尾页")
+    out = _sanitize_case(case, ECHO_TEXT, bid_norm=bid_norm)
+    assert out["sanitized"] == "ok"
+    assert out.get("quote_source") == "case_name"
+    assert out.get("match_tier") == "case_name"
+    assert out["work_proof"] is True  # 材料布尔不得被降级
+
+
+def test_sanitize_unlocatable_quote_fabricated_name_still_rejected() -> None:
+    """重排引文 + 伪造案例名（回不到标书）→ 仍拒（不得靠编名字放行）。"""
+    from app.services.scoring_service import _sanitize_case
+
+    case = {
+        "name": "华信集团某某系统集成项目",
+        "work_proof": True,
+        "quote": "担任华信集团某某系统集成项目的项目经理并通过验收",
+    }
+    out = _sanitize_case(case, ECHO_TEXT, bid_norm=_norm("完全无关的标书内容"))
+    assert out["sanitized"] == "quote_not_in_bid"
+    assert not out["work_proof"]
+
+
 def test_sanitize_no_bid_norm_trusts_model() -> None:
     """未接 bid_norm 时：真证据引文 → ok（向后兼容，不误杀未接线的调用方）。"""
     out = _sanitize("2023年6月签订合同金额2208000元服务期三年", req=REQ_TEXT)
