@@ -1,4 +1,4 @@
-import { Alert, Button, Card, Empty, List, Space, Spin, Tag, Tooltip, Typography, Upload } from "antd";
+import { Alert, Button, Card, Collapse, Empty, List, Space, Spin, Tag, Tooltip, Typography, Upload } from "antd";
 import { InboxOutlined, ReloadOutlined, SyncOutlined } from "@ant-design/icons";
 import type { DocumentOut, JobOut, MergeRecord } from "../../types";
 
@@ -189,35 +189,47 @@ export default function AutoMatchBanner({
           )}
 
           {records.length > 0 && (
-            <List
+            <Collapse
               size="small"
-              header={
-                <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                  最近一次匹配的规则变更（{records.length} 条）
-                </Typography.Text>
-              }
-              dataSource={records.slice(0, 50)}
-              locale={{ emptyText: <Empty description="暂无变更记录" image={Empty.PRESENTED_IMAGE_SIMPLE} /> }}
-              renderItem={(r) => {
-                const meta = ACTION_META[r.action] ?? { color: "default", text: r.action };
-                return (
-                  <List.Item style={{ padding: "4px 0" }}>
-                    <Space size={6} wrap style={{ fontSize: 12 }}>
-                      <Tag color={meta.color}>{meta.text}</Tag>
-                      <span>{r.document.code ?? r.template.code ?? "—"}</span>
-                      <span>{r.document.name ?? r.template.name ?? "—"}</span>
-                      {r.template.name && r.document.name && r.template.name !== r.document.name && (
-                        <Typography.Text type="secondary">
-                          （原：{r.template.code} {r.template.name}）
-                        </Typography.Text>
-                      )}
-                      {r.match_method && <Tag>{r.match_method}</Tag>}
-                      {r.similarity && <Tag>相似度 {r.similarity}</Tag>}
-                      {r.document_page != null && <Tag>第 {r.document_page} 页</Tag>}
-                    </Space>
-                  </List.Item>
-                );
-              }}
+              ghost
+              defaultActiveKey={[]}
+              items={[
+                {
+                  key: "changes",
+                  label: (
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                      最近一次匹配的规则变更（{records.length} 条）
+                    </Typography.Text>
+                  ),
+                  children: (
+                    <List
+                      size="small"
+                      dataSource={records.slice(0, 50)}
+                      locale={{ emptyText: <Empty description="暂无变更记录" image={Empty.PRESENTED_IMAGE_SIMPLE} /> }}
+                      renderItem={(r) => {
+                        const meta = ACTION_META[r.action] ?? { color: "default", text: r.action };
+                        return (
+                          <List.Item style={{ padding: "4px 0" }}>
+                            <Space size={6} wrap style={{ fontSize: 12 }}>
+                              <Tag color={meta.color}>{meta.text}</Tag>
+                              <span>{r.document.code ?? r.template.code ?? "—"}</span>
+                              <span>{r.document.name ?? r.template.name ?? "—"}</span>
+                              {r.template.name && r.document.name && r.template.name !== r.document.name && (
+                                <Typography.Text type="secondary">
+                                  （原：{r.template.code} {r.template.name}）
+                                </Typography.Text>
+                              )}
+                              {r.match_method && <Tag>{r.match_method}</Tag>}
+                              {r.similarity && <Tag>相似度 {r.similarity}</Tag>}
+                              {r.document_page != null && <Tag>第 {r.document_page} 页</Tag>}
+                            </Space>
+                          </List.Item>
+                        );
+                      }}
+                    />
+                  ),
+                },
+              ]}
             />
           )}
         </Space>
