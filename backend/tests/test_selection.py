@@ -77,3 +77,38 @@ def test_derive_keywords() -> None:
 def test_derive_keywords_empty_falls_back() -> None:
     assert derive_keywords({"name": "评分项"}) != ()
     assert derive_keywords({"name": ""}) == ()
+
+
+def test_index_text_weight_toc_vs_content():
+    """目录/索引页降权（结构性判据，2026-10-27 run 58 目录中毒实证）。"""
+    from app.engine.selection import index_text_weight
+
+    toc = "\n".join(
+        ["服务团队技术力量（20分）见投标文件（63~131）页",
+         "投标方案评析（10分）………132",
+         "评析（10分）详见第173页",
+         "应急预案………136"])
+    assert index_text_weight(toc) <= 0.4  # 强索引 → 封顶档
+    content = (
+        "驻场服务团队由项目经理1名、运维工程师6名组成，实行AB角轮岗。"
+        "月度巡检计划表见附件，故障响应承诺30分钟内到达现场并出具处理单。")
+    assert index_text_weight(content) == 1.0
+    assert index_text_weight("") == 1.0
+
+
+def test_tier_selection_prefers_content_over_index(monkeypatch):
+    """同一关键词：索引 chunk 分数不得压过正文 chunk。"""
+    from app.engine.selection import split_text_chunks, select_chunks_by_tier
+
+    # 3 个 chunk：正文命中1词、索引命中多词（逐字含评分项名+见投标文件页引用）
+    text = (
+        "驻场服务团队技术力量由项目经理和运维工程师组成，分工明确。\n"
+        + "x" * 600
+        + "服务团队技术力量（20分）见投标文件（63~131）页\n服务团队健全合理性（5分）………64\n"
+        + "服务团队技术力量职责分工（10分）详见第70页\n服务团队（20）………71\n"
+        + "y" * 600)
+    chunks = split_text_chunks(text, chunk_size=400)
+    picked, meta = select_chunks_by_tier(
+        chunks, (("scoring", ("服务团队", "技术力量", "健全")),), budget=1200)
+    picked_text = "\n".join(t for _i, t in picked)
+    assert "驻场服务团队技术力量由项目经理" in picked_text  # 正文入选

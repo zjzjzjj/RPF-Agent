@@ -128,21 +128,29 @@ export function useSelectedRun(pid: string) {
   };
 }
 
-/** 评分结果聚合（排名 + 四分桶 + 逐项加减分明细与理由）。 */
-export function useScoreSummary(runId: number | null, pid: string) {
+/**
+ * 评分结果聚合（排名 + 四分桶 + 逐项加减分明细与理由）。
+ *
+ * `live=true` 时以 4s 间隔轮询——评分运行进行中结果页必须渐进刷新，
+ * 否则横幅冻结在 run 创建瞬间的 queued、评分格全「未执行」
+ * （2026-10-26 run 54 实证）。仅 ScoreResults 传 live，复核/证据页不受影响。
+ */
+export function useScoreSummary(runId: number | null, pid: string, opts?: { live?: boolean }) {
   return useQuery({
     queryKey: ["scoreSummary", runId],
     queryFn: () =>
       api.get<ScoreSummary>(`/runs/${runId}/score-summary?project_id=${encodeURIComponent(pid)}`),
     enabled: runId != null && !!pid,
+    refetchInterval: opts?.live ? 4000 : false,
   });
 }
 
-export function useMatrix(runId: number | null) {
+export function useMatrix(runId: number | null, opts?: { live?: boolean }) {
   return useQuery({
     queryKey: ["matrix", runId],
     queryFn: () => api.get<Matrix>(`/runs/${runId}/matrix`),
     enabled: runId != null,
+    refetchInterval: opts?.live ? 4000 : false,
   });
 }
 

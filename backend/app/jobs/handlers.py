@@ -43,6 +43,7 @@ def registered_kinds() -> list[str]:
 
 # 导入各处理器模块以触发注册（新增处理器时在此追加）
 def _load_all() -> None:
+    from app.material_index import service as _material_index  # noqa: F401  (classify_material)
     from app.rules import compiler  # noqa: F401  (compile_rules)
     from app.services import (  # noqa: F401
         bidder_service,

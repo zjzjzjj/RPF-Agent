@@ -13,7 +13,7 @@ from pathlib import Path
 from sqlalchemy import delete, select
 
 from app import config
-from app.db.models import Document, DocumentPage, DocNode
+from app.db.models import Document, DocumentPage, DocNode, MaterialTag
 from app.db.session import session_scope
 from app.jobs.handlers import register
 from app.jobs.queue import JobContext
@@ -84,6 +84,54 @@ def save_upload(
     return doc_id, job_id
 
 
+def _tender_mismatch_warning(project_id: str, document_id: int, extracted) -> str | None:  # noqa: ANN001
+    """投标文件与项目招标文件的项目关键词重合率过低 → 错配告警（纯确定性）。
+
+    2026-10-27 GYUU 事故实证：二维码项目招标文件 + 多媒体投标文件混在同项目，
+    评标细则与投标内容文不对题却静默出分。取各自首页 3 页文本做 2-gram Jaccard，
+    低于阈值 → 警告（仅提示不阻断）。
+    """
+    try:
+        with session_scope() as s:
+            tender_id = s.execute(
+                select(Document.id).where(
+                    Document.project_id == project_id,
+                    Document.kind.in_(("tender", "addendum")),
+                    Document.id != document_id,
+                ).order_by(Document.id).limit(1)
+            ).scalar_one_or_none()
+            if tender_id is None:
+                return None
+            tender_pages = s.execute(
+                select(DocumentPage.text).where(DocumentPage.document_id == tender_id)
+                .order_by(DocumentPage.page_no).limit(3)
+            ).scalars().all()
+        bid_head = "\n".join(
+            (p.text or "") for p in list(extracted.pages)[:3]
+        )
+        tender_head = "\n".join(t or "" for t in tender_pages)
+        if not bid_head.strip() or not tender_head.strip():
+            return None
+
+        def _grams(t: str) -> set[str]:
+            t = re.sub(r"\s+", "", t or "")[:4000]
+            return {t[i: i + 2] for i in range(len(t) - 1)}
+
+        a, b = _grams(tender_head), _grams(bid_head)
+        inter = len(a & b)
+        union = max(1, len(a | b))
+        overlap = inter / union
+        if overlap < 0.10:
+            return (
+                f"【规则包错配告警】投标文件与本项目招标文件的文本重合率仅 {overlap:.0%}"
+                "（低于 10%）——两者可能不属于同一项目，请核对招标文件与投标文件"
+                "的项目名称后再评分"
+            )
+    except Exception:  # noqa: BLE001 —— 护栏失败不阻断解析
+        log.debug("错配检查失败", exc_info=True)
+    return None
+
+
 @register("parse_document")
 def parse_document(ctx: JobContext, payload: dict) -> dict:
     document_id = int(payload["document_id"])
@@ -96,6 +144,7 @@ def parse_document(ctx: JobContext, payload: dict) -> dict:
         path = doc.stored_path
         prefix = f"{doc.kind}{doc.id}"
         project_id = doc.project_id
+        doc_kind = doc.kind
 
     try:
         extracted = extract_document(path)
@@ -114,9 +163,11 @@ def parse_document(ctx: JobContext, payload: dict) -> dict:
 
     ctx.advance(message="写入数据库")
     with session_scope() as s:
-        # 重解析：先清旧数据（幂等）
+        # 重解析：先清旧数据（幂等）。material_tags 同步清——页号会错位、
+        # 旧标签悬挂是隐性事故（标签锚点是 (document_id, page_no)）
         s.execute(delete(DocNode).where(DocNode.document_id == document_id))
         s.execute(delete(DocumentPage).where(DocumentPage.document_id == document_id))
+        s.execute(delete(MaterialTag).where(MaterialTag.document_id == document_id))
 
         for page in extracted.pages:
             c_start, c_end = page_ranges.get(page.page_no, (0, 0))
@@ -159,6 +210,11 @@ def parse_document(ctx: JobContext, payload: dict) -> dict:
             doc.parse_engine = extracted.engine
             doc.parse_status = "degraded" if extracted.degraded else "parsed"
             doc.author = extracted.author  # 串通检测信号源（无元数据则 None）
+            # 规则包错配护栏（2026-10-27）：投标文件与项目招标文件的项目关键词
+            # 重合率过低 → 落警告（GYUU 类事故：二维码招标+多媒体投标静默出分）
+            warn = _tender_mismatch_warning(project_id, document_id, extracted)
+            if warn:
+                warnings = list(warnings or []) + [warn]
             doc.warnings_json = warnings
 
     ctx.advance(message="完成")
@@ -171,6 +227,13 @@ def parse_document(ctx: JobContext, payload: dict) -> dict:
     from app.services.auto_merge_service import maybe_schedule_auto_match
 
     result.update(maybe_schedule_auto_match(project_id, document_id))
+    # 投标文件解析成功 → 自动分类打标（四类材料索引；tender 侧暂不分类）
+    if doc_kind == "bid" and result.get("rejected") is None:
+        from app.material_index.service import schedule_classify
+
+        classify_job = schedule_classify(document_id, project_id=project_id)
+        if classify_job:
+            result["classify_job_id"] = classify_job
     return result
 
 
@@ -252,6 +315,13 @@ def rescue_material_pages(document_id: int, max_pages: int | None = None) -> dic
             row.source = "ocr"
             rescued.append(int(pno))
         if rescued:
+            # 页文本已变 → 标签失效（因果链：text_sha 校验只是兜底）
+            s.execute(
+                delete(MaterialTag).where(
+                    MaterialTag.document_id == document_id,
+                    MaterialTag.page_no.in_(rescued),
+                )
+            )
             # 重算全文偏移（页文本变长，后续页 char_start 必须同步平移）
             offset = 0
             for p in s.execute(
@@ -359,6 +429,13 @@ def rescue_person_material_pages(document_id: int, max_pages: int = 60) -> dict:
             row.source = "ocr"
             rescued.append(int(pno))
         if rescued:
+            # 页文本已变 → 标签失效（同 rescue_material_pages 口径）
+            s.execute(
+                delete(MaterialTag).where(
+                    MaterialTag.document_id == document_id,
+                    MaterialTag.page_no.in_(rescued),
+                )
+            )
             offset = 0
             for p in s.execute(
                 select(DocumentPage)

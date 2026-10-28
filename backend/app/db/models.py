@@ -135,6 +135,45 @@ class DocNode(Base):
     __table_args__ = (UniqueConstraint("document_id", "node_id", name="uq_doc_nodes_doc_node"),)
 
 
+class MaterialTag(Base):
+    """投标材料分类标签（页级 + 段级）。
+
+    锚点 (document_id, page_no)——rescue_* 会重算 char 区间，char 锚点不可用；
+    reparse 清页数据时必须同步删除本表（ingest_service.parse_document）。
+    category 管检索分桶（资格/商务/技术/报价），tags_json 管证据语义（营业执照/
+    社保证明/开标一览表…），解耦以对冲跨类材料误分类的影响。
+    """
+
+    __tablename__ = "material_tags"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    document_id: Mapped[int] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), index=True)
+    page_no: Mapped[int] = mapped_column(Integer)  # 从 1 开始，与 document_pages 一致
+    seg_kind: Mapped[str] = mapped_column(String(8), default="page")  # page|table|image|text
+    seg_index: Mapped[int] = mapped_column(Integer, default=0)  # 同页多段序号
+    bbox_json: Mapped[dict | None] = mapped_column(JSON)  # 段坐标（points）+ 面积占比，表格/图片段用
+    category: Mapped[str] = mapped_column(String(16))  # qualification|commercial|technical|price|other
+    tags_json: Mapped[list | None] = mapped_column(JSON)  # 细粒度标签 ["营业执照","社保证明"]…
+    method: Mapped[str] = mapped_column(String(8), default="rule")  # rule|llm|manual
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    basis: Mapped[str | None] = mapped_column(String(512))  # 命中关键词/标题链/LLM 理由摘要（审计）
+    text_sha: Mapped[str | None] = mapped_column(String(16))  # 页文本 sha256 前 16 位（失效检测）
+    classifier_version: Mapped[str | None] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "document_id", "page_no", "seg_kind", "seg_index", name="uq_material_tags_page_seg"
+        ),
+        CheckConstraint(
+            "category IN ('qualification','commercial','technical','price','other')",
+            name="material_category_valid",
+        ),
+        CheckConstraint("seg_kind IN ('page','table','image','text')", name="seg_kind_valid"),
+        CheckConstraint("method IN ('rule','llm','manual')", name="method_valid"),
+    )
+
+
 # ---------------------------------------------------------------------------
 # 规则包（评分细则）
 # ---------------------------------------------------------------------------

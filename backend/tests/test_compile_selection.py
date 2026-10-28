@@ -180,3 +180,103 @@ def test_dedupe_extracted_across_chunks() -> None:
     assert len(out) == 3
     assert out[0].name == "具有独立法人资格"
     assert {c.category for c in out} == {"qualification", "compliance"}
+
+
+def test_dedupe_keeps_same_name_subitems_with_different_scores() -> None:
+    """同名不同分值的子项行（评标细则表空名列形态）不得误杀。"""
+    from decimal import Decimal
+
+    from app.rules.compiler import dedupe_extracted
+    from app.rules.model import ExtractedCriterion
+
+    def mk(name: str, score: str | None) -> ExtractedCriterion:
+        return ExtractedCriterion(
+            name=name, category="technical", score_type="subjective",
+            max_score=Decimal(score) if score else None,
+        )
+
+    items = [
+        mk("服务保障情况", "2"),
+        mk("服务保障情况", "3"),   # 子项，旧版被误杀
+        mk("服务保障情况", "3"),   # 与上条全同 → 真重复，丢
+        mk("服务保障情况", "2"),   # 与首条全同 → 真重复，丢
+    ]
+    out = dedupe_extracted(items)
+    assert [str(c.max_score) for c in out] == ["2", "3"]
+
+
+def test_dedupe_merges_missing_score_into_scored_twin() -> None:
+    """同名一有一无分值：保留有分值的，并入缺失方的描述/引文。"""
+    from decimal import Decimal
+
+    from app.rules.compiler import dedupe_extracted
+    from app.rules.model import ExtractedCriterion
+
+    a = ExtractedCriterion(name="业绩实力", category="commercial", score_type="count",
+                           max_score=None, description="旧描述")
+    b = ExtractedCriterion(name="业绩实力", category="commercial", score_type="count",
+                           max_score=Decimal("6"), quote="逐字原文")
+    out = dedupe_extracted([a, b])
+    assert len(out) == 1
+    assert str(out[0].max_score) == "6"
+    assert out[0].description == "旧描述"
+    assert out[0].quote == "逐字原文"
+
+    # 反序（有分值在前）：仍保一条，且分值不丢
+    out2 = dedupe_extracted([b.model_copy(), a.model_copy()])
+    assert len(out2) == 1
+    assert str(out2[0].max_score) == "6"
+
+def test_dedupe_keeps_same_name_different_score_type() -> None:
+    """同名但评分类型不同（如客观计分 vs 主观）视为不同条目。"""
+    from decimal import Decimal
+
+    from app.rules.compiler import dedupe_extracted
+    from app.rules.model import ExtractedCriterion
+
+    items = [
+        ExtractedCriterion(name="服务团队", category="technical", score_type="count",
+                           max_score=Decimal("2")),
+        ExtractedCriterion(name="服务团队", category="technical", score_type="subjective",
+                           max_score=Decimal("2")),
+    ]
+    out = dedupe_extracted(items)
+    assert len(out) == 2
+
+
+def test_split_for_extraction_protected_span_not_cut() -> None:
+    """protected_spans 区间（评标细则章节）不被 chunk 边界切开。"""
+    from app.rules.compiler import split_for_extraction
+
+    head = "\n".join(f"第{i}条 前置条款内容。" for i in range(1, 40))
+    scoring = "评标细则\n" + "\n".join(
+        f"序号{i} 评审因素{i} 客观分 0-{i % 5 + 1} 细则内容第{i}行。" for i in range(1, 30))
+    text = head + "\n" + scoring
+    span = (head.__len__() + 1, len(text))
+    chunks = split_for_extraction(text, chunk_chars=300, protected_spans=[span])
+    # 评分细则整段出现在同一块
+    whole = next((c for c in chunks if "评标细则" in c), None)
+    assert whole is not None
+    assert "细则内容第1行" in whole and "细则内容第29行" in whole
+    # 内容不丢、原文可复原（换行保留）
+    assert "".join(chunks).replace("\n", "") == text.replace("\n", "")
+
+
+def test_split_for_extraction_no_span_behavior_unchanged() -> None:
+    """不传 protected_spans：与旧版逐字节一致（回归锚）。"""
+    from app.rules.compiler import split_for_extraction
+
+    text = "\n".join(f"第{i}条 内容。" for i in range(1, 30))
+    chunks = split_for_extraction(text, chunk_chars=200)
+    assert all(len(c) <= 200 + 80 for c in chunks)
+    assert "".join(chunks).replace("\n", "") == text.replace("\n", "")
+
+
+def test_protected_scoring_span_locates_last_title() -> None:
+    from app.rules.compiler import _protected_scoring_span
+
+    text = "目录\n评标办法见第 90 页\n" + "x" * 100 + "\n第六部分 评标办法\n评标细则\n1、商务部分（10 分）"
+    span = _protected_scoring_span(text)
+    assert span is not None
+    assert text[span[0]:].startswith("评标细则")  # 最后一个标题命中处
+    assert _protected_scoring_span("没有任何章节标题的文本") is None

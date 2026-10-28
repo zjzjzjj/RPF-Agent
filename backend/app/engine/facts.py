@@ -320,6 +320,9 @@ class BidFacts:
     # 跨投标人串通信号（engine/collusion.py 预计算后注入；单家抽取无法产出）。
     # 结构：{"signals": [...], "detail": str, "available": bool}；未注入 = 空 dict → need_human 兜底
     cross_bidder: dict = field(default_factory=dict)
+    # P1-E 事实扩展（人员属性表：[{name, years, title, ...}]；由表解析/LLM 填充，
+    # 缺失时 attribute_tier 的 years/title 口径走 unresolved=no_facts 不猜测）
+    person_attributes: list[dict] = field(default_factory=list)
 
 
 def extract_bid_facts(text: str, documents: list[str] | None = None) -> BidFacts:

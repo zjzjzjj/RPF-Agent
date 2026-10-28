@@ -11,6 +11,7 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import select
 
 from app.db.models import EvidenceCitation, ScoreRecord, utcnow
 from app.db.session import session_scope

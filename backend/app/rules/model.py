@@ -35,6 +35,8 @@ class ExtractedCriterion(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     max_score: Decimal | None = None
     score_type: ScoreType
+    # P0-C：评分表"主/客观分"明文列的照抄值（仅 hint，骨架 reconcile 仍是权威）
+    subjectivity_hint: str | None = None
     is_veto: bool = False
     veto_consequence: VetoConsequence | None = None
     description: str | None = None

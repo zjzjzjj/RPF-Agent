@@ -8,7 +8,7 @@ from decimal import Decimal
 
 from sqlalchemy import select
 
-from app.db.models import Bidder, Criterion, EvaluationRun, ScoreRecord
+from app.db.models import Bidder, Criterion, CriterionCheck, EvaluationRun, ScoreRecord
 from app.db.session import session_scope
 from app.engine.aggregate import rank_rows
 from app.engine.models import RankRow
@@ -31,6 +31,18 @@ def compute_ranking(project_id: str, run_id: int | None = None) -> dict:
             .join(Bidder, Bidder.id == ScoreRecord.bidder_id)
             .where(ScoreRecord.run_id == run_id)
         ).all()
+
+        # P1-C.6 总分口径：params.in_total=False 的评分项（样品单列，新代商标三部分
+        # 口径实证）不进总分与类别合计；breakdown 照常记录（审计可见）。
+        _crit_ids = {crit.id for _sc, crit, _b in rows}
+        in_total_by_crit: dict[int, bool] = {}
+        if _crit_ids:
+            for chk in s.execute(
+                select(CriterionCheck).where(CriterionCheck.criterion_id.in_(_crit_ids))
+            ).scalars():
+                _p = chk.params_json or {}
+                if _p.get("in_total") is False:
+                    in_total_by_crit[chk.criterion_id] = False
 
         bidders: dict[int, dict] = {}
         for score, crit, bidder in rows:
@@ -64,13 +76,15 @@ def compute_ranking(project_id: str, run_id: int | None = None) -> dict:
                 if final is None:
                     entry["missing_final"].append(crit.name)
                     continue
-                entry["total"] += Decimal(str(final))
-                if crit.category == "technical":
-                    entry["tech"] += Decimal(str(final))
-                elif crit.category == "commercial":
-                    entry["commercial"] += Decimal(str(final))
-                elif crit.category == "price":
-                    entry["price"] = Decimal(str(final))
+                _skip_total = in_total_by_crit.get(crit.id) is False
+                if not _skip_total:
+                    entry["total"] += Decimal(str(final))
+                    if crit.category == "technical":
+                        entry["tech"] += Decimal(str(final))
+                    elif crit.category == "commercial":
+                        entry["commercial"] += Decimal(str(final))
+                    elif crit.category == "price":
+                        entry["price"] = Decimal(str(final))
             entry["breakdown"].append(
                 {
                     "criterion": crit.name,

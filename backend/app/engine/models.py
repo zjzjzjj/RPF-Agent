@@ -13,6 +13,10 @@ class PriceBid:
     name: str
     price: Decimal
     excluded: bool = False  # 建议否决/否决 → 不进基准价（exclude_invalid=true 时）
+    # P1-C 基准价资格门槛输入（由 scoring_service 注入；None=不可得 → 门槛不执行）
+    gate_value: Decimal | None = None   # 门槛所依据的实际得分（如技术分合计）
+    gate_basis: Decimal | None = None   # 门槛分母（如技术部分总分，percent 口径用）
+    sample_pass: bool | None = None     # 样品评审结论（sample_or_composite 口径用）
 
 
 @dataclass

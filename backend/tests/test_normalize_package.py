@@ -248,6 +248,53 @@ def test_price_text_parse_asymmetric_rates() -> None:
     assert parsed["trim_threshold"] == 5
 
 
+# 多媒体维保项目 p137 实录（措辞与 Zhejiang 不同："每低于一个百分点"、"去掉…次高价"）
+MM_PRICE_TEXT = """3、报价部分（50 分）
+投标价格的合理性：分析投标价格是否合理，投标价格范围是否完整，有否重大错漏项，报价口径是否一致。
+1、若有效投标人＞10 个时，全部有效投标人投标总价中去掉一个最高价、一个次高价、一个最低价和一个次低价后的算术平均值*0.95 为评标基准价；
+2、若5 个＜有效投标人≤10 个时，则全部有效投标人投标总价扣除一个最高价和一个最低价后的算术平均值*0.95 为最佳报价值；
+3、若有效投标人≤5 个，则全部有效投标人最终报价的算术平均值*0.95 为最佳报价值。
+投标人评标价与最佳报价值对比，计算各投标人的报价得分：
+2）评标价偏离（高于或低于）最佳报价值的，按评标价偏离最佳报价值的正负百分率，计算报价得分：每高于1 个百分点扣0.8 分，每低于一个百分点扣0.4 分。
+注：1）投标有效家数超过5 家，经专家评审的（商务分+技术分）达不到（商务分+技术分）满分的70%的，不进入最佳报价计算。
+2）有效投标报价高于最佳报价的两倍或低于最佳报价的一半，其商务报价得分为0 分，并剔除该报价后重新计算得出最佳报价。
+"""
+
+
+def test_price_text_parse_multimedia_wording() -> None:
+    """"每低于一个百分点"/"每高于1 个百分点"形态的扣分率解析（实测曾整体返回 {}）。"""
+    from app.rules.compiler import parse_price_formula_text
+
+    parsed = parse_price_formula_text(MM_PRICE_TEXT)
+    assert parsed["formula_type"] == "deviation_deduct"
+    assert parsed["deduct_rate_down"] == Decimal("0.4")
+    assert parsed["deduct_rate_up"] == Decimal("0.8")
+
+
+def test_price_text_parse_trim_tiers_and_special_rules() -> None:
+    """三档截尾 → trim_tiers 留档；70% 门槛/超倍剔除重算 → special_rules 留档。"""
+    from app.rules.compiler import parse_price_formula_text
+
+    parsed = parse_price_formula_text(MM_PRICE_TEXT)
+    # 分档截尾：≤5 不截 / 5<n≤10 去 1+1 / >10 去 2+2（次高次低）
+    assert parsed["trim_tiers"] == [[5, 0], [10, 1], [None, 2]]
+    # 引擎近似键仍在（中间档）
+    assert parsed["trim_count"] == 1
+    assert parsed["trim_threshold"] == 5
+    special = parsed["special_rules"]
+    assert any("不进入最佳报价计算" in s for s in special)
+    assert any("剔除该报价后重新计算" in s for s in special)
+
+
+def test_price_trim_tiers_none_for_single_tier() -> None:
+    """单档截尾（浙江形态）不产 trim_tiers，只走旧键。"""
+    from app.rules.compiler import parse_price_formula_text
+
+    parsed = parse_price_formula_text(PRICE_NODE_TEXT)
+    assert "trim_tiers" not in parsed
+    assert parsed["trim_count"] == 1
+
+
 def test_price_upper_capped_at_max_and_zero_bid() -> None:
     from app.engine.models import PriceBid
     from app.engine.price import compute_price_scores

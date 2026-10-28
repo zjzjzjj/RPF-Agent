@@ -795,9 +795,19 @@ def _auto_settle_blocking(package_id: int, actor: str) -> None:
         crits = s.execute(
             select(Criterion).where(Criterion.package_id == package_id)
         ).scalars().all()
+        # 未识别的价格公式不自动收敛（2026-10-28）：解析器无法识别的形态
+        # 落 PRICE_FORMULA_UNRECOGNIZED（error），auto 模式不得静默采纳，
+        # 必须人工确认公式后才能冻结。
+        from app.db.models import PriceFormula
+        unres_formula_ids: set[int] = set()
+        for pf in s.execute(select(PriceFormula)).scalars().all():
+            if pf.criterion_id is not None and not str(pf.formula_type or "").strip():
+                unres_formula_ids.add(pf.criterion_id)
         for c in crits:
             if c.status in ("verified", "retired"):
                 continue
+            if c.score_type == "formula" and c.id in unres_formula_ids:
+                continue  # 价格公式未识别 → 保留原状态，不自动采纳
             old = c.status
             c.status = "verified"
             if c.origin == "template" and old == "needs_signoff":
@@ -1002,8 +1012,14 @@ def normalize_package(package_id: int, actor: str = "auto") -> dict[str, int]:
             parsed = compiler.parse_price_formula_text("\n".join(texts))
             changed_formula = False
             if parsed:
-                formula.formula_type = "deviation_deduct"
-                formula.k = parsed.get("k") or Decimal("1")
+                # 2026-10-28：不再硬编码 deviation_deduct——解析器已给出真实
+                # formula_type（deviation_deduct 或 benchmark_ratio），硬编码会把
+                # benchmark_ratio 型误改写成 deviation_deduct 且无扣分率，
+                # confirm 时 PRICE_PARAMS_INCOMPLETE（test_merge 实证）。
+                if parsed.get("formula_type"):
+                    formula.formula_type = parsed["formula_type"]
+                if parsed.get("k") is not None:
+                    formula.k = parsed["k"]
                 ext = dict(formula.params_json or {})
                 for key in ("deduct_rate_down", "deduct_rate_up"):
                     if parsed.get(key) is not None:
@@ -1011,6 +1027,9 @@ def normalize_package(package_id: int, actor: str = "auto") -> dict[str, int]:
                 for key in ("trim_count", "trim_threshold"):
                     if parsed.get(key) is not None:
                         ext[key] = str(parsed[key])
+                for key in ("trim_tiers", "special_rules", "benchmark_gate", "outlier_policy"):
+                    if parsed.get(key) is not None:
+                        ext.setdefault(key, parsed[key])
                 formula.params_json = ext
                 if parsed.get("benchmark_method"):
                     formula.benchmark_method = parsed["benchmark_method"]
@@ -1052,28 +1071,59 @@ def normalize_package(package_id: int, actor: str = "auto") -> dict[str, int]:
                 s.add(check)
                 s.flush()
             params = dict(check.params_json or {})
-            per_item = None
-            if params.get("per_item") is not None:
-                try:
-                    per_item = Decimal(str(params["per_item"]))
-                except Exception:  # noqa: BLE001
-                    per_item = None
-            derived = compiler.parse_count_params_text(
-                f"{c.description or ''}\n{c.source_quote or ''}",
-                c.max_score,
-                per_item,
-                c.name,
+            before = dict(params)
+            # 与 compiler 落库同源的确定性推断（per_item/max_items/min_amount/
+            # person_scope/field 全口径），只填缺失项
+            from app.rules.check_infer import infer_count_params
+
+            params = infer_count_params(
+                {"name": c.name, "description": c.description,
+                 "source_quote": c.source_quote, "required_evidence": c.required_evidence,
+                 "max_score": c.max_score},
+                params,
             )
-            added = False
-            for key, value in derived.items():
-                if key not in params:
-                    params[key] = value
-                    added = True
+            added = params != before
             if added:
                 check.params_json = params
+                if check.field is None and isinstance(params.get("field"), str):
+                    check.field = params["field"]
                 s.add(check)
-                record(c, "自动修复：补齐计数参数（最高项数/金额门槛/人员范围）")
+                record(c, "自动修复：补齐计数参数（计分口径/最高项数/金额门槛/人员范围）")
                 stats["count_repaired"] += 1
+
+        # ⑤b match/veto 检查定义补全：缺 check 会让评分端落入「缺少可执行的检查
+        # 定义」恒 need_human 死项（2026-10-26 run 54 c51/c57/c63 实证）
+        for c in active:
+            if c.score_type not in ("match", "veto") or c.origin not in ("template", "document"):
+                continue
+            check = s.execute(
+                select(CriterionCheck).where(CriterionCheck.criterion_id == c.id)
+            ).scalar_one_or_none()
+            if check is not None and check.check_type:
+                continue
+            from app.rules.check_infer import infer_check
+
+            gen = infer_check(
+                {"name": c.name, "description": c.description, "source_quote": c.source_quote}
+            )
+            check_type, gen_params = gen if gen else ("human_only", {})
+            if check is None:
+                check = CriterionCheck(
+                    criterion_id=c.id,
+                    check_type=check_type,
+                    field=None,
+                    params_json=dict(gen_params),
+                    on_fail="recommend_reject" if c.score_type == "veto" else "need_human",
+                    source_quote=c.source_quote,
+                )
+            else:
+                check.check_type = check_type
+                merged = dict(gen_params)
+                merged.update(check.params_json or {})
+                check.params_json = merged
+            s.add(check)
+            record(c, f"自动修复：补全检查定义（{check_type}）")
+            stats["count_repaired"] += 1
 
         # ⑥ is_veto 归一 + 否决后果补全
         for c in active:

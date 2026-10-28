@@ -497,7 +497,10 @@ def classify_materials(
 
     - 强信号命中且页可读 → True
     - 页在但不可读（短文本 + 图片占比≥0.10）→ None(reason=unreadable)
-    - 可读页但无信号 → False(reason=absent)
+    - **扫描页无特征 → None(reason=scan_unverified)**：图占比高或 OCR 来源的页
+      上找不到票据特征 = 不可见 ≠ 不存在（2026-10-27 训练集测试2 实证：有业主
+      证明但发票是扫描件，旧口径判 False「确认缺失」→ 业绩全灭，人工照计）
+    - 全部页均为文字层可读且无信号 → False(reason=absent)
     - 案例未绑定页 → None(reason=unlinked, ambiguous)
     """
     by_no = {p.page_no: p for p in pages}
@@ -513,6 +516,13 @@ def classify_materials(
             for no in b.pages
             if len((by_no.get(no).text if by_no.get(no) else "").strip()) < 200
             and ratios.get(no, 0.0) >= 0.10
+        ]
+        # 扫描页（图占比 ≥0.35 或 OCR 来源）：文本层不可信，缺席判定不成立
+        scan_pages = [
+            no
+            for no in b.pages
+            if ratios.get(no, 0.0) >= 0.35
+            or (by_no.get(no) is not None and (by_no.get(no).source or "text") != "text")
         ]
         for mat, pat in (
             ("contract", None),
@@ -544,6 +554,11 @@ def classify_materials(
                 b.status[mat] = None
                 b.pages_by_material[mat] = unreadable_pages[:3]
                 b.reasons[mat] = "unreadable"
+            elif scan_pages:
+                # 扫描页无特征：不可见 ≠ 缺失，留 null 走疑问/救援，不判 False
+                b.status[mat] = None
+                b.pages_by_material[mat] = scan_pages[:3]
+                b.reasons[mat] = "scan_unverified"
             else:
                 b.status[mat] = False
                 b.reasons[mat] = "absent"

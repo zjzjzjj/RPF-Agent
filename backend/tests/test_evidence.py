@@ -128,3 +128,29 @@ def test_page_hint_string_coerced(client, tender_document_id):
 
 def test_normalize_quote_still_matches(normalize_check=True):
     assert normalize("价格分＝４０×") == "价格分=40x"
+
+
+def test_locate_cache_identical_to_fresh(tender_document_id):  # noqa: ANN001
+    """归一化缓存/行框懒加载/memo 不改变 LocateResult（不变式 I3）。
+
+    同一引文在「冷缓存」与「热缓存」两次 locate 结果必须逐字段一致。
+    """
+    from app.evidence.verifier import create_citation, verify_citation
+
+    with DocumentSource(tender_document_id) as src:
+        r1 = locate(REAL_QUOTE, src)   # 冷缓存
+        r2 = locate(REAL_QUOTE, src)   # 热缓存（归一化/行框已缓存）
+    assert r1.found and r2.found
+    assert r1.verified == r2.verified is True
+    assert r1.page_no == r2.page_no
+    assert r1.method == r2.method
+    assert r1.bbox == r2.bbox
+    assert r1.page_size == r2.page_size
+
+    # memo 路径（verify_citation 层）：两次核验结果一致
+    cid = create_citation(tender_document_id, REAL_QUOTE, page_hint=3, role="score")
+    c1 = verify_citation(cid)
+    c2 = verify_citation(cid)
+    assert c1.verified is True and c2.verified is True
+    assert c1.bbox_json == c2.bbox_json
+    assert c1.page_no == c2.page_no

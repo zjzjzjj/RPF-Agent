@@ -284,6 +284,21 @@ def _build_open_questions(rows: list, run_id: int) -> tuple[list[dict], dict]:
     return questions, progress, by_criterion
 
 
+def _doc_name(document_id: int | None) -> str | None:
+    """细则来源招标文件名（错配护栏标注用）。"""
+    if not document_id:
+        return None
+    try:
+        from app.db.models import Document
+        from app.db.session import session_scope
+
+        with session_scope() as s:
+            doc = s.get(Document, document_id)
+            return doc.original_filename if doc else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def build_report(project_id: str, run_id: int | None = None) -> dict:
     with session_scope() as s:
         project = s.get(Project, project_id)
@@ -414,6 +429,12 @@ def build_report(project_id: str, run_id: int | None = None) -> dict:
                 "content_hash": pkg.content_hash if pkg else None,
                 "frozen_by": pkg.frozen_by if pkg else None,
                 "frozen_at": pkg.frozen_at.isoformat() if pkg and pkg.frozen_at else None,
+                # 细则来源标注（2026-10-27 错配护栏）：评分依据的招标文件名——
+                # GYUU 类事故（投标文件与招标文件不是同一项目）在此一眼可见
+                "source_document_name": (
+                    _doc_name(pkg.source_document_id) if pkg and pkg.source_document_id else None
+                ),
+                "origin": pkg.origin if pkg else None,
             },
             "ranking": ranking,
             "bidders": list(bidders_detail.values()),

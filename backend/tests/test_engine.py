@@ -686,3 +686,75 @@ def test_recover_artifacts_from_tender_returns_empty_when_absent():
     assert recover_artifacts_from_tender({"source_quote": ""}, [(1, "x")]) == ""
     assert recover_artifacts_from_tender({"source_quote": "某段"}, []) == ""
 
+
+
+# ---------------------------------------------------------------------------
+# contains_phrase 承诺语义（检索失败 ≠ 不存在，2026-10-26 run 54 c13 误否决实证）
+# ---------------------------------------------------------------------------
+def test_contains_phrase_commitment_variants_hit():
+    """「不转包、不分包」要能命中措辞变体（不进行转包/不得转包或违法分包）。"""
+    from app.engine.objective import run_check
+
+    phrase = {"phrase": "不转包、不分包"}
+    for text in (
+        "我方承诺不进行转包，不进行违法分包。",
+        "本项目不得转包或违法分包，特此承诺。",
+        "不转包、不分包。",
+        "保证不 拖欠工资，不 转包。",
+    ):
+        r = run_check("contains_phrase", phrase, _facts(text))
+        assert r.status == "pass", f"应命中变体: {text}"
+
+
+def test_contains_phrase_positive_mention_not_a_declaration():
+    """肯定语境提及（存在转包行为）不算声明成立。"""
+    from app.engine.objective import run_check
+
+    r = run_check(
+        "contains_phrase",
+        {"phrase": "不转包、不分包"},
+        _facts("经查该项目存在转包行为的线索。"),
+    )
+    assert r.status != "pass"
+
+
+def test_contains_phrase_miss_is_unknown_never_reject():
+    """检索未命中必须转人工，绝不硬 fail（误否决=0 的机制保证）。"""
+    from app.engine.objective import run_check
+
+    r = run_check(
+        "contains_phrase",
+        {"phrase": "不转包、不分包"},
+        _facts("本文件只谈技术方案，未提及任何承包方式。"),
+    )
+    assert r.status == "unknown" and r.need_human
+    assert "否决" in r.message  # 明示不作为否决依据
+
+    # 空短语/空文本同样不得 fail
+    assert run_check("contains_phrase", {}, _facts("任意")).status == "unknown"
+    assert run_check("contains_phrase", {"phrase": "不转包"}, _facts("")).status == "unknown"
+
+
+def test_contains_phrase_fullwidth_normalized_hit():
+    """全角标点/空白打断的原短语仍走归一化快路径。"""
+    from app.engine.objective import run_check
+
+    r = run_check(
+        "contains_phrase",
+        {"phrase": "不转包、不分包"},
+        _facts("承诺不转包、 不分包，如有违反愿负法律责任。"),
+    )
+    assert r.status == "pass"
+
+
+def test_required_flags_unmapped_materials_fall_back_to_contract_gate():
+    """细则点名了材料但关键词映射不上 → 不得空闸门放行（假通过），退回合同闸门。"""
+    from app.engine.objective import _required_flags
+
+    # 完全没点名材料 → 不设闸（计数项自由计数）
+    assert _required_flags("", "") == ()
+    # 点名了但映射不上 → 兜底 contract
+    assert _required_flags("提供用户证书和查询截图", "") == ("contract",)
+    # 映射得上 → 按点名材料闸
+    assert _required_flags("中标通知书、用户证明", "") == ("contract", "acceptance")
+    assert _required_flags("合同复印件、发票复印件、业主证明", "") == ("contract", "invoice", "acceptance")

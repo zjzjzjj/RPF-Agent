@@ -75,8 +75,10 @@ export default function ScoreResults() {
   const currentRunActive =
     currentRun?.status === "queued" || currentRun?.status === "running";
 
-  const { data: summary, isLoading: summaryLoading } = useScoreSummary(runId, pid);
-  const { data: matrix, isLoading: matrixLoading } = useMatrix(runId);
+  // live 轮询只在选中的运行进行中开启：结果页必须渐进刷新，否则横幅冻结在
+  // queued、评分格全「未执行」（2026-10-26 run 54 实证）；运行一结束即停。
+  const { data: summary, isLoading: summaryLoading } = useScoreSummary(runId, pid, { live: currentRunActive });
+  const { data: matrix, isLoading: matrixLoading } = useMatrix(runId, { live: currentRunActive });
   const { data: report, isError: reportError } = useReport(pid, runId);
 
   const [jobId, setJobId] = useState<number | null>(null);
@@ -161,6 +163,25 @@ export default function ScoreResults() {
     prevJobStatus.current = status;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [job?.status]);
+
+  // 跨会话/跨标签页的运行终态刷新：jobId 是本页 useState，刷新页面即丢，
+  // 上面的 job effect 永远不会触发——以 useRuns 1.5s 轮询的 run.status 为准，
+  // 非终态翻到终态时拉一次终版（与 live 轮询衔接，覆盖收尾瞬间）。
+  const prevRunStatus = useRef<string | null>(null);
+  useEffect(() => {
+    const status = currentRun?.status ?? null;
+    if (prevRunStatus.current && prevRunStatus.current !== status) {
+      const wasActive =
+        prevRunStatus.current === "queued" || prevRunStatus.current === "running";
+      const nowTerminal =
+        status === "succeeded" || status === "failed" || status === "cancelled";
+      if (wasActive && nowTerminal) {
+        invalidateResults();
+      }
+    }
+    prevRunStatus.current = status;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [currentRun?.status]);
 
   const openEvidence = (item: SummaryItem) => {
     if (item.score_record_id != null) {
@@ -276,12 +297,22 @@ export default function ScoreResults() {
           type="warning"
           showIcon
           style={{ marginBottom: 12 }}
-          message={summary.run.incomplete_reason ?? "评分运行尚未完成，结果可能不完整"}
+          message={
+            currentRunActive
+              ? // 状态取 useRuns 1.5s 轮询的活值：summary.incomplete_reason 是
+                // 服务端取数瞬间拼死的文案，运行中会冻结在旧状态（run 54 里
+                // 曾一路显示 queued）。
+                `评分运行 #${summary.run.id} 状态为 ${currentRun?.status ?? summary.run.status}，正在评审中，结果持续更新`
+              : summary.run.incomplete_reason ?? "评分运行尚未完成，结果可能不完整"
+          }
         />
       )}
-      {summary?.warnings.map((w, i) => (
-        <Alert key={i} type="warning" showIcon message={w} style={{ marginBottom: 8 }} />
-      ))}
+      {/* incomplete_reason 同时被服务端塞进 warnings——不滤掉就双条同文黄幅 */}
+      {summary?.warnings
+        .filter((w) => w !== summary.run.incomplete_reason)
+        .map((w, i) => (
+          <Alert key={i} type="warning" showIcon message={w} style={{ marginBottom: 8 }} />
+        ))}
 
       <Tabs
         activeKey={tab}

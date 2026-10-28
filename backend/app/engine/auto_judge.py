@@ -128,12 +128,16 @@ def refine_with_llm(
     bid_text: str,
     machine_result: PrimitiveResult,
     data_class: str = "synthetic",
+    *,
+    chunk_cats: list[str | None] | None = None,
+    chunk_cat_confs: list[float] | None = None,
 ) -> PrimitiveResult:
     """run_check 的 unknown/fail+need_human 结果 → LLM 带证据裁决 → 终态。
 
     模型故障（LLMError）时返回 need_human=False 的 PrimitiveResult（全自动不悬挂）；
     配置类 AppError（未配置/密钥缺失/预算超限）不被捕获——整个运行显式失败
     （fail-fast，见模块 docstring 与 decisions/0005）。
+    chunk_cats/chunk_cat_confs：选段软过滤的材料类别（None=无标签，行为不变）。
     """
     truncated = bid_text
     if len(bid_text) > MAX_BID_CHARS:
@@ -151,6 +155,7 @@ def refine_with_llm(
                 "quote": criterion.get("quote") or criterion.get("source_quote") or "",
             },
             MAX_BID_CHARS,
+            chunk_cats=chunk_cats, chunk_cat_confs=chunk_cat_confs,
         )
         truncated = "\n".join(t for _i, t in picked)
     # 报价口径注入：LLM 曾把投标文件里的"年度服务投标价"当总价去论证低于成本

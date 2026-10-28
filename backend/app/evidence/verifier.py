@@ -36,6 +36,27 @@ def coerce_page_hint(value) -> int | None:  # noqa: ANN001
     return int(m.group()) if m else None
 
 
+# 共享 DocumentSource 缓存（2026-10-27 提速）：同一 run 对同一文档几十条引文，
+# 旧实现逐引文重建（DB 读 + pdfplumber 打开）——改为进程内共享一份读会话。
+# 进程退出即释放；pdfplumber 句柄常驻（每文档一个，可接受）。
+_SOURCES: dict[int, DocumentSource] = {}
+_SOURCES_LOCK = __import__("threading").Lock()
+# 引文结果 memo：同 (doc, quote, hint) 的重复核验直接复用（结果确定性，I3）
+_MEMO: dict[tuple, dict] = {}
+_MEMO_LIMIT = 4096
+
+
+def _get_source(document_id: int) -> DocumentSource:
+    with _SOURCES_LOCK:
+        src = _SOURCES.get(document_id)
+        if src is None:
+            src = DocumentSource(document_id)
+            if len(_SOURCES) >= 8:  # 上限护栏：超了就放弃共享（退化为临时会话）
+                return src
+            _SOURCES[document_id] = src
+        return src
+
+
 def verify_citation(citation_id: int) -> EvidenceCitation | None:
     """核验一条证据引用并落库（本函数是 verified 的唯一写入点）。"""
     with session_scope() as s:
@@ -55,14 +76,28 @@ def verify_citation(citation_id: int) -> EvidenceCitation | None:
 
     if document_id is not None:
         try:
-            with DocumentSource(document_id) as src:
-                result = locate(quote, src, hint_page=hint)
-            verified = result.verified
-            method = result.method
-            page_no = result.page_no if result.found else hint
-            bbox = result.bbox
-            page_size = result.page_size
-            candidates = result.candidates
+            memo_key = (document_id, quote or "", hint)
+            cached = _MEMO.get(memo_key)
+            if cached is not None:
+                verified = cached["verified"]
+                method = cached["method"]
+                page_no = cached["page_no"]
+                bbox = cached["bbox"]
+                page_size = cached["page_size"]
+                candidates = cached["candidates"]
+            else:
+                result = locate(quote, _get_source(document_id), hint_page=hint)
+                verified = result.verified
+                method = result.method
+                page_no = result.page_no if result.found else hint
+                bbox = result.bbox
+                page_size = result.page_size
+                candidates = result.candidates
+                if len(_MEMO) < _MEMO_LIMIT:
+                    _MEMO[memo_key] = {
+                        "verified": verified, "method": method, "page_no": page_no,
+                        "bbox": bbox, "page_size": page_size, "candidates": candidates,
+                    }
         except Exception:  # noqa: BLE001 —— 核验失败不阻塞评分，降级为未核验
             log.exception("证据核验异常 citation=%s", citation_id)
 

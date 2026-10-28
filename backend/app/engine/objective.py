@@ -44,6 +44,43 @@ def _phrase_hit(phrases: list[str], facts: BidFacts) -> str | None:
     return None
 
 
+# 否定/禁止标记：承诺类声明的语义核心是「内容词 + 否定语境」
+_RE_NEG_MARK = re.compile(r"(?:不|无|禁|杜绝|严禁|禁止|不允许|不得|不再)")
+# 声明短语里的非实词前缀（「不得转包」→「转包」）
+_RE_MODAL_PREFIX = re.compile(
+    r"^(?:不得不|不得|不能|不应|不允许|严禁|禁止|杜绝|进行|违法|违规|发生|出现|不|未|无)+"
+)
+
+
+def _commitment_hit(phrase: str, text: str) -> str | None:
+    """承诺/禁止类声明的语义检索（contains_phrase 匹配核）。
+
+    精确子串对措辞变体毫无鲁棒性：「不转包、不分包」检索不到「不进行转包」
+    「不得转包或违法分包」——2026-10-26 run 54 实证 c13 7/7 全员误否决。
+    语义：① 归一化全串命中（快路径）；② 短语按顿号/逗号拆内容词（剥否定/情态
+    前缀），内容词在正文出现且**前 8 字内有否定标记**→ 声明成立（"存在转包行为"
+    这类肯定语境不算）。多段短语任一段成立即命中（声明条款通常一句涵盖）。
+    """
+    if not phrase:
+        return None
+    text_n = normalize_no_ws(text or "")
+    if not text_n:
+        return None
+    phrase_n = normalize_no_ws(phrase)
+    if phrase_n and phrase_n in text_n:
+        return phrase
+    for part in re.split(r"[、，,；;和及与或/]", phrase):
+        core = _RE_MODAL_PREFIX.sub("", normalize_no_ws(part))
+        core = re.sub(r"(?:行为|现象|情况|的承诺|承诺)$", "", core)
+        if len(core) < 2:
+            continue
+        for m in re.finditer(re.escape(core), text_n):
+            window = text_n[max(0, m.start() - 8): m.start()]
+            if _RE_NEG_MARK.search(window):
+                return f"{core}（否定语境）"
+    return None
+
+
 def run_check(check_type: str, params: dict, facts: BidFacts) -> PrimitiveResult:
     """单一检查原语。params 来自规则包的 criterion_checks。"""
     if check_type == "human_only":
@@ -142,11 +179,71 @@ def run_check(check_type: str, params: dict, facts: BidFacts) -> PrimitiveResult
             return PrimitiveResult("fail", f"证书 {count} 项 < 要求 {minimum} 项")
         return PrimitiveResult("unknown", f"未知计数字段：{field}", need_human=True)
 
+    if check_type == "date_valid":
+        # 确定性日期核查（2026-10-27 无效标识别）：params {document, not_before?,
+        # not_after?}——定位文件段落中的落款/签署日期与有效期窗口比对。
+        # 找不到日期/文件 → unknown（不可判定）；日期在窗口外 → fail（文本事实，
+        # 逐字可核验，如授权书落款晚于投标截止）。
+        doc_name = str(params.get("document") or "")
+        text = facts.text or ""
+        window = text
+        if doc_name:
+            pos = text.find(doc_name)
+            if pos >= 0:
+                window = text[pos: pos + 2000]
+            else:
+                hit = _phrase_hit(_document_phrases(doc_name), facts)
+                if hit is None:
+                    return PrimitiveResult(
+                        "unknown", f"未定位到「{doc_name}」（可能为扫描件），无法核查日期",
+                        need_human=True)
+        from datetime import date as _date
+
+        dates = []
+        for m in re.finditer(r"(\d{4})\s*[-/年]\s*(\d{1,2})\s*[-/月]\s*(\d{1,2})", window):
+            try:
+                dates.append(_date(int(m.group(1)), int(m.group(2)), int(m.group(3))))
+            except ValueError:
+                continue
+        if not dates:
+            return PrimitiveResult(
+                "unknown", f"「{doc_name or '文件'}」中未识别到日期（需人工核查落款）",
+                need_human=True)
+        signed = min(dates) if params.get("use_earliest") else max(dates)
+
+        def _parse_bound(v):  # noqa: ANN001
+            try:
+                y, mo, d = str(v).split("-")
+                return _date(int(y), int(mo), int(d))
+            except Exception:  # noqa: BLE001
+                return None
+
+        lo = _parse_bound(params.get("not_before"))
+        hi = _parse_bound(params.get("not_after"))
+        if hi is not None and signed > hi:
+            return PrimitiveResult(
+                "fail", f"「{doc_name or '文件'}」落款日期 {signed.isoformat()} 晚于截止 {hi.isoformat()}")
+        if lo is not None and signed < lo:
+            return PrimitiveResult(
+                "fail", f"「{doc_name or '文件'}」落款日期 {signed.isoformat()} 早于起始 {lo.isoformat()}")
+        return PrimitiveResult(
+            "pass", f"「{doc_name or '文件'}」落款日期 {signed.isoformat()} 在有效窗口内")
+
     if check_type == "contains_phrase":
         phrase = str(params.get("phrase") or "")
-        if phrase and phrase in facts.text:
-            return PrimitiveResult("pass", f"已找到声明「{phrase}」")
-        return PrimitiveResult("fail", f"投标文件中未找到声明「{phrase}」")
+        if not phrase:
+            return PrimitiveResult("unknown", "未提供检索短语（检查定义缺失）", need_human=True)
+        hit = _commitment_hit(phrase, facts.text)
+        if hit:
+            return PrimitiveResult("pass", f"已找到声明「{hit}」")
+        # 检索未命中**不能**证明声明不存在：措辞变体、OCR 断行、扫描件都会漏检。
+        # 硬 fail→recommend_reject 是误否决的制造机（2026-10-26 run 54 实证：
+        # c13「不得转包」7/7 全员误否决）。未命中一律转人工/auto 模式 LLM 语义裁决。
+        return PrimitiveResult(
+            "unknown",
+            f"未检索到声明「{phrase}」（措辞变体/扫描件可能导致漏检，不作为否决依据）",
+            need_human=True,
+        )
 
     if check_type == "math_relation":
         return _check_math(params, facts)
@@ -482,7 +579,7 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
         for claim in facts.cert_claims:
             if normalize_cert(claim) not in cert_keys:
                 conflict = True
-        # ISO 三体系与 CMMI 分开计数（本项目认证项的计分结构：
+        # ISO 三体系与 CMMI 分开计数（ISO 型认证项的计分结构：
         # ISO9001/27001/20000 每项 1 分上限 3，CMMI 二级以上 1 分）。
         # 证书名必须先归一化：OCR 形态（ISO/IEC 20000-1:2018、中文证书名）与
         # 同一体系的两种写法（GB/T19001 与 质量管理体系）旧实现全部匹配不上。
@@ -490,22 +587,44 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
         has_cmmi = False
         for cert in facts.certificates:
             key = normalize_cert(cert)
-            if key in ("ISO9001", "ISO27001", "ISO20000"):
-                iso_set.add(key)
+            if key.startswith("ISO"):
+                iso_set.add(key)  # 任意 ISO 族（9001/14001/45001…）都计
             elif key == "CMMI":
                 has_cmmi = True
-        count = len(iso_set) + (1 if has_cmmi else 0)
+        # ISO 型判定看规则文本是否点名体系；未点名的证件计数项（资质证/操作证/
+        # 职称证等）按证书清单总数计——旧实现无条件走 ISO/CMMI 口径，非 ISO
+        # 证件项恒 0（2026-10-26 run 54 通用证件类实证）。
+        # 裸数字（9001/27001/20000）不得进正则：「120000 元」「19001 元」会把
+        # 非 ISO 项误判成 ISO 型（审查实锤），体系号必须带 ISO/GB/T 前缀。
+        _cert_text = (
+            str(criterion.get("name") or "")
+            + str(criterion.get("description") or "")
+            + str(criterion.get("required_artifacts_raw") or criterion.get("required_artifacts") or "")
+        )
+        _iso_shaped = bool(re.search(
+            r"ISO|CMMI|三体系|GB/?T\s*\d"
+            r"|质量管理体系|信息安全管理体系|信息技术服务管理体系",
+            _cert_text,
+        ))
+        if _iso_shaped:
+            count = len(iso_set) + (1 if has_cmmi else 0)
+        else:
+            count = len(facts.certificates)
         # 一条都没抽到 ≠ 一条都不合格：前者是抽取能力问题，必须与"确实 0 项"区分开，
         # 否则 0 分会被当成评分结论进入总分。
         if not facts.certificates and not facts.cert_claims:
             detail = "未提取到证书清单（需人工核查）"
             unresolved = "no_facts"
-        else:
+        elif _iso_shaped:
             detail = f"提供证书 {count} 项（ISO 三体系 {len(iso_set)} 项" + (
                 "、CMMI 1 项）" if has_cmmi else "）"
             )
             if conflict:
                 detail += "；正文声称的认证中有未附证书复印件的（待人工核查）"
+        else:
+            detail = f"提供证书 {len(facts.certificates)} 项（按证书清单计数）"
+            if conflict:
+                detail += "；正文声称的证书中有未附复印件的（待人工核查）"
     elif field == "performance":
         min_amount = Decimal(str(params.get("min_amount_yuan") or 0))
         count = len([a for a in facts.performance_amounts if a >= min_amount])
@@ -516,8 +635,17 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
             detail = f"满足金额要求的业绩 {count} 个"
     else:
         count = 0
-        detail = "未知计数字段（评分项未给出 field，且无法从名称安全推断）"
-        unresolved = "field_missing"
+        if person_scope:
+            # 人员级条目 field 被强制清空走 verified_cases；无案例时的正确文案是
+            # 「核验未产出」而非「未知计数字段」（run 54 c59-c62 的误导性告警来源）
+            detail = "人员级条目：逐案例核验未产出可计案例"
+            unresolved = "no_facts"
+        elif field:
+            detail = f"逐条核验未产出可计条目（计数口径 {field}，需人工核查）"
+            unresolved = "no_facts"
+        else:
+            detail = "未知计数字段（评分项未给出 field，且无法从名称安全推断）"
+            unresolved = "field_missing"
 
     effective = min(Decimal(count), Decimal(max_items)) if max_items else Decimal(count)
     score = (effective * per_item).quantize(Decimal("0.01"))
@@ -537,13 +665,15 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
         and not criterion.get("cert_section_present", True)
     ):
         iso_count = len(iso_set)
+        # 截图是点名材料：未按要求提供 → ISO 系全项计 0；CMMI 类仅需证书
+        # 复印件照计（锚定口径）。通用证件同样归零（"否则不得分"规则执行）。
         count = 1 if has_cmmi else 0
         effective = min(Decimal(count), Decimal(max_items)) if max_items else Decimal(count)
         score = (effective * per_item).quantize(Decimal("0.01"))
         if max_score and score > max_score:
             score = max_score
         detail = (
-            f"未见认证平台查询结果截图节：ISO 三体系 {iso_count} 项按"
+            f"未见认证平台查询结果截图节：ISO 系 {iso_count} 项按"
             "「未按要求提供不得分」计 0"
             + ("；CMMI 1 项（仅需证书复印件）照计" if has_cmmi else "")
         )
@@ -655,11 +785,12 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
             # 是逐材料硬执行（run 48 实证：诚道 2 个 inv=None 案例被 null_policy
             # 放行 → 6 分，真实 4 分；先数 1 个同样放行 → 4 分，真实 0）。
             # null 救援仅保留在**未明确点名**的材料键上。
+            # 2026-10-27 对齐人工口径（训练集测试2 p5 实证）：**业主证明/验收是
+            # 硬口径**（集服缺→0），发票 OCR 不可见≠缺失——发票移出 _strict_none，
+            # acceptance=True 时 invoice=None 走疑问不阻计。
             _strict_none: set[str] = set()
             if not person_scope:
-                if "发票" in artifacts:
-                    _strict_none.add("invoice")
-                if "验收" in artifacts or "业主证明" in artifacts:
+                if any(k in artifacts for k in ("验收", "业主证明", "用户证明", "用户报告")):
                     _strict_none.add("acceptance")
             # 三态材料：True=确认有；False=确认无（规则"不全不得分"→不计）；
             # None=页不可读/未提供。None 不直接当 0——"机器看不见 ≠ 没有"
@@ -667,15 +798,28 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
             # 策略允许时计入并标疑问，避免"发票没 OCR 就整项清零"。
             complete: list[dict] = []
             null_counted = 0
+            null_dropped = 0
             null_policy = config.case_null_policy()
             for c in cases:
                 vals = {k: c.get(k) for k in required_flags}
                 if any(v is False for v in vals.values()):
                     continue  # 确认缺失 → 不计
                 if any(v is None and k in _strict_none for k, v in vals.items()):
-                    continue  # 明确要求的材料不可读 → 按"不全不得分"不计
+                    # 明确要求的材料不可读 → 按"不全不得分"不计，但必须可见：
+                    # 不可读≠确认缺失（可能是扫描件），静默丢弃会把"OCR 没看见"
+                    # 伪装成"评分结论 0 分"（run 54 T5.1 19 案例仅计 1 的一环）
+                    null_dropped += 1
+                    continue
                 if all(v is True for v in vals.values()):
                     complete.append(c)  # 全部确认 → 计
+                    continue
+                # 人工口径（训练集测试2）：有业主证明/验收（acceptance=True）时
+                # 发票 OCR 不可见（None）不阻计——按已提供计并标疑问。
+                if vals.get("acceptance") is True and vals.get("invoice") is None \
+                        and vals.get("contract") is not False:
+                    complete.append(c)
+                    null_counted += 1
+                    conflict = True
                     continue
                 # B2 材料闸门校准：null_policy 从"仅 contract=True 即救"收紧为
                 # "至少 2 项确认 True"——先进数通只有合同无发票/验收（真实 0 分），
@@ -699,9 +843,11 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                 f"逐案例核验：提供案例 {len(cases)} 个，其中可计 {len(complete)} 个"
                 + (f"（{incomplete} 个缺证明材料不计分）" if incomplete else "")
                 + (f"（{null_counted} 个材料页不可读，按已提供计并标疑问）" if null_counted else "")
+                + (f"（{null_dropped} 个案例材料页不可读未计，可能为扫描件，建议人工核看）"
+                   if null_dropped else "")
                 + _type_gate_note
             )
-            if incomplete:
+            if incomplete or null_dropped:
                 conflict = True
     elif artifacts:
         conflict = True
@@ -714,13 +860,14 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
 
 
 def _required_flags(artifacts: str, person_scope: str = "", criterion_name: str = "") -> tuple[str, ...]:
-    """材料要求段 → 案例核验布尔键。
+    """材料要求段 → 案例核验布尔键（**只闸细则点名的材料**，规则文本驱动）。
 
-    项目级：合同恒查；见"发票"查发票；见"验收/业主证明"查验收。
-    人员级（person_scope 非空）：
-      - work_proof（合同/业绩证明中人员姓名+角色）恒查。
-      - experience_proof（五年工作经验证明）仅项目负责人经验（c59）要求。
-      - social_security（社保缴纳证明）恒查。
+    项目级：见"合同"查合同；见"发票"查发票；见"验收/业主证明"查验收；
+    细则未点名任何材料 → 不设材料闸门（旧实现无条件恒查 contract + 人员级
+    无条件恒查 social_security，是按旧项目假设的隐性拟合，换项目就误杀——
+    2026-10-26 run 54 T5.1 19 案例仅计 1 的放大器之一）。
+    人员级：work_proof（人在材料表行出现）恒查——人员证据的存在性锚；
+    experience_proof/social_security 仅细则点名时查。
     2026-10-22 修复：旧实现对人员级硬编码 contract → 全部"缺证明材料"→ 0 分。
     """
     if person_scope:
@@ -728,15 +875,22 @@ def _required_flags(artifacts: str, person_scope: str = "", criterion_name: str 
         # 项目负责人经验要求"五年及以上工作经验证明"（独立文档）
         if "负责人" in criterion_name or "五年" in artifacts or "5年" in artifacts:
             flags.append("experience_proof")
-        # 社保缴纳证明（规则恒要求）
-        if "社保" in artifacts or "社会保险" in artifacts or "缴纳" in artifacts or not artifacts:
+        if "社保" in artifacts or "社会保险" in artifacts or "缴纳" in artifacts:
             flags.append("social_security")
         return tuple(flags)
-    flags = ["contract"]
+    flags: list[str] = []
+    if "合同" in artifacts or "中标通知书" in artifacts:
+        flags.append("contract")
     if "发票" in artifacts:
         flags.append("invoice")
-    if "验收" in artifacts or "业主证明" in artifacts:
+    if any(k in artifacts for k in ("验收", "业主证明", "用户证明", "用户报告")):
         flags.append("acceptance")
+    if not flags and artifacts:
+        # 细则点名了材料但关键词映射不上（"提供用户证书/查询截图"等长尾）→
+        # **不能空闸门放行**（空 vals 会把材料全 False 的案例也算成可计 = 假通过，
+        # 审查实锤）。退回基线合同闸门并在 detail/conflict 暴露；只有细则完全
+        # 没点名材料（artifacts 为空）才不设闸门。
+        flags.append("contract")
     return tuple(flags)
 
 
@@ -805,3 +959,386 @@ def _normalize_role(case: dict) -> str | None:
     if "member" in role or "成员" in role or "团队" in role:
         return "member"
     return None
+
+
+# ===========================================================================
+# P1-E 新计分原语（21 份浙江中烟语料客观分类型学缺口，docs/评分规则库改进方案.md §4）
+#
+# 统一约定（与 score_count 同构）：
+# - **阈值/档位/扣分率只来自项目规则文本**（params，编译期 check_infer 解析）；
+# - 投标人侧事实从 facts 确定性抽取，抽取到的值带原文片段（可审计），
+#   启发式抽取的值一律 conflict=True → review_status=conflict_flagged 供人工复核；
+# - 抽不到事实 → unresolved="no_facts"（机器没抽到 ≠ 0 分结论，照 0 分记但标疑问）。
+# ===========================================================================
+
+# 响应时间承诺："2 小时内到达现场" / "响应时间：4 小时"（优先带标签的首匹配）
+_RE_HOURS_LABELED = re.compile(
+    r"(?:响应时间|故障响应|到场时间|到达时间|响应时限)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*(?:个)?\s*小时"
+)
+_RE_HOURS = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(?:个)?\s*小时(?:内|以内|之内)?(?:到达|到现场|到场|响应)"
+)
+# 质保期承诺："免费保修 3 年" / "质保期：36 个月" / "质保 3 年"
+_RE_WARRANTY_LABELED = re.compile(
+    r"(?:免费保修|质保期|保修期|质量保证期)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*(年|个月|月)"
+)
+_RE_WARRANTY = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(?:年|个月|月)\s*(?:的)?(?:免费)?(?:保修|质保)"
+)
+# 技术偏离表定位与行状态
+_RE_DEV_SECTION = re.compile(r"技术偏离表|技术响应偏离表|偏离表")
+_RE_DEV_NEG = re.compile(r"负偏离|低于(?:要求|招标)|不满足")
+_RE_DEV_MISSING = re.compile(r"未提供|无响应|未响应|未填写")
+
+
+def _units_to_months(value: Decimal, unit: str) -> Decimal:
+    return value * 12 if unit == "年" else value
+
+
+def _extract_response_hours(text: str) -> tuple[Decimal | None, str]:
+    """投标人响应时间承诺（小时）。带标签首匹配优先；返回 (值, 原文片段)。"""
+    m = _RE_HOURS_LABELED.search(text) or _RE_HOURS.search(text)
+    if not m:
+        return None, ""
+    try:
+        return Decimal(m.group(1)), m.group(0)
+    except Exception:  # noqa: BLE001
+        return None, ""
+
+
+def _extract_warranty_months(text: str) -> tuple[Decimal | None, str]:
+    """投标人质保期承诺（统一换算月）。返回 (月数, 原文片段)。"""
+    m = _RE_WARRANTY_LABELED.search(text) or _RE_WARRANTY.search(text)
+    if not m:
+        return None, ""
+    try:
+        if m.lastindex and m.lastindex >= 2 and m.group(2):
+            return _units_to_months(Decimal(m.group(1)), m.group(2)), m.group(0)
+        raw = m.group(0)
+        unit = "月" if "个月" in raw else "年"
+        return _units_to_months(Decimal(m.group(1)), unit), raw
+    except Exception:  # noqa: BLE001
+        return None, ""
+
+
+def _extract_deviation_counts(text: str) -> tuple[dict | None, str]:
+    """技术偏离表行状态计数。定位不到该表 → (None, "")。"""
+    m = _RE_DEV_SECTION.search(text)
+    if not m:
+        return None, ""
+    # 从表标题向后取窗口：到下一个明显章节标题/表题为止（最多 4000 字符）
+    tail = text[m.end(): m.end() + 4000]
+    stop = re.search(r"\n\s*(?:表\s*\d|[一二三四五六]、|第[一二三四五六][章节部分])", tail)
+    window = tail[: stop.start()] if stop else tail
+    rows = [ln for ln in window.splitlines() if re.search(r"\d", ln) and len(ln.strip()) >= 6]
+    if not rows:
+        return None, ""
+    neg = sum(1 for ln in rows if _RE_DEV_NEG.search(ln))
+    missing = sum(
+        1 for ln in rows if _RE_DEV_MISSING.search(ln) and not _RE_DEV_NEG.search(ln)
+    )
+    return {"total": len(rows), "negative": neg, "missing": missing}, window[:160]
+
+
+def _q2(v: Decimal) -> Decimal:
+    return v.quantize(Decimal("0.01"))
+
+
+def score_deviation_deduct_table(
+    criterion: dict, params: dict, facts: BidFacts
+) -> CountResult:
+    """偏离表/清单逐条扣分（G9：缺失每条扣 N、负偏离每条扣 M，单项 0-20）。"""
+    try:
+        per_missing = Decimal(str(params.get("per_missing") or 0))
+        per_negative = Decimal(str(params.get("per_negative") or 0))
+    except Exception:  # noqa: BLE001
+        return CountResult(
+            Decimal(0), "偏离扣分参数非法（非数字）", True, unresolved="field_missing"
+        )
+    max_score = criterion.get("max_score")
+    counts, snippet = _extract_deviation_counts(facts.text or "")
+    if counts is None:
+        return CountResult(
+            Decimal(0),
+            "未在投标文件中定位到技术偏离表，无法逐条扣分（按 0 分记，待人工核对）",
+            True, unresolved="no_facts",
+        )
+    deduct = per_missing * counts["missing"] + per_negative * counts["negative"]
+    if max_score is not None:
+        deduct = min(deduct, Decimal(str(max_score)))
+    score = max(Decimal(0), Decimal(str(max_score or 0)) - deduct)
+    return CountResult(
+        score,
+        f"偏离表 {counts['total']} 行：缺失 {counts['missing']}×{per_missing} + "
+        f"负偏离 {counts['negative']}×{per_negative} = 扣 {_q2(deduct)} → {score}；"
+        f"窗口片段：{snippet[:60]}",
+        conflict=True,  # 行状态是启发式判读 → conflict_flagged 供人工复核
+    )
+
+
+def score_value_tier(
+    criterion: dict, params: dict, facts: BidFacts
+) -> CountResult:
+    """连续值→分值档位（G10：响应时间档 10 文件、质保年限档）。"""
+    field = str(params.get("field") or "")
+    try:
+        tiers = list(params.get("tiers") or [])
+    except Exception:  # noqa: BLE001
+        tiers = []
+    if not tiers or field not in ("response_hours", "warranty_months"):
+        return CountResult(
+            Decimal(0), f"值档位参数不完备（field={field!r}）", True,
+            unresolved="field_missing",
+        )
+    if field == "response_hours":
+        value, snippet = _extract_response_hours(facts.text or "")
+    else:
+        value, snippet = _extract_warranty_months(facts.text or "")
+    if value is None:
+        return CountResult(
+            Decimal(0),
+            f"未在投标文件中抽取到 {field} 的承诺值（按 0 分记，待人工核对）",
+            True, unresolved="no_facts",
+        )
+    best: Decimal | None = None
+    for t in tiers:
+        try:
+            score_t = Decimal(str(t.get("score")))
+            lo = t.get("min_value")
+            hi = t.get("max_value")
+            if lo is not None and value < Decimal(str(lo)):
+                continue
+            if hi is not None and value > Decimal(str(hi)):
+                continue
+        except Exception:  # noqa: BLE001
+            continue
+        if best is None or score_t > best:
+            best = score_t
+    if best is None:
+        return CountResult(
+            Decimal(0),
+            f"抽取到 {field}={value}（依据：{snippet[:40]}），但不落入任何档位 → 0 分",
+            conflict=True,
+        )
+    return CountResult(
+        best,
+        f"{field}={value}（依据：{snippet[:40]}）命中档位 → {best} 分",
+        conflict=True,  # 承诺值为文本启发式抽取 → 人工复核
+    )
+
+
+def score_value_linear(
+    criterion: dict, params: dict, facts: BidFacts
+) -> CountResult:
+    """线性步进计分（G10 质保档："满足 1 年以外每增 12 个月 +1 分，封顶 2"）。
+
+    params: {field, base, step, per, cap}——base/step/per/cap 全部来自项目细则原文。
+    """
+    field = str(params.get("field") or "")
+    try:
+        base = Decimal(str(params.get("base") or 0))
+        step = Decimal(str(params.get("step") or 0))
+        per = Decimal(str(params.get("per") or 0))
+        cap = (
+            Decimal(str(params.get("cap")))
+            if params.get("cap") is not None else None
+        )
+    except Exception:  # noqa: BLE001
+        return CountResult(
+            Decimal(0), "线性计分参数非法（非数字）", True, unresolved="field_missing"
+        )
+    if step <= 0 or per <= 0 or field not in ("response_hours", "warranty_months"):
+        return CountResult(
+            Decimal(0), f"线性计分参数不完备（field={field!r}）", True,
+            unresolved="field_missing",
+        )
+    if field == "warranty_months":
+        value, snippet = _extract_warranty_months(facts.text or "")
+    else:
+        value, snippet = _extract_response_hours(facts.text or "")
+    if value is None:
+        return CountResult(
+            Decimal(0),
+            f"未在投标文件中抽取到 {field} 的承诺值（按 0 分记，待人工核对）",
+            True, unresolved="no_facts",
+        )
+    steps = max(Decimal(0), (value - base) / step)
+    score = (steps * per).to_integral_value(rounding="ROUND_FLOOR")
+    if cap is not None:
+        score = min(score, cap)
+    score = max(Decimal(0), score)
+    return CountResult(
+        score,
+        f"{field}={value}（依据：{snippet[:40]}），基线 {base} 每 {step} 计 {per} 分"
+        f"封顶 {cap} → {score}",
+        conflict=True,
+    )
+
+
+def score_attribute_tier(
+    criterion: dict, params: dict, facts: BidFacts
+) -> CountResult:
+    """属性分档计数（G7/G8：16 文件 22 条）——每个对象命中满足的最高档，Σ 封顶。
+
+    params: {attr: years|title|cert_name|count, tiers: [{min|level|match, score}]}
+    事实源：cert_name/count → facts.certificates（现网可用）；
+    years/title → facts.person_attributes（结构化人员表抽取，缺则 no_facts 不猜测）。
+    """
+    attr = str(params.get("attr") or "years")
+    try:
+        tiers = list(params.get("tiers") or [])
+    except Exception:  # noqa: BLE001
+        tiers = []
+    if not tiers:
+        return CountResult(
+            Decimal(0), "属性分档参数缺 tiers", True, unresolved="field_missing"
+        )
+    max_score = criterion.get("max_score")
+
+    if attr in ("cert_name", "count"):
+        objects: list[str] = list(facts.certificates or [])
+        if not objects:
+            return CountResult(
+                Decimal(0), "未在证书表/正文中抽取到证书清单（按 0 分记，待人工核对）",
+                True, unresolved="no_facts",
+            )
+        total = Decimal(0)
+        detail_parts: list[str] = []
+        for obj in objects:
+            best: Decimal | None = None
+            for t in tiers:
+                try:
+                    score_t = Decimal(str(t.get("score")))
+                except Exception:  # noqa: BLE001
+                    continue
+                match = str(t.get("match") or "")
+                if match:
+                    nm = normalize_cert(match)
+                    if nm and nm in normalize_cert(obj):
+                        if best is None or score_t > best:
+                            best = score_t
+                elif attr == "count":
+                    if best is None or score_t > best:
+                        best = score_t
+            if best is not None:
+                total += best
+                detail_parts.append(f"{obj}→{best}")
+        if max_score is not None:
+            total = min(total, Decimal(str(max_score)))
+        if not detail_parts:
+            return CountResult(
+                Decimal(0),
+                f"证书 {len(objects)} 项均不命中任何分档（tiers 按名称匹配），0 分",
+                True,
+            )
+        return CountResult(total, "；".join(detail_parts) + f"，合计 {total}", True)
+
+    # years / title：人员属性表（facts.person_attributes，表解析/LLM 填充）
+    attrs = list(getattr(facts, "person_attributes", None) or [])
+    if not attrs:
+        return CountResult(
+            Decimal(0),
+            "人员属性表未抽取到（年限/职称无法结构化核对），按 0 分记待人工核对",
+            True, unresolved="no_facts",
+        )
+    total = Decimal(0)
+    detail_parts = []
+    for person in attrs:
+        best = None
+        for t in tiers:
+            try:
+                score_t = Decimal(str(t.get("score")))
+            except Exception:  # noqa: BLE001
+                continue
+            ok = False
+            if attr == "years" and t.get("min") is not None:
+                try:
+                    years = person.get("years")
+                    if years is not None and Decimal(str(years)) >= Decimal(str(t["min"])):
+                        ok = True
+                except Exception:  # noqa: BLE001
+                    ok = False
+            elif attr == "title" and t.get("level"):
+                if str(t["level"]) in str(person.get("title") or ""):
+                    ok = True
+            if ok and (best is None or score_t > best):
+                best = score_t
+        if best is not None:
+            total += best
+            detail_parts.append(f"{person.get('name', '?')}→{best}")
+        else:
+            detail_parts.append(f"{person.get('name', '?')}→未命中档位")
+    if max_score is not None:
+        total = min(total, Decimal(str(max_score)))
+    return CountResult(total, "；".join(detail_parts) + f"，合计 {total}", False)
+
+
+# 中文基数词（分档计数"两项得1分"句式用）
+_CN_NUM = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+           "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
+# 分档计数："（ISO三体系）两项得1分，三项得2分" / "提供2项得1分，3项得2分"
+# 容忍"三项得得2分"（原文/OCR 双得，run 59 T5.2 实证）——得+ 允许重复
+_RE_COUNT_TIER = re.compile(
+    r"(一|二|两|三|四|五|六|七|八|九|十|\d+)\s*(?:项|个|本|张|类)"
+    r"[^得。；]{0,8}?得+\s*(\d+(?:\.\d+)?)\s*分"
+)
+
+
+def score_count_tier(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
+    """分档计数（P3："ISO体系认证两项得1分，三项得2分"）——按对象计数命中最高档。
+
+    params: {field: certificates|performance, tiers: [{min_count, score}]}
+    与 score_count 的 per_item×count 不同：分数不是线性，而是"计数落在哪个区间"。
+    只认编译期已结构化的 tiers（来自规则原文），不猜档位。
+    """
+    field = str(params.get("field") or "certificates")
+    try:
+        tiers = list(params.get("tiers") or [])
+    except Exception:  # noqa: BLE001
+        tiers = []
+    if not tiers:
+        return CountResult(
+            Decimal(0), "分档计数参数缺 tiers", True, unresolved="field_missing"
+        )
+    max_score = criterion.get("max_score")
+
+    if field == "performance":
+        amounts = list(getattr(facts, "performance_amounts", None) or [])
+        if not amounts:
+            return CountResult(
+                Decimal(0), "未抽取到业绩清单（分档计数按 0 记，待人工核对）",
+                True, unresolved="no_facts",
+            )
+        n = len(amounts)
+    else:
+        certs = list(facts.certificates or [])
+        if not certs:
+            return CountResult(
+                Decimal(0), "未抽取到证书清单（分档计数按 0 记，待人工核对）",
+                True, unresolved="no_facts",
+            )
+        n = len(certs)
+
+    best: Decimal | None = None
+    best_min = None
+    for t in tiers:
+        try:
+            min_c = int(t.get("min_count"))
+            score_t = Decimal(str(t.get("score")))
+        except Exception:  # noqa: BLE001
+            continue
+        if n >= min_c and (best is None or score_t > best):
+            best = score_t
+            best_min = min_c
+    if best is None:
+        return CountResult(
+            Decimal(0), f"计数 {n} 项不满足任何分档（tiers 按 min_count 匹配），0 分",
+            conflict=True,
+        )
+    if max_score is not None:
+        best = min(best, Decimal(str(max_score)))
+    return CountResult(
+        best,
+        f"计数 {n} 项命中「≥{best_min} 项」档 → {best} 分",
+        conflict=True,  # 计数来自 facts 抽取 → 人工复核
+    )

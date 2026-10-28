@@ -156,7 +156,10 @@ def test_score_count_no_cases_stays_unresolved() -> None:
     facts = BidFacts(text="")
     crit = _count_crit()
     result = score_count(crit, crit["params"], facts)
-    assert result.unresolved == "field_missing"
+    # 语义锚：无案例 → 必须 unresolved（不能把 0 当评审结论）。
+    # 诊断码由 field_missing 精化为 no_facts：人员级 field 不缺（刻意清空走
+    # verified_cases），缺的是案例——旧码把排查引向错误方向（2026-10-26）。
+    assert result.unresolved == "no_facts"
 
 
 def test_score_count_leader_type_gate_drops_non_ops_cases() -> None:
@@ -595,7 +598,11 @@ def _perf_crit(**kw) -> dict:
 
 
 def test_score_count_null_with_contract_counts_and_flags() -> None:
-    """点名材料(invoice)不可读(None) → 硬闸门不计（真实评审口径，2026-10-23）。"""
+    """发票不可读(None) + 有业主证明/验收 → 计分并标疑问（2026-10-27 语义变更）。
+
+    训练集测试2 人工口径实证：有业主证明/验收的案例照计（发票 OCR 不可见≠缺失），
+    旧「发票 null 硬闸门不计」把 5 家业绩几乎清零。确认缺失（False）仍硬不计。
+    """
     from app.engine.objective import score_count
 
     crit = _perf_crit(verified_cases=[
@@ -605,9 +612,19 @@ def test_score_count_null_with_contract_counts_and_flags() -> None:
          "case_source": "table", "sanitized": "ok"},
     ])
     res = score_count(crit, crit["params"], BidFacts(text=""))
-    assert res.score == Decimal("2.00")  # 只有 B（A 的发票不可读 → 不全不得分）
+    assert res.score == Decimal("4.00")  # A（发票不可读+有验收→计并标疑问）+ B
     assert res.unresolved is None
     assert res.conflict is True
+
+    # 对照：发票**确认缺失**（False）仍硬不计
+    crit2 = _perf_crit(verified_cases=[
+        {"name": "A", "contract": True, "invoice": False, "acceptance": True,
+         "case_source": "table", "sanitized": "ok"},
+        {"name": "B", "contract": True, "invoice": True, "acceptance": True,
+         "case_source": "table", "sanitized": "ok"},
+    ])
+    res2 = score_count(crit2, crit2["params"], BidFacts(text=""))
+    assert res2.score == Decimal("2.00")
 
 
 def test_score_count_null_without_contract_does_not_count() -> None:
@@ -679,3 +696,89 @@ def test_upsert_score_persists_ai_raw_json(app_env) -> None:  # noqa: ANN001
         row = s.query(ScoreRecord).filter_by(run_id=9001, bidder_id=900).one()
         assert row.ai_raw_json["verified_cases"][0]["sanitized"] == "requirement_shadow"
         assert row.ai_raw_json["meta"]["pages_dropped_echo"] == [95]
+
+
+def test_sanitize_person_case_name_anchor_rescues_short_quote():
+    """人员级案例（人名+证件）无逐字引文时，人名+证件词回标书即放行。
+
+    2026-10-26 run 54 c60 实证：LLM 找到「顾爱军 电工证」但 quote 空 →
+    quote_too_short 整案丢弃 → 全员 0 分。人证组合都在标书人员/证书表
+    （"顾爱军 特种作业操作证（电工）"）应判真实存在。
+    """
+    from app.services.scoring_service import _sanitize_case
+
+    case = {
+        "name": "顾爱军 电工证", "person_name": "顾爱军",
+        "quote": "", "work_proof": True, "social_security": True,
+        "experience_proof": False, "contract": None, "invoice": None, "acceptance": None,
+    }
+    bid_norm = "拟派团队成员一览表顾爱军特种作业操作证电工高压电工证复印件"
+    out = _sanitize_case(case, "须提供证书复印件", bid_norm=bid_norm, echo_n="须提供证书复印件")
+    assert out["sanitized"] == "ok"
+    assert out.get("quote_source") == "case_name"
+
+
+def test_sanitize_person_case_fabricated_name_still_rejected():
+    """人名回不到标书 → 仍判伪造（防模型编造持证人）。"""
+    from app.services.scoring_service import _sanitize_case
+
+    case = {
+        "name": "张三丰 电工证", "person_name": "张三丰",
+        "quote": "", "work_proof": True,
+    }
+    bid_norm = "拟派团队成员一览表李四特种作业操作证"
+    out = _sanitize_case(case, "须提供证书复印件", bid_norm=bid_norm, echo_n="须提供证书复印件")
+    assert out["sanitized"] != "ok"
+    assert out["work_proof"] is False
+
+
+def test_sanitize_company_case_null_person_key_not_killed():
+    """公司级业绩案例带 "person_name": null 空键 → 不得套人员校验（P0 回归）。
+
+    2026-10-27 run 57 实证：LLM 输出的公司级案例常带 null 人员键，旧键存在判定
+    误套人员校验 → 合同签署页 quote（甲方/乙方）触发 project_header_not_person
+    → 整案材料强刷 False → 业绩全灭（人工业绩 23/30 vs 机 4/20）。
+    """
+    from app.services.scoring_service import _sanitize_case
+
+    case = {
+        "name": "国网陕西渭南供电局运维服务项目",
+        "person_name": None, "work_proof": None,
+        "quote": "甲方：国网陕西省电力有限公司 乙方：杭州致成电子科技有限公司 合同金额：258万元",
+        "contract": True, "invoice": None, "acceptance": True,
+    }
+    out = _sanitize_case(case, "须提供合同复印件、发票复印件和业主证明", bid_norm=None,
+                         person_scope="")
+    assert out["sanitized"] != "project_header_not_person"
+    # 材料不得被强刷（contract/acceptance 保持原判定）
+    assert out.get("contract") is not False
+    assert out.get("acceptance") is not False
+
+
+def test_sanitize_person_case_contract_header_still_killed():
+    """人员级案例（真 person_name 值）的合同头引文仍触发人员校验并降级人员键。"""
+    from app.services.scoring_service import _sanitize_case
+
+    case = {
+        "name": "张三 项目经理业绩",
+        "person_name": "张三", "work_proof": True,
+        "quote": "甲方：某单位 乙方：某公司 合同金额：100万元",
+    }
+    out = _sanitize_case(case, "须提供人员经验证明", bid_norm=None, person_scope="leader")
+    assert out["sanitized"] == "project_header_not_person"
+    assert out.get("work_proof") is False
+
+
+def test_sanitize_explicit_scope_wins_over_null_keys():
+    """准则级 person_scope 显式传入时按人员级处理（即使案例内键全空）。"""
+    from app.services.scoring_service import _sanitize_case
+
+    case = {
+        "name": "某项目", "person_name": None,
+        "quote": "甲方：某单位 乙方：某公司 合同金额：100万元",
+    }
+    out = _sanitize_case(case, "人员经验证明", bid_norm=None, person_scope="member")
+    assert out["sanitized"] == "project_header_not_person"
+    # 公司级（scope 空）同样输入不触发
+    out2 = _sanitize_case(dict(case), "人员经验证明", bid_norm=None, person_scope="")
+    assert out2["sanitized"] != "project_header_not_person"

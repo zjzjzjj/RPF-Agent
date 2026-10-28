@@ -424,3 +424,52 @@ def test_retired_criterion_hidden(client, summary_chain):  # noqa: ANN001
 
     d = _get(client, summary_chain).json()
     assert all(i["code"] != "T5.1" for b in d["bidders"] for i in _all_items(b))
+
+
+def test_sample_in_total_false_excluded_from_ranking(client, summary_chain):  # noqa: ANN001
+    """P1-C.6 总分口径：params.in_total=False（新代商标"三部分总和"样品单列）
+    → 不进总分与类别合计；分数与 breakdown 照常保留（审计可见）。"""
+    from app.db.models import Criterion, CriterionCheck, ScoreRecord
+    from app.db.session import session_scope
+
+    chain = summary_chain
+    sample_score = Decimal("8")
+    with session_scope() as s:
+        sample = Criterion(
+            package_id=chain["package_id"],
+            code="SP1", category="commercial", name="样品评审",
+            max_score=Decimal("10"), score_type="count",
+            status="verified", sort_order=998,
+        )
+        s.add(sample)
+        s.flush()
+        s.add(CriterionCheck(
+            criterion_id=sample.id, check_type="human_only",
+            params_json={"in_total": False},
+        ))
+        for bid_id in chain["bidder_ids"]:
+            s.add(ScoreRecord(
+                run_id=chain["run_id"], bidder_id=bid_id, criterion_id=sample.id,
+                max_score=Decimal("10"), score_type="count",
+                machine_score=sample_score, final_score=sample_score,
+                machine_status="pass", review_status="pending",
+            ))
+        # 排除样品后每家的应计总分（直接从库算期望值，防口径漂移）
+        expected: dict[int, Decimal] = {}
+        for sc in s.execute(
+            select(ScoreRecord).where(
+                ScoreRecord.run_id == chain["run_id"],
+                ScoreRecord.criterion_id != sample.id,
+            )
+        ).scalars():
+            if sc.final_score is None or sc.score_type in ("veto", "match"):
+                continue
+            expected[sc.bidder_id] = expected.get(sc.bidder_id, Decimal(0)) + Decimal(
+                str(sc.final_score)
+            )
+
+    from app.services.ranking_service import compute_ranking
+
+    ranking = compute_ranking(chain["pid"], chain["run_id"])
+    for row in ranking["rows"]:
+        assert Decimal(str(row["total"])) == expected.get(row["bidder_id"], Decimal(0)), row["name"]

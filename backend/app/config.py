@@ -113,6 +113,16 @@ def auto_match_enabled() -> bool:
     return os.environ.get("BID_EVAL_AUTO_MATCH", "1").strip().lower() not in ("0", "false", "no", "off")
 
 
+def scoring_skeleton_enabled() -> bool:
+    """评标细则表格骨架对账（默认开）。
+
+    编译后用确定性表格骨架核对 LLM 抽取结果，补齐缺口行/校正分值
+    （多媒体维保项目实证：LLM 碎行抽漏致总分 91≠100）。骨架解析失败
+    自动回退纯 LLM 抽取；置 0 完全关闭对账。
+    """
+    return os.environ.get("BID_EVAL_SCORING_SKELETON", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
 # ---------------------------------------------------------------------------
 # 解析
 # ---------------------------------------------------------------------------
@@ -284,6 +294,45 @@ def review_mode() -> str:
     return os.environ.get("BID_EVAL_REVIEW_MODE", "hierarchical").strip().lower()
 
 
+def job_workers() -> int:
+    """任务 worker 并发数（默认 1 = 串行队列）。
+
+    部署设 2：评分与规则编译并行（2026-10-27 实证：评分 job 被 28min 编译任务
+    排队阻塞 18min）。`_claim_next_job` 是条件 UPDATE 原子领取，多 worker 安全。
+    """
+    return max(1, int(os.environ.get("BID_EVAL_JOB_WORKERS", 1)))
+
+
+def benchmark_exclude_suspect() -> bool:
+    """确定性资格硬 fail（date_valid/结构化事实类）是否剔出价格基准价（默认开）。
+
+    「AI 不否决」不变：投标人照常评分/排名/展示，只影响基准价口径（对齐人工
+    "有效标均价"实践，2026-10-27 训练集测试2 实证：无效标进基准 → 价格分 +4~7）。
+    """
+    return os.environ.get("BID_EVAL_BENCHMARK_EXCLUDE_SUSPECT", "1").strip() not in ("0", "false", "")
+
+
+def calibration_profile() -> dict:
+    """主观档位校准参数（data/calibration/<name>.json，2026-10-27 训练集校准）。
+
+    env `BID_EVAL_CALIBRATION_PROFILE` 选文件名（默认 "default"）。文件缺失/坏
+    JSON → 空 profile（纯细则文本驱动，不注入任何尺度提示）。返回
+    {"version":..., "scale_text":...}，version 落 ai_raw_json 供审计还原。
+    """
+    import json as _json
+
+    name = (os.environ.get("BID_EVAL_CALIBRATION_PROFILE") or "default").strip() or "default"
+    path = data_dir() / "calibration" / f"{name}.json"
+    try:
+        data = _json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 —— 缺失/坏文件都不阻断评分
+        return {"version": "", "scale_text": ""}
+    return {
+        "version": str(data.get("version") or ""),
+        "scale_text": str(data.get("scale_text") or ""),
+    }
+
+
 def ocr_max_pages() -> int:
     """单本文档 OCR 页数上限（护栏）；超限的缺字页跳过并记警告。"""
     return int(os.environ.get("BID_EVAL_OCR_MAX_PAGES", 60))
@@ -320,6 +369,16 @@ def case_max_batches() -> int:
 def material_ocr_max_pages() -> int:
     """单个投标文档材料页 OCR 救援的页数上限。"""
     return int(os.environ.get("BID_EVAL_MATERIAL_OCR_MAX_PAGES", 20))
+
+
+def material_index_enabled() -> bool:
+    """材料分类索引总开关（0=全链路退化为无标签现状）。"""
+    return os.environ.get("BID_EVAL_MATERIAL_INDEX", "1") not in ("0", "false", "False")
+
+
+def classify_llm_max_pages() -> int:
+    """单文档 LLM 兜底分类的页数上限（超出部分落 other）。"""
+    return int(os.environ.get("BID_EVAL_CLASSIFY_LLM_MAX_PAGES", 200))
 
 
 def case_name_prefix_min() -> int:

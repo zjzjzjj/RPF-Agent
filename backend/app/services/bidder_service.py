@@ -102,7 +102,56 @@ def extract_price(bidder_id: int) -> Bidder:
     """
     bidder = get_bidder(bidder_id)
     text, _titles, doc_ids = bid_text(bidder_id)
+    text = _price_domain_text(bidder_id, text, doc_ids)
     return _extract_price_impl(bidder, text, doc_ids)
+
+
+def _price_domain_text(bidder_id: int, full_text: str, doc_ids: list[int]) -> str:
+    """报价类材料页文本（material_index 的 price 类标签）——抽价硬过滤检索域。
+
+    无有效价格类页（分类缺失/判丢/未启用）→ 回退全量文本（安全阀：
+    分类故障不得打死报价抽取）。抽取只读返回域，引文同域可查。
+    """
+    from app import config as _config
+
+    if not _config.material_index_enabled() or not doc_ids:
+        return full_text
+    try:
+        from sqlalchemy import select as _select
+
+        from app.db.models import DocumentPage as _DP
+        from app.db.models import MaterialTag
+        from app.material_index.service import text_sha as _tsha
+
+        with session_scope() as s:
+            price_pages = [
+                int(p) for p in s.execute(
+                    _select(MaterialTag.page_no).where(
+                        MaterialTag.document_id.in_(doc_ids),
+                        MaterialTag.seg_kind == "page",
+                        MaterialTag.category == "price",
+                    )
+                ).scalars().all()
+            ]
+            if not price_pages:
+                return full_text
+            parts: list[str] = []
+            for d_id in doc_ids:
+                for pno, ptext, psha in s.execute(
+                    _select(_DP.page_no, _DP.text, MaterialTag.text_sha)
+                    .join(MaterialTag, (MaterialTag.document_id == _DP.document_id)
+                          & (MaterialTag.page_no == _DP.page_no)
+                          & (MaterialTag.seg_kind == "page"), isouter=True)
+                    .where(_DP.document_id == d_id, _DP.page_no.in_(price_pages))
+                    .order_by(_DP.page_no)
+                ):
+                    if psha and _tsha(ptext or "") != psha:
+                        continue  # 标签已过期，宁缺勿错
+                    parts.append(ptext or "")
+            text = "\n".join(p for p in parts if p.strip())
+        return text or full_text  # 空集安全阀
+    except Exception:  # noqa: BLE001 —— 分类是增强，不阻塞抽价
+        return full_text
 
 
 def _extract_price_impl(bidder: Bidder, text: str, doc_ids: list[int]) -> Bidder:
@@ -160,7 +209,7 @@ def extract_price_job(ctx: JobContext, payload: dict) -> dict:
 
     text, _titles, doc_ids = bid_text(bidder_id, on_doc=_on_doc)
     ctx.advance(message="识别投标报价")
-    updated = _extract_price_impl(bidder, text, doc_ids)
+    updated = _extract_price_impl(bidder, _price_domain_text(bidder_id, text, doc_ids), doc_ids)
     ctx.advance(message="建立证据引用")
     return {
         "bidder_id": bidder_id,

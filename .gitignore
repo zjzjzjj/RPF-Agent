@@ -35,3 +35,5 @@ frontend/tsconfig.tsbuildinfo
 # ---- 本地环境 ----
 .env
 .env.local
+# env 备份（含 LLM 密钥，勿提交）
+.env.bak*

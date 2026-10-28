@@ -115,10 +115,52 @@ def remote_ocr_page(
         raise RuntimeError(f"PaddleOCR-VL 响应缺少内容：{str(answer)[:200]}") from exc
     if choice.get("finish_reason") == "length":
         # 旧实现忽略 finish_reason：密集扫描页被静默截断，内容丢失却无人知晓。
-        # 救援模式接受部分输出（材料信号通常在前半段），正常解析仍抛错。
+        # 救援模式接受部分输出（材料信号通常在前半段）；正常解析不再整体放弃——
+        # 竖切两半分段识别后拼接（2026-10-26 run 54 实证：截断 ×60，文本缺失是
+        # 下游「未见/缺证→0」误判的温床）。
         if not allow_truncated:
-            raise RuntimeError("PaddleOCR-VL 输出被 max_tokens 截断")
+            return _ocr_segmented(png_bytes, prompt)
     return text.strip()
+
+
+def _ocr_segmented(png_bytes: bytes, prompt: str | None) -> str:
+    """截断页的分段识别：竖切上下两半（5% 重叠）各识别一次后拼接。
+
+    只切一层：单半再截断时接受部分输出（配合拼接已远优于整体丢弃）。
+    分段调用失败抛 RuntimeError（调用方按既有熔断/回退路径处置）。
+    """
+    import io
+
+    from PIL import Image
+
+    try:
+        img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
+    except Exception as exc:  # noqa: BLE001
+        raise RuntimeError(f"PaddleOCR-VL 输出被 max_tokens 截断（分段重试失败：{exc}）") from exc
+    w, h = img.size
+    if h < 32:
+        raise RuntimeError("PaddleOCR-VL 输出被 max_tokens 截断")
+    overlap = max(4, int(h * 0.05))
+    mid = h // 2
+    crops = [
+        img.crop((0, 0, w, min(h, mid + overlap))),
+        img.crop((0, max(0, mid - overlap), w, h)),
+    ]
+    parts: list[str] = []
+    for crop in crops:
+        buf = io.BytesIO()
+        crop.save(buf, format="PNG")
+        try:
+            answer = _post(buf.getvalue(), prompt, config.paddle_ocr_max_tokens())
+        except (OSError, ValueError, urllib.error.URLError) as exc:
+            raise RuntimeError(f"PaddleOCR-VL 调用失败：{exc}") from exc
+        try:
+            text = str(answer["choices"][0]["message"]["content"] or "")
+        except (KeyError, IndexError, TypeError) as exc:
+            raise RuntimeError(f"PaddleOCR-VL 响应缺少内容：{str(answer)[:200]}") from exc
+        if text.strip():
+            parts.append(text.strip())
+    return "\n".join(parts)
 
 
 def _post(png_bytes: bytes, prompt: str | None, max_tokens: int) -> dict:

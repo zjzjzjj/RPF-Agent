@@ -68,21 +68,54 @@ def compile_char_budget() -> int:
     return min(MAX_COMPILE_CHARS, int(usable * _CHARS_PER_TOKEN))
 
 
-def split_for_extraction(text: str, chunk_chars: int | None = None) -> list[str]:
+def split_for_extraction(
+    text: str,
+    chunk_chars: int | None = None,
+    protected_spans: list[tuple[int, int]] | None = None,
+) -> list[str]:
     """把选段按行边界切成若干块，每块尽量不超过 chunk_chars 字符。
 
     分块是长文档可靠抽取的前提：规则 JSON 的输出量随文档线性增长，而模型的
     单次输出上限是固定的。按行切分保证不会在句子中间断开（条款跨块丢失）。
+
+    protected_spans：原文字符区间 [start, end) 列表（如评标细则章节），span 内
+    不切开——即使单块因此超出 size（上限 = span 长度）。不传时行为与旧版一致。
     """
     size = chunk_chars if chunk_chars is not None else config.compile_chunk_chars()
     if size <= 0 or len(text) <= size:
         return [text]
 
+    # 预切片为 (是否原子块, 片段)：protected span 整段原子；其余按行（精确保留原文）
+    def _line_pieces(region: str) -> list[tuple[bool, str]]:
+        if not region:
+            return []
+        parts = region.split("\n")
+        out = [(False, p + "\n") for p in parts[:-1]]
+        if parts[-1]:
+            out.append((False, parts[-1]))
+        return out
+
+    pieces: list[tuple[bool, str]] = []
+    spans = sorted((s, e) for s, e in (protected_spans or []) if 0 <= s < e <= len(text))
+    cursor = 0
+    for s, e in spans:
+        if s < cursor:  # 重叠/乱序 span 容错
+            continue
+        pieces.extend(_line_pieces(text[cursor:s]))
+        pieces.append((True, text[s:e]))  # 原子块
+        cursor = e
+    pieces.extend(_line_pieces(text[cursor:]))
+
     chunks: list[str] = []
     buf: list[str] = []
     used = 0
-    for line in text.split("\n"):
-        piece = line + "\n"
+    for atomic, piece in pieces:
+        if atomic:
+            if buf:
+                chunks.append("".join(buf))
+                buf, used = [], 0
+            chunks.append(piece)
+            continue
         # 单行本身超长：先冲掉缓冲区，再硬切成整块
         if len(piece) > size:
             if buf:
@@ -106,17 +139,54 @@ def split_for_extraction(text: str, chunk_chars: int | None = None) -> list[str]
 
 
 def dedupe_extracted(items: list["ExtractedCriterion"]) -> list["ExtractedCriterion"]:
-    """跨块去重：同 category + 规范化名称只保留第一条。
+    """跨块去重：只丢**真重复**，同名不同分值的子项行全部保留。
 
-    分块边界附近的上下文重叠会让模型在相邻两块里各抽一次同一条规则。
+    分块边界附近的上下文重叠会让模型在相邻两块里各抽一次同一条规则——
+    那是（category, 名称, score_type, 分值）全同的真重复，丢后条。
+
+    但评标细则表的子项行常共享父项名称（"服务保障情况（10）"下的 4 个子项
+    都被模型命名为"服务保障情况"），旧版按 (category, 名称) 去重会把
+    0-3/0-3/0-2 子项误杀（多媒体维保项目实证：总分 91≠100）。
+    同名但分值/评分类型不同的条目现在全部保留；同名且恰有一方分值缺失时
+    保留有分值的那条并把缺失方的描述/引文并入。
     """
-    seen: set[tuple[str, str]] = set()
+    exact_seen: set[tuple[str, str, str, str]] = set()
+    by_name: dict[tuple[str, str], int] = {}  # (category, name) → out 下标
     out: list["ExtractedCriterion"] = []
     for c in items:
-        key = (c.category, normalize_no_ws(c.name or ""))
-        if key in seen:
+        name_key = (c.category, normalize_no_ws(c.name or ""))
+        exact_key = (*name_key, c.score_type, str(c.max_score))
+        if exact_key in exact_seen:
             continue
-        seen.add(key)
+        idx = by_name.get(name_key)
+        if idx is not None:
+            prev = out[idx]
+            same_kind = prev.score_type == c.score_type
+            if same_kind and prev.max_score is not None and c.max_score is None:
+                # 同名一有一无：保有分值的，把缺失方的描述/引文并入
+                if c.description and not prev.description:
+                    prev.description = c.description
+                if c.quote and not prev.quote:
+                    prev.quote = c.quote
+                if c.required_evidence and not prev.required_evidence:
+                    prev.required_evidence = c.required_evidence
+                exact_seen.add(exact_key)
+                continue
+            if same_kind and prev.max_score is None and c.max_score is not None:
+                # 后条有分值：就地提升为权威条目（保序：仍占原位置）
+                if prev.description and not c.description:
+                    c.description = prev.description
+                if prev.quote and not c.quote:
+                    c.quote = prev.quote
+                if prev.required_evidence and not c.required_evidence:
+                    c.required_evidence = prev.required_evidence
+                out[idx] = c
+                exact_seen.add(exact_key)
+                continue
+            # 同名不同分值/类型 → 子项行，全部保留
+        else:
+            by_name[name_key] = len(out)
+        exact_seen.add(exact_key)
         out.append(c)
     return out
 
@@ -124,50 +194,367 @@ def dedupe_extracted(items: list["ExtractedCriterion"]) -> list["ExtractedCriter
 # ---------------------------------------------------------------------------
 # 抽取结果的确定性补全（8B 模型经常漏字段，不能把正确性押在提示词上）
 # ---------------------------------------------------------------------------
+# 容忍"每低于一个百分点"（多媒体维保项目 p137 实测措辞："每低于一个百分点扣0.4 分"）
+_RE_RATE_NUM = r"(?:\d+(?:\.\d+)?|一)"
 _RE_RATE_DOWN = re.compile(
-    r"每低\s*(\d+(?:\.\d+)?)\s*个百分点[^。；\n]{0,12}?扣\s*(\d+(?:\.\d+)?)\s*分"
+    r"每(?:低(?:于)?|下浮)\s*(" + _RE_RATE_NUM + r")\s*个百分点[^。；\n]{0,12}?扣\s*(\d+(?:\.\d+)?)\s*分"
 )
 _RE_RATE_UP = re.compile(
-    r"每高\s*(\d+(?:\.\d+)?)\s*个百分点[^。；\n]{0,12}?扣\s*(\d+(?:\.\d+)?)\s*分"
+    r"每(?:高(?:于)?|上浮)\s*(" + _RE_RATE_NUM + r")\s*个百分点[^。；\n]{0,12}?扣\s*(\d+(?:\.\d+)?)\s*分"
 )
-_RE_TRIM_BOTH = re.compile(r"扣除一个最高价和一个最低价")
+# 公式式扣分率（语料 3/4 份）："投标报价得分（报价高于基准值）=50-（投标报价-基准值）/基准值*100*0.4"
+# → deduct_rate_up=0.4；"（报价低于基准值）=50-（基准值-投标报价）/基准值*100*0.2" → deduct_rate_down=0.2
+# 匹配：括注方向 + 公式体尾部的最后一个乘数（扣分率）
+_RE_RATE_FORMULA_UP = re.compile(
+    r"[（(]报价高于基准值[)）][^=]*=[^（]{0,20}?[（(]投标报价-基准值[)）]\s*/\s*基准值\s*[*×xX]\s*100\s*[*×xX]\s*(\d+(?:\.\d+)?)"
+)
+_RE_RATE_FORMULA_DOWN = re.compile(
+    r"[（(]报价低于基准值[)）][^=]*=[^（]{0,20}?[（(]基准值-投标报价[)）]\s*/\s*基准值\s*[*×xX]\s*100\s*[*×xX]\s*(\d+(?:\.\d+)?)"
+)
+# "扣除/去掉一个最高价和一个最低价"（含"最高报价/投标报价"变体，语料烟叶/薄片实证）；
+# 4-way 形态："去掉一个最高价、一个次高价、一个最低价和一个次低价"
+_RE_TRIM_BOTH = re.compile(
+    r"(?:扣除|去掉|剔除)一个最高(?:投标)?(?:报)?价[和、及与][^。；]{0,20}?一个最低(?:投标)?(?:报)?价"
+)
+_RE_TRIM_FOUR = re.compile(r"次高价")
 _RE_ARITH_AVG = re.compile(r"算术平均")
 _RE_MAX_ITEM_SCORE = re.compile(r"最高(?:得|扣)?\s*(\d+(?:\.\d+)?)\s*分")
 _RE_AMOUNT_WAN = re.compile(r"合同金额(?:达到|≥|不低于|不少于)?\s*(\d+(?:\.\d+)?)\s*万元")
+
+# --- 分档截尾的通用家数条件（P0-A 泛化：不再硬编码 5/10 边界） -------------------
+# 语料实证边界：5/10（多媒体维保/数据库）、10/11（去 2 高 2 低档）、15/30（老代商标）
+_RE_TIER_UNIT = r"(?:\s*(?:个|家|户))?"
+# 低档："≤5 个" / "不足 6 家" / "等于或不足 15 家" / "不超过 5 个"
+_RE_TIER_LOW = re.compile(
+    r"(?:[≤<=]\s*(\d+)" + _RE_TIER_UNIT
+    + r"|(?:等于或)?不足\s*(\d+)" + _RE_TIER_UNIT
+    + r"|不超过\s*(\d+)" + _RE_TIER_UNIT
+    + r")"
+)
+# 中档："5 个＜…≤10 个" / "超过 6 家且不足 11 家"（取上界）/ "9≥报价≥6"（反向，取首数为上界）
+_RE_TIER_MID = re.compile(
+    r"(\d+)" + _RE_TIER_UNIT + r"\s*[＜<][^。；]{0,40}?[≤<=]\s*(\d+)" + _RE_TIER_UNIT
+    + r"|(?:超过|大于)\s*(\d+)" + _RE_TIER_UNIT
+    + r"[^。；]{0,25}?(?:且不足|且小于|至|—|–|~|－|-)\s*(\d+)" + _RE_TIER_UNIT
+    + r"|(\d+)" + _RE_TIER_UNIT + r"\s*[≥>][=]?[^。；]{0,20}?[≥>][=]?\s*(\d+)" + _RE_TIER_UNIT
+)
+# 高档（开区间顶）："＞10 个" / "超过 15 家" / "≥30 家"
+_RE_TIER_HIGH = re.compile(
+    r"[＞>]\s*(\d+)" + _RE_TIER_UNIT
+    + r"|(?:超过|大于)\s*(\d+)" + _RE_TIER_UNIT
+    + r"|≥\s*(\d+)" + _RE_TIER_UNIT
+    + r"|\d+\s*(?:个|家)?\s*以上"
+)
+# 分档句内"不截尾"显式措辞
+_RE_TIER_NO_TRIM = re.compile(r"不(?:再去|去|剔除|扣除|去掉)|则不")
+# 非分档语境的家数句（竞争性判断/离群重算 fallback）——不是基准价分档表，须跳过
+_RE_TIER_SKIP = re.compile(r"竞争性|评标委员会|继续进行|招标失败|终止|未剔除|不影响竞争")
+# "去掉 N 个最高…和 M 个最低"数字式（休闲细支"去掉 2 个最高和 2 个最低"）
+_RE_TRIM_N_PAIR = re.compile(
+    r"(?:去掉?|剔除|扣除)\s*(\d+)\s*个(?:最高的?|投标报价|报价)[^。；\n]{0,30}?"
+    r"(?:去掉?|剔除|扣除)?\s*(\d+)\s*个(?:最低的?|投标报价|报价)"
+)
+# 家数条件（单档截尾阈值）："＞5 个" / "超过 5 家" / "≥6 家"
+_RE_TRIM_GT = re.compile(r"(?:[＞>]|超过|大于|≥)\s*(\d+)\s*(?:个|家|户)")
+# 基准价乘系数："算术平均值*0.95" / "平均价×0.95"（K 只认原文明示数值）
+_RE_K_FACTOR = re.compile(r"(?:平均值|平均价|评标基准价|基准价)\s*[*×xX]\s*(0\.\d{1,2}|1\.\d{1,2})")
+# 次低价基准（"次低价为最佳报价值"/"次低投标报价为最佳报价值"）；
+# 必须紧接"为"——"去掉一个次低价后的算术平均值…为评标基准价"是截尾句不是次低价基准
+_RE_SECOND_LOWEST = re.compile(r"次低(?:有效)?(?:投标)?(?:报价|价)\s*为(?:最佳报价值|评标基准价)")
+# 二次算术平均：有"第一次算术平均"且有"低于…再…平均"
+_RE_SECOND_AVG_FIRST = re.compile(r"第[一二]次算术平均")
+_RE_SECOND_AVG_BELOW = re.compile(r"低于[^。；\n]{0,20}(?:平均值|平均价)[^。；\n]{0,30}?(?:再|然后)[^。；\n]{0,15}?算术平均")
+# 特殊规则（引擎暂不执行，原文留档 + 校验器提示人工复核）
+_RE_SPECIAL_70 = re.compile(r"[^。；\n]{0,60}不进入最佳报价计算[^。；\n]{0,20}")
+_RE_SPECIAL_OUTLIER = re.compile(r"[^。；\n]{0,80}剔除该报价后重新计算[^。；\n]{0,20}")
 _PRICE_HINTS = ("报价", "价格", "评标价", "基准价", "投标价")
 
 
 def _rate_per_point(match: re.Match[str]) -> Decimal:
-    """把"每低 X 个百分点扣 Y 分"换算成每 1 个百分点扣分。"""
-    points = Decimal(match.group(1))
+    """把"每低 X 个百分点扣 Y 分"换算成每 1 个百分点扣分（"一个"= 1）。"""
+    points_raw = match.group(1)
+    points = Decimal("1") if points_raw == "一" else Decimal(points_raw)
     deduct = Decimal(match.group(2))
     return (deduct / points).quantize(Decimal("0.0001"))
+
+
+def _cut_for_tier_segment(seg: str, full_text: str) -> int | None:
+    """一个档位句的截尾家数。None=该句没写截尾措辞（回退全文启发式）。"""
+    if _RE_TIER_NO_TRIM.search(seg) and not _RE_TRIM_BOTH.search(seg):
+        return 0
+    m_pair = _RE_TRIM_N_PAIR.search(seg)
+    if m_pair:
+        return max(int(m_pair.group(1)), int(m_pair.group(2)))
+    if _RE_TRIM_FOUR.search(seg):
+        return 2
+    if _RE_TRIM_BOTH.search(seg):
+        return 1
+    return None
+
+
+def _parse_trim_tiers(text: str) -> list[list[Any]] | None:
+    """按有效家数分档截尾 → [[bound, cut], ...]（bound 升序，末档 bound=None）。
+
+    泛化（P0-A）：档位边界从原文提取，不再硬编码 5/10——语料实证边界包括
+    5/10（多媒体维保/数据库）、10/11（去 2 高 2 低）、15/30（老代商标休闲细支/山外山）。
+    结构语义：n ≤ bound（None=+∞）落入该档，取**最小的 bound ≥ n** 档的 cut。
+    仅当原文出现 ≥2 个档位条件时返回；单档（"＞5 个扣除最高最低"）返回 None 走旧键。
+    """
+    t = text or ""
+    segments = re.split(r"[。；\n]", t)
+    tier_by_bound: dict[int, int] = {}  # 上界 → 截尾家数
+    top_cut: int | None = None
+    for seg in segments:
+        if _RE_TIER_SKIP.search(seg):
+            continue  # 竞争性判断/离群重算 fallback 的家数句不是分档表
+        m_mid = _RE_TIER_MID.search(seg)
+        if m_mid:
+            # 正向 "≤N"/"…＜M" 取后界；反向 "M≥X≥N" 取首数（M 为该档上界）
+            upper = m_mid.group(2) or m_mid.group(4) or m_mid.group(5)
+            cut = _cut_for_tier_segment(seg, t)
+            if cut is None:
+                # 中档句本身没写截尾措辞 → 按全文措辞回退
+                cut = 2 if _RE_TRIM_FOUR.search(t) else (
+                    1 if (_RE_TRIM_BOTH.search(t) or _RE_TRIM_N_PAIR.search(t)) else 0
+                )
+            if upper:
+                tier_by_bound[int(upper)] = cut
+            continue
+        m_low = _RE_TIER_LOW.search(seg)
+        if m_low and not _RE_TIER_HIGH.search(seg):
+            upper = next(g for g in m_low.groups() if g is not None)
+            cut = _cut_for_tier_segment(seg, t)
+            if cut is None:
+                # 低档句没写截尾措辞 = 该档不截（"≤N 家全平均"语义）
+                cut = 0
+            tier_by_bound[int(upper)] = cut
+            continue
+        m_high = _RE_TIER_HIGH.search(seg)
+        if m_high and not _RE_TIER_MID.search(seg) and not _RE_TIER_LOW.search(seg):
+            cut = _cut_for_tier_segment(seg, t)
+            if cut is not None:
+                top_cut = cut
+    # 高档句没写截尾措辞（写在相邻句）→ 按全文措辞回退：次高次低=2、最高最低=1
+    if top_cut is None and tier_by_bound:
+        if _RE_TRIM_FOUR.search(t):
+            top_cut = 2
+        elif _RE_TRIM_BOTH.search(t) or _RE_TRIM_N_PAIR.search(t):
+            top_cut = 1
+        elif _RE_TIER_NO_TRIM.search(t):
+            top_cut = 0
+    if len(tier_by_bound) < 2 or top_cut is None:
+        return None  # 单档或结构不完整 → 走旧键（trim_count/trim_threshold）
+    tiers = [[bound, cut] for bound, cut in sorted(tier_by_bound.items())]
+    tiers.append([None, top_cut])
+    return tiers
+
+
+def _parse_benchmark_gate(text: str) -> dict[str, Any] | None:
+    """基准价资格门槛结构化（语料 5+1 形态）。
+
+    返回 benchmark_gate={min_ratio, ratio_kind, gate_on, on_fail, half_max_ratio,
+    still_reviewable, source_text}；识别不出返回 None。数值只认原文明示。
+    """
+    t = text or ""
+    for seg in re.split(r"[。；\n]", t):
+        if not re.search(
+            r"不(?:进入|纳入)(?:最佳报价|最佳报价值|评标基准价)|赋(?:值为)?满分|从报价分满分", seg
+        ):
+            continue
+        gate: dict[str, Any] = {"source_text": seg.strip()}
+        if re.search(r"样品", seg) and re.search(r"0\s*分|得分为\s*0", seg):
+            gate["gate_on"] = "sample_or_composite"
+        elif re.search(r"技术资信", seg):
+            gate["gate_on"] = "tech_qualification"
+        elif re.search(r"商务分\s*\+\s*技术分|商务\s*\+\s*技术", seg):
+            gate["gate_on"] = "biz_tech"
+        else:
+            gate["gate_on"] = "tech"
+        m_pct = re.search(r"(\d+(?:\.\d+)?)\s*%", seg)
+        m_abs = re.search(r"即\s*(\d+(?:\.\d+)?)\s*分", seg) or re.search(
+            r"(?:[＜<]|低于|不足)\s*(\d+(?:\.\d+)?)\s*分", seg
+        )
+        if m_pct:
+            gate["min_ratio"] = m_pct.group(1)
+            gate["ratio_kind"] = "percent"
+        elif m_abs:
+            gate["min_ratio"] = m_abs.group(1)
+            gate["ratio_kind"] = "absolute"
+        else:
+            continue  # 门槛句但比例缺失 → 不结构化（校验端 PRICE_GATE_INCOMPLETE 不会见到残缺件）
+        m_half = re.search(r"(?:满分报价分的?|赋(?:值为)?满分(?:报价分)?的?)\s*(\d+(?:\.\d+)?)\s*%", seg)
+        if re.search(r"赋(?:值为)?满分|从报价分满分", seg):
+            gate["on_fail"] = "half_max"
+            if m_half:
+                gate["half_max_ratio"] = m_half.group(1)
+        else:
+            gate["on_fail"] = "exclude"
+        # 门槛前置条件："投标有效家数超过5家…才不进入最佳报价计算"——
+        # 超过 N 家 → min_valid_bidders=N+1（有效家数 ≤ N 时门槛不生效）。
+        # 缺此条件会把有条件门槛当无条件执行（2026-10-27 二维码项目实证）。
+        m_valid = re.search(
+            r"(?:有效(?:投标)?(?:家数|投标人数量|投标人|家))[^。；\n]{0,15}(?:超过|大于|＞|>)\s*(\d+)\s*(?:家|个)?",
+            seg,
+        )
+        if m_valid:
+            gate["min_valid_bidders"] = int(m_valid.group(1)) + 1
+        if re.search(r"未参与评标基准价计算[^。；\n]{0,30}(?:可以|方可|仍可)进入", t):
+            gate["still_reviewable"] = True
+        return gate
+    # 后备句式（烟丝仪器型）："进入商务报价最佳报价值需满足以下条件：……技术……70%及以上"
+    m_enter = re.search(
+        r"进入[^。；\n]{0,25}?(?:最佳报价值|基准价)[^。；\n]{0,25}?条件[\s\S]{0,150}?(\d+(?:\.\d+)?)\s*%", t
+    )
+    if m_enter:
+        span = m_enter.group(0)
+        gate = {
+            "min_ratio": m_enter.group(1),
+            "ratio_kind": "percent",
+            "on_fail": "exclude",
+            "source_text": span.strip(),
+        }
+        if re.search(r"技术资信", span):
+            gate["gate_on"] = "tech_qualification"
+        elif re.search(r"商务分\s*\+\s*技术分|商务\s*\+\s*技术", span):
+            gate["gate_on"] = "biz_tech"
+        else:
+            gate["gate_on"] = "tech"
+        return gate
+    return None
+
+
+def _parse_outlier_policy(text: str) -> dict[str, Any] | None:
+    """离群保护结构化（数值式"＞*2 或 ＜/2"与文字式"两倍/一半"）。
+
+    返回 outlier_policy={max_mult, min_mult, on_hit, source_text}；无原文不产出。
+    遍历全部"剔除…重新计算"匹配取首个能抽出阈值的（赋半分句常也带该短语，
+    21 文件回放实证：只看首个匹配会被门槛句抢占而漏掉真正的离群句）。
+    """
+    t = text or ""
+    for m_frag in _RE_SPECIAL_OUTLIER.finditer(t):
+        seg = m_frag.group(0)
+        policy: dict[str, Any] = {"on_hit": "zero_and_recompute", "source_text": seg.strip()}
+        m_max = re.search(r"[＞>]\s*[^。；]{0,25}?[*×xX]\s*(\d+(?:\.\d+)?)", seg)
+        m_min = re.search(r"[＜<]\s*[^。；]{0,25}?[/／]\s*(\d+(?:\.\d+)?)", seg)
+        if m_max:
+            policy["max_mult"] = m_max.group(1)
+        elif re.search(r"两倍|2\s*倍", seg):
+            policy["max_mult"] = "2"
+        if m_min:
+            try:
+                policy["min_mult"] = str((Decimal(1) / Decimal(m_min.group(1))).normalize())
+            except Exception:  # noqa: BLE001
+                pass
+        elif re.search(r"一半", seg):
+            policy["min_mult"] = "0.5"
+        if "max_mult" in policy or "min_mult" in policy:
+            return policy
+    return None
 
 
 def parse_price_formula_text(text: str) -> dict[str, Any]:
     """从一段招标原文解析偏离扣分参数；非偏离扣分型返回空 dict。
 
     供编译期（enrich_extracted）与草稿自愈（normalize_package）共用。
+    P0-A 起输出确定性目录的完整结构化：基准法六变体 / k / trim_tiers /
+    benchmark_gate / outlier_policy；数值只认原文明示（红线：不猜默认值）。
+
+    入口做空白归一（21 文件回放实证）：pymupdf 文本行内换行/空格会让
+    `[^。；\\n]` 类正则跨行失配——整段去空白后再匹配，与 normalize_no_ws 同哲学。
     """
-    m_down = _RE_RATE_DOWN.search(text or "")
-    m_up = _RE_RATE_UP.search(text or "")
-    if not m_down and not m_up:
-        return {}
-    out: dict[str, Any] = {
-        "formula_type": "deviation_deduct",
-        "k": Decimal("1"),
-    }
+    text = re.sub(r"[\s　]+", "", text or "")
+
+    # 基准价方法目录（优先级从具体到一般；语料六变体）——与扣分率检测**独立**，
+    # 互不为前提（2026-10-28 重构：旧实现在扣分率未命中时早退，导致
+    # 只有"基准法 + 公式式扣分率"或"只有基准法"的形态整套丢失——语料 3/4 份
+    # 为公式式扣分率，实测全部返回空）。
+    out: dict[str, Any] = {}
+    if _RE_SECOND_LOWEST.search(text):
+        out["benchmark_method"] = "second_lowest"
+    elif _RE_SECOND_AVG_FIRST.search(text) and _RE_SECOND_AVG_BELOW.search(text):
+        # 复合：≥N 家首均先去极值，再对低于首均者二次算术平均（实验室设备/第二批检测/重招）
+        out["benchmark_method"] = "average_trimmed_then_below"
+        m_gt = _RE_TRIM_GT.search(text)
+        out["trim_count"] = 1
+        out["trim_threshold"] = int(m_gt.group(1)) if m_gt else 6
+    else:
+        tiers = _parse_trim_tiers(text)
+        if tiers is not None:
+            # 分档截尾：引擎（price.py）按 tiers 精确执行
+            out["benchmark_method"] = "average_trimmed"
+            out["trim_count"] = 1
+            out["trim_threshold"] = int(tiers[0][0])
+            out["trim_tiers"] = tiers
+        elif _RE_TRIM_BOTH.search(text):
+            out["benchmark_method"] = "average_trimmed"
+            out["trim_count"] = 1
+            m_gt = _RE_TRIM_GT.search(text)
+            if m_gt:
+                out["trim_threshold"] = int(m_gt.group(1))
+            # 2026-10-28：不再默认 trim_threshold=5（硬编码猜测）——未明示家数
+            # 阈值时不写入，引擎侧 trim_threshold or 0 → 无条件截尾，与
+            # "扣除一个最高价和一个最低价后的算术平均值"原文一致。
+        elif _RE_ARITH_AVG.search(text):
+            out["benchmark_method"] = "average"
+
+    # 扣分率（多形态独立检测）：句式 "每低(于) X 个百分点扣 Y 分" 或
+    # 公式式 "=满分-（投标报价-基准值）/基准值*100*Y"（语料 3/4 份）
+    m_down = _RE_RATE_DOWN.search(text)
+    m_up = _RE_RATE_UP.search(text)
     if m_down:
         out["deduct_rate_down"] = _rate_per_point(m_down)
     if m_up:
         out["deduct_rate_up"] = _rate_per_point(m_up)
-    if _RE_TRIM_BOTH.search(text):
-        out["benchmark_method"] = "average_trimmed"
-        out["trim_count"] = 1
-        out["trim_threshold"] = 5
-    elif _RE_ARITH_AVG.search(text):
-        out["benchmark_method"] = "average"
+    if "deduct_rate_up" not in out:
+        m_fu = _RE_RATE_FORMULA_UP.search(text)
+        if m_fu:
+            out["deduct_rate_up"] = Decimal(m_fu.group(1))
+    if "deduct_rate_down" not in out:
+        m_fd = _RE_RATE_FORMULA_DOWN.search(text)
+        if m_fd:
+            out["deduct_rate_down"] = Decimal(m_fd.group(1))
+
+    if not out:
+        return {}  # 基准法与扣分率均未识别——交调用方报 PRICE_FORMULA_UNRECOGNIZED
+
+    # formula_type：有扣分率 → deviation_deduct；只识别出基准法 → benchmark_ratio
+    if "deduct_rate_down" in out or "deduct_rate_up" in out:
+        out["formula_type"] = "deviation_deduct"
+    else:
+        out["formula_type"] = "benchmark_ratio"
+
+    k = _extract_k_factor(text)
+    if k is not None:
+        out["k"] = k
+    # 2026-10-28：不再默认 k=1——未明示则不设，由 PRICE_PARAMS_INCOMPLETE 阻断
+    # （benchmark_ratio 型缺 k 是明确的阻断信号；deviation_deduct 型引擎侧
+    # k 仅用于基准价乘法，缺省时引擎 or 1 维持旧行为）。
+    # 特殊规则（商技 70% 门槛/超倍半价剔除重算）：原文留档 + 结构化（P1 执行）
+    special = []
+    for m in (_RE_SPECIAL_70, _RE_SPECIAL_OUTLIER):
+        frag = m.search(text or "")
+        if frag:
+            special.append(frag.group(0).strip())
+    if special:
+        out["special_rules"] = special
+    gate = _parse_benchmark_gate(text)
+    if gate is not None:
+        out["benchmark_gate"] = gate
+    outlier = _parse_outlier_policy(text)
+    if outlier is not None:
+        out["outlier_policy"] = outlier
     return out
+
+
+def _extract_k_factor(text: str) -> Decimal | None:
+    """基准价乘系数（"算术平均值*0.95"）。只认原文明示；无匹配返回 None。"""
+    m = _RE_K_FACTOR.search(text or "")
+    if not m:
+        return None
+    try:
+        return Decimal(m.group(1))
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def parse_count_params_text(
@@ -263,23 +650,84 @@ def enrich_extracted(
     """用确定性规则补齐 LLM 漏掉的公式/计数参数（就地修改并返回）。"""
     for c in criteria:
         normalize_veto_semantics(c)
+        # P0-C：主/客观 hint（仅技术/商务计分类）。评分表"主/客观分"明文列值
+        # 由模型照抄进 subjectivity_hint；缺席时用量化措辞兜底（"每…得 N 分"类）。
+        # 只产 hint 不改 score_type——hint=objective 且 score_type=match 的冲突
+        # 由校验器 AMBIGUOUS_SUBJECTIVITY 告警，交人工（歧义不猜测）。
+        if c.category in ("technical", "commercial"):
+            hint = c.subjectivity_hint if c.subjectivity_hint in (
+                "objective", "subjective") else None
+            if hint is None:
+                text_c = f"{c.name or ''}\n{c.description or ''}\n{c.quote or ''}"
+                if re.search(
+                    r"客观分|每(?:个|项|人|条|家|份|证|次)?[^。；，,]{0,12}?得\s*\d+(?:\.\d+)?\s*分"
+                    r"|最高(?:得|不超过)?\s*\d+(?:\.\d+)?\s*分",
+                    text_c,
+                ):
+                    hint = "objective"
+            if hint == "objective":
+                params = dict(c.params or {})
+                params.setdefault("_subjectivity_hint", hint)
+                c.params = params
+        # P1-C.6 样品分总分口径（代际反转实证：老代"四部分总和"样品入总分、
+        # 新代"三部分总和"样品单列）——原文口径挂到样品项 params.in_total，
+        # ranking 据此决定是否计入总分；无样品项/无口径句 → 不动（默认计入=旧行为）
+        if "样品" in (c.name or ""):
+            m_scope = re.search(
+                r"综合得(?:分为|是)?以上\s*([三四])\s*部分得分的总和", tender_text or ""
+            )
+            if m_scope:
+                params = dict(c.params or {})
+                params["in_total"] = m_scope.group(1) == "四"
+                c.params = params
         if c.category == "price":
             window = _price_window(c, tender_text)
             parsed = parse_price_formula_text(window)
             if parsed:
-                c.formula_type = "deviation_deduct"
-                c.k = Decimal("1")
+                # 2026-10-28：不再硬编码 formula_type/k——解析器已给出真实
+                # formula_type（deviation_deduct 或 benchmark_ratio）与真实 k；
+                # 未明示则不设默认，交 PRICE_PARAMS_INCOMPLETE 阻断（不猜默认值）。
+                if parsed.get("formula_type"):
+                    c.formula_type = parsed["formula_type"]
+                if parsed.get("k") is not None:
+                    c.k = parsed["k"]
                 if parsed.get("deduct_rate_down") is not None:
                     c.deduct_rate_down = parsed["deduct_rate_down"]
                 if parsed.get("deduct_rate_up") is not None:
                     c.deduct_rate_up = parsed["deduct_rate_up"]
-            # 基准法只在原文明确表述时改写，否则保留模型给出的值
-            if _RE_TRIM_BOTH.search(window):
-                c.benchmark_method = "average_trimmed"
-                c.trim_count = 1
-                c.trim_threshold = 5
-            elif _RE_ARITH_AVG.search(window) and not c.benchmark_method:
-                c.benchmark_method = "average"
+                # 分档截尾/门槛/离群：引擎暂按近似执行，原文与结构化参数进 params 留档
+                params = dict(c.params or {})
+                for key in ("trim_tiers", "special_rules", "benchmark_gate", "outlier_policy"):
+                    if parsed.get(key) is not None:
+                        params.setdefault(key, parsed[key])
+                # 基准法：确定性目录优先（G20 归一）；与模型自报标签冲突时留痕
+                if parsed.get("benchmark_method"):
+                    if (
+                        c.benchmark_method
+                        and c.benchmark_method != parsed["benchmark_method"]
+                        and "_label_mismatch" not in params
+                    ):
+                        params["_label_mismatch"] = {
+                            "model": c.benchmark_method,
+                            "deterministic": parsed["benchmark_method"],
+                        }
+                    c.benchmark_method = parsed["benchmark_method"]
+                    if parsed.get("trim_count") is not None:
+                        c.trim_count = parsed["trim_count"]
+                    if parsed.get("trim_threshold") is not None:
+                        c.trim_threshold = parsed["trim_threshold"]
+                elif _RE_TRIM_BOTH.search(window):
+                    c.benchmark_method = "average_trimmed"
+                    c.trim_count = 1
+                    # 2026-10-28：不再硬编码 trim_threshold=5（语料分档阈值依原文而定），
+                    # 只在原文明示家数阈值时才写入，否则交阻断。
+                    m_gt_fb = _RE_TRIM_GT.search(re.sub(r"[\s　]+", "", window))
+                    if m_gt_fb:
+                        c.trim_threshold = int(m_gt_fb.group(1))
+                elif _RE_ARITH_AVG.search(window) and not c.benchmark_method:
+                    c.benchmark_method = "average"
+                if params:
+                    c.params = params
 
         if c.score_type == "count":
             params = dict(c.params or {})
@@ -455,13 +903,16 @@ def _load_tender_text(document_id: int) -> tuple[str, Document]:
 
 
 def _load_tender_pages(document_id: int) -> list[tuple[int, str]]:
+    from app.parsing.ocr_tags import clean_ocr_tags
+
     with session_scope() as s:
         rows = s.execute(
             select(DocumentPage.page_no, DocumentPage.text)
             .where(DocumentPage.document_id == document_id)
             .order_by(DocumentPage.page_no)
         ).all()
-    return [(int(no), txt or "") for no, txt in rows]
+    # OCR 标签清理（PaddleOCR-VL 对表格页自发输出 <fcel>/<nl> 等，污染选段/抽取）
+    return [(int(no), clean_ocr_tags(txt or "")) for no, txt in rows]
 
 
 def select_compile_text(pages: list[tuple[int, str]], budget: int = MAX_COMPILE_CHARS) -> tuple[str, dict]:
@@ -664,11 +1115,11 @@ def _persist_criterion(
 
     # 客观检查原语（否决/匹配/计数类需要 params 供确定性引擎执行）。
     # 价格项的参数（trim_count 等）走 PriceFormula.params_json，不能误建 human_only check。
-    wants_check = bool(c.check_type) or (
-        c.score_type in ("veto", "match", "count")
-        and (bool(c.params) or c.count_per_item is not None)
-    )
+    # veto/match/count 一律建 check：缺 check 会让评分端落入「缺少可执行的检查
+    # 定义」死项或「未知计数字段」恒 0（2026-10-26 run 54 c51/c57/c63、c64 实证）。
+    wants_check = bool(c.check_type) or c.score_type in ("veto", "match", "count")
     if wants_check:
+        from app.rules.check_infer import infer_check, infer_count_params
         from app.rules.freeze import _jsonable
 
         params = dict(c.params or {})
@@ -676,10 +1127,28 @@ def _persist_criterion(
         # 这里必须折叠，否则真实模型路径下 count 项全部恒 0 分。
         if c.count_per_item is not None and "per_item" not in params:
             params["per_item"] = c.count_per_item
+        check_type = c.check_type or ""
+        if c.score_type == "count":
+            # 计分参数从评标细则原文补缺口（per_item/max_items/field/person_scope）
+            params = infer_count_params(
+                {"name": c.name, "description": c.description,
+                 "source_quote": c.quote, "required_evidence": c.required_evidence},
+                params,
+            )
+            check_type = check_type or "count_at_least"
+        if not check_type:
+            gen = infer_check(
+                {"name": c.name, "description": c.description, "source_quote": c.quote}
+            )
+            if gen is not None:
+                check_type, gen_params = gen
+                params = {**gen_params, **params}  # 模型显式参数优先
+            else:
+                check_type = "human_only"
         s.add(
             CriterionCheck(
                 criterion_id=crit.id,
-                check_type=c.check_type or ("count_at_least" if c.score_type == "count" else "human_only"),
+                check_type=check_type,
                 field=params.get("field") if isinstance(params.get("field"), str) else None,
                 params_json=_jsonable(params),
                 on_fail="recommend_reject" if is_veto else "need_human",
@@ -692,7 +1161,7 @@ def _persist_criterion(
     if c.category == "price":
         from app.rules.freeze import _jsonable
 
-        ext: dict[str, str] = {}
+        ext: dict[str, Any] = {}
         if c.deduct_rate is not None:
             ext["deduct_rate"] = str(c.deduct_rate)
         if c.deduct_rate_down is not None:
@@ -703,12 +1172,20 @@ def _persist_criterion(
             ext["trim_count"] = str(c.trim_count)
         if c.trim_threshold is not None:
             ext["trim_threshold"] = str(c.trim_threshold)
+        # 分档截尾/特殊规则/门槛/离群：引擎暂按近似执行（trim_count/trim_threshold），
+        # 完整原文与结构化参数进 params_json 留档，供 PRICE_ENGINE_APPROX 提示与后续引擎扩展
+        for key in ("trim_tiers", "special_rules", "benchmark_gate", "outlier_policy", "_label_mismatch"):
+            if (c.params or {}).get(key) is not None:
+                ext[key] = c.params[key]
         s.add(
             PriceFormula(
                 package_id=package_id,
                 criterion_id=crit.id,
-                formula_type=c.formula_type or "benchmark_ratio",
-                benchmark_method=c.benchmark_method or "average",
+                # 2026-10-28：未识别则落空串（NOT NULL 约束下用 "" 代替默认值），
+                # 让 validator 的 PRICE_FORMULA_UNRECOGNIZED 能看到——旧
+                # `or "benchmark_ratio"` 会把未识别态改写回默认，阻断形同虚设。
+                formula_type=c.formula_type or "",
+                benchmark_method=c.benchmark_method or "",
                 k=c.k,
                 trim_ratio=c.trim_ratio,
                 deduct_rate=c.deduct_rate,
@@ -785,6 +1262,21 @@ def run_validations(package_id: int) -> list[dict]:
     return [f.as_dict() for f in findings]
 
 
+def _protected_scoring_span(text: str) -> tuple[int, int] | None:
+    """评标细则章节在选段文本中的字符区间（分块时不切开）。
+
+    取最后一个章节标题（评标细则/评分细则/评标办法/评分办法）到文本尾——
+    评标办法通常在文档尾部，标题之前是目录等干扰项；报价段/证明材料都在
+    该区间内，整段原子化即可保证细则表不被 chunk 边界切开。
+    """
+    title = None
+    for m in re.finditer(r"评标细则|评分细则|评标办法|评分办法", text):
+        title = m.start()
+    if title is None:
+        return None
+    return (title, len(text))
+
+
 def compile_rules(
     project_id: str,
     document_id: int,
@@ -806,7 +1298,8 @@ def compile_rules(
     from app.llm.registry import get_provider
 
     _text, doc = _load_tender_text(document_id)  # 校验 kind/parse_status 并取回 doc
-    text, sel = select_compile_text(_load_tender_pages(document_id), budget=compile_char_budget())
+    tender_pages = _load_tender_pages(document_id)
+    text, sel = select_compile_text(tender_pages, budget=compile_char_budget())
     if selection_meta_out is not None:
         selection_meta_out.update(sel)
     if sel["truncated"]:
@@ -820,7 +1313,7 @@ def compile_rules(
     # 分块抽取：长招标文件的规则集合可能远超单次输出上限（99 页文档实测 12000
     # tokens 仍被截断）。按字符预算切块分别抽取，再合并去重——每块输入小，
     # 输出空间充足，模型不会中途被截断。
-    chunks = split_for_extraction(text)
+    chunks = split_for_extraction(text, protected_spans=[s] if (s := _protected_scoring_span(text)) else None)
     criteria_acc: list[ExtractedCriterion] = []
     result_model: str | None = None
     for idx, chunk in enumerate(chunks, start=1):
@@ -841,6 +1334,23 @@ def compile_rules(
 
     apply_category_to_extracted(criteria_acc, document_id)
     criteria_acc = enrich_extracted(criteria_acc, text)
+
+    # 评标细则骨架对账：确定性表格台账核对 LLM 抽取（补缺口行/校正分值）。
+    # 骼架解析失败自动回退纯抽取（与旧行为一致），report 进 selection_meta 审计。
+    from app.rules.reconcile import reconcile_with_skeleton
+
+    criteria_acc, reconcile_report = reconcile_with_skeleton(
+        criteria_acc, document_id=document_id, pages=tender_pages)
+    if selection_meta_out is not None and not reconcile_report.get("skipped"):
+        selection_meta_out["skeleton_reconcile"] = reconcile_report
+        if reconcile_report.get("generated") or reconcile_report.get("price_generated"):
+            log.info(
+                "评标细则骨架对账：补齐 %d 行%s，分值校正 %d 处，合计 %s",
+                len(reconcile_report.get("generated", [])),
+                "（含表外报价段）" if reconcile_report.get("price_generated") else "",
+                len(reconcile_report.get("score_fixed", [])),
+                reconcile_report.get("final_sum"),
+            )
 
     version = _next_version(project_id)
     with session_scope() as s:
@@ -1064,6 +1574,18 @@ def compile_rules_job(ctx: JobContext, payload: dict) -> dict:
     result: dict = {"package_id": package_id}
     if selection_meta.get("truncated"):
         result["selection_meta"] = selection_meta
+    # 校验摘要（2026-10-27 错配护栏）：编译结果即时带出 error/warn（Σ 满分核对、
+    # 价格参数缺参等），前端编译完成即可见红字——不让"Σ≠100/无法执行"静默上线
+    try:
+        from app.services import rule_service as _rs
+
+        findings = _rs.get_validations(package_id)
+        result["validations"] = {
+            "error_codes": sorted({v.code for v in findings if v.severity == "error"}),
+            "warn_codes": sorted({v.code for v in findings if v.severity != "error"}),
+        }
+    except Exception:  # noqa: BLE001 —— 校验摘要失败不阻断编译结果
+        pass
     if merge_target_id and config.auto_mode():
         # 全自动模式：合并配对自动采纳（覆盖/追加/弃用全留痕），不再进人工抽屉。
         # best-effort：合并处置失败不让编译失败，原因进 result_json 供前端提示。

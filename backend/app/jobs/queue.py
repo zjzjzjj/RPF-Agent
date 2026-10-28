@@ -309,7 +309,13 @@ async def start_worker() -> None:
     if _worker_task is not None:
         return
     _stop_event = asyncio.Event()
-    _worker_task = asyncio.create_task(_worker_loop(), name="job-worker")
+    # 多 worker（2026-10-27 提速）：评分与规则编译并行，消除单 worker 排队阻塞
+    # （job 155 被 28min compile_rules 队头挡了 18min）。_claim_next_job 是条件
+    # UPDATE 原子领取，多 worker 下不会重复领取。默认 1（串行）兼容旧行为。
+    n = config.job_workers()
+    _worker_task = asyncio.gather(
+        *(_worker_loop() for _ in range(n)), return_exceptions=True
+    ) if n > 1 else asyncio.create_task(_worker_loop(), name="job-worker")
 
 
 async def stop_worker() -> None:

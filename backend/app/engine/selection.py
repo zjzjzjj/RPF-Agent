@@ -26,6 +26,7 @@ from app import config
 log = logging.getLogger("bid_eval.engine.selection")
 
 Chunk = tuple[int, str]  # (chunk 序号, 文本)
+PageChunkSrc = tuple[int, int]  # chunk 出处：(document_id, page_no)
 
 # 通用后缀：名称关键词的主干提炼（"售后服务方案" → "售后服务"）
 _GENERIC_SUFFIXES = ("方案", "情况", "能力", "程度", "水平", "承诺", "响应", "措施")
@@ -33,34 +34,78 @@ _GENERIC_SUFFIXES = ("方案", "情况", "能力", "程度", "水平", "承诺",
 _KEYWORD_DELIM = re.compile(r"[，,、;；\s/]+")
 
 
-def split_text_chunks(text: str, chunk_size: int = 2000) -> list[Chunk]:
-    """平面文本 → ≈chunk_size 的伪页序列：按换行边界切，段内不硬截；
-    超长单段（无换行的表格流）按硬上限再切。序号 = 全局递增。"""
-    chunks: list[Chunk] = []
+def _split_spans(text: str, chunk_size: int = 2000) -> list[tuple[int, int, str]]:
+    """平面文本 → (start, end, body) 切块（切分口径即原 split_text_chunks）。"""
+    spans: list[tuple[int, int, str]] = []
     buf: list[str] = []
     size = 0
+    start = 0
+    pos = 0
 
     def flush() -> None:
-        nonlocal buf, size
+        nonlocal buf, size, start
         if buf:
-            chunks.append((len(chunks), "\n".join(buf)))
+            body = "\n".join(buf)
+            spans.append((start, start + len(body), body))
             buf, size = [], 0
+            start = pos
 
     for line in text.split("\n"):
+        if not buf:
+            start = pos
         buf.append(line)
         size += len(line) + 1
+        pos += len(line) + 1
         if size >= chunk_size:
             flush()
     flush()
-    # 无换行的超长流兜底：硬切（split 之后 buf 里可能还有超长单行）
-    out: list[Chunk] = []
-    for no, body in chunks:
+    # 无换行的超长流兜底：硬切
+    out: list[tuple[int, int, str]] = []
+    for s, _e, body in spans:
         if len(body) <= chunk_size * 2:
-            out.append((no, body))
+            out.append((s, s + len(body), body))
             continue
         for i in range(0, len(body), chunk_size):
-            out.append((len(out), body[i:i + chunk_size]))
+            out.append((s + i, s + min(i + chunk_size, len(body)), body[i:i + chunk_size]))
     return out
+
+
+def split_text_chunks(text: str, chunk_size: int = 2000) -> list[Chunk]:
+    """平面文本 → ≈chunk_size 的伪页序列：按换行边界切，段内不硬截；
+    超长单段（无换行的表格流）按硬上限再切。序号 = 全局递增。"""
+    return [(i, body) for i, (_s, _e, body) in enumerate(_split_spans(text, chunk_size))]
+
+
+def split_page_chunks(
+    pages: list[tuple[int, int, str]], chunk_size: int = 2000
+) -> tuple[list[Chunk], list[PageChunkSrc]]:
+    """(document_id, page_no, text) 有序页序列 → 页出处标注的 chunk 序列。
+
+    切分口径与 split_text_chunks(joined) **逐字节一致**（同算法同输入），
+    仅多返回每块的出处 (document_id, page_no)；跨页块归入起始页。
+    """
+    joined = "\n".join(t for _d, _p, t in pages)
+    # 页起点在 joined 中的偏移（每页文本 + 连接换行）
+    starts: list[int] = []
+    acc = 0
+    for _d, _p, t in pages:
+        starts.append(acc)
+        acc += len(t) + 1
+    spans = _split_spans(joined, chunk_size)
+    chunks: list[Chunk] = []
+    srcs: list[PageChunkSrc] = []
+    for i, (s, _e, body) in enumerate(spans):
+        chunks.append((i, body))
+        # 起点落在的页（最后一个 start ≤ s 的页）
+        page_idx = 0
+        for j, st in enumerate(starts):
+            if st <= s:
+                page_idx = j
+            else:
+                break
+        doc_id, page_no, _t = pages[page_idx]
+        srcs.append((doc_id, page_no))
+    return chunks, srcs
 
 
 def derive_keywords(criterion: dict) -> tuple[str, ...]:
@@ -95,14 +140,58 @@ def derive_keywords(criterion: dict) -> tuple[str, ...]:
 _FALLBACK_TIERS: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 
+# 目录/索引页识别（结构性，零项目拟合）：目录点线、页码引用行、"见投标文件X页"
+# 交叉引用——这类 chunk 逐字含评分项名（关键词/向量都会命中它）却**没有实质
+# 内容**，毒化选段与证据簇（2026-10-27 run 58 实证：模型只见目录标题 → 按
+# "只罗列标题 0-30%" 打出系统性低分，实际方案在132页却未入选）。
+_RE_TOC_LINE = re.compile(
+    r"(?:[.。…·]{3,}\s*\d{1,3}\s*$)"        # 点线目录：标题………42
+    r"|(?:[（(]?\s*(?:第\s*)?\d{1,3}\s*页\s*[)）]?\s*$)"  # 行尾页码
+    r"|(?:见\s*投标\s*文件)"                  # 交叉引用：见投标文件（63~131）页
+    r"|(?:详见\s*第?\s*\d)"                   # 详见第86页
+)
+
+
+def index_text_weight(body: str) -> float:
+    """chunk 的目录/索引浓度 → 权重（1.0 正常，最低 0.25）。
+
+    按行比例降权：索引/目录行占比越高越不可信；结构性判据（点线/页码引用），
+    与具体项目无关。
+    """
+    lines = [ln for ln in body.split("\n") if ln.strip()]
+    if not lines:
+        return 1.0
+    hits = sum(1 for ln in lines if _RE_TOC_LINE.search(ln.strip()))
+    frac = hits / len(lines)
+    if frac <= 0.2:
+        return 1.0
+    # 例：40% 目录行 → 0.55；60%+ → 0.25 封底
+    return max(0.25, round(1.0 - (frac - 0.2) * 1.25, 2))
+
+
 def select_chunks_by_tier(
     chunks: list[Chunk],
     tiers: tuple[tuple[str, tuple[str, ...]], ...],
     budget: int,
     fallback_diffuse: bool = False,
+    *,
+    score_scale: list[float] | None = None,
+    pool: list[int] | None = None,
 ) -> tuple[list[Chunk], dict]:
     """贪心分档选取。fallback_diffuse=True 且关键词全未命中时，退化
-    "头 30% + 尾 30% + 中段均分"的散布选取（无词可用时不至于只看头部）。"""
+    "头 30% + 尾 30% + 中段均分"的散布选取（无词可用时不至于只看头部）。
+
+    score_scale：每块分数的乘数（类别软过滤的类内加成用），默认全 1。
+    pool：只在这些下标构成的子集里选（类内硬过滤用）；None=全部。
+    """
+    if pool is not None:
+        return select_chunks_by_tier(
+            [chunks[i] for i in pool],
+            tiers,
+            budget,
+            fallback_diffuse,
+            score_scale=([score_scale[i] for i in pool] if score_scale else None),
+        )
     full_chars = sum(len(t) for _i, t in chunks)
     if full_chars <= budget:
         return list(chunks), {
@@ -111,8 +200,10 @@ def select_chunks_by_tier(
             "tiers": {name: 0 for name, _kw in tiers},
         }
 
-    # 打分：本 chunk 命中 + 0.5×相邻最大
+    # 打分：本 chunk 命中 + 0.5×相邻最大；目录/索引 chunk 降权（逐字含评分项名
+    # 却无实质内容——毒化第一名，正文永远选不进）
     scores = [0.0] * len(chunks)
+    idx_weights = [index_text_weight(body) for _i, body in chunks]
     for tier_no, (_name, keywords) in enumerate(tiers):
         hits = [0] * len(chunks)
         for idx, (_no, body) in enumerate(chunks):
@@ -126,7 +217,14 @@ def select_chunks_by_tier(
             bonus = 0.5 * max(neighbors) if neighbors else 0.0
             # 同 chunk 命中多档：以最高档计入（tier_no 越小优先级越高）
             tier_weight = 1.0 / (tier_no + 1)
-            scores[idx] = max(scores[idx], (hit + bonus) * tier_weight)
+            candidate = (hit + bonus) * tier_weight * idx_weights[idx]
+            # 强索引 chunk（点线/页码引用行过半）封顶 0.5：多关键词连击也不得
+            # 压过单命中的正常正文（索引表一行可同时含多个评分项名）
+            if idx_weights[idx] <= 0.4:
+                candidate = min(candidate, 0.5)
+            if score_scale is not None:
+                candidate *= score_scale[idx]
+            scores[idx] = max(scores[idx], candidate)
 
     scored_order = sorted(
         range(len(chunks)), key=lambda i: (-scores[i], i)
@@ -219,14 +317,25 @@ def select_chunks_by_vector(
     chunks: list[Chunk],
     query_text: str,
     budget: int,
+    *,
+    score_scale: list[float] | None = None,
+    pool: list[int] | None = None,
 ) -> tuple[list[Chunk], dict] | None:
     """bge-m3 语义检索选段。嵌入服务不可用 → None（调用方回退关键词分档）。
 
     打分 = 查询向量与 chunk 向量的余弦（bge-m3 输出已 L2 归一化，点积即余弦）；
     高分块连同相邻块成组入选（保持上下文完整），输出按原序。
+    score_scale/pool 语义同 select_chunks_by_tier（类别软/硬过滤用）。
     """
     from app.evidence import embed_client
 
+    if pool is not None:
+        return select_chunks_by_vector(
+            [chunks[i] for i in pool],
+            query_text,
+            budget,
+            score_scale=([score_scale[i] for i in pool] if score_scale else None),
+        )
     if not chunks or not query_text.strip():
         return None
     try:
@@ -241,6 +350,8 @@ def select_chunks_by_vector(
         return None
 
     scores = [embed_client.cosine(qvec, v) for v in cvecs if v is not None]
+    if score_scale is not None:
+        scores = [sc * score_scale[i] for i, sc in enumerate(scores)]
     scored_order = sorted(range(len(chunks)), key=lambda i: -scores[i])
     picked_ids: set[int] = set()
     used = 0
@@ -289,17 +400,30 @@ def _criterion_query_text(criterion: dict) -> str:
     return "\n".join(p for p in parts if p.strip())[:2000]
 
 
-def select_chunks_for_criterion(
+# 类内加成（软过滤的"优先"落点）与低置信继承页的减半加成
+_IN_CLASS_BOOST = 1.3
+_INHERIT_BOOST = 1.1
+# 类内产出低于预算该比例 → 判"类内不足"，回退全库混选
+_SOFT_FILL_RATIO = 0.5
+# vector 混选触发：类内最高分低于全体最高分该比例
+_VECTOR_MIX_RATIO = 0.6
+
+
+def _select_once(
     chunks: list[Chunk],
     criterion: dict,
     budget: int,
-    fallback_diffuse: bool = True,
+    fallback_diffuse: bool,
+    *,
+    score_scale: list[float] | None,
+    pool: list[int] | None,
 ) -> tuple[list[Chunk], dict]:
-    """统一入口：vector 模式优先（BID_EVAL_SELECTION=vector），失败回退关键词分档。"""
+    """vector 优先、失败回退 keyword（单次选段，无类别逻辑）。"""
     if config.selection_mode() == "vector":
         try:
             out = select_chunks_by_vector(
-                chunks, _criterion_query_text(criterion), budget
+                chunks, _criterion_query_text(criterion), budget,
+                score_scale=score_scale, pool=pool,
             )
             if out is not None:
                 out[1]["mode"] = "vector"
@@ -311,8 +435,99 @@ def select_chunks_for_criterion(
         (("criterion", derive_keywords(criterion)),),
         budget,
         fallback_diffuse=fallback_diffuse,
+        score_scale=score_scale,
+        pool=pool,
     )
     meta["mode"] = "keyword"
+    return picked, meta
+
+
+def select_chunks_for_criterion(
+    chunks: list[Chunk],
+    criterion: dict,
+    budget: int,
+    fallback_diffuse: bool = True,
+    *,
+    chunk_cats: list[str | None] | None = None,
+    chunk_cat_confs: list[float] | None = None,
+) -> tuple[list[Chunk], dict]:
+    """统一入口：vector 模式优先（BID_EVAL_SELECTION=vector），失败回退关键词分档。
+
+    chunk_cats（与 chunks 等长）非空时启用类别软过滤：
+    - price 类评分项：**硬过滤**——只在 price 类块里选；price 块为空（分类缺失/
+      判丢）→ 回退全库 + meta.price_fallback=True（防分类故障打死报价分）；
+    - 其余类：**软过滤**——先在类内选；类内为空或产出 < budget×0.5 → 全库混选
+      且类内块分数 ×1.3（低置信继承页 ×1.1）；meta.soft_fallback=True。
+    chunk_cats=None（默认）→ 与旧实现逐字节一致（兼容门禁）。
+    chunk_cat_confs：每块类别置信度（可选，控制加成幅度）。
+    """
+    meta_keys: dict = {}
+    if chunk_cats is None or len(chunk_cats) != len(chunks) or not chunks:
+        picked, meta = _select_once(
+            chunks, criterion, budget, fallback_diffuse,
+            score_scale=None, pool=None,
+        )
+        return picked, meta
+
+    from app.material_index.catalog import material_category_for
+
+    target = material_category_for(criterion)
+    meta_keys["in_class"] = sum(1 for c in chunk_cats if c == target)
+    meta_keys["soft_fallback"] = False
+
+    in_class = [i for i, c in enumerate(chunk_cats) if c == target]
+
+    def _scale() -> list[float]:
+        out = [1.0] * len(chunks)
+        for i in in_class:
+            conf = chunk_cat_confs[i] if chunk_cat_confs and i < len(chunk_cat_confs) else 1.0
+            out[i] = _IN_CLASS_BOOST if conf >= 0.85 else _INHERIT_BOOST
+        return out
+
+    if target == "price":
+        # 硬过滤：只在报价类块里选
+        if in_class:
+            picked, meta = _select_once(
+                chunks, criterion, budget, fallback_diffuse,
+                score_scale=None, pool=in_class,
+            )
+            meta.update(meta_keys)
+            return picked, meta
+        meta_keys["price_fallback"] = True
+        meta_keys["soft_fallback"] = True
+        picked, meta = _select_once(
+            chunks, criterion, budget, fallback_diffuse,
+            score_scale=None, pool=None,
+        )
+        meta.update(meta_keys)
+        return picked, meta
+
+    if not in_class:
+        meta_keys["soft_fallback"] = True
+        picked, meta = _select_once(
+            chunks, criterion, budget, fallback_diffuse,
+            score_scale=None, pool=None,
+        )
+        meta.update(meta_keys)
+        return picked, meta
+
+    # 阶段 1：类内选
+    picked, meta = _select_once(
+        chunks, criterion, budget, fallback_diffuse,
+        score_scale=None, pool=in_class,
+    )
+    # 充足性只看类内产出量（truncated=False 只说明池内全选完，池本身可能很小）
+    if meta.get("chars", 0) >= budget * _SOFT_FILL_RATIO:
+        meta.update(meta_keys)
+        return picked, meta
+
+    # 阶段 2：全库混选 + 类内加成
+    meta_keys["soft_fallback"] = True
+    picked, meta = _select_once(
+        chunks, criterion, budget, fallback_diffuse,
+        score_scale=_scale(), pool=None,
+    )
+    meta.update(meta_keys)
     return picked, meta
 
 
@@ -321,12 +536,14 @@ def build_evidence_map(
     criterion: dict,
     *,
     min_gap: int = 2,
+    chunk_cats: list[str | None] | None = None,
 ) -> tuple[list[dict], str] | None:
     """证据地图：全量分块按相关性排序并聚类为不相交证据簇（零 LLM 成本）。
 
     返回 (簇列表, 排序用查询文本)；嵌入服务不可用返回 None。
     簇结构：{"ids": [块序号], "chars": 总字符, "score": 聚合相似度}——
     相邻高分组块合并为一簇，簇与簇之间至少间隔 min_gap 个低分块（保证语义独立）。
+    chunk_cats 非空时类内块种子分 ×1.3（软过滤口径，不硬排除）。
     """
     from app.evidence import embed_client
 
@@ -345,6 +562,19 @@ def build_evidence_map(
         return None
 
     scores = [embed_client.cosine(qvec, v) for v in cvecs if v is not None]
+    # 目录/索引 chunk 降权（与关键词选段同一判据）：索引表逐字是评分项名，
+    # 余弦必然最高——不降权则证据簇永远由目录页当种子（run 58 实证）
+    for i, (_no, body) in enumerate(chunks):
+        w = index_text_weight(body)
+        if w < 1.0:
+            scores[i] = round(scores[i] * w, 6)
+    if chunk_cats is not None and len(chunk_cats) == len(chunks):
+        from app.material_index.catalog import material_category_for
+
+        target = material_category_for(criterion)
+        for i, c in enumerate(chunk_cats):
+            if c == target:
+                scores[i] = round(scores[i] * _IN_CLASS_BOOST, 6)
     order = sorted(range(len(chunks)), key=lambda i: -scores[i])
 
     # 贪心聚类：从最高分块起，双向行走吸收「相对高分」相邻块成簇。

@@ -287,3 +287,28 @@ def test_report_rejects_run_of_another_project(client, chain):  # noqa: ANN001
     assert r.status_code == 404, r.text
     assert client.get(f"/api/projects/{pid_a}/report",
                       params={"run_id": summary["run_id"]}).status_code == 200
+
+
+def test_subjective_forced_zero_shortcut_does_not_crash(client, chain, monkeypatch):  # noqa: ANN001
+    """forced_zero 短路格的返回形状必须与主路径一致（P0 回归）。
+
+    审查实锤：短路分支曾 `return bid_id, c, ...`（c 是 criterion dict），收集循环
+    拿 dict 当 `_results` 键 → TypeError: unhashable → 带强制零分格的整场 run
+    崩掉。此测试强制所有主观格走短路，任何形状漂移都会让 job failed。
+    """
+    import app.services.scoring_service as scoring_mod
+
+    monkeypatch.setattr(
+        scoring_mod, "_forced_zero_reason",
+        lambda cname, ps, c=None: "测试强制零分（材料门槛）",
+    )
+    pid, package_id, bidder_ids, _exp = chain
+    resp = client.post(
+        f"/api/projects/{pid}/runs",
+        json={"package_id": package_id, "bidder_ids": list(bidder_ids.values()),
+              "stages": ["objective", "price", "subjective"]},
+    )
+    assert resp.status_code == 200, resp.text
+    job = wait_job(client, resp.json()["job_id"], timeout=180)
+    assert job["status"] == "succeeded", job.get("error")
+    assert job["result_json"]["subjective"] > 0
