@@ -334,8 +334,13 @@ def calibration_profile() -> dict:
 
 
 def ocr_max_pages() -> int:
-    """单本文档 OCR 页数上限（护栏）；超限的缺字页跳过并记警告。"""
-    return int(os.environ.get("BID_EVAL_OCR_MAX_PAGES", 60))
+    """单本文档 OCR 页数上限（护栏）；超限的缺字页跳过并记警告。
+
+    2026-10-29 run 60 实证：默认 60 使云锦汇智 334 页标书"超限跳过 92 页"
+    扫描件（案例/证书/截图页全部不可见 → 计数项系统性全 0）。10-16 曾验证
+    350 可行；60 是 10-21 重建 .env 时的回归值。护栏值非校准参数。
+    """
+    return int(os.environ.get("BID_EVAL_OCR_MAX_PAGES", 350))
 
 
 # ---------------------------------------------------------------------------
@@ -367,8 +372,13 @@ def case_max_batches() -> int:
 
 
 def material_ocr_max_pages() -> int:
-    """单个投标文档材料页 OCR 救援的页数上限。"""
-    return int(os.environ.get("BID_EVAL_MATERIAL_OCR_MAX_PAGES", 20))
+    """单个投标文档材料页 OCR 救援的页数上限。
+
+    保留防打爆远程 OCR 的初衷（限量救援而非全量重扫）；2026-10-29 run 60
+    实证默认 20 过紧（大标书案例材料页成批落在救援名单尾部被截断），放宽
+    至 60。远程过载时可经 .env 单键 BID_EVAL_MATERIAL_OCR_MAX_PAGES 回退。
+    """
+    return int(os.environ.get("BID_EVAL_MATERIAL_OCR_MAX_PAGES", 60))
 
 
 def material_index_enabled() -> bool:

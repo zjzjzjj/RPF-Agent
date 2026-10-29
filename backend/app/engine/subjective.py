@@ -49,8 +49,22 @@ def parse_subitems(description: str | None) -> list[tuple[str, Decimal]]:
     return out
 
 
+# 尾部"（2 分）/(1分)"类分值后缀：模型输出子项名常带它，先剥掉再归一
+# （c52 型"名称（2 分）"污染：不剥会把"服务（1 分）"错配到"服务1"）
+_RE_SCORE_SUFFIX = re.compile(
+    r"[（(]\s*\d+(?:\.\d+)?(?:\s*[-~至]\s*\d+(?:\.\d+)?)?\s*分?\s*[)）]\s*$"
+)
+
+
 def _norm_name(text: str) -> str:
-    return re.sub(r"[\s（）()：:、，,。.]+", "", text or "")
+    t = (text or "").strip()
+    # 循环剥离：可能叠"（2 分）（得分）"等多层尾缀
+    while True:
+        stripped = _RE_SCORE_SUFFIX.sub("", t)
+        if stripped == t:
+            break
+        t = stripped
+    return re.sub(r"[\s（）()：:、，,。.]+", "", t)
 
 
 def _match_subitem(name: str, keys: list[str]) -> str | None:
@@ -92,7 +106,10 @@ def aggregate_subitems(
         hit = _match_subitem(name, keys)
         if hit is None:
             missing.append(name)
-            normalized.append({"name": name, "score": "0", "max": str(cap), "quote": ""})
+            # evidence_state="missing"：合成的缺失条目是"弃权"不是"0 票"——
+            # 分层聚合据此退出均值（缺席者不投票，2026-10-29 弃权语义）
+            normalized.append({"name": name, "score": "0", "max": str(cap),
+                               "quote": "", "evidence_state": "missing"})
             continue
         src = next(
             (s for s in sub_scores if isinstance(s, dict) and str(s.get("name") or "") == hit),
@@ -100,7 +117,8 @@ def aggregate_subitems(
         )
         if src is None:
             missing.append(name)
-            normalized.append({"name": name, "score": "0", "max": str(cap), "quote": ""})
+            normalized.append({"name": name, "score": "0", "max": str(cap),
+                               "quote": "", "evidence_state": "missing"})
             continue
         matched += 1
         raw = _parse_score(src.get("score"))
@@ -147,9 +165,15 @@ def apply_quote_gate(
         if quote and verify_quote(quote):
             total += score
             continue
-        if score > 0:
+        if score > 0 or quote:
+            # 击杀标记：合并层据此把该条目判为"弃权"退出均值。
+            # 0 分+引文定位不到同样打标（否则与"带引文的真实 0"无法区分）；
+            # 0 分+无引文是规则 (b) 弃权，不打 gate_killed。
             reason = "引文未在投标文件中定位到" if quote else "未提供引文"
-            warnings.append(f"子项「{item.get('name')}」{reason}，按 0 计")
+            if score > 0:
+                warnings.append(f"子项「{item.get('name')}」{reason}，按 0 计")
+            item["gate_killed"] = True
+            item["pre_gate_score"] = str(score)
         item["score"] = "0"
     return total, warnings, True
 
@@ -180,6 +204,9 @@ class SubjectiveSuggestion:
     sub_scores: list[dict] = field(default_factory=list)  # 复合因素子项得分
     # 子项证据闸门：True=已执行且通过/扣减；False=模型没给引文未执行（应标疑问）
     quote_gate_executed: bool | None = None
+    # 疑问标记（2026-10-29 弃权语义）：all-abstain 子项、证据闸门未核验、
+    # 或整项全簇弃权时置位——消费方（scoring_service）据此强制 conflict_flagged
+    doubt: bool = False
     # 聚合算式（可复算不变式 I1）：{rule, inputs:[{source,score,provisional}], arithmetic}
     # 持久化进 ai_raw_json["aggregation_v2"]，final_score 可由它重算核对
     aggregation: dict | None = None
@@ -560,6 +587,56 @@ def suggest_score_committee(
 # ---------------------------------------------------------------------------
 # 分层证据评审：证据地图 → 前 K 簇分别深评 → 聚合（解决几百页标书覆盖不足）
 # ---------------------------------------------------------------------------
+def _subitem_vote_state(entry: dict, verify_quote=None) -> tuple[str, str]:  # noqa: ANN001
+    """子项×证据簇条目三态判定（纯函数，评委会常识：缺席者不投票）。
+
+    - abstain 弃权：(a) aggregate_subitems 合成的缺失条目；(b) score=0 且无引文；
+      (c) 引文闸门击杀（gate_killed，无论原分正负）→ 退出均值，不进分母
+    - real_zero 真实 0：score=0 且引文非空且核验通过 → 计入均值（0 票）
+    - vote 有效票：score>0（含 provisional 正分）→ 计入均值
+    返回 (state, reason)。
+    """
+    if not isinstance(entry, dict):
+        return "abstain", "invalid_entry"
+    if entry.get("evidence_state") == "missing":
+        return "abstain", "synthetic_missing"
+    if entry.get("gate_killed"):
+        return "abstain", "quote_gate_killed"
+    score = _parse_score(entry.get("score"))
+    score = score if score is not None and score > 0 else Decimal(0)
+    quote = str(entry.get("quote") or "").strip()
+    if score > 0:
+        return "vote", ""
+    if not quote:
+        return "abstain", "no_evidence"
+    if verify_quote is None:
+        return "real_zero", "quote_present"
+    if verify_quote(quote):
+        return "real_zero", "verified"
+    return "abstain", "quote_unlocatable"
+
+
+def _cluster_vote_state(suggestion, verify_quote=None) -> tuple[str, str]:  # noqa: ANN001
+    """簇级建议三态（纯函数）：score>0 → vote；0 分带可核验证据 → real_zero；
+    其余（无分/无证据/证据定位不到）→ abstain。返回 (state, reason)。"""
+    if suggestion is None or suggestion.score is None:
+        return "abstain", "no_score"
+    if suggestion.score > 0:
+        return "vote", ""
+    quotes = [
+        str(ev.get("quote") or "").strip()
+        for ev in (suggestion.evidence or [])
+        if isinstance(ev, dict) and str(ev.get("quote") or "").strip()
+    ]
+    if not quotes:
+        return "abstain", "no_evidence"
+    if verify_quote is None:
+        return "real_zero", "quote_present"
+    if any(verify_quote(q) for q in quotes):
+        return "real_zero", "verified"
+    return "abstain", "quotes_unlocatable"
+
+
 def suggest_score_hierarchical(
     gateway: Gateway,
     criterion: dict,
@@ -627,7 +704,7 @@ def suggest_score_hierarchical(
         with ThreadPoolExecutor(max_workers=_workers) as pool:
             scored = list(pool.map(_score_cluster, cluster_items))
 
-    for cl, cluster_text, s in scored:
+    for cl_ord, (cl, cluster_text, s) in enumerate(scored, start=1):
         evaluated += 1
         sent_by_cluster[id(cl)] = len(cluster_text)
         # provisional（证据不足但给了数字）也参与聚合——清零机制修复：
@@ -635,6 +712,10 @@ def suggest_score_hierarchical(
         # 人工评委从不因"证据格式不合机器口径"给 0（2026-10-27）
         provisional = s.status != "ai_suggested" and s.score is not None
         entry = {
+            # cluster_no=物理簇序号（含失败簇，审计稳定）；judge_no=有效评分簇
+            # 序号（失败簇不占号）——失败簇与后继簇曾共享 judge_no，votes/inputs
+            # 的簇编号必须用 cluster_no 才能对上（2026-10-29 审查 P2）
+            "cluster_no": cl_ord,
             "judge_no": len(suggestions) + 1,
             "cluster_chars": cl["chars"],
             "score": str(s.score) if s.score is not None else None,
@@ -654,10 +735,11 @@ def suggest_score_hierarchical(
             warnings=[f"分层评审：{evaluated} 个证据簇均未给出有效分", "llm_failed"],
         ), cluster_results
 
-    # 聚合：有原文子项时按"子项跨簇平均"（每个子项取给出该子项得分的簇的平均值，
-    # 全部簇都没提到的子项按 0），否则按簇相关性加权平均。
-    # 旧实现①取最高分簇、②子项同名取最高——任一章节看起来不错就按该值计分，
-    # 系统性把分数推向满分并抹平差异（2026-10-21 实证：T4.2 四家全 8/8）。
+    # 聚合（2026-10-29 弃权语义）：评委会常识"缺席者不投票"——无证据的 0 票是
+    # 弃权，退出均值不进分母；带引文证明"未提供"的真实 0 是投票，计入均值。
+    # 旧实现把弃权簇的 0 计入平均（(0+5.6+0)/3=1.87、(1.8+0+0)/3=0.60），
+    # 技术分被簇数整除、普遍压到满分 0-30%（2026-10-29 run 60 实证）。
+    # 更早的实现①取最高分簇/子项——把分数推向满分（2026-10-21 实证：T4.2 四家全 8/8）。
     scores = [s.score for _cl, s in suggestions if s.score is not None]
     parsed = parse_subitems(criterion.get("description"))
     merged_subs: list[dict] = []
@@ -665,9 +747,21 @@ def suggest_score_hierarchical(
     parse_keys = [name for name, _cap in parsed]
     sub_map: dict[str, Decimal] = {}
     sub_quotes: dict[str, str] = {}
+    sub_zero_quotes: dict[str, str] = {}  # real_zero 条目引文（无正票引文时兜底）
+    sub_meta: dict[str, list[dict]] = {}  # 子项 → 逐簇投票记录（含弃权，I1 落档）
+    sub_vals: dict[str, list[Decimal]] = {}  # 子项 → 计票簇的（已夹取）分值
+    sub_abstain: list[str] = []  # 全簇弃权（或无任何簇给出）的子项
+    doubt = any(s.quote_gate_executed is False for _cl, s in suggestions)
+    counted_cluster_scores: list[Decimal] = []
+    agg_inputs: list[dict] = []
+    agg_rule = ""
+    agg_arith = ""
+    agg_note = ""
+    best_cl = None
+    best = None
+
     if parsed and any(s.sub_scores for _cl, s in suggestions):
-        vals: dict[str, list[Decimal]] = {}
-        for _cl, s in suggestions:
+        for ci, (_cl, s) in enumerate(suggestions, start=1):
             for ss in s.sub_scores or []:
                 if not isinstance(ss, dict):
                     continue
@@ -675,19 +769,43 @@ def suggest_score_hierarchical(
                 if hit is None:
                     continue
                 cap = next(cap for name, cap in parsed if name == hit)
+                state, reason = _subitem_vote_state(ss, verify_quote)
+                sub_meta.setdefault(hit, []).append({
+                    # 物理簇编号（失败簇不与后继簇撞号）
+                    "cluster": _cl.get("cluster_no") or _cl.get("judge_no") or ci,
+                    "score": str(ss.get("score") if ss.get("score") is not None else "0"),
+                    "state": state,
+                    "reason": reason,
+                })
+                if state == "abstain":
+                    continue  # 弃权：退出均值，不进分母
                 val = _parse_score(ss.get("score")) or Decimal(0)
-                vals.setdefault(hit, []).append(min(max(val, Decimal(0)), cap))
+                sub_vals.setdefault(hit, []).append(min(max(val, Decimal(0)), cap))
                 q = str(ss.get("quote") or "").strip()
-                if q and hit not in sub_quotes:
-                    sub_quotes[hit] = q
-        for name, _cap in parsed:
-            got = vals.get(name)
-            if got:
-                # 跨簇平均：两个簇都看到了同一子项内容时，取它们的均值
-                # （ROUND_HALF_UP 2 位），而不是像旧实现那样取最高
-                sub_map[name] = (sum(got, Decimal(0)) / Decimal(len(got))).quantize(
-                    Decimal("0.01"), rounding=ROUND_HALF_UP
-                )
+                if q:
+                    # 引文只从计入票的条目取（弃权簇的空/坏引文会污染代表引文）
+                    if state == "vote" and hit not in sub_quotes:
+                        sub_quotes[hit] = q
+                    elif state == "real_zero" and hit not in sub_zero_quotes:
+                        sub_zero_quotes[hit] = q
+        if any(sub_vals.values()):
+            for name, _cap in parsed:
+                got = sub_vals.get(name)
+                if got:
+                    # 跨簇平均：只对计票簇（vote/real_zero）取均值（ROUND_HALF_UP 2 位）
+                    sub_map[name] = (sum(got, Decimal(0)) / Decimal(len(got))).quantize(
+                        Decimal("0.01"), rounding=ROUND_HALF_UP
+                    )
+                else:
+                    # 全部簇弃权（或无任何簇给出该子项）→ 计 0 + 理由，
+                    # 依据细则"不提供不得分"，但与"评委一致给 0"可区分
+                    sub_map[name] = Decimal(0)
+                    sub_abstain.append(name)
+                    doubt = True
+            for name in sub_map:
+                if name not in sub_quotes and name in sub_zero_quotes:
+                    sub_quotes[name] = sub_zero_quotes[name]
+
     if sub_map:
         merged_score = min(sum(sub_map.values(), Decimal(0)), max_score)
         merged_subs = [
@@ -696,47 +814,119 @@ def suggest_score_hierarchical(
                 "score": str(sub_map.get(name, Decimal(0))),
                 "max": str(cap),
                 "quote": sub_quotes.get(name, ""),
+                **({"zero_reason": "all_abstain"} if name in sub_abstain else {}),
             }
             for name, cap in parsed
         ]
-        # 证据/理由取"贡献子项最多"的簇
-        best_cl, best = max(
-            suggestions,
-            key=lambda pair: sum(
+        # 证据/理由取"贡献计票子项最多"的簇（弃权/闸门击杀不计贡献）
+        def _contrib(pair) -> int:  # noqa: ANN001
+            return sum(
                 1 for ss in (pair[1].sub_scores or [])
                 if isinstance(ss, dict)
                 and _match_subitem(str(ss.get("name") or ""), parse_keys) is not None
-            ),
-        )
+                and _subitem_vote_state(ss, verify_quote)[0] != "abstain"
+            )
+        best_cl, best = max(suggestions, key=_contrib)
+        voted_cls = {
+            rec["cluster"] for recs in sub_meta.values() for rec in recs
+            if rec["state"] != "abstain"
+        }
+        counted_cluster_scores = [
+            s.score for i, (_cl, s) in enumerate(suggestions, start=1)
+            if i in voted_cls and s.score is not None
+        ]
         agg_note = f"按子项跨簇平均汇总 {merged_score}/{max_score} 分"
         agg_rule = "subitem_cluster_mean"
-        agg_arith = (
-            "；".join(f"{n}={sub_map[n]}" for n, _c in parsed) + f" 合计 {merged_score}"
-        )
+        parts: list[str] = []
+        for name, _cap in parsed:
+            if name in sub_abstain:
+                parts.append(f"{name}=0（全部簇弃权）")
+                continue
+            got = sub_vals.get(name) or []
+            expr = f"{name}=mean({','.join(str(v) for v in got)})={sub_map[name]}"
+            abs_cls = [
+                str(rec["cluster"]) for rec in sub_meta.get(name, [])
+                if rec["state"] == "abstain"
+            ]
+            if abs_cls:
+                expr += f"（簇{'、'.join(abs_cls)}弃权）"
+            parts.append(expr)
+        agg_arith = "；".join(parts) + f" 合计 {merged_score}"
+        agg_inputs = [
+            {
+                "source": f"sub:{name}",
+                "score": str(sub_map.get(name, Decimal(0))),
+                "max": str(cap),
+                "votes": [
+                    {"cluster": rec["cluster"], "score": rec["score"],
+                     "state": rec["state"], "reason": rec["reason"]}
+                    for rec in sub_meta.get(name, [])
+                ],
+            }
+            for name, cap in parsed
+        ]
     else:
         # **等权算术平均**（2026-10-27 可复算化）：旧「相关性加权」的权重（证据地图
-        # 相似度）不落档、A3/A5 无法复算——审计缺陷实证。等权后 final_score 可由
-        # 各簇分直接重算（不变式 I1）。
+        # 相似度）不落档、A3/A5 无法复算——审计缺陷实证。
+        # 2026-10-29：分母只含计票簇（vote/real_zero），弃权簇保留记录不进均值。
+        cluster_states = [_cluster_vote_state(s, verify_quote) for _cl, s in suggestions]
+        counted = [
+            (pair, st)
+            for pair, (st, _r) in zip(suggestions, cluster_states)
+            if st in ("vote", "real_zero")
+        ]
+        if not counted:
+            # 整项全簇弃权：0 分不得伪装成评审结论，转人工
+            return SubjectiveSuggestion(
+                status="need_human",
+                score=None,
+                doubt=True,
+                warnings=[
+                    f"分层证据评审：{len(suggestions)} 个证据簇均无有效证据（弃权），整项转人工"
+                ],
+            ), cluster_results
+        vals = [pair[1].score for pair, _st in counted]
         merged_score = (
-            sum((s.score for _cl, s in suggestions), Decimal(0))
-            / Decimal(len(suggestions))
+            sum(vals, Decimal(0)) / Decimal(len(vals))
         ).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
         merged_score = min(merged_score, max_score)
-        best_cl, best = max(suggestions, key=lambda pair: float(pair[0].get("score") or 0.0))
-        agg_note = f"按证据簇等权平均 {merged_score} 分"
-        agg_rule = "cluster_equal_mean"
-        agg_arith = (
-            "(" + "+".join(str(s.score) for _cl, s in suggestions)
-            + f")/{len(suggestions)}={merged_score}"
+        (best_cl, best), _st = max(
+            counted, key=lambda item: float(item[0][0].get("score") or 0.0)
         )
+        counted_cluster_scores = list(vals)
+        agg_note = f"按证据簇等权平均 {merged_score} 分（分母 {len(vals)} 个计票簇）"
+        agg_rule = "cluster_equal_mean"
+        abs_ids = [
+            str(pair[0].get("cluster_no") or idx)
+            for idx, (pair, (st, _r)) in enumerate(
+                zip(suggestions, cluster_states), start=1
+            )
+            if st == "abstain"
+        ]
+        agg_arith = (
+            "(" + "+".join(str(v) for v in vals) + f")/{len(vals)}={merged_score}"
+            + (f"（簇{'、'.join(abs_ids)}弃权）" if abs_ids else "")
+        )
+        agg_inputs = []
+        si = 0
+        for entry in cluster_results:
+            if entry.get("score") is None:
+                st, reason = "abstain", "no_score"
+            else:
+                st, reason = cluster_states[si]
+                si += 1
+            agg_inputs.append({
+                "source": f"cluster{entry.get('cluster_no') or entry['judge_no']}",
+                "score": entry["score"],
+                "provisional": bool(entry.get("provisional")),
+                "state": st,
+                "reason": reason,
+            })
     aggregation_v2 = {
         "rule": agg_rule,
-        "inputs": [
-            {"source": f"cluster{entry['judge_no']}", "score": entry["score"],
-             "provisional": bool(entry.get("provisional"))}
-            for entry in cluster_results
-            if entry.get("score") is not None
-        ],
+        "inputs": agg_inputs,
+        # 顶层满分：subitem 规则 recompute=Σ 后按此封顶（I1）；equal_mean 同样可用
+        "max_score": str(max_score),
         "arithmetic": agg_arith,
     }
 
@@ -747,9 +937,18 @@ def suggest_score_hierarchical(
         f"（主依据 实际送审 {sent_by_cluster.get(id(best_cl), best_cl['chars'])}"
         f"/簇共 {best_cl['chars']} 字符）"
     ))
-    if scores and max(scores) - min(scores) >= 2:
+    for name in sub_abstain:
         warnings.append(
-            f"证据分散：各证据簇评分差异 {min(scores)}–{max(scores)}，建议人工复核"
+            f"子项「{name}」全部证据簇无有效证据（弃权），按细则『不提供不得分』计 0，"
+            "建议人工复核"
+        )
+    # 证据分散只看计票簇（弃权簇的 0 不是评分差异）
+    if len(counted_cluster_scores) >= 2 and (
+        max(counted_cluster_scores) - min(counted_cluster_scores) >= 2
+    ):
+        warnings.append(
+            f"证据分散：各证据簇评分差异 {min(counted_cluster_scores)}–"
+            f"{max(counted_cluster_scores)}，建议人工复核"
         )
 
     merged = SubjectiveSuggestion(
@@ -765,6 +964,7 @@ def suggest_score_hierarchical(
         sub_scores=merged_subs or best.sub_scores,
         warnings=warnings,
         quote_gate_executed=None,  # 分层路径的闸门在各簇 suggest_score 内执行
+        doubt=doubt,
         aggregation=aggregation_v2,
     )
     committee = [

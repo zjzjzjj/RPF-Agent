@@ -352,6 +352,14 @@ class CountResult:
     conflict: bool
     # None=正常算出 | "field_missing"=未给出计数口径 | "no_facts"=未抽取到事实
     unresolved: str | None = None
+    # 零分理由（W1-C，2026-10-29）：score=0 时必须给理由，0 分不得伪装成
+    # 确定性评审结论。取值：
+    # - "confirmed_absent"  确认未提供（材料三态 False/计数有依据的 0）
+    # - "unreadable"        机器不可见（点名材料页不可读 None / OCR 超限）——
+    #                       非确认缺失，强制 need_human + conflict_flagged
+    # - "no_facts"          机器没抽到事实（no_facts/cases_unverified/口径缺失）
+    # - "gate_named_missing" 点名材料闸门未核验/未通过（材料要求存在但核验未执行）
+    zero_reason: str | None = None
 
 
 def _infer_count_field(criterion: dict) -> str | None:
@@ -559,6 +567,7 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
     person_scope = str(params.get("person_scope") or "")
     inferred = ""
     unresolved: str | None = None
+    zero_reason: str | None = None  # 0 分理由（见 CountResult.zero_reason）
     if person_scope:
         # 人员级项：facts.performance_amounts 是公司级业绩，按它计数会让人人封顶。
         # 强制走 verified_cases（LLM 按人核验）；无案例则 unresolved。
@@ -615,6 +624,7 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
         if not facts.certificates and not facts.cert_claims:
             detail = "未提取到证书清单（需人工核查）"
             unresolved = "no_facts"
+            zero_reason = "no_facts"
         elif _iso_shaped:
             detail = f"提供证书 {count} 项（ISO 三体系 {len(iso_set)} 项" + (
                 "、CMMI 1 项）" if has_cmmi else "）"
@@ -631,6 +641,7 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
         if not facts.performance_amounts:
             detail = "未提取到业绩清单（需人工核查）"
             unresolved = "no_facts"
+            zero_reason = "no_facts"
         else:
             detail = f"满足金额要求的业绩 {count} 个"
     else:
@@ -640,9 +651,11 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
             # 「核验未产出」而非「未知计数字段」（run 54 c59-c62 的误导性告警来源）
             detail = "人员级条目：逐案例核验未产出可计案例"
             unresolved = "no_facts"
+            zero_reason = "no_facts"
         elif field:
             detail = f"逐条核验未产出可计条目（计数口径 {field}，需人工核查）"
             unresolved = "no_facts"
+            zero_reason = "no_facts"
         else:
             detail = "未知计数字段（评分项未给出 field，且无法从名称安全推断）"
             unresolved = "field_missing"
@@ -677,6 +690,33 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
             "「未按要求提供不得分」计 0"
             + ("；CMMI 1 项（仅需证书复印件）照计" if has_cmmi else "")
         )
+        # 零分理由分离（W1-C）：截图节"看不见"≠"确认未提供"。本文档解析警告
+        # 含 OCR 超限/不可用/识别失败 → 页面可能根本没进文本层 → "unreadable"
+        # （机器不可见，非确认缺失）；否则维持规则硬口径 "confirmed_absent"。
+        # doc_parse_warnings 由 scoring_service 从 Document.warnings_json 传入；
+        # 拿不到（旧路径/键缺失）→ 退化 confirmed_absent（保守，不误标转人工）。
+        # CMMI 照计时 score>0，不置零分理由（约定：score=0 才必须给理由）。
+        if score == 0:
+            _doc_warns = criterion.get("doc_parse_warnings") or []
+            # warnings_json 条目形态：{"code":..., "message":...} 或裸字符串
+            _warn_text = " ".join(
+                str(w.get("message") if isinstance(w, dict) else w) for w in _doc_warns
+            )
+            # 关键词覆盖 pdf_pymupdf 实际文案：逐页「已超出 OCR 页数上限…跳过」、
+            # 汇总「超限跳过 N 页」、「OCR 识别失败」「OCR 不可用」「无文字层」
+            # （2026-10-29 审查 P2：只认"超限跳过"匹配不上逐页文案）
+            _ocr_blind = any(
+                k in _warn_text
+                for k in ("OCR 页数上限", "超限跳过", "OCR 不可用", "识别失败", "无文字层")
+            )
+            if _ocr_blind:
+                zero_reason = "unreadable"
+            elif unresolved:
+                # 证书本身没提取到（no_facts/field_missing）→ 不能宣称"确认未提供"
+                #（2026-10-29 审查 P2：ISO 门曾把 no_facts 覆盖成 confirmed_absent）
+                zero_reason = "no_facts"
+            else:
+                zero_reason = "confirmed_absent"
 
     # 证明材料链校验（LLM 逐案例核验版）：有 cases 明细时按"材料齐全的案例"计数；
     # 因素带证明材料要求但 LLM 核验未执行 → 分数照算并标冲突转人工
@@ -717,10 +757,15 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                     f"；{len(cases)} 个案例的引文均未通过核验（{_breakdown}），"
                     f"按 {score} 分计入并标疑问"
                 )
+            # 引文全毙且分数仍为 0 → 计数无依据（no_facts），不是确认缺失
+            if score == 0:
+                zero_reason = "no_facts"
         else:
             cases = clean_cases
             # 已有逐案例核验结果 = 计数有依据；清掉"字段缺失/未抽到事实"的 unresolved
+            # 及早前分支可能置的 no_facts 零分理由（材料闸门段会按实际 0 因重置）
             unresolved = None
+            zero_reason = None
             _type_gate_note = ""
             # 人员级：按负责人/成员过滤；模型完全没给 role 时退回全部案例并标疑问
             if person_scope:
@@ -849,13 +894,37 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
             )
             if incomplete or null_dropped:
                 conflict = True
+            # 零分理由分离（W1-C，run 60 实证）："5 个案例材料页不可读未计"仍记
+            # 0 分——分数维持规则硬口径不改（不提供/不全不得分），但 0 的性质要
+            # 区分：点名材料页不可读(None)未计 → "unreadable"（机器不可见，非确认
+            # 缺失，强制转人工）；确认缺失(False)未计 → "confirmed_absent"。
+            # 优先 unreadable：只要存在不可读丢弃且总分 0，就不能伪装成确认缺失。
+            if score == 0:
+                if null_dropped:
+                    zero_reason = "unreadable"
+                elif incomplete:
+                    zero_reason = "confirmed_absent"
     elif artifacts:
         conflict = True
         detail += "；该评分项含证明材料要求，材料齐全性需人工核对原件（AI 逐案例核验未执行）"
+        if score == 0 and zero_reason is None:
+            zero_reason = "gate_named_missing"
+
+    # 约定：score=0 必须给零分理由；score>0 不携带（避免下游误读）。
+    if score != 0:
+        zero_reason = None
+    elif zero_reason is None:
+        # 兜底：计数有依据的 0（如金额门槛过滤后 0 个、分档不命中）→ 确认未提供；
+        # unresolved 机器侧故障（口径缺失/没抽到事实）→ no_facts。
+        zero_reason = (
+            "no_facts" if unresolved in ("no_facts", "field_missing", "cases_unverified")
+            else "confirmed_absent"
+        )
 
     return CountResult(
         score=score, detail=f"{detail}，得 {score} 分{inferred}", conflict=conflict,
         unresolved=unresolved,
+        zero_reason=zero_reason,
     )
 
 

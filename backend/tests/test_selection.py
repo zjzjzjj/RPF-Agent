@@ -112,3 +112,64 @@ def test_tier_selection_prefers_content_over_index(monkeypatch):
         chunks, (("scoring", ("服务团队", "技术力量", "健全")),), budget=1200)
     picked_text = "\n".join(t for _i, t in picked)
     assert "驻场服务团队技术力量由项目经理" in picked_text  # 正文入选
+
+
+def test_vector_selection_downweights_toc_chunks(monkeypatch):
+    """vector 路径目录降权：确定性向量下目录块余弦 1.0 高于正文 0.8，
+    降权后正文块入选、目录块不入选（2026-10-29 run 60 补：服务器
+    BID_EVAL_SELECTION=vector，此前只有关键词/证据地图路径有此降权）。"""
+    from app.evidence import embed_client
+    from app.engine.selection import select_chunks_by_vector
+
+    def pad(s: str) -> str:
+        return s + "x" * (100 - len(s))
+
+    # 5 块各 100 字符；目录块(4)与正文块(2)远离，防目录块当选后把正文
+    # 当邻居捎带入选。预算 220 只装得下 主命中块 + 1 邻居（100+100）。
+    toc = pad("\n".join([
+        "驻场服务团队技术力量（20分）见投标文件（63~131）页",
+        "服务团队健全合理性（5分）………64",
+        "团队职责分工（10分）详见第70页",
+        "服务承诺（5分）………71",
+    ]))
+    chunks = [
+        (0, pad("无关填充块零")),
+        (1, pad("无关填充块一")),
+        (2, pad("驻场服务团队由项目经理1名、运维工程师6名组成，AB角轮岗。")),
+        (3, pad("无关填充块三")),
+        (4, toc),
+    ]
+    assert all(len(t) == 100 for _i, t in chunks)
+
+    def fake_embed_batch(texts):
+        out = []
+        for t in texts:
+            if "见投标文件" in t:
+                out.append([1.0, 0.0])    # 目录块：与查询完全对齐，余弦 1.0
+            elif "驻场服务团队由项目经理" in t:
+                out.append([0.8, 0.6])    # 正文块：余弦 0.8，与目录接近（已 L2 归一）
+            else:
+                out.append([0.0, 1.0])    # 无关块：余弦 0
+        return out
+
+    monkeypatch.setattr(embed_client, "embed_one", lambda t: [1.0, 0.0])
+    monkeypatch.setattr(embed_client, "embed_batch", fake_embed_batch)
+
+    out = select_chunks_by_vector(chunks, "驻场服务团队技术力量", budget=220)
+    assert out is not None
+    picked, meta = out
+    picked_text = "\n".join(t for _i, t in picked)
+    assert "驻场服务团队由项目经理" in picked_text   # 正文入选
+    assert "见投标文件" not in picked_text           # 目录块被降权后排不进预算
+    assert meta["ids"] == [1, 2], meta["ids"]  # 正文 + 左邻居
+
+
+def test_ocr_config_defaults(monkeypatch) -> None:
+    """OCR 护栏默认值：60 页会截断 334 页大标书（run 60 实证跳过 92 页
+    扫描件），默认 350；材料救援 20→60。服务器可经 .env 单键回退。"""
+    from app import config
+
+    monkeypatch.delenv("BID_EVAL_OCR_MAX_PAGES", raising=False)
+    monkeypatch.delenv("BID_EVAL_MATERIAL_OCR_MAX_PAGES", raising=False)
+    assert config.ocr_max_pages() == 350
+    assert config.material_ocr_max_pages() == 60

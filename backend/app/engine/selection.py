@@ -350,6 +350,21 @@ def select_chunks_by_vector(
         return None
 
     scores = [embed_client.cosine(qvec, v) for v in cvecs if v is not None]
+    # 目录/索引 chunk 降权（与关键词路径 :206-224 / build_evidence_map :567-570
+    # 同一判据；2026-10-29 run 60 补：服务器 BID_EVAL_SELECTION=vector 时此前
+    # 无此降权——目录页逐字含评分项名，余弦必然压过正文，模型只见标题）。
+    # 权重乘完后，强索引块（weight<=0.4）再对最终排序分 min(score, 0.3) 封顶：
+    # 关键词路径的 min(candidate, 0.5) 是命中计数域的封顶；余弦值域下多关键词
+    # 连击不复存在，但 weight=0.4 边界处高余弦（0.9×0.4=0.36）仍可能压过弱相关
+    # 正文，0.3 绝对封顶保证强索引块永远排不进正文梯队（与 cap 语义一致）。
+    # 注意：放在 pool 递归之后的真实执行路径上（递归会重建 chunks 列表）。
+    for i, (_no, body) in enumerate(chunks):
+        w = index_text_weight(body)
+        if w >= 1.0:
+            continue
+        scores[i] = scores[i] * w
+        if w <= 0.4:
+            scores[i] = min(scores[i], 0.3)
     if score_scale is not None:
         scores = [sc * score_scale[i] for i, sc in enumerate(scores)]
     scored_order = sorted(range(len(chunks)), key=lambda i: -scores[i])

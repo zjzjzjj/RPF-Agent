@@ -55,7 +55,15 @@ def _match_item(gt_item: dict, crit_name: str) -> bool:
 
 
 def _recomputability_check(cur, run_id: int) -> tuple[int, int, list[str]]:
-    """I1 校验：final_score 可由 ai_raw_json.aggregation_v2 重算。"""
+    """I1 校验：final_score 可由 ai_raw_json.aggregation_v2 重算。
+
+    新格式（2026-10-29 弃权语义）：
+    - subitem_cluster_mean：inputs=逐子项合并分（含 votes 明细），recompute=Σ
+      inputs.score 再按顶层 max_score 封顶；旧格式（无 max_score）按 Σ 兼容。
+    - cluster_equal_mean：inputs=全量簇条目带 state；state=="abstain" 不进均值、
+      不进分母（无 state 的旧 run 条目一律视为 vote，向后兼容）。
+    - trimmed_mean_drop_high_low（委员会路径）：不变。
+    """
     ok = bad = 0
     errs: list[str] = []
     rows = cur.execute(
@@ -75,18 +83,30 @@ def _recomputability_check(cur, run_id: int) -> tuple[int, int, list[str]]:
         if not inputs:
             continue
         rule = agg.get("rule")
+        cap = agg.get("max_score")
         try:
             if rule == "cluster_equal_mean":
-                recomputed = (sum(inputs) / Decimal(len(inputs))).quantize(Decimal("0.01"))
+                # 弃权簇保留记录但不进均值；旧格式无 state 视为 vote
+                counted = [
+                    Decimal(str(i["score"]))
+                    for i in agg.get("inputs", [])
+                    if i.get("score") is not None and i.get("state", "vote") != "abstain"
+                ]
+                if not counted:
+                    continue
+                recomputed = (sum(counted) / Decimal(len(counted))).quantize(Decimal("0.01"))
+                if cap is not None:
+                    recomputed = min(recomputed, Decimal(str(cap)))
             elif rule == "trimmed_mean_drop_high_low":
                 ordered = sorted(inputs)
                 middle = ordered[1:-1]
                 recomputed = (sum(middle) / Decimal(len(middle))).quantize(Decimal("0.01")) if middle else ordered[0]
             elif rule == "subitem_cluster_mean":
                 recomputed = sum(inputs, Decimal(0))
+                if cap is not None:
+                    recomputed = min(recomputed, Decimal(str(cap)))
             else:
                 continue
-            recomputed = min(recomputed, Decimal(str(final)) if False else recomputed)
             if abs(recomputed - Decimal(str(final))) <= Decimal("0.01"):
                 ok += 1
             else:

@@ -584,6 +584,11 @@ def execute_run(
                      "项目经理", "运维负责人", "主要实施", "项目总监", "团队成员")
     material_hints: dict[int, str] = {}
     bid_pages: dict[int, list[tuple[int, str, str]]] = {}
+    # 每家主文档解析警告（Document.warnings_json）：ISO 截图节门槛判
+    # "unreadable vs confirmed_absent" 的依据（OCR 超限跳过/不可用/识别失败
+    # → 页面可能根本没进文本层，0 分不能伪装成确认缺失）。取不到 → 空列表，
+    # objective 侧退化 confirmed_absent。
+    doc_warnings_by_bidder: dict[int, list] = {}
     with session_scope() as s:
         from app.db.models import DocumentPage
 
@@ -612,6 +617,10 @@ def execute_run(
                     if kw in (ptext or ""):
                         pages.setdefault(kw, []).append(int(page_no))
             bid_pages[bid_id] = page_rows
+            from app.db.models import Document as _Document
+
+            _warn_doc = s.get(_Document, doc_id)
+            doc_warnings_by_bidder[bid_id] = list(_warn_doc.warnings_json or []) if _warn_doc else []
             hint_parts = [
                 f"{kw}：第{'、'.join(str(p) for p in nos[:12])} 页"
                 for kw, nos in pages.items() if nos
@@ -737,9 +746,11 @@ def execute_run(
 
             fallback = SimpleNamespace(
                 score=Decimal(0), detail=f"计数执行失败：{exc}",
-                unresolved="llm_failed", conflict=True,
+                unresolved="llm_failed", conflict=True, zero_reason="no_facts",
             )
-            return bid_id, c, fallback, True, True, None
+            # audit 带 zero_reason：异常兜底的 0 分同样要过"score=0 必有理由"
+            # 的审计约定（2026-10-29 审计 P2：曾因 audit=None 丢理由且 machine_status=pass）
+            return bid_id, c, fallback, "llm_failed", True, {"zero_reason": "no_facts"}
 
     def _count_cell_impl(bid_id, c):  # noqa: ANN001
         facts = facts_by_bidder[bid_id]
@@ -770,7 +781,12 @@ def execute_run(
 
             _field = _infer_count_field(c) or ""
         if _field == "certificates":
-            c_scoring = {**c_scoring, "cert_section_present": cert_sections.get(bid_id, (True, ""))[0]}
+            c_scoring = {
+                **c_scoring,
+                "cert_section_present": cert_sections.get(bid_id, (True, ""))[0],
+                # ISO 截图节门槛的 unreadable/confirmed_absent 分离依据
+                "doc_parse_warnings": doc_warnings_by_bidder.get(bid_id) or [],
+            }
         # LLM 逐案例核验仅用于**业绩类**（按案例核对合同/发票/验收）。
         # 证书类（认证/资质）不适用：案例核验的 contract/invoice/acceptance
         # 三标记语义与"证书复印件+查询截图"错位，会把有证书的投标人整体清零
@@ -841,7 +857,18 @@ def execute_run(
         # "机器没抽到事实"不是 0 分结论：不进总分（final=None），报告标未定分。
         # conflict（证明材料链缺失/部分缺失）分数照算但保留疑问态。
         unresolved = bool(result.unresolved)
-        doubt = result.conflict or unresolved
+        # 零分理由（W1-C）：score=0 时落 ai_raw_json["zero_reason"]；
+        # "unreadable"（机器不可见）强制 need_human + conflict_flagged——
+        # 0 分维持规则硬口径，但不得伪装成确定性评审结论（run 60 实证）。
+        zero_reason = getattr(result, "zero_reason", None)
+        if result.score == 0 and zero_reason is None:
+            # P1E 引擎（count_tier/value_tier 等）与异常兜底未逐一设置 zero_reason →
+            # 从 unresolved 统一映射：有任何 unresolved（含 llm_failed）都是机器侧
+            # 原因 → no_facts；无 unresolved 的 0 是计数有依据 → confirmed_absent。
+            # 保证"score=0 必有理由"约定全覆盖。
+            zero_reason = "no_facts" if result.unresolved else "confirmed_absent"
+        unreadable_zero = zero_reason == "unreadable" and result.score == 0
+        doubt = result.conflict or unresolved or unreadable_zero
         # 审计留痕：把逐案例核验结果 + 候选页统计落 ai_raw_json，否则判"照抄/
         # 未在标书定位"后无法复盘是抽取错还是闸门误杀（2026-10-21 实证为空）。
         audit = None
@@ -865,6 +892,9 @@ def execute_run(
                 ],
                 "meta": case_stats,
             }
+        if result.score == 0 and (zero_reason or audit):
+            audit = dict(audit or {})
+            audit["zero_reason"] = zero_reason
         return bid_id, c, result, unresolved, doubt, audit
 
     # Phase1：并行计算（业绩表快路径不走 LLM；LLM 逐案例核验 4 并发→8 并发）
@@ -872,17 +902,19 @@ def execute_run(
     count_results = _parallel_map(_count_cell, count_cells, ctx=ctx, message_fmt="案例核验 {done}/{total}")
     # Phase2：串行落库（SQLite 单写者）
     for bid_id, c, result, unresolved, doubt, audit in count_results:
+        _warn_entry, _unreadable_zero = _count_zero_warn_entry(result, audit)
         _upsert_score(
             run_id, bid_id, c,
             machine_score=result.score,
-            machine_status="pass",
+            # unreadable 零分：机器不可见 ≠ 确认缺失 → 强制转人工（不因
+            # 全自动模式被收敛成 auto_confirmed——doubt=True 已保住复核态）
+            machine_status="need_human" if _unreadable_zero else "pass",
             review_status="conflict_flagged" if doubt else "pending",
             # 全自动化评分（用户要求零未定分）：计分项**一律写分**。
             # unresolved 只作疑问标记（落 warnings 供报告判读），不再决定弃评；
             # 依据提取不到的兜底 0 分同样进总分，并在 detail/warnings 里说明。
             final_score=result.score,
-            warnings_json=([{"message": result.detail, "unresolved": result.unresolved}]
-                           if result.unresolved else [{"message": result.detail}]),
+            warnings_json=[_warn_entry],
             doubt=doubt,
             ai_raw_json=audit,
         )
@@ -1935,6 +1967,36 @@ def _review_status_for_verdict(result: dict) -> str:
     return "pending"
 
 
+def _count_zero_warn_entry(result, audit: dict | None) -> tuple[dict, bool]:
+    """count 落库警告条目 + unreadable 零分判定（W1-C）。
+
+    返回 (warnings_json 条目, unreadable_zero)：
+    - unreadable（机器不可见）→ 文案明示"非确认缺失，建议人工核看"，
+      调用方必须配 machine_status="need_human" + review_status="conflict_flagged"；
+    - confirmed_absent → 文案明示"确认未提供"（规则硬口径 0，无需转人工）；
+    - 条目携带结构化 zero_reason/unresolved 键，报告疑问清单按此分组，
+      不再靠匹配中文措辞（与 unresolved 落库同一教训）。
+    """
+    score = result.score
+    zero_reason = (audit or {}).get("zero_reason") if isinstance(audit, dict) else None
+    if not zero_reason and score == 0:
+        # 兜底：audit 缺席时从 result 侧取（异常路径的 SimpleNamespace 已带字段）
+        zero_reason = getattr(result, "zero_reason", None)
+    unreadable_zero = zero_reason == "unreadable" and score == 0
+    if unreadable_zero:
+        msg = f"{result.detail}；零分理由：机器不可见（unreadable），非确认缺失，建议人工核看"
+    elif score == 0 and zero_reason == "confirmed_absent":
+        msg = f"{result.detail}；零分理由：确认未提供（confirmed_absent）"
+    else:
+        msg = result.detail
+    entry: dict = {"message": msg}
+    if result.unresolved:
+        entry["unresolved"] = result.unresolved
+    if score == 0 and zero_reason:
+        entry["zero_reason"] = zero_reason
+    return entry, unreadable_zero
+
+
 def _upsert_score(
     run_id: int,
     bidder_id: int,
@@ -2049,6 +2111,8 @@ def _persist_subjective(
         row.ai_level_label = suggestion.level_label
         row.ai_reasoning = suggestion.reasoning
         row.ai_confidence = suggestion.confidence
+        # 聚合算式（可复算不变式 I1）：final_score 可由 inputs 按 rule 重算核对
+        _agg_v2 = getattr(suggestion, "aggregation", None)
         row.ai_raw_json = {
             "warnings": suggestion.warnings,
             "evidence": suggestion.evidence,
@@ -2059,13 +2123,16 @@ def _persist_subjective(
             "committee_semantic": (
                 "evidence_cluster" if config.review_mode() == "hierarchical" else "judge"
             ),
+            # 过期字符串 "evidence_cluster_weighted" 已废弃：聚合规则以
+            # aggregation_v2["rule"] 为准（W1-A 新格式），此处仅作旧读者兼容镜像
             "aggregation": (
-                f"trimmed_mean_{len(committee)}_drop_high_low"
-                if committee and config.review_mode() != "hierarchical"
-                else ("evidence_cluster_weighted" if committee else None)
+                (str(_agg_v2.get("rule")) if isinstance(_agg_v2, dict) and _agg_v2.get("rule") else None)
+                or (
+                    f"trimmed_mean_{len(committee)}_drop_high_low"
+                    if committee and config.review_mode() != "hierarchical" else None
+                )
             ),
-            # 聚合算式（可复算不变式 I1）：final_score 可由 inputs 按 rule 重算核对
-            "aggregation_v2": getattr(suggestion, "aggregation", None),
+            "aggregation_v2": _agg_v2,
             # 校准参数版本（2026-10-27 训练集校准，审计可还原用的哪版尺度）
             "calibration_profile": config.calibration_profile().get("version") or None,
             # 证明材料链核对与复合因素子项得分（评分透明度）
@@ -2113,45 +2180,69 @@ def _persist_subjective(
         # 子项引文闸门未执行（模型整体没给引文）→ 分数不可复核，标疑问
         gate_not_executed = getattr(suggestion, "quote_gate_executed", None) is False
         if config.auto_mode():
-            # 全自动模式：AI 建议直接生效；给不出分的按最低档兜底（宁严勿纵），
-            # 警告与 reasoning 全部保留在 ai_raw_json / warnings 供事后审计。
-            # 例外：模型输出截断/解析失败（parse_failed）→ 疑问 + 不进总分——
-            # 兜底 0 分会把"模型输出坏了"伪装成"投标人做得差"
-            # （2026-10-15 诚道运维方案 0 分实证）。
+            # 全自动模式语义统一（W1-D，2026-10-29）：
+            # 2026-10-15 诚道运维方案 0 分实证的教训——机器故障（parse_failed /
+            # llm_failed / 分层全簇失败 / insufficient 无分）**不得静默伪装成评审
+            # 结论**；表达方式是"最低档兜底 + 显式疑问"：靠 conflict_flagged +
+            # zero_reason（count 路径）可审计，警告明示兜底分非评审结论。
+            #
+            # suggestion.score 非 None（含 provisional / 分层聚合分 / insufficient
+            # 带分）→ 直接进总分，**不得被最低档地板分丢弃**（旧行为把 provisional
+            # 聚合分扔掉重算地板分——分层评审有效簇的分数被静默清零）。
+            # 但 status != ai_suggested 或聚合层标 doubt → need_human +
+            # conflict_flagged：分照进（用户要求零未定分），复核态必须可见。
             parse_failed = any(
                 isinstance(w, dict) and w.get("message") in ("parse_failed", "llm_failed")
                 for w in (row.warnings_json or [])
             )
+            doubt_flag = bool(getattr(suggestion, "doubt", False))
             if gate_not_executed:
                 # 保留分值（进总分，不影响排名），但标疑问进复核清单：
                 # 若整项直接判未定分，8B 偶尔不给逐子项引文就会让整份报告失效
                 row.warnings_json = (row.warnings_json or []) + [
                     {"message": "子项引文未提供，证据闸门未执行，建议人工复核"}
                 ]
-            if suggestion.status == "ai_suggested":
+            if suggestion.score is not None:
+                # 有分（正常建议 / provisional / 分层聚合 / insufficient 带分）
                 row.final_score = suggestion.score
-                row.machine_status = "pass"
+                if suggestion.status == "ai_suggested" and not doubt_flag and not parse_failed:
+                    row.machine_status = "pass"
+                else:
+                    # 分数有效但机器自标存疑（insufficient / need_human / doubt /
+                    # 全簇弃权 all-abstain）→ 分进总分，状态强制转人工可见
+                    row.machine_status = "need_human"
+                    row.warnings_json = (row.warnings_json or []) + [
+                        {"message": f"全自动模式：模型建议分（{suggestion.score}）已入总分，"
+                                    f"但状态为 {suggestion.status}"
+                                    + ("且聚合层标疑问（doubt）" if doubt_flag else "")
+                                    + "，建议人工复核"}
+                    ]
             else:
-                # 全自动化评分（用户要求零未定分）：模型没给有效分（parse_failed /
-                # llm_failed / 分层全簇失败 / 委员会有效分<3 / insufficient）一律按
-                # **最低档兜底**并保留疑问，不再置 final=None。
+                # score is None（parse_failed / llm_failed / 分层全簇失败 /
+                # insufficient 无分）→ **最低档兜底**并保留疑问，不再置 final=None。
                 # 故障详情留在 warnings / ai_raw_json，供事后审计；机器状态用
                 # need_human 区分"兜底"与"正常评审"，但不阻止计分与排名。
+                # 兜底分非评审结论——警告必须明示（不得静默伪装）。
                 mins = [Decimal(str(lv.get("min")))
                         for lv in (criterion.get("levels") or []) if lv.get("min") is not None]
                 fallback = min(mins) if mins else Decimal(0)
                 row.final_score = fallback
-                row.machine_status = "need_human" if parse_failed else "pass"
+                row.machine_status = "need_human"
                 if parse_failed:
                     row.warnings_json = (row.warnings_json or []) + [
-                        {"message": f"全自动模式：模型调用失败/输出解析失败，按最低档兜底（{fallback} 分），建议复核"}
+                        {"message": f"全自动模式：机器故障/无有效输出（模型调用失败或输出解析失败），"
+                                    f"按最低档兜底（{fallback} 分）——兜底分非评审结论，建议人工复核或重跑"}
                     ]
                 else:
                     row.warnings_json = (row.warnings_json or []) + [
-                        {"message": f"全自动模式：模型未给出有效分值，按最低档兜底（{fallback} 分）"}
+                        {"message": f"全自动模式：机器故障/无有效输出（{suggestion.status}），"
+                                    f"按最低档兜底（{fallback} 分）——兜底分非评审结论，建议人工复核或重跑"}
                     ]
             row.review_status = (
-                "conflict_flagged" if (gate_not_executed or parse_failed) else "auto_confirmed"
+                "conflict_flagged"
+                if (gate_not_executed or parse_failed or doubt_flag
+                    or suggestion.status != "ai_suggested" or suggestion.score is None)
+                else "auto_confirmed"
             )
             s.add(row)
         elif suggestion.status == "ai_suggested" and evidence_status != "verified":

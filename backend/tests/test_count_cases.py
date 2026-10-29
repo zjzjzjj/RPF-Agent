@@ -782,3 +782,194 @@ def test_sanitize_explicit_scope_wins_over_null_keys():
     # 公司级（scope 空）同样输入不触发
     out2 = _sanitize_case(dict(case), "人员经验证明", bid_norm=None, person_scope="")
     assert out2["sanitized"] != "project_header_not_person"
+
+
+# ---- 零分理由 zero_reason（W1-C，2026-10-29）--------------------------------
+# run 60 实证："5 个案例材料页不可读未计"仍记 0——分数维持规则硬口径（不改分
+# 避免拟合），但 0 的性质必须可区分：机器看不见 ≠ 确认不符合。
+def test_score_count_unreadable_drop_zero_reason() -> None:
+    """点名材料页不可读(None)丢弃 → score=0 + zero_reason="unreadable"。
+
+    与 confirmed_absent 分离：不可读可能是扫描件（机器看不见），
+    不是"确认未提供"；落库侧强制 need_human + conflict_flagged。
+    """
+    from app.engine.objective import score_count
+
+    crit = _perf_crit(verified_cases=[
+        {"name": "A", "contract": None, "invoice": None, "acceptance": None,
+         "case_source": "table", "sanitized": "ok"},
+    ])
+    res = score_count(crit, crit["params"], BidFacts(text=""))
+    assert res.score == Decimal("0")
+    assert res.zero_reason == "unreadable"
+    assert res.conflict is True
+    assert "可能为扫描件" in res.detail
+
+
+def test_score_count_confirmed_absent_zero_reason_no_doubt_forcing() -> None:
+    """确认缺失（False）→ score=0 + zero_reason="confirmed_absent"（规则硬口径）。
+
+    与 unreadable 的区别：confirmed_absent 是确定性评审结论（材料确认缺失），
+    不需要 unreadable 那档强制转人工（conflict 仍标，但理由分类不同）。
+    """
+    from app.engine.objective import score_count
+
+    crit = _perf_crit(verified_cases=[
+        {"name": "A", "contract": True, "invoice": False, "acceptance": False,
+         "case_source": "table", "sanitized": "ok"},
+    ])
+    res = score_count(crit, crit["params"], BidFacts(text=""))
+    assert res.score == Decimal("0")
+    assert res.zero_reason == "confirmed_absent"
+
+
+def test_score_count_no_facts_zero_reason() -> None:
+    """没抽到事实 → score=0 + zero_reason="no_facts"（机器侧原因，非确认缺失）。"""
+    from app.engine.objective import score_count
+
+    crit = _count_crit()  # person_scope，无 verified_cases
+    res = score_count(crit, crit["params"], BidFacts(text=""))
+    assert res.score == Decimal("0")
+    assert res.unresolved == "no_facts"
+    assert res.zero_reason == "no_facts"
+
+
+def test_score_count_cases_unverified_zero_reason() -> None:
+    """引文全毙（cases_unverified）且无回退事实 → zero_reason="no_facts"。"""
+    from app.engine.objective import score_count
+
+    crit = _count_crit(verified_cases=[
+        {"name": "A", "role": "member", "contract": False, "invoice": False,
+         "acceptance": False, "quote": "长伪造引文", "sanitized": "quote_not_in_bid"},
+    ])
+    res = score_count(crit, crit["params"], BidFacts(text=""))
+    assert res.score == Decimal("0")
+    assert res.unresolved == "cases_unverified"
+    assert res.zero_reason == "no_facts"
+
+
+def test_score_count_positive_score_has_no_zero_reason() -> None:
+    """约定：score>0 不携带 zero_reason（避免下游误读）。"""
+    from app.engine.objective import score_count
+
+    crit = _perf_crit(verified_cases=[
+        {"name": "A", "contract": True, "invoice": True, "acceptance": True,
+         "case_source": "table", "sanitized": "ok"},
+    ])
+    res = score_count(crit, crit["params"], BidFacts(text=""))
+    assert res.score > 0
+    assert res.zero_reason is None
+
+
+def test_score_count_iso_gate_unreadable_via_doc_warnings() -> None:
+    """ISO 截图节门槛 + 本文档解析警告含 OCR 超限 → zero_reason="unreadable"。
+
+    run 60 实证：航天拓扑"超限跳过页"→ 截图页没进文本层 →"未见截图节"0 分
+    不能伪装成确认缺失。
+    """
+    from app.engine.objective import score_count
+
+    facts = BidFacts(text="")
+    facts.certificates = ["ISO9001"]
+    crit = {
+        "name": "投标人认证及资质情况", "max_score": Decimal("3"),
+        "required_artifacts": "查询结果截图", "cert_section_present": False,
+        # 生产形态：Document.warnings_json 条目是 {"code","message"} dict
+        "doc_parse_warnings": [{"code": "WARN", "message": "OCR 汇总：识别 10 页，超限跳过 92 页"}],
+    }
+    res = score_count(crit, {"field": "certificates", "per_item": "1", "max_items": "3"}, facts)
+    assert res.score == Decimal("0")
+    assert res.zero_reason == "unreadable"
+
+
+def test_score_count_iso_gate_confirmed_absent_without_doc_warnings() -> None:
+    """ISO 截图节门槛 + 无 OCR 警告 → zero_reason="confirmed_absent"（确认未提供）。"""
+    from app.engine.objective import score_count
+
+    facts = BidFacts(text="")
+    facts.certificates = ["ISO9001"]
+    crit = {
+        "name": "投标人认证及资质情况", "max_score": Decimal("3"),
+        "required_artifacts": "查询结果截图", "cert_section_present": False,
+        "doc_parse_warnings": [],
+    }
+    res = score_count(crit, {"field": "certificates", "per_item": "1", "max_items": "3"}, facts)
+    assert res.score == Decimal("0")
+    assert res.zero_reason == "confirmed_absent"
+
+
+def test_score_count_iso_gate_unreadable_via_per_page_warning() -> None:
+    """逐页 OCR 超限文案（无"超限跳过"字样）同样判 unreadable。
+
+    2026-10-29 审查 P2：pdf_pymupdf 逐页警告是「已超出 OCR 页数上限（60），跳过」，
+    只认"超限跳过"（汇总行才有）会漏匹配。
+    """
+    from app.engine.objective import score_count
+
+    facts = BidFacts(text="")
+    facts.certificates = ["ISO9001"]
+    crit = {
+        "name": "投标人认证及资质情况", "max_score": Decimal("3"),
+        "required_artifacts": "查询结果截图", "cert_section_present": False,
+        "doc_parse_warnings": ["第 111 页疑似扫描件，已超出 OCR 页数上限（60），跳过"],
+    }
+    res = score_count(crit, {"field": "certificates", "per_item": "1", "max_items": "3"}, facts)
+    assert res.score == Decimal("0")
+    assert res.zero_reason == "unreadable"
+
+
+def test_score_count_iso_gate_no_facts_not_overridden_to_confirmed() -> None:
+    """证书本身没提取到（no_facts）时 ISO 门不覆盖为"确认未提供"。
+
+    2026-10-29 审查 P2：facts.certificates 空 → unresolved="no_facts"（:624），
+    ISO 截图门曾把它覆盖成 confirmed_absent——同一格同时带两个矛盾审计信号。
+    """
+    from app.engine.objective import score_count
+
+    facts = BidFacts(text="")  # certificates 与 cert_claims 均空 → no_facts
+    crit = {
+        "name": "投标人认证及资质情况", "max_score": Decimal("3"),
+        "required_artifacts": "查询结果截图", "cert_section_present": False,
+        "doc_parse_warnings": [],
+    }
+    res = score_count(crit, {"field": "certificates", "per_item": "1", "max_items": "3"}, facts)
+    assert res.score == Decimal("0")
+    assert res.zero_reason == "no_facts"
+
+
+def test_count_zero_warn_entry_unreadable_forces_need_human() -> None:
+    """落库映射：unreadable 零分 → 警告文案"机器不可见"+ unreadable_zero=True。
+
+    调用方（Phase2）据此强制 machine_status="need_human" +
+    review_status="conflict_flagged"——0 分不得伪装成确定性评审结论。
+    """
+    from types import SimpleNamespace
+
+    from app.services.scoring_service import _count_zero_warn_entry
+
+    result = SimpleNamespace(
+        score=Decimal("0"), detail="逐案例核验：提供案例 5 个，其中可计 0 个"
+        "（5 个案例材料页不可读未计，可能为扫描件，建议人工核看）",
+        unresolved=None,
+    )
+    entry, unreadable_zero = _count_zero_warn_entry(result, {"zero_reason": "unreadable"})
+    assert unreadable_zero is True
+    assert "机器不可见" in entry["message"]
+    assert "非确认缺失" in entry["message"]
+    assert entry["zero_reason"] == "unreadable"
+
+
+def test_count_zero_warn_entry_confirmed_absent文案区分() -> None:
+    """confirmed_absent 零分 → 文案"确认未提供"，不强制 unreadable 转人工。"""
+    from types import SimpleNamespace
+
+    from app.services.scoring_service import _count_zero_warn_entry
+
+    result = SimpleNamespace(
+        score=Decimal("0"), detail="逐案例核验：提供案例 2 个，其中可计 0 个（2 个缺证明材料不计分）",
+        unresolved=None,
+    )
+    entry, unreadable_zero = _count_zero_warn_entry(result, {"zero_reason": "confirmed_absent"})
+    assert unreadable_zero is False
+    assert "确认未提供" in entry["message"]
+    assert entry["zero_reason"] == "confirmed_absent"
