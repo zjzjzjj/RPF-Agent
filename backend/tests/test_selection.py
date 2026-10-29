@@ -173,3 +173,218 @@ def test_ocr_config_defaults(monkeypatch) -> None:
     monkeypatch.delenv("BID_EVAL_MATERIAL_OCR_MAX_PAGES", raising=False)
     assert config.ocr_max_pages() == 350
     assert config.material_ocr_max_pages() == 60
+
+
+# ---------------------------------------------------------------------------
+# 证据地图：阈值与加成分离 + 复述块降权（2026-10-29 run 63 云锦汇智 c49 实证）
+# ---------------------------------------------------------------------------
+def test_evidence_map_boost_does_not_starve_neighbors(monkeypatch):
+    """类内加成只影响种子排序，不得抬高 floor_extend 饿死真实内容簇的邻居。
+
+    run 63 根因链：chunk_cats 加成乘进 scores → top 抬高 → 相对阈值
+    floor_seed/floor_extend 连锁抬升 → 邻居（原始 0.5~0.66）全够不着 →
+    簇退化单块 → top-3 预算全被抬分的通用块占住 → 模型无证据弃权 0 分。
+    """
+    from app.evidence import embed_client
+    from app.engine.selection import build_evidence_map
+
+    criterion = {
+        "name": "订单管理功能",
+        "description": "订单管理模块需支持订单全生命周期管理，含状态同步与异常回执。",
+        "category": "technical",
+        "max_score": "5",
+    }
+    # 余弦：核心内容 0.64 > 类内通用块 0.55（加成后 0.715 反超）> 邻居 0.50/0.52
+    cos_by_marker = {
+        "核心内容块": 0.64,
+        "类内通用块": 0.55,
+        "相邻扩展块乙": 0.52,
+        "相邻扩展块甲": 0.50,
+    }
+    chunks = [
+        (0, "无关填充块零" + "x" * 60),
+        (1, "核心内容块：订单创建、审批流转、状态同步与异常回执均已实现。" + "x" * 40),
+        (2, "相邻扩展块甲：异常回执的通知渠道与重试策略说明。" + "x" * 50),
+        (3, "相邻扩展块乙：状态同步的接口协议与幂等处理。" + "x" * 50),
+        (4, "无关填充块四" + "x" * 60),
+        (5, "类内通用块：运维服务体系与巡检计划概述。" + "x" * 50),
+        (6, "无关填充块六" + "x" * 60),
+        (7, "无关填充块七" + "x" * 60),
+    ]
+    chunk_cats = [None, None, None, None, None, "technical", None, None]
+
+    def fake_embed_batch(texts):
+        out = []
+        for t in texts:
+            s = next((v for m, v in cos_by_marker.items() if m in t), 0.1)
+            out.append([s, 0.0])  # qvec=[1,0] → 余弦 = s
+        return out
+
+    monkeypatch.setattr(embed_client, "embed_one", lambda t: [1.0, 0.0])
+    monkeypatch.setattr(embed_client, "embed_batch", fake_embed_batch)
+
+    emap = build_evidence_map(chunks, criterion, chunk_cats=chunk_cats)
+    assert emap is not None
+    clusters, _q = emap
+    # 核心内容簇不止 1 块（扩展按 raw 判定：0.50/0.52 ≥ 0.64×0.75=0.48）
+    core = next(cl for cl in clusters if 1 in cl["ids"])
+    assert {2, 3} <= set(core["ids"]), core
+    assert len(core["ids"]) >= 2, core
+    # 真实内容簇进入 top-3 预算（suggest_score_hierarchical 只取前 3 簇）
+    top3_ids = [i for cl in clusters[:3] for i in cl["ids"]]
+    assert 1 in top3_ids
+    # 类内加成语义保留在展示分：0.55×1.3=0.715
+    boosted = next(cl for cl in clusters if 5 in cl["ids"])
+    assert boosted["score"] >= 0.71, boosted
+
+
+def test_evidence_map_restatement_chunk_downweighted(monkeypatch):
+    """逐字复述 criteria 文本的块经 criterion_restatement_weight 后不得成为 top 簇种子。
+
+    run 63 实证：p38 应答表逐字照抄评分标准（余弦 0.669、目录降权 1.00 未拦），
+    在选段路径冒充证据——复述块降权后种子应是真实内容块。
+    """
+    from app.evidence import embed_client
+    from app.engine.selection import (
+        build_evidence_map,
+        criterion_restatement_weight,
+    )
+
+    crit_desc = "订单管理模块需支持订单全生命周期管理，含状态同步与异常回执。"
+    criterion = {"name": "订单管理功能", "description": crit_desc, "max_score": "5"}
+    restatement = "订单管理（应答）：" + crit_desc
+    content = "系统实测：订单创建到回执归档共 12 步，异常单自动重推三次后转人工。"
+    chunks = [
+        (0, restatement),
+        (1, "无关填充块一" + "z" * 60),
+        (2, content),
+        (3, "无关填充块三" + "z" * 60),
+        (4, "无关填充块四" + "z" * 60),
+    ]
+
+    def fake_embed_batch(texts):
+        out = []
+        for t in texts:
+            if "订单管理（应答）" in t:
+                out.append([0.9, 0.0])   # 复述块余弦最高（run 63 p38 同型）
+            elif "订单创建到回执归档" in t:
+                out.append([0.6, 0.0])
+            else:
+                out.append([0.1, 0.0])
+        return out
+
+    monkeypatch.setattr(embed_client, "embed_one", lambda t: [1.0, 0.0])
+    monkeypatch.setattr(embed_client, "embed_batch", fake_embed_batch)
+
+    # 判据本身：复述块降权 0.25，真实内容块不受影响
+    assert criterion_restatement_weight(restatement, criterion) == 0.25
+    assert criterion_restatement_weight(content, criterion) == 1.0
+
+    emap = build_evidence_map(chunks, criterion)
+    assert emap is not None
+    clusters, _q = emap
+    # 复述块降权（0.9×0.25=0.225 < 0.6×0.55=0.33）→ 不得成任何簇种子；
+    # top 簇是真实内容块
+    assert clusters[0]["ids"] == [2], clusters
+    assert all(0 not in cl["ids"] for cl in clusters), clusters
+
+
+def test_vector_selection_restatement_downweighted(monkeypatch):
+    """select_chunks_by_vector 路径复述块降权生效：预算只装得下内容块时，
+    余弦更高的复述块不得挤掉真实内容块。"""
+    from app.evidence import embed_client
+    from app.engine.selection import select_chunks_by_vector
+
+    crit_desc = "订单管理模块需支持订单全生命周期管理，含状态同步与异常回执。"
+    criterion = {"name": "订单管理功能", "description": crit_desc, "max_score": "5"}
+
+    def pad(s: str) -> str:
+        return s + "x" * (100 - len(s))
+
+    chunks = [
+        (0, pad("无关填充块零")),
+        (1, pad("无关填充块一")),
+        (2, pad("系统实测订单创建到回执归档共12步，异常单自动重推。")),
+        (3, pad("无关填充块三")),
+        (4, pad("订单管理（应答）：" + crit_desc)),
+    ]
+    assert all(len(t) == 100 for _i, t in chunks)
+
+    def fake_embed_batch(texts):
+        out = []
+        for t in texts:
+            if "订单管理（应答）" in t:
+                out.append([0.9, 0.0])   # 复述块余弦最高
+            elif "订单创建到回执归档" in t:
+                out.append([0.7, 0.0])   # 真实内容块次高
+            else:
+                out.append([0.1, 0.0])
+        return out
+
+    monkeypatch.setattr(embed_client, "embed_one", lambda t: [1.0, 0.0])
+    monkeypatch.setattr(embed_client, "embed_batch", fake_embed_batch)
+
+    # 预算 220 只装得下 内容块 + 1 邻居；复述块降权 0.9×0.25=0.225 < 0.7 后
+    # 内容块先入选（旧语义复述块 0.9 首选，内容块被挤出预算）
+    out = select_chunks_by_vector(
+        chunks, "订单管理功能", budget=220, criterion=criterion)
+    assert out is not None
+    picked, meta = out
+    picked_text = "\n".join(t for _i, t in picked)
+    assert "订单创建到回执归档" in picked_text
+    assert "订单管理（应答）" not in picked_text
+    assert 2 in meta["ids"]
+
+
+def test_restatement_weight_mixed_block_not_downweighted():
+    """"前半引用细则 + 后半真实方案"的混合块不得被整块降权。
+
+    2026-10-29 审查 P2：反向包含（细则⊆块正文）曾把混合块降 0.25——
+    唯一实质证据被踢出证据簇，恰好复现"无证据弃权 0 分"的失败模式。
+    二元组占比天然处理：混合块随真实内容占比上升自然豁免。
+    """
+    from app.engine.selection import criterion_restatement_weight
+
+    crit_desc = "订单管理模块需支持订单全生命周期管理，含状态同步与异常回执。"
+    criterion = {"name": "订单管理功能", "description": crit_desc, "max_score": "5"}
+    pure = "订单管理（应答）：" + crit_desc
+    mixed = (
+        crit_desc
+        + "我司实现方案：订单创建到回执归档共 12 步，异常单自动重推三次后转人工，"
+        + "并配套监控告警与月度对账机制，已在我司承建的三个同类项目上线运行。"
+    )
+    assert criterion_restatement_weight(pure, criterion) == 0.25
+    assert criterion_restatement_weight(mixed, criterion) == 1.0
+
+
+def test_keyword_selection_restatement_downweighted(monkeypatch):  # noqa: ANN001
+    """关键词路径（缺省模式/嵌入熔断回退）复述块降权：逐字含全部关键词的
+    复述应答表不得霸占预算，真实内容块入选。
+
+    2026-10-29 审查 P2：keyword 是 config.selection_mode() 缺省值，
+    _select_once 未接 restatement_w 时 run 63 同型故障在缺省路径原样复现。
+    """
+    from app import config as app_config
+    from app.engine.selection import _select_once
+
+    crit_desc = "订单管理模块需支持订单全生命周期管理，含状态同步与异常回执。"
+    criterion = {"name": "订单管理", "description": crit_desc, "max_score": "5"}
+
+    def pad(s: str) -> str:
+        return s + "x" * (80 - len(s))
+
+    chunks = [
+        (0, pad("订单管理（应答）：" + crit_desc)),  # 复述：逐字含 name+description
+        (1, pad("无关填充块一")),
+        (2, pad("订单管理实测：创建到回执归档 12 步，异常单自动重推。")),
+        (3, pad("无关填充块三")),
+    ]
+
+    monkeypatch.setattr(app_config, "selection_mode", lambda: "keyword")
+    # 预算只装得下内容块+1 邻居：复述块降权后不得挤掉真实内容块
+    picked, meta = _select_once(chunks, criterion, budget=len(chunks[2][1]) * 2 + 10,
+                                 fallback_diffuse=False, score_scale=None, pool=None)
+    picked_ids = set(meta["ids"])
+    assert meta["mode"] == "keyword"
+    assert 2 in picked_ids, picked_ids
+    assert 0 not in picked_ids, picked_ids

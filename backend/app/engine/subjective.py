@@ -590,33 +590,13 @@ def suggest_score_committee(
 def _quote_is_restatement(quote: str, criterion: dict | None) -> bool:
     """引文是否是细则原文的复述（点对点应答表逐字照抄评分标准）。
 
-    复述文本在标书里逐字可定位，但不构成"未提供"的证明——拿要求文本当
-    证据是 2026-10-15 _sanitize_case 防过的同一反模式的镜像（2026-10-29
-    审查 P2：real_zero 曾被应答表复述骗入均值）。结构性判据：归一化后
-    引文与因素名/描述/逐字引文互为包含，或字符二元组重合度 ≥ 0.6。
+    判据实现委托 selection.quote_is_restatement（选段/证据地图路径共用同一
+    核心，2026-10-29 去重）；函数名与返回语义不变——test_abstain_aggregation
+    的弃权行为断言仍以本符号为门禁。
     """
-    if not criterion:
-        return False
+    from app.engine.selection import quote_is_restatement
 
-    def _norm(s: str) -> str:
-        return re.sub(r"[\s　，。；：、（）()【】\[\]《》〈〉.,;:!?？！“”‘’\"']", "", s)
-
-    q = _norm(quote)
-    if len(q) < 8:
-        return False  # 太短无法判定，交给引文闸门
-    for key in ("name", "description", "source_quote"):
-        blob = _norm(str(criterion.get(key) or ""))
-        if not blob:
-            continue
-        # 只认"引文⊆细则文本"（纯复述）；不反向包含——"本节未涉及订单管理功能"
-        # 这类真实缺证陈述会包含短因素名，反向判会误伤真实 0 票
-        if q in blob:
-            return True
-        gb = set(zip(blob, blob[1:]))
-        gq = set(zip(q, q[1:]))
-        if gb and len(gq & gb) / len(gq) >= 0.6:
-            return True
-    return False
+    return quote_is_restatement(quote, criterion)
 
 
 def _subitem_vote_state(entry: dict, verify_quote=None, criterion=None) -> tuple[str, str]:  # noqa: ANN001
