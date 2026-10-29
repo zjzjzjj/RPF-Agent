@@ -76,7 +76,11 @@ def _warnings(db: Path, document_id: int) -> list[str]:
     if not row or not row[0]:
         return []
     try:
-        return [str(w.get("message") or w) for w in json.loads(row[0])]
+        # warnings_json 条目混有 dict 与裸字符串（如"材料页 OCR 救援：第 111 页"）
+        return [
+            str(w.get("message") or w) if isinstance(w, dict) else str(w)
+            for w in json.loads(row[0])
+        ]
     except (TypeError, ValueError):
         return []
 
