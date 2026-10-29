@@ -98,6 +98,56 @@ def test_locate_section_none() -> None:
     assert not sec.found
 
 
+def test_locate_section_index_range_page_before_业绩() -> None:
+    """索引行"第45页到第71页 …… 业绩案例"（页码在前、业绩在后）必须命中。
+
+    7.10 用友实证：旧正则只认"业绩在前"语序 → 不命中 → 被无邻近约束的 PAREN
+    变体抢配到同页其他模块的（112-127）页 → 段错位到技术方案章节 → rows(0)。
+    """
+    pages = [
+        PageRec(25, "商务技术文件索引目录\n第27页到第28页 2.1 投标保证金\n"
+                    "第45页到第71页 2.8 投标人类似项目业绩案例\n"
+                    "第112页到第127页 2.11 技术服务方案\n- 25 -", "text"),
+        PageRec(45, "2.8 投标人类似项目业绩案例\n序号 项目名称 合同金额 合同签订时间", "text"),
+    ]
+    sec = locate_section(pages)
+    assert sec.found
+    assert (sec.start, sec.end) == (45, 71)
+    assert sec.method == "index_offset"
+
+
+def test_locate_section_paren_requires_业绩_line() -> None:
+    """PAREN 变体只在含"业绩"的行内匹配（同页其他模块的（X-Y）页不得抢配）。"""
+    pages = [
+        PageRec(10, "详细评审索引表\n技术文件（112-127）页\n"
+                    "见投标文件（45-71）页 投标人业绩\n- 10 -", "text"),
+        PageRec(45, "投标人类似项目业绩案例 序号 项目名称 合同金额", "text"),
+    ]
+    sec = locate_section(pages)
+    assert sec.found
+    assert (sec.start, sec.end) == (45, 71), f"抢配到他模块区间：{sec}"
+
+
+def test_locate_section_boundary_body_hit_not_truncated() -> None:
+    """章节边界关键词命中在**正文深处**（页首 300 字符外）不得截断证据段。
+
+    7.10 云锦实证：案例#1 合同扫描页正文「项目运维服务方案一份」@807 触发
+    _BOUNDARY → 段被截在 p59，其后 60 余页材料全部丢失。真正的下章节标题
+    （「乙方项目团队」@40）在页首区，正常截断。
+    """
+    pages = [
+        PageRec(20, "业绩案例 序号 项目名称 合同金额", "text"),
+        # 边界词在正文深处（>300 字符标题区之外）：前置足量正文
+        PageRec(21, "合同正文开头" + "正文" * 200
+                    + "（1）经甲方审核通过的项目运维服务方案一份；", "text"),
+        PageRec(22, "乙方项目团队\n" + "表格" * 200, "text"),  # 真边界：页首标题
+        PageRec(23, "后续章节", "text"),
+    ]
+    sec = locate_section(pages)
+    assert sec.method == "heading_window"
+    assert sec.end == 21, f"正文命中不应截断：{sec}"
+
+
 # ---------------------------------------------------------------------------
 # 案例 → 材料页绑定
 # ---------------------------------------------------------------------------
@@ -221,6 +271,78 @@ def test_material_ocr_targets_select_unreadable_material_pages() -> None:
     ]
     ratios = {11: 0.22, 12: 0.0, 13: 0.02}
     sec = type(locate_section([]))(10, 20, "index_offset", 1.0, 0)
+    targets = material_ocr_targets(pages, ratios, sec)
+    assert targets == [11]
+
+
+def test_classify_medium_text_image_page_is_unreadable() -> None:
+    """200~800 字 + 图≥0.10 的「标题+扫描图」页 → None/unreadable（可救援）。
+
+    7.10 实证：旧口径（<200）把这类页判 False/absent（"确认缺失"）且永远
+    进不了救援名单。统一为 _low_evidence（<800）口径。
+    """
+    pages = [
+        PageRec(10, "某某项目合同 甲方 乙方 合同金额", "text"),
+        PageRec(11, "2. 发票扫描件\n" + "说明文字" * 40, "text"),  # ~330 字
+    ]
+    b = _run_classify(pages, {11: 0.20}, [10, 11])
+    assert b.status["invoice"] is None
+    assert b.reasons["invoice"] == "unreadable"
+
+
+def test_classify_medium_text_no_image_stays_absent() -> None:
+    """对照：同等文本量但无图 → 仍 False/absent（可读页缺席判定不受影响）。"""
+    pages = [
+        PageRec(10, "某某项目合同 甲方 乙方 合同金额", "text"),
+        PageRec(11, "普通正文无图" + "说明文字" * 40, "text"),
+    ]
+    b = _run_classify(pages, {11: 0.0}, [10, 11])
+    assert b.status["invoice"] is False
+    assert b.reasons["invoice"] == "absent"
+
+
+def test_material_ocr_targets_includes_scan_unverified_block() -> None:
+    """scan_unverified 块同样进救援靶（OCR 后才能核验信号）。"""
+    pages = [PageRec(i, "扫描页" * 30, "text") for i in range(10, 14)]
+    ratios = {i: 0.5 for i in range(10, 14)}
+    block = CaseBlock(
+        row=CaseRow(1, "某项目", None, None, 10),
+        pages=list(range(10, 14)),
+        status={"contract": True, "invoice": None, "acceptance": None},
+        reasons={"contract": "signal", "invoice": "scan_unverified",
+                 "acceptance": "scan_unverified"},
+    )
+    sec = SectionGuess(10, 20, "index_offset", 1.0, 0)
+    targets = material_ocr_targets(pages, ratios, sec, blocks=[block], per_block=2)
+    assert targets == [10, 11]
+
+
+def test_material_ocr_targets_fair_budget_across_blocks() -> None:
+    """总预算块间轮转：10 块各需救援、max_total=6 → 覆盖 6 个不同块（防顺序饿死）。"""
+    pages = [PageRec(i, "短文本页", "text") for i in range(10, 70)]
+    ratios = {i: 0.3 for i in range(10, 70)}
+    blocks = []
+    for bno in range(10):
+        p0 = 10 + bno * 5
+        blocks.append(CaseBlock(
+            row=CaseRow(bno + 1, f"项目{bno}", None, None, p0),
+            pages=list(range(p0, p0 + 5)),
+            status={"contract": None, "invoice": None, "acceptance": None},
+            reasons={"contract": "scan_unverified", "invoice": "scan_unverified",
+                     "acceptance": "scan_unverified"},
+        ))
+    sec = SectionGuess(10, 69, "index_offset", 1.0, 0)
+    targets = material_ocr_targets(pages, ratios, sec, blocks=blocks, per_block=2, max_total=6)
+    assert len(targets) == 6
+    owners = {(t - 10) // 5 for t in targets}
+    assert len(owners) == 6, f"预算必须块间轮转而非顺序截断：{targets}"
+
+
+def test_material_ocr_targets_skips_ocr_source_pages() -> None:
+    """已 OCR 页（source != text）不入靶（幂等，2026-10-21 语义）。"""
+    pages = [PageRec(10, "短", "ocr"), PageRec(11, "短", "text")]
+    ratios = {10: 0.5, 11: 0.2}
+    sec = SectionGuess(10, 20, "index_offset", 1.0, 0)
     targets = material_ocr_targets(pages, ratios, sec)
     assert targets == [11]
 

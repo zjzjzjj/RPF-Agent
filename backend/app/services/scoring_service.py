@@ -655,7 +655,10 @@ def execute_run(
 
     # 业绩案例证据（确定性）：索引+页脚定位证据段 → PyMuPDF 表 → 案例 → 材料三态。
     # 每投标人只做一次，同一家所有业绩类计数项复用。
+    # section 常驻（7.10 用友实证）：表解析失败时旧代码把已定位的证据段一并丢弃
+    # → LLM 候选页拿不到 section → 材料扫描页（无锚点词）进不了送审窗口。
     case_evidence_by_bidder: dict[int, dict] = {}
+    section_by_bidder: dict[int, tuple[int, int]] = {}
     if _has_perf:
         from app.db.models import Document as _Doc
         from app.evidence.case_evidence import (
@@ -675,6 +678,7 @@ def execute_run(
             sec = locate_section(recs)
             if not sec.found:
                 continue
+            section_by_bidder[bid_id] = (sec.start, sec.end)
             doc_id = main_doc_by_bidder.get(bid_id)
             pdf_path = None
             with session_scope() as s:
@@ -829,6 +833,7 @@ def execute_run(
                 stats_out=case_stats,
                 page_cats=page_cats_by_bidder.get(bid_id),
                 prefer={"qualification", "commercial"},
+                section=section_by_bidder.get(bid_id),
             )
             if cases:
                 c_scoring = {**c_scoring, "verified_cases": cases}
@@ -1337,6 +1342,7 @@ def _case_candidate_pages(
     *,
     page_cats: dict[int, str] | None = None,
     prefer: set[str] | None = None,
+    section: tuple[int, int] | None = None,
 ) -> list[list[tuple[int, str]]]:
     """业绩/人员案例核验的候选页 → 剔除"要求复述页" → 按预算切批。
 
@@ -1373,6 +1379,15 @@ def _case_candidate_pages(
     idx: set[int] = set()
     for i in hits:
         idx.update({i - 1, i, i + 1})
+    anchor_idx = {i for i in idx if 0 <= i < len(pages)}
+    # section 感知（7.10 用友实证）：确定性业绩表解析失败时，锚点±1 圈不住材料页
+    # （扫描页无锚点词）→ LLM 视野里没有证据页。section 内全部页并入候选，锚点页
+    # 仍排前（排序键），4 批预算与 pages_omitted 留痕不变。
+    if section:
+        lo, hi = section
+        for i, (no, _t, _s) in enumerate(pages):
+            if lo <= no <= hi:
+                idx.add(i)
     ordered = sorted(i for i in idx if 0 <= i < len(pages))
     n_candidates = len(ordered)
 
@@ -1387,24 +1402,37 @@ def _case_candidate_pages(
         _person_mat = _re.compile(
             r"社保|参保|缴纳|经验证明|工作经验证明|劳动合同|社会保障号|缴费明细"
         )
+        # 材料标题页：人员业绩的证明材料（发票/验收/中标通知书/业主证明/合同复印件
+        # 扫描页）**必须**送审——7.10 实证：旧词表把这些页整页排除，LLM 视野里 0 张
+        # 材料页 → 逐案例判"缺证明材料"（航天拓扑业绩段 32 页仅 3 页进送审、派克
+        # 业绩段 44-78 共 0 页）。只放行带**明确材料标题**的页；纯合同头页（合同
+        # 金额+甲方乙方、无人员词）仍排除——c59/c60 误带偏回归防线不变。
+        _person_material_page = _re.compile(
+            r"发票扫描|发票|验收报告|验收单|中标通知书|业主证明|用户证明"
+            r"|合同复印件|合同扫描"
+        )
         kept = []
         for i in ordered:
             t = _cleaned(pages[i][1])
-            if not _person_evidence.search(t):
-                continue  # 无人物证据 → 排除（项目合同页、发票页等）
+            if not (_person_evidence.search(t) or _person_material_page.search(t)):
+                continue  # 无人物证据且非材料标题页 → 排除（纯项目合同页等）
             kept.append(i)
-        # 类内页（材料类别标签命中 prefer）优先于人员材料词命中，装批截断时保住类内页
+        # 类内页（材料类别标签命中 prefer）优先于人员材料词命中，装批截断时保住类内页；
+        # 排序层：社保/经验证明 > 材料标题页 > 其余人员证据页
         _prefer = prefer or set()
         kept.sort(key=lambda i: (
             0 if (page_cats or {}).get(pages[i][0]) in _prefer else 1,
-            0 if _person_mat.search(_cleaned(pages[i][1])) else 1,
+            0 if _person_mat.search(_cleaned(pages[i][1])) else
+            (1 if _person_material_page.search(_cleaned(pages[i][1])) else 2),
             i,
         ))
         ordered = kept
     else:
-        # 项目级：类内页 → 人员证据页 → 其余（让 LLM 优先看到人员表）
+        # 项目级：锚点页 → 类内页 → 人员证据页 → 其余（让 LLM 优先看到证据页；
+        # section 并入的非锚点页排在锚点页之后）
         _prefer = prefer or set()
         ordered.sort(key=lambda i: (
+            0 if i in anchor_idx else 1,
             0 if (page_cats or {}).get(pages[i][0]) in _prefer else 1,
             0 if _person_re.search(_cleaned(pages[i][1])) else 1,
             i,
@@ -1490,6 +1518,7 @@ def _llm_verify_cases(
     *,
     page_cats: dict[int, str] | None = None,
     prefer: set[str] | None = None,
+    section: tuple[int, int] | None = None,
 ) -> list[dict] | None:
     """带证明材料要求的计数项：LLM 逐案例列出并核对材料齐全性。
 
@@ -1513,7 +1542,7 @@ def _llm_verify_cases(
     person_scope_raw = str((c.get("params") or {}).get("person_scope") or "")
     batches = _case_candidate_pages(
         pages, echo_n=echo_n, stats_out=stats_out, person_scope=person_scope_raw,
-        page_cats=page_cats, prefer=prefer,
+        page_cats=page_cats, prefer=prefer, section=section,
     )
     if not batches:
         return None
@@ -1573,6 +1602,9 @@ def _llm_verify_cases(
                 continue
             case = _sanitize_case(x, requirement_text, bid_norm=bid_norm, echo_n=echo_n,
                                   person_scope=person_scope_raw)
+            # D4 审计留痕：LLM 路径案例显式标 source——闸门的 table 救援分支
+            # （case_source=="table"）明确不适用于 LLM 案例
+            case.setdefault("case_source", "llm")
             key = (
                 str(case.get("name") or "").strip().lower(),
                 str(case.get("person") or "").strip(),
@@ -1630,7 +1662,9 @@ def _sanitize_case(
         _cut = re.split(r"[（(]", _name_n, maxsplit=1)[0]
         if len(_cut) >= 8 and _cut in bid_norm:
             return _cut, _cut
-        for _plen in (24, 16, 12):
+        # 前缀梯尾接 config.case_name_prefix_min()（默认 8）——与 case_evidence
+        # 的 _name_prefixes 同源（C2：消除两处硬编码漂移）
+        for _plen in (24, 16, 12, config.case_name_prefix_min()):
             if len(_name_n) > _plen and _name_n[:_plen] in bid_norm:
                 return _name_n[:_plen], _name_n[:_plen]
         return None
@@ -1752,8 +1786,18 @@ def _sanitize_case(
         _project_keys = ("contract", "invoice", "acceptance")
         # 有 person 值（非空）→ 人员级；否则项目级
         _is_person = _is_person_scope or any(_has_person_value(k) for k in _person_keys)
-        for key in (_person_keys if _is_person else _project_keys):
-            case[key] = False
+        keys = _person_keys if _is_person else _project_keys
+        if reason in ("quote_not_in_bid", "quote_too_short"):
+            # 引文定位失败型（OCR 串行噪声/过短且无锚）≠ 作弊证据：机器没核上
+            # ≠ 材料确认缺失。置 None + 记 unverified，闸门侧归"不可读"转人工
+            # （与 objective 侧丢弃分账配套，否则这类 0 分伪装 confirmed_absent）。
+            # 作弊型（requirement_shadow/project_header_not_person）维持 False。
+            for key in keys:
+                case[key] = None
+            case["unverified"] = reason
+        else:
+            for key in keys:
+                case[key] = False
     case["sanitized"] = reason
     if tier is not None:
         case["match_tier"] = tier
@@ -1982,8 +2026,13 @@ def _count_zero_warn_entry(result, audit: dict | None) -> tuple[dict, bool]:
     if not zero_reason and score == 0:
         # 兜底：audit 缺席时从 result 侧取（异常路径的 SimpleNamespace 已带字段）
         zero_reason = getattr(result, "zero_reason", None)
-    unreadable_zero = zero_reason == "unreadable" and score == 0
-    if unreadable_zero:
+    # type_gate（类型门槛剔空）与 unreadable 同级：0 分是类型判断结论而非
+    # "未提供材料"，必须转人工核看（7.10 实证：集成/维保类案例被剔后
+    # 曾伪装 confirmed_absent/pass）
+    unreadable_zero = zero_reason in ("unreadable", "type_gate") and score == 0
+    if zero_reason == "type_gate" and score == 0:
+        msg = f"{result.detail}；零分理由：类型门槛剔除（type_gate），非材料缺失，建议人工核看"
+    elif unreadable_zero:
         msg = f"{result.detail}；零分理由：机器不可见（unreadable），非确认缺失，建议人工核看"
     elif score == 0 and zero_reason == "confirmed_absent":
         msg = f"{result.detail}；零分理由：确认未提供（confirmed_absent）"

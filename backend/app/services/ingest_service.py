@@ -287,7 +287,11 @@ def rescue_material_pages(document_id: int, max_pages: int | None = None) -> dic
         if table_rows:
             blocks = link_case_blocks(table_rows, recs, sec)
             classify_materials(blocks, recs, ratios)
-    targets = material_ocr_targets(recs, ratios, sec, blocks=blocks or None)[: max(0, limit)]
+    # 预算传入选靶函数内部做块间公平轮转——外部 [:limit] 顺序截断会让排在
+    # 后面的案例块整批饿死（run 60 实证）
+    targets = material_ocr_targets(
+        recs, ratios, sec, blocks=blocks or None, max_total=max(0, limit)
+    )
     if not targets:
         return {"document_id": document_id, "targets": 0, "rescued": 0, "pages": []}
     try:

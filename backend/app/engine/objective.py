@@ -757,9 +757,15 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                     f"；{len(cases)} 个案例的引文均未通过核验（{_breakdown}），"
                     f"按 {score} 分计入并标疑问"
                 )
-            # 引文全毙且分数仍为 0 → 计数无依据（no_facts），不是确认缺失
+            # 引文全毙且分数仍为 0：作弊型（requirement_shadow 等）→ 计数无依据
+            # （no_facts）；**定位失败型**（quote_not_in_bid/quote_too_short，OCR
+            # 串行噪声最常见）→ 归 unreadable 转人工——机器没核上 ≠ 没有材料
             if score == 0:
-                zero_reason = "no_facts"
+                _locate_fail_kinds = {"quote_not_in_bid", "quote_too_short"}
+                if _reasons and all(k in _locate_fail_kinds for k in _reasons):
+                    zero_reason = "unreadable"
+                else:
+                    zero_reason = "no_facts"
         else:
             cases = clean_cases
             # 已有逐案例核验结果 = 计数有依据；清掉"字段缺失/未抽到事实"的 unresolved
@@ -767,6 +773,7 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
             unresolved = None
             zero_reason = None
             _type_gate_note = ""
+            _type_dropped = 0
             # 人员级：按负责人/成员过滤；模型完全没给 role 时退回全部案例并标疑问
             if person_scope:
                 roles = [_normalize_role(c) for c in cases]
@@ -798,6 +805,7 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                         if len(_typed) < len(cases):
                             _ntype = len(cases) - len(_typed)
                             cases = _typed
+                            _type_dropped = _ntype
                             conflict = True
                             # detail 在本分支末尾整体重建 → 用 note 变量传递
                             _type_gate_note = (
@@ -844,11 +852,13 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
             complete: list[dict] = []
             null_counted = 0
             null_dropped = 0
+            dropped_false = 0
             null_policy = config.case_null_policy()
             for c in cases:
                 vals = {k: c.get(k) for k in required_flags}
                 if any(v is False for v in vals.values()):
-                    continue  # 确认缺失 → 不计
+                    dropped_false += 1  # 确认缺失 → 不计
+                    continue
                 if any(v is None and k in _strict_none for k, v in vals.items()):
                     # 明确要求的材料不可读 → 按"不全不得分"不计，但必须可见：
                     # 不可读≠确认缺失（可能是扫描件），静默丢弃会把"OCR 没看见"
@@ -879,31 +889,40 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                     complete.append(c)
                     null_counted += 1
                     conflict = True
+                    continue
+                # 未命中任何救援（含 None 未计）→ 归"不可读丢弃"，不得混进
+                # "确认缺失"（旧口径 incomplete 混账让 OCR 没看见的 0 分
+                # 伪装成 confirmed_absent/pass，不转人工）
+                null_dropped += 1
             effective = min(Decimal(len(complete)), Decimal(max_items)) if max_items else Decimal(len(complete))
             score = (effective * per_item).quantize(Decimal("0.01"))
             if max_score and score > max_score:  # 封顶：真实规则"最高得 M 分"
                 score = max_score
-            incomplete = len(cases) - len(complete)
             detail = (
                 f"逐案例核验：提供案例 {len(cases)} 个，其中可计 {len(complete)} 个"
-                + (f"（{incomplete} 个缺证明材料不计分）" if incomplete else "")
+                + (f"（{dropped_false} 个缺证明材料不计分）" if dropped_false else "")
                 + (f"（{null_counted} 个材料页不可读，按已提供计并标疑问）" if null_counted else "")
                 + (f"（{null_dropped} 个案例材料页不可读未计，可能为扫描件，建议人工核看）"
                    if null_dropped else "")
                 + _type_gate_note
             )
-            if incomplete or null_dropped:
+            if dropped_false or null_dropped:
                 conflict = True
             # 零分理由分离（W1-C，run 60 实证）："5 个案例材料页不可读未计"仍记
             # 0 分——分数维持规则硬口径不改（不提供/不全不得分），但 0 的性质要
-            # 区分：点名材料页不可读(None)未计 → "unreadable"（机器不可见，非确认
+            # 区分：材料页不可读(None)未计 → "unreadable"（机器不可见，非确认
             # 缺失，强制转人工）；确认缺失(False)未计 → "confirmed_absent"。
             # 优先 unreadable：只要存在不可读丢弃且总分 0，就不能伪装成确认缺失。
             if score == 0:
                 if null_dropped:
                     zero_reason = "unreadable"
-                elif incomplete:
+                elif dropped_false:
                     zero_reason = "confirmed_absent"
+                elif _type_dropped:
+                    # 类型门槛剔空（"类似运维"过滤掉全部案例）：0 分是类型判断
+                    # 结论而非"未提供材料"——转人工核看（7.10 实证：集成/维保类
+                    # 案例被剔后伪装 confirmed_absent/pass）
+                    zero_reason = "type_gate"
     elif artifacts:
         conflict = True
         detail += "；该评分项含证明材料要求，材料齐全性需人工核对原件（AI 逐案例核验未执行）"

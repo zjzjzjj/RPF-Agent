@@ -45,10 +45,15 @@ _RE_ACCEPTANCE = re.compile(
 _RE_MATERIAL_HEADING = re.compile(r"发票|验收|业主证明|用户证明|合同|证书|扫描件")
 
 _RE_DATE = re.compile(r"(\d{4})\s*[年.\-/]\s*(\d{1,2})\s*[月.\-/]\s*(\d{1,2})\s*日?")
-# 索引行：业绩案例 …… 第118页到第167页 / （118-167）页
+# 索引行：业绩案例 …… 第118页到第167页 / 第45页到第71页 …… 业绩案例（7.10 实证：
+# 真实行文是"第45 页到第71 页 2.8 投标人类似项目业绩案例"——**页码在前、业绩在后**，
+# 旧正则只认"业绩在前"→不命中，随后被无邻近约束的 PAREN 变体抢配到同页其他模块的
+# （112-127）页 → 段错位到技术方案章节）。故双向支持；分组 (1,2)=(前,后)。
 _RE_INDEX_RANGE = re.compile(
-    r"业绩[^\n]{0,40}?第?\s*(\d{1,4})\s*页?\s*(?:到|至|—|－|-|~|～)\s*第?\s*(\d{1,4})\s*页"
+    r"(?:业绩[^\n]{0,40}?第?\s*(\d{1,4})\s*页?\s*(?:到|至|—|－|-|~|～)\s*第?\s*(\d{1,4})\s*页"
+    r"|第?\s*(\d{1,4})\s*页?\s*(?:到|至|—|－|-|~|～)\s*第?\s*(\d{1,4})\s*页[^\n]{0,40}?业绩)"
 )
+# 括号变体**必须**限定在含"业绩"的行内匹配（同页其他模块的（X-Y）页不得抢配）
 _RE_INDEX_RANGE_PAREN = re.compile(r"[（(]\s*(\d{1,4})\s*[-—~～至到]\s*(\d{1,4})\s*[）)]\s*页")
 # 页脚印刷页码： ``- 118 -`` / ``第16 页`` / 裸数字行
 _RE_FOOTER_DASH = re.compile(r"^[-—－]\s*(\d{1,4})\s*[-—－]$")
@@ -234,6 +239,11 @@ def _find_case_table_header_page(pages: list[PageRec]) -> int | None:
 
 
 _BOUNDARY = re.compile(r"保密承诺书|项目团队|技术方案|技术服务方案|服务方案|售后服务|培训服务")
+# 章节边界命中必须落在**页首标题区**：扫描合同条款正文天然含"服务方案/技术方案"等词
+# （7.10 实证：云锦案例#1 合同扫描页正文「经甲方审核通过的项目运维服务方案一份」@807
+#  → 段被截在 p59，其后 60 余页材料全部丢失）。真正的下章节标题（p65「乙方项目团队」
+#  @40）总在页首区。300 字符 = 通用标题区窗口，非项目拟合。
+_BOUNDARY_HEADING_ZONE = 300
 
 
 def _extend_until_boundary(pages: list[PageRec], start: int, max_pages: int) -> int:
@@ -245,8 +255,14 @@ def _extend_until_boundary(pages: list[PageRec], start: int, max_pages: int) -> 
         if p is None:
             continue
         text = p.text or ""
-        # 起始页之后遇到章节边界且有较实质正文 → 截断
-        if pno > start and _BOUNDARY.search(text) and len(text) > 200:
+        # 起始页之后遇到章节边界（且命中在页首标题区）且有较实质正文 → 截断
+        m = _BOUNDARY.search(text)
+        if (
+            pno > start
+            and m
+            and m.start() < _BOUNDARY_HEADING_ZONE
+            and len(text) > 200
+        ):
             break
         end = pno
         count += 1
@@ -270,11 +286,23 @@ def locate_section(
             continue
         if not ("索引" in t or "详细评审" in t or "评审索引" in t):
             continue
-        m = _RE_INDEX_RANGE.search(t) or _RE_INDEX_RANGE_PAREN.search(t)
+        m = _RE_INDEX_RANGE.search(t)
+        if not m:
+            # 括号变体只在"业绩行"内匹配——同页其他模块的（X-Y）页不得抢配
+            for ln in t.splitlines():
+                if "业绩" in ln:
+                    m = _RE_INDEX_RANGE_PAREN.search(ln)
+                    if m:
+                        break
         if not m:
             continue
         try:
-            printed_start, printed_end = int(m.group(1)), int(m.group(2))
+            # 双向主正则：前向（业绩…范围）用组 1/2，反向（范围…业绩）用组 3/4；
+            # PAREN 变体只有组 1/2（后两组为 None）。注意 re.Match.group 无默认值
+            # 参数——m.group(3, None) 会被当成请求两个分组而抛 "no such group"。
+            g1, g2, g3, g4 = (m.groups() + (None, None, None, None))[:4]
+            printed_start = int(g1 or g3)
+            printed_end = int(g2 or g4)
         except Exception:
             continue
         printed_here = _printed_page(t)
@@ -439,7 +467,14 @@ def _norm_text(text: str) -> str:
     return normalize_no_ws(text or "")
 
 
-def _name_prefixes(name: str, lengths: tuple[int, ...] = (12, 10, 8)) -> list[str]:
+def _name_prefixes(name: str, lengths: tuple[int, ...] | None = None) -> list[str]:
+    """案例名归一化前缀（长→短）。默认尾长接 `config.case_name_prefix_min()`
+    （默认 8），与 scoring_service `_sanitize_case._case_name_hit` 前缀梯同源
+    （C2：消除两处硬编码漂移）。"""
+    if lengths is None:
+        from app import config
+
+        lengths = (12, 10, config.case_name_prefix_min())
     n = _norm_text(name)
     out: list[str] = []
     for L in lengths:
@@ -488,6 +523,16 @@ def link_case_blocks(
     return blocks
 
 
+def _low_evidence(text: str, ratio: float) -> bool:
+    """低证据页（统一口径）：图占比≥0.10 且文本<800 字符。
+
+    800 = `config.OCR_MIXED_PAGE_MAX_CHARS`（救援选靶与混合页 OCR 触发同口径）。
+    旧分类口径用 <200，与选靶的 <800 不一致——200~800 字的「标题+扫描图」页被
+    判 False/absent（"确认缺失"）且**永远进不了救援名单**（7.10 派克实证 5 页）。
+    """
+    return ratio >= 0.10 and len((text or "").strip()) < 800
+
+
 def classify_materials(
     blocks: list[CaseBlock],
     pages: list[PageRec],
@@ -496,7 +541,7 @@ def classify_materials(
     """对每个案例块按强信号判定 contract/invoice/acceptance 三态（就地修改）。
 
     - 强信号命中且页可读 → True
-    - 页在但不可读（短文本 + 图片占比≥0.10）→ None(reason=unreadable)
+    - 页在但低证据（短文本 + 图片占比≥0.10，`_low_evidence` 口径）→ None(reason=unreadable)
     - **扫描页无特征 → None(reason=scan_unverified)**：图占比高或 OCR 来源的页
       上找不到票据特征 = 不可见 ≠ 不存在（2026-10-27 训练集测试2 实证：有业主
       证明但发票是扫描件，旧口径判 False「确认缺失」→ 业绩全灭，人工照计）
@@ -514,8 +559,9 @@ def classify_materials(
         unreadable_pages = [
             no
             for no in b.pages
-            if len((by_no.get(no).text if by_no.get(no) else "").strip()) < 200
-            and ratios.get(no, 0.0) >= 0.10
+            if _low_evidence(
+                by_no.get(no).text if by_no.get(no) else "", ratios.get(no, 0.0)
+            )
         ]
         # 扫描页（图占比 ≥0.35 或 OCR 来源）：文本层不可信，缺席判定不成立
         scan_pages = [
@@ -570,13 +616,18 @@ def material_ocr_targets(
     section: SectionGuess,
     blocks: list[CaseBlock] | None = None,
     per_block: int = 2,
+    max_total: int | None = None,
 ) -> list[int]:
     """选出需定向 OCR 的材料页。
 
-    有案例块时**只救援"材料不可读"的案例块**，且每块最多 `per_block` 页——
-    证据段里短文本+图片页可能几十页，全送 OCR 会打爆服务（2026-10-21 doc24
-    61 页断言实证：远程 OCR 熔断→整本救援失败）。
-    无块时回退为证据段内短文本+图片页（限 8 页）。
+    有案例块时**只救援"材料不可读/扫描待核"的案例块**（reasons ∈ unreadable/
+    scan_unverified——scan_unverified 页同样需要 OCR 后才能核验信号），且每块每轮
+    最多 `per_block` 页——证据段里短文本+图片页可能几十页，全送 OCR 会打爆服务
+    （2026-10-21 doc24 61 页断言实证：远程 OCR 熔断→整本救援失败）。
+    块间**轮转分配**（第一轮每块 ≤per_block，预算未用完第二轮追加）——旧实现按
+    块顺序截断，排在后面的案例块整批饿死（run 60 实证）。
+    块内排序：材料标题命中 → 图占比降序 → 页码升序（把预算花在最像材料页的页上）。
+    无块时回退为证据段内低证据页（限 `max_total` 或 8 页），同排序。
     """
     if not section.found:
         return []
@@ -586,37 +637,68 @@ def material_ocr_targets(
         p = by_no.get(no)
         if p is None or (p.source or "") != "text":
             return False
-        t = (p.text or "").strip()
-        return len(t) < 800 and image_ratios.get(no, 0.0) >= 0.10
+        return _low_evidence(p.text or "", image_ratios.get(no, 0.0))
+
+    def _rank(no: int) -> tuple:
+        p = by_no.get(no)
+        t = ((p.text if p else "") or "")
+        return (
+            0 if _RE_MATERIAL_HEADING.search(t) else 1,
+            -image_ratios.get(no, 0.0),
+            no,
+        )
 
     out: list[int] = []
     seen: set[int] = set()
     if blocks:
+        needing: list[list[int]] = []
         for b in blocks:
             needs = any(
-                (b.status or {}).get(m) is None and (b.reasons or {}).get(m) == "unreadable"
+                (b.status or {}).get(m) is None
+                and (b.reasons or {}).get(m) in ("unreadable", "scan_unverified")
                 for m in ("contract", "invoice", "acceptance")
             )
             if not needs:
                 continue
-            cnt = 0
-            for no in b.pages:
-                if no in seen or not unreadable(no):
-                    continue
-                out.append(no)
-                seen.add(no)
-                cnt += 1
-                if cnt >= max(1, per_block):
-                    break
-        return out
-    for p in pages:
-        if p.page_no < section.start or p.page_no > section.end:
-            continue
-        if unreadable(p.page_no):
-            out.append(p.page_no)
-            if len(out) >= 8:
+            cand = [no for no in b.pages if no not in seen and unreadable(no)]
+            if cand:
+                needing.append(sorted(cand, key=_rank))
+        if not needing:
+            return []
+        cap = max(1, per_block)
+        # 第一轮：每块 ≤per_block 页，块间轮转（防顺序偏置）
+        for k in range(cap):
+            for cand in needing:
+                if max_total is not None and len(out) >= max_total:
+                    return out
+                remaining = [no for no in cand if no not in seen]
+                if remaining:
+                    out.append(remaining[0])
+                    seen.add(remaining[0])
+        # 第二轮：仅在有总预算时追加（无预算时 per_block 即上限，防失控扩张）
+        if max_total is None:
+            return out
+        while len(out) < max_total:
+            progressed = False
+            for cand in needing:
+                if max_total is not None and len(out) >= max_total:
+                    return out
+                remaining = [no for no in cand if no not in seen]
+                if remaining:
+                    out.append(remaining[0])
+                    seen.add(remaining[0])
+                    progressed = True
+            if not progressed:
                 break
-    return out
+        return out
+    # 无块兜底：段内低证据页（旧硬编码 8 页 → max_total 驱动）
+    limit = max_total if max_total is not None else 8
+    cands = [
+        p.page_no
+        for p in pages
+        if section.start <= p.page_no <= section.end and unreadable(p.page_no)
+    ]
+    return sorted(cands, key=_rank)[: max(0, limit)]
 
 
 # ---------------------------------------------------------------------------

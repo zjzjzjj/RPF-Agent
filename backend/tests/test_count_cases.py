@@ -719,7 +719,12 @@ def test_sanitize_person_case_name_anchor_rescues_short_quote():
 
 
 def test_sanitize_person_case_fabricated_name_still_rejected():
-    """人名回不到标书 → 仍判伪造（防模型编造持证人）。"""
+    """人名回不到标书 → 仍判不可信（防模型编造持证人）。
+
+    C1 语义（2026-10-29）：定位失败型（quote_too_short/quote_not_in_bid）降
+    **None**（不可读≠确认缺失）；案例拒绝靠 sanitized != ok（进不了 clean_cases），
+    不再依赖三件套 False。
+    """
     from app.services.scoring_service import _sanitize_case
 
     case = {
@@ -729,7 +734,7 @@ def test_sanitize_person_case_fabricated_name_still_rejected():
     bid_norm = "拟派团队成员一览表李四特种作业操作证"
     out = _sanitize_case(case, "须提供证书复印件", bid_norm=bid_norm, echo_n="须提供证书复印件")
     assert out["sanitized"] != "ok"
-    assert out["work_proof"] is False
+    assert out["work_proof"] is not True  # 不可信（不可读），不得保持 True
 
 
 def test_sanitize_company_case_null_person_key_not_killed():
@@ -835,12 +840,30 @@ def test_score_count_no_facts_zero_reason() -> None:
 
 
 def test_score_count_cases_unverified_zero_reason() -> None:
-    """引文全毙（cases_unverified）且无回退事实 → zero_reason="no_facts"。"""
+    """引文全毙（cases_unverified）：定位失败型 → unreadable 转人工（D2）。
+
+    全部原因为 quote_not_in_bid/quote_too_short（OCR 串行噪声最常见）时，
+    0 分归"机器不可见"而非 no_facts——机器没核上 ≠ 没有材料。
+    """
+    from app.engine.objective import score_count
+
+    crit = _count_crit(verified_cases=[
+        {"name": "A", "role": "member", "contract": None, "invoice": None,
+         "acceptance": None, "quote": "长伪造引文", "sanitized": "quote_not_in_bid"},
+    ])
+    res = score_count(crit, crit["params"], BidFacts(text=""))
+    assert res.score == Decimal("0")
+    assert res.unresolved == "cases_unverified"
+    assert res.zero_reason == "unreadable"
+
+
+def test_score_count_cases_unverified_cheat_type_stays_no_facts() -> None:
+    """作弊型全毙（requirement_shadow 等）→ 维持 no_facts（D2 反向守门）。"""
     from app.engine.objective import score_count
 
     crit = _count_crit(verified_cases=[
         {"name": "A", "role": "member", "contract": False, "invoice": False,
-         "acceptance": False, "quote": "长伪造引文", "sanitized": "quote_not_in_bid"},
+         "acceptance": False, "quote": "须提供合同复印件发票复印件", "sanitized": "requirement_shadow"},
     ])
     res = score_count(crit, crit["params"], BidFacts(text=""))
     assert res.score == Decimal("0")
@@ -973,3 +996,161 @@ def test_count_zero_warn_entry_confirmed_absent文案区分() -> None:
     assert unreadable_zero is False
     assert "确认未提供" in entry["message"]
     assert entry["zero_reason"] == "confirmed_absent"
+
+
+# ---- 闸门丢弃分账（D1，2026-10-29）------------------------------------------
+def test_score_count_null_drop_without_strict_marks_unreadable() -> None:
+    """非严格键（未点名验收）上的 None 丢弃 → unreadable（旧口径混进
+    incomplete → confirmed_absent/pass，OCR 没看见伪装成确认缺失）。"""
+    from app.engine.objective import score_count
+
+    crit = _perf_crit(
+        required_artifacts="合同复印件、发票复印件",  # 未点名验收 → 无 strict 键
+        verified_cases=[
+            {"name": "A", "contract": None, "invoice": None, "acceptance": None,
+             "sanitized": "ok"},
+        ],
+    )
+    res = score_count(crit, crit["params"], BidFacts(text=""))
+    assert res.score == Decimal("0")
+    assert res.zero_reason == "unreadable"
+    assert "不可读" in res.detail
+
+
+def test_score_count_false_drop_stays_confirmed_absent() -> None:
+    """反向守门：纯 False 丢弃仍归 confirmed_absent（D1 不改计分语义）。"""
+    from app.engine.objective import score_count
+
+    crit = _perf_crit(verified_cases=[
+        {"name": "A", "contract": False, "invoice": False, "acceptance": False,
+         "sanitized": "ok"},
+    ])
+    res = score_count(crit, crit["params"], BidFacts(text=""))
+    assert res.score == Decimal("0")
+    assert res.zero_reason == "confirmed_absent"
+    assert "缺证明材料" in res.detail
+
+
+def test_score_count_mixed_drop_reasons_prefers_unreadable() -> None:
+    """False 与 None 混合丢弃且总分 0 → 优先 unreadable（不可读丢弃存在即转人工）。"""
+    from app.engine.objective import score_count
+
+    crit = _perf_crit(verified_cases=[
+        {"name": "A", "contract": True, "invoice": True, "acceptance": True,
+         "sanitized": "ok"},
+        {"name": "B", "contract": False, "invoice": None, "acceptance": None,
+         "sanitized": "ok"},
+        {"name": "C", "contract": None, "invoice": None, "acceptance": None,
+         "sanitized": "ok"},
+    ])
+    res = score_count(crit, crit["params"], BidFacts(text=""))
+    # A 可计 2 分 → score>0 不带 zero_reason；改为只有 B/C（A 材料不全）
+    crit2 = _perf_crit(verified_cases=[
+        {"name": "B", "contract": False, "invoice": None, "acceptance": None,
+         "sanitized": "ok"},
+        {"name": "C", "contract": None, "invoice": None, "acceptance": None,
+         "sanitized": "ok"},
+    ])
+    res2 = score_count(crit2, crit2["params"], BidFacts(text=""))
+    assert res2.score == Decimal("0")
+    assert res2.zero_reason == "unreadable"
+    assert "1 个缺证明材料" in res2.detail and "1 个案例材料页不可读" in res2.detail
+
+
+def test_score_count_type_gate_zero_reason() -> None:
+    """类型门槛剔空 → zero_reason='type_gate'（类型判断 ≠ 未提供材料）。"""
+    from app.engine.objective import score_count
+
+    crit = _count_crit(
+        name="项目负责人具有类似运维项目经验",
+        params={"person_scope": "leader", "per_item": "2", "max_items": "2"},
+        verified_cases=[
+            {"name": "XX系统集成建设项目", "role": "leader", "contract": True,
+             "invoice": True, "acceptance": True, "sanitized": "ok"},
+            {"name": "YY网络建设项目", "role": "leader", "contract": True,
+             "invoice": True, "acceptance": True, "sanitized": "ok"},
+        ],
+    )
+    res = score_count(crit, crit["params"], BidFacts(text=""))
+    assert res.score == Decimal("0")
+    assert res.zero_reason == "type_gate"
+    assert "类型门槛" in res.detail
+
+
+def test_count_zero_warn_entry_type_gate_marks_need_human() -> None:
+    """落库映射：type_gate 零分 → unreadable_zero=True（转人工）+ 文案明示类型门槛。"""
+    from types import SimpleNamespace
+
+    from app.services.scoring_service import _count_zero_warn_entry
+
+    result = SimpleNamespace(
+        score=Decimal("0"),
+        detail="逐案例核验：提供案例 0 个，其中可计 0 个（按'类似运维项目'类型门槛剔除 2 个集成/维保/建设类案例）",
+        unresolved=None,
+    )
+    entry, unreadable_zero = _count_zero_warn_entry(result, {"zero_reason": "type_gate"})
+    assert unreadable_zero is True
+    assert "类型门槛" in entry["message"]
+    assert entry["zero_reason"] == "type_gate"
+
+
+# ---- _sanitize_case 降级分档（C1，2026-10-29）--------------------------------
+def test_sanitize_quote_not_in_bid_sets_null_not_false() -> None:
+    """定位失败型（quote_not_in_bid）→ 三件套 None + unverified 留痕（非作弊证据）。"""
+    from app.services.scoring_service import _sanitize_case
+
+    case = {
+        "name": "某项目案例名称足够长", "contract": True, "invoice": True, "acceptance": True,
+        "quote": "这段引文在标书里根本找不到内容A",
+    }
+    out = _sanitize_case(case, REQ_TEXT, bid_norm="标书全文里只有完全无关的内容")
+    assert out["sanitized"] == "quote_not_in_bid"
+    assert out["unverified"] == "quote_not_in_bid"
+    assert all(out[k] is None for k in ("contract", "invoice", "acceptance"))
+
+
+def test_sanitize_requirement_shadow_stays_false() -> None:
+    """作弊型（requirement_shadow）维持三件套 False（C1 反向守门）。"""
+    from app.services.scoring_service import _sanitize_case
+
+    case = {
+        "name": "某项目", "contract": True, "invoice": True, "acceptance": True,
+        "quote": "须提供合同复印件、发票复印件和业主证明",
+    }
+    out = _sanitize_case(case, REQ_TEXT, bid_norm="无关全文")
+    assert out["sanitized"] == "requirement_shadow"
+    assert all(out[k] is False for k in ("contract", "invoice", "acceptance"))
+
+
+# ---- 人员级候选页保留材料标题页（Fix1，2026-10-29）---------------------------
+def test_case_candidate_pages_person_keeps_material_heading_pages() -> None:
+    """人员级过滤不得丢弃材料标题页（发票/验收/中标通知书扫描页）。
+
+    7.10 实证：旧词表把业绩证明材料页整页排除 → LLM 视野 0 张材料页 →
+    逐案例判"缺证明材料"（航天拓扑 32 页仅 3 页送审、派克 0 页）。
+    """
+    from app.services.scoring_service import _case_candidate_pages
+
+    pages = [
+        (1, "拟派团队成员一览表 项目经理：张三 社保", "text"),          # 人员证据页
+        (2, "普通正文" * 100, "text"),                                  # 无关页
+        (3, "2. 发票扫描件 北京增值税专用发票", "ocr"),                 # 材料标题页
+        (4, "4. 验收报告 验收结论 合格", "ocr"),                        # 材料标题页
+        (5, "合同金额：100万元 甲方：某公司 乙方：某公司", "text"),      # 纯合同头页（仍排除）
+    ]
+    batches = _case_candidate_pages(pages, person_scope="member")
+    sent = {no for b in batches for no, _t in b}
+    assert 1 in sent and 3 in sent and 4 in sent
+    assert 5 not in sent, "纯合同头页仍须排除（c59/c60 回归防线）"
+
+
+def test_case_candidate_pages_section_includes_non_anchor_pages() -> None:
+    """section 感知：段内无锚点词的页并入候选，锚点页仍排前（B1）。"""
+    from app.services.scoring_service import _case_candidate_pages
+
+    pages = [(i, f"无关内容第{i}页" * 20, "text") for i in range(1, 60)]
+    pages[49] = (50, "合同名称：某运维项目 甲方：浙江中烟 合同金额：2,208,000元", "text")
+    batches = _case_candidate_pages(pages, section=(45, 55))
+    sent = [no for b in batches for no, _t in b]
+    assert 50 in sent and 46 in sent and 54 in sent, "section 内页必须并入候选"
+    assert sent.index(50) < sent.index(46), "锚点页应排在 section 非锚点页之前"
