@@ -587,11 +587,44 @@ def suggest_score_committee(
 # ---------------------------------------------------------------------------
 # 分层证据评审：证据地图 → 前 K 簇分别深评 → 聚合（解决几百页标书覆盖不足）
 # ---------------------------------------------------------------------------
-def _subitem_vote_state(entry: dict, verify_quote=None) -> tuple[str, str]:  # noqa: ANN001
+def _quote_is_restatement(quote: str, criterion: dict | None) -> bool:
+    """引文是否是细则原文的复述（点对点应答表逐字照抄评分标准）。
+
+    复述文本在标书里逐字可定位，但不构成"未提供"的证明——拿要求文本当
+    证据是 2026-10-15 _sanitize_case 防过的同一反模式的镜像（2026-10-29
+    审查 P2：real_zero 曾被应答表复述骗入均值）。结构性判据：归一化后
+    引文与因素名/描述/逐字引文互为包含，或字符二元组重合度 ≥ 0.6。
+    """
+    if not criterion:
+        return False
+
+    def _norm(s: str) -> str:
+        return re.sub(r"[\s　，。；：、（）()【】\[\]《》〈〉.,;:!?？！“”‘’\"']", "", s)
+
+    q = _norm(quote)
+    if len(q) < 8:
+        return False  # 太短无法判定，交给引文闸门
+    for key in ("name", "description", "source_quote"):
+        blob = _norm(str(criterion.get(key) or ""))
+        if not blob:
+            continue
+        # 只认"引文⊆细则文本"（纯复述）；不反向包含——"本节未涉及订单管理功能"
+        # 这类真实缺证陈述会包含短因素名，反向判会误伤真实 0 票
+        if q in blob:
+            return True
+        gb = set(zip(blob, blob[1:]))
+        gq = set(zip(q, q[1:]))
+        if gb and len(gq & gb) / len(gq) >= 0.6:
+            return True
+    return False
+
+
+def _subitem_vote_state(entry: dict, verify_quote=None, criterion=None) -> tuple[str, str]:  # noqa: ANN001
     """子项×证据簇条目三态判定（纯函数，评委会常识：缺席者不投票）。
 
     - abstain 弃权：(a) aggregate_subitems 合成的缺失条目；(b) score=0 且无引文；
-      (c) 引文闸门击杀（gate_killed，无论原分正负）→ 退出均值，不进分母
+      (c) 引文闸门击杀（gate_killed，无论原分正负）；(d) 引文是细则复述
+      → 退出均值，不进分母
     - real_zero 真实 0：score=0 且引文非空且核验通过 → 计入均值（0 票）
     - vote 有效票：score>0（含 provisional 正分）→ 计入均值
     返回 (state, reason)。
@@ -609,6 +642,8 @@ def _subitem_vote_state(entry: dict, verify_quote=None) -> tuple[str, str]:  # n
         return "vote", ""
     if not quote:
         return "abstain", "no_evidence"
+    if _quote_is_restatement(quote, criterion):
+        return "abstain", "quote_is_criterion_restatement"
     if verify_quote is None:
         return "real_zero", "quote_present"
     if verify_quote(quote):
@@ -616,9 +651,9 @@ def _subitem_vote_state(entry: dict, verify_quote=None) -> tuple[str, str]:  # n
     return "abstain", "quote_unlocatable"
 
 
-def _cluster_vote_state(suggestion, verify_quote=None) -> tuple[str, str]:  # noqa: ANN001
+def _cluster_vote_state(suggestion, verify_quote=None, criterion=None) -> tuple[str, str]:  # noqa: ANN001
     """簇级建议三态（纯函数）：score>0 → vote；0 分带可核验证据 → real_zero；
-    其余（无分/无证据/证据定位不到）→ abstain。返回 (state, reason)。"""
+    其余（无分/无证据/证据定位不到/引文全是细则复述）→ abstain。返回 (state, reason)。"""
     if suggestion is None or suggestion.score is None:
         return "abstain", "no_score"
     if suggestion.score > 0:
@@ -630,6 +665,8 @@ def _cluster_vote_state(suggestion, verify_quote=None) -> tuple[str, str]:  # no
     ]
     if not quotes:
         return "abstain", "no_evidence"
+    if all(_quote_is_restatement(q, criterion) for q in quotes):
+        return "abstain", "quote_is_criterion_restatement"
     if verify_quote is None:
         return "real_zero", "quote_present"
     if any(verify_quote(q) for q in quotes):
@@ -769,7 +806,7 @@ def suggest_score_hierarchical(
                 if hit is None:
                     continue
                 cap = next(cap for name, cap in parsed if name == hit)
-                state, reason = _subitem_vote_state(ss, verify_quote)
+                state, reason = _subitem_vote_state(ss, verify_quote, criterion)
                 sub_meta.setdefault(hit, []).append({
                     # 物理簇编号（失败簇不与后继簇撞号）
                     "cluster": _cl.get("cluster_no") or _cl.get("judge_no") or ci,
@@ -805,6 +842,11 @@ def suggest_score_hierarchical(
             for name in sub_map:
                 if name not in sub_quotes and name in sub_zero_quotes:
                     sub_quotes[name] = sub_zero_quotes[name]
+        else:
+            # 全部子项条目弃权（闸门全击杀/引文全是细则复述）：0 分不得伪装成
+            # 评审结论——回退 equal_mean 也必须保留疑问（2026-10-29 审查 P2：
+            # 曾在此丢失 doubt，闸门全击杀的 0 分被 auto_confirmed）
+            doubt = True
 
     if sub_map:
         merged_score = min(sum(sub_map.values(), Decimal(0)), max_score)
@@ -824,7 +866,7 @@ def suggest_score_hierarchical(
                 1 for ss in (pair[1].sub_scores or [])
                 if isinstance(ss, dict)
                 and _match_subitem(str(ss.get("name") or ""), parse_keys) is not None
-                and _subitem_vote_state(ss, verify_quote)[0] != "abstain"
+                and _subitem_vote_state(ss, verify_quote, criterion)[0] != "abstain"
             )
         best_cl, best = max(suggestions, key=_contrib)
         voted_cls = {
@@ -869,7 +911,7 @@ def suggest_score_hierarchical(
         # **等权算术平均**（2026-10-27 可复算化）：旧「相关性加权」的权重（证据地图
         # 相似度）不落档、A3/A5 无法复算——审计缺陷实证。
         # 2026-10-29：分母只含计票簇（vote/real_zero），弃权簇保留记录不进均值。
-        cluster_states = [_cluster_vote_state(s, verify_quote) for _cl, s in suggestions]
+        cluster_states = [_cluster_vote_state(s, verify_quote, criterion) for _cl, s in suggestions]
         counted = [
             (pair, st)
             for pair, (st, _r) in zip(suggestions, cluster_states)

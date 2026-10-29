@@ -132,6 +132,65 @@ def test_c52_equal_mean_abstains_exit_denominator(monkeypatch):  # noqa: ANN001
     assert (sum(counted) / Decimal(len(counted))).quantize(Decimal("0.01")) == merged.score
 
 
+def test_real_zero_restatement_quote_abstains(monkeypatch):  # noqa: ANN001
+    """0 分引文是细则复述（点对点应答表照抄）→ 弃权，不计真实 0 票。
+
+    2026-10-29 审查 P2：real_zero 曾被应答表复述骗入均值——复述文本在标书
+    里逐字可定位，但不构成"未提供"的证明（_sanitize_case 同反模式镜像）。
+    """
+    desc = "订单管理模块提供订单全生命周期管理功能，含状态同步与异常回执。"
+    crit = {
+        "name": "订单管理",
+        "max_score": "5",
+        "description": f"订单管理（0-5 分）：{desc}",
+        "levels": [],
+    }
+    clusters = [
+        _cluster(Decimal("5.6"), sub_scores=[
+            {"name": "订单管理", "score": "5.6", "max": "5",
+             "quote": "订单管理模块已实现全生命周期管理，测试环境实测通过"},
+        ]),
+        _cluster(Decimal("0"), sub_scores=[
+            {"name": "订单管理", "score": "0", "max": "5", "quote": desc},  # 复述
+        ]),
+    ]
+    merged, _committee = _run_hier(
+        monkeypatch, crit, clusters, verify_quote=lambda q: True
+    )
+    # 旧语义：复述引文可定位 → real_zero → (5+0)/2=2.50（5.6 被子项封顶 5）
+    assert merged.score == Decimal("5.00")
+    assert merged.aggregation["rule"] == "subitem_cluster_mean"
+    votes = merged.aggregation["inputs"][0]["votes"]
+    assert [v["state"] for v in votes] == ["vote", "abstain"]
+
+
+def test_all_subitem_entries_gated_fallback_keeps_doubt(monkeypatch):  # noqa: ANN001
+    """全部子项条目弃权回退 equal_mean 时保留 doubt（0 分不得伪装成评审结论）。
+
+    2026-10-29 审查 P2：闸门全击杀/子项全缺证据时回退簇平均曾丢失 doubt，
+    0 分被 auto_confirmed 直接定稿。
+    """
+    crit = {
+        "name": "订单管理",
+        "max_score": "5",
+        "description": "订单管理（0-5 分）：提供订单全生命周期管理功能。",
+        "levels": [],
+    }
+    clusters = [
+        _cluster(Decimal("0"), sub_scores=[
+            {"name": "订单管理", "score": "0", "max": "5", "quote": ""},
+        ]),
+        _cluster(Decimal("0"), sub_scores=[
+            {"name": "订单管理", "score": "0", "max": "5", "quote": ""},
+        ]),
+    ]
+    merged, _committee = _run_hier(
+        monkeypatch, crit, clusters, verify_quote=lambda q: True
+    )
+    assert merged.score == Decimal("0.00")  # 簇级证据可定位 → real_zero 均值
+    assert merged.doubt is True  # 子项全部弃权的疑问不得丢失
+
+
 def test_failed_cluster_numbering_stable(monkeypatch):  # noqa: ANN001
     """失败簇（score=None）不与后继簇共享编号：inputs 用物理簇序号。
 
