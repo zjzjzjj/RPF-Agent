@@ -207,6 +207,68 @@ def test_score_count_leader_type_gate_drops_non_ops_cases() -> None:
     assert res2.score == Decimal("4")
 
 
+def test_score_count_leader_type_gate_keeps_platform_named_cases() -> None:
+    """类型门槛三态：平台名运维案例保留+疑问，明确非运维单一形态剔除。
+
+    2026-10-29 run 64 实证：旧"名称须含运维|维护"把"二维码综合管理平台
+    项目"这类实质运维案例当"集成/建设类"剔除（人工计满分）——
+    机器无法确认类型 ≠ 确认不符。
+    """
+    from app.engine.objective import score_count
+
+    crit = {
+        "name": "项目负责人经验",
+        "description": "项目负责人具有五年及以上工作经验且作为项目负责人具有"
+                       "类似系统运维项目的实施/服务经验的，每提供一个案例得2分",
+        "max_score": Decimal("4"),
+        "required_artifacts": "合同复印件、社保证明",
+        "params": {"person_scope": "leader", "per_item": "2", "max_items": "2"},
+        "verified_cases": [
+            # 平台名（无运维/维护字样、无明确非运维标记）→ 保留 + 疑问
+            {"name": "浙江中烟《二维码综合管理平台》项目", "role": "leader",
+             "work_proof": True, "experience_proof": True, "social_security": True,
+             "quote": "姜维 曾担任项目负责人", "sanitized": "ok"},
+            {"name": "河北中烟企业二维码管理系统项目", "role": "leader",
+             "work_proof": True, "experience_proof": True, "social_security": True,
+             "quote": "姜维 曾担任项目经理", "sanitized": "ok"},
+            # 明确非运维单一形态 → 剔除
+            {"name": "某市局网络系统建设项目", "role": "leader",
+             "work_proof": True, "experience_proof": True, "social_security": True,
+             "quote": "张三 曾担任项目经理", "sanitized": "ok"},
+        ],
+    }
+    res = score_count(crit, crit["params"], BidFacts(text=""))
+    assert res.score == Decimal("4")  # 2 个保留案例 × 2 分
+    assert "类型无法机器确认" in res.detail
+    assert "剔除 1 个" in res.detail
+    assert res.conflict is True
+
+
+def test_overlay_experience_proof_rescue() -> None:
+    """experience_proof 文档级救援：证明页含人员姓名 → False 升 True；
+    找不到证明页 → 保持原判不强 False（机器没看见 ≠ 确认缺失）。"""
+    from app.services.scoring_service import _overlay_experience_proof
+
+    pages = [
+        (1, "投标文件正文", "text"),
+        (50, "项目负责人简历 工作经验证明 姜维 自2013年7月参加工作至今",
+         "ocr"),
+        (80, "普通方案页", "text"),
+    ]
+    cases = [
+        {"person_name": "姜维", "experience_proof": False, "work_proof": True},
+        {"person_name": "韩跃嵩", "experience_proof": None, "work_proof": True},
+    ]
+    _overlay_experience_proof(cases, pages)
+    assert cases[0]["experience_proof"] is True   # 锚点救援
+    assert cases[1]["experience_proof"] is None   # 无锚 → 保持原判
+
+    # 全文档无证明页 → 全部保持原判（不强 False）
+    cases2 = [{"person_name": "姜维", "experience_proof": False}]
+    _overlay_experience_proof(cases2, [(1, "只有正文", "text")])
+    assert cases2[0]["experience_proof"] is False
+
+
 def test_score_count_member_scope_no_type_gate() -> None:
     """团队成员项因素无"运维"字样 → 不做类型过滤（诚道交警项目得计）。"""
     from app.engine.objective import score_count

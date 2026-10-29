@@ -789,27 +789,45 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                 else:
                     conflict = True
                     detail += "；模型未标注案例人员归属，按全部案例计（需人工核对）"
-                # 负责人经验"类似运维项目"类型确定性过滤：prompt 门槛 LLM 会无视
-                # （2026-10-23 run 47 实证：先数设备维保/网络建设类案例仍计 4 分，
-                # 真实评审 0）。因素含"运维"时案例名须含 运维/维护 才计。
+                # 负责人经验"类似运维项目"类型确定性过滤（2026-10-29 三态重做）：
+                # 旧实现名称须含 运维|维护 才计——"二维码综合管理平台项目"这类
+                # 平台名运维案例被当"集成/建设类"系统性误杀（7.10 run 64 实证，
+                # 人工计满分）。按细则枚举改为三态：运维类标记 → 保留；**明确**
+                # 非运维单一形态（细则点名排除的设备维保/网络建设/系统集成/
+                # 软件开发）→ 剔除；两者皆无 → 机器无法确认类型 ≠ 确认不符，
+                # 保留并标疑问（同"机器看不见≠不符合"原则）。
                 if person_scope == "leader" and cases:
                     _factor_text = (
                         str(criterion.get("name") or "")
                         + str(criterion.get("description") or "")
                     )
                     if "运维" in _factor_text:
-                        _typed = [
-                            c for c in cases
-                            if re.search(r"运维|维护", str(c.get("name") or ""))
-                        ]
-                        if len(_typed) < len(cases):
-                            _ntype = len(cases) - len(_typed)
-                            cases = _typed
+                        _RE_OPS_TYPE = re.compile(r"运维|维护|技术服务|保障服务")
+                        _RE_NON_OPS_TYPE = re.compile(
+                            r"设备维保|硬件维保|网络(?:系统)?建设|系统集成|"
+                            r"软件开发|系统开发|开发(?:项目|工程)"
+                        )
+                        kept: list[dict] = []
+                        _ntype = 0
+                        _nsure = 0
+                        for _c in cases:
+                            _nm = str(_c.get("name") or "")
+                            if _RE_OPS_TYPE.search(_nm):
+                                kept.append(_c)
+                            elif _RE_NON_OPS_TYPE.search(_nm):
+                                _ntype += 1  # 明确非运维单一形态 → 剔除
+                            else:
+                                kept.append(_c)
+                                _nsure += 1  # 类型无法确认 → 保留+疑问
+                        if _ntype or _nsure:
+                            cases = kept
                             _type_dropped = _ntype
                             conflict = True
-                            # detail 在本分支末尾整体重建 → 用 note 变量传递
                             _type_gate_note = (
-                                f"（按'类似运维项目'类型门槛剔除 {_ntype} 个集成/维保/建设类案例）"
+                                (f"（按'类似运维项目'类型门槛剔除 {_ntype} 个"
+                                 f"明确非运维类案例）" if _ntype else "")
+                                + (f"（{_nsure} 个案例类型无法机器确认，保留计分"
+                                   f"并标疑问，建议人工核看）" if _nsure else "")
                             )
             # 金额门槛：明确低于门槛的不计；金额缺失的照计但标疑问
             min_amount = Decimal(str(params.get("min_amount_yuan") or 0))

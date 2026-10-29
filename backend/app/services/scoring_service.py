@@ -850,6 +850,12 @@ def execute_run(
                 _overlay_work_proof(
                     c_scoring["verified_cases"], bid_pages.get(bid_id) or []
                 )
+            # 负责人 experience_proof 文档级救援（五年证明在独立人员章节，
+            # 案例核验链不上 → False 误杀材料齐全的案例）
+            if str(params.get("person_scope")) == "leader":
+                _overlay_experience_proof(
+                    c_scoring["verified_cases"], bid_pages.get(bid_id) or []
+                )
         # P1-E 新计分原语：与业绩案例三态机器无关的确定性评分，直接分发。
         # CountResult 同构 → 下面的 unresolved/doubt/落库路径完全复用。
         _engine = params.get("engine")
@@ -1871,6 +1877,35 @@ def _overlay_work_proof(cases: list[dict], pages: list[tuple[int, str, str]]) ->
             c["work_proof"] = None  # 无法对应到人 → 留待闸门处置
             continue
         c["work_proof"] = any(person in t for t in ev_pages_text)
+
+
+# 五年工作经验证明页标记（负责人经验项的独立材料章节）
+_EXP_PROOF_PAGE = re.compile(
+    r"工作(?:经验证明|年限证明|经历)|经验证明|个人简历|工作简历|"
+    r"职称(?:证书|证明)|(?:工作|从业|参加工作)\s*年限"
+)
+
+
+def _overlay_experience_proof(cases: list[dict], pages: list[tuple[int, str, str]]) -> None:
+    """负责人 experience_proof 文档级救援（**只升不降**）。
+
+    五年经验证明通常在独立人员资料章节（简历/工作证明扫描页），案例核验只看
+    案例页附近——链不上 → False 把材料齐全的整案例判缺（7.10 run 64 实证：
+    云锦姜维 work_proof=True/social_security=True 仍 0 可计）。有证明页且
+    含该人员姓名 → 置 True（锚点即证据，与 _person_anchor_hit 同构）；
+    找不到证明页 → 保持 LLM 原判（机器没看见 ≠ 确认缺失，不强 False）。
+    """
+    proof_pages = [t for _n, t, _s in pages if t and _EXP_PROOF_PAGE.search(t)]
+    if not proof_pages:
+        return
+    for c in cases:
+        if c.get("experience_proof") is True:
+            continue
+        person = str(c.get("person_name") or c.get("person") or "").strip()
+        if len(person) < 2:
+            continue
+        if any(person in t for t in proof_pages):
+            c["experience_proof"] = True
 
 
 def _load_material_maps(
