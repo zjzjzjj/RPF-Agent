@@ -8,8 +8,10 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import threading
 import time
+from pathlib import Path
 from typing import TypeVar
 
 from pydantic import BaseModel, ValidationError
@@ -23,6 +25,10 @@ log = logging.getLogger("bid_eval.llm")
 T = TypeVar("T", bound=BaseModel)
 
 _CACHE_LIMIT = 512
+
+# 缓存命中统计（阶段 1，2026-10-30）：mem=内存命中 / disk=磁盘命中 / miss=真实调用。
+# 阶段 5 验收直接读它。+= 非原子，但只是观测计数，不参与判定。
+_CACHE_STATS: dict[str, int] = {"mem": 0, "disk": 0, "miss": 0}
 
 # 进程级预算计数（跨 Gateway 实例共享、按天滚动）
 _BUDGET_LOCK = threading.Lock()
@@ -304,6 +310,63 @@ def _parse_candidate(candidate: str) -> dict:
     raise LLMError("模型输出 JSON 无法解析")
 
 
+# ---------------------------------------------------------------------------
+# LLM 磁盘缓存（阶段 1，2026-10-30）
+# ---------------------------------------------------------------------------
+def _disk_cache_path(key: str) -> Path:
+    """缓存文件路径：data/llm_cache/<key 前 16 位>.json（键是 sha256，16 位前缀已够唯一）。"""
+    return config.data_dir() / "llm_cache" / f"{key[:16]}.json"
+
+
+def _disk_get(key: str) -> dict | None:
+    """读磁盘缓存：文件缺失/坏 JSON/缺字段一律 None（静默当 miss，绝不抛）。
+
+    缓存是 best-effort 加速层：任何读失败都退回真实调用，不能让评分链路失败。
+    """
+    if not config.llm_disk_cache_enabled():
+        return None
+    try:
+        data = json.loads(_disk_cache_path(key).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 —— 文件不存在/坏 JSON/坏编码都当 miss
+        return None
+    if (
+        not isinstance(data, dict)
+        or not isinstance(data.get("text"), str)
+        or not isinstance(data.get("provider"), str)
+        or not isinstance(data.get("model"), str)
+    ):
+        return None
+    return data
+
+
+def _disk_put(key: str, result: LLMResult) -> None:
+    """写磁盘缓存（best-effort）：mkdir + 临时文件 + os.replace 原子替换。
+
+    只在 chat_json 校验通过后调用（2026-10-30 阶段 1）：坏文本绝不上盘，
+    避免重启/重试后反复命中坏缓存。任何 IO 失败都静默——缓存写不进
+    绝不能让评分失败。
+    """
+    if not config.llm_disk_cache_enabled():
+        return
+    payload = {
+        "provider": result.provider,
+        "model": result.model,
+        "text": result.text,
+        "tokens_in": result.tokens_in,
+        "tokens_out": result.tokens_out,
+        "latency_ms": result.latency_ms,
+    }
+    try:
+        path = _disk_cache_path(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # 临时文件带 pid+线程 id：并发写同一 key 互不踩踏，os.replace 保证原子可见
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001 —— 落盘失败静默，绝不影响本次调用结果
+        pass
+
+
 class Gateway:
     """对上层只暴露 chat_json；provider 可替换（将来换 kuncore model_router）。"""
 
@@ -377,12 +440,56 @@ class Gateway:
         prompt_version: str,
         temperature: float = 0.0,
         max_tokens: int | None = None,
+        thinking: str = "auto",
+        disable_thinking: bool = False,
+        seed: int | None = None,
+        base_url: str = "",
     ) -> str:
-        # 影响输出的所有维度都要进键：temperature/max_tokens 不同 → 结果不同
+        # 影响输出的所有维度都要进键：temperature/max_tokens/thinking/seed/base_url
+        # 任一不同 → 结果不同（2026-10-30 阶段 1：补 thinking/disable_thinking/seed/
+        # base_url；同 host 不同路径前缀的端点也可能是不同模型服务）。
         payload = "\x00".join(
-            [provider, model, prompt_version, system, user, f"t={temperature}", f"m={max_tokens}"]
+            [
+                provider,
+                model,
+                base_url,
+                prompt_version,
+                system,
+                user,
+                f"t={temperature}",
+                f"m={max_tokens}",
+                f"thinking={thinking}",
+                f"dt={disable_thinking}",
+                f"seed={seed}",
+            ]
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _key_for(
+        self,
+        system: str,
+        user: str,
+        prompt_version: str,
+        temperature: float,
+        max_tokens: int | None,
+    ) -> str:
+        """chat / chat_json 共用的缓存键：现取 provider 与全部影响输出的配置维度。
+
+        base_url 用 getattr 容错：FakeProvider 等测试替身没有该属性（2026-10-30）。
+        """
+        return self._cache_key(
+            system,
+            user,
+            self.provider.name,
+            self.provider.model,
+            prompt_version,
+            temperature,
+            max_tokens,
+            thinking=config.llm_thinking(),
+            disable_thinking=config.llm_disable_thinking(),
+            seed=config.llm_seed(),
+            base_url=getattr(self.provider, "base_url", ""),
+        )
 
     def chat(
         self,
@@ -396,16 +503,35 @@ class Gateway:
     ) -> LLMResult:
         prompt_version = prompt_version or config.llm_prompt_version()
         self._check_data_class(data_class)
-        key = self._cache_key(
-            system, user, self.provider.name, self.provider.model, prompt_version,
-            temperature, max_tokens,
-        )
+        key = self._key_for(system, user, prompt_version, temperature, max_tokens)
 
         with self._cache_lock:
             hit = self._cache.get(key)
         if hit is not None:
+            _CACHE_STATS["mem"] += 1
             return hit.model_copy(update={"cached": True})
 
+        # 磁盘缓存（阶段 1，2026-10-30）：命中即回填内存并返回——不调 provider、
+        # 不耗预算（预算只统计真实调用）。
+        disk = _disk_get(key)
+        if disk is not None:
+            result = LLMResult(
+                text=disk["text"],
+                provider=disk["provider"],
+                model=disk["model"],
+                tokens_in=disk.get("tokens_in"),
+                tokens_out=disk.get("tokens_out"),
+                latency_ms=disk.get("latency_ms"),
+                cached=True,
+            )
+            with self._cache_lock:
+                if len(self._cache) >= _CACHE_LIMIT:
+                    self._cache.pop(next(iter(self._cache)))
+                self._cache[key] = result
+            _CACHE_STATS["disk"] += 1
+            return result
+
+        _CACHE_STATS["miss"] += 1
         self._check_budget()
         with self._sem:
             result = self.provider.complete(
@@ -436,7 +562,12 @@ class Gateway:
 
         JSON 解析/契约失败重试 2 次（采样偶发缺逗号/截断，换一次生成大概率就好；
         余额/配额类错误不重试——上层按 fail-fast 处理）。
+        model_validate 成功才落磁盘缓存（阶段 1，2026-10-30）：坏文本绝不上盘；
+        失败重试前驱逐该 key 的内存/磁盘缓存——chat() 刚把这份坏文本缓存了进去，
+        不驱逐的话下一轮重试会直接命中它、永远不再调 provider（自缓存毒化）。
         """
+        prompt_version = prompt_version or config.llm_prompt_version()
+        key = self._key_for(system, user, prompt_version, temperature, max_tokens)
         last_exc: LLMError | None = None
         result = None
         for attempt in range(3):
@@ -450,7 +581,7 @@ class Gateway:
             )
             try:
                 payload = extract_json(result.text)
-                return out_model.model_validate(payload), result
+                validated = out_model.model_validate(payload)
             except ValidationError as exc:
                 # 只保留 type/loc/msg：pydantic v2 的 errors() 默认带 input（字段原值），
                 # 而这段文本会被拼进 AppError → job.error → 前端/日志——招标原文
@@ -460,17 +591,36 @@ class Gateway:
                 ]
                 last_exc = LLMError(f"模型输出不符合契约：{brief}")
                 last_exc.__cause__ = exc
+                self._evict_failed(key)
             except LLMError as exc:
                 msg = str(exc)
                 if any(k in msg for k in ("402", "insufficient", "quota", "30001", "arrears")):
                     raise  # 余额/配额：fail-fast，不重试
                 last_exc = exc
+                self._evict_failed(key)
+            else:
+                _disk_put(key, result)  # 校验通过才上盘（阶段 1，2026-10-30）
+                return validated, result
             if attempt < 2:
                 log.warning(
                     "chat_json 第 %d 次输出解析失败，重试：%s", attempt + 1, last_exc
                 )
         assert last_exc is not None and result is not None
         raise last_exc
+
+    def _evict_failed(self, key: str) -> None:
+        """驱逐坏文本缓存：弹内存 + 删盘上文件（best-effort）。
+
+        2026-10-30 阶段 1：解析/契约失败的文本无论来自 provider 还是缓存，都
+        不允许留在缓存里——否则重试（含新 Gateway 实例）会反复命中同一份坏
+        文本、永远不调 provider（自缓存毒化）。删不存在的文件是 no-op。
+        """
+        with self._cache_lock:
+            self._cache.pop(key, None)
+        try:
+            _disk_cache_path(key).unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _is_private_host(host: str) -> bool:
@@ -502,3 +652,4 @@ def reset_gateway() -> None:
     """测试用：重建网关（重读环境变量、清缓存与预算）。"""
     global _GATEWAY
     _GATEWAY = None
+    _CACHE_STATS.update({"mem": 0, "disk": 0, "miss": 0})

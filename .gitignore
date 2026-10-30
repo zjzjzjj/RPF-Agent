@@ -25,6 +25,10 @@ data/embed_cache/
 data/reports/
 # 样例招标/投标件（可由 scripts/generate_sample_*.py 重建）
 data/samples/
+# 诊断产物（含真实投标/招标上传件 + SQLite/OCR 缓存，2026-10-30 审查 P2：106M 实盘件防误提交）
+data/diag/
+# LLM 结果磁盘缓存（模型对投标内容的输出衍生文本，含敏感语料）
+data/llm_cache/
 
 # ---- 前端 ----
 frontend/node_modules/

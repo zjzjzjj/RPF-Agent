@@ -213,12 +213,27 @@ def _printed_page(text: str) -> int | None:
     return None
 
 
+# 业绩表表头三元组（2026-10-30 阶段3a，通用放宽、零项目拟合）：名称列词 + 金额列词 +
+# 第三列词（序号/时间类）。旧口径硬绑"项目名称"，真实标书常见"业绩名称/案例名称/
+# 合同名称 + 中标金额"变体 → 表路径整条落空；三元组仍**全要求**，防把目录/索引页
+# （只有"项目名称+金额"或只有"序号"的模块表）误配成业绩表。
+_RE_HDR_NAME = re.compile(r"项目名称|业绩名称|案例名称|合同名称")
+_RE_HDR_AMOUNT = re.compile(r"金额|中标金额|合同金额")  # "金额"已覆盖后两词，列此备查
+_RE_HDR_THIRD = re.compile(r"序号|编号|时间|签订|日期")
+
+
+def _is_case_header_text(t: str) -> bool:
+    """通用业绩表表头判定：三元组词全命中（任意顺序、任意单元格）。"""
+    return bool(
+        _RE_HDR_NAME.search(t) and _RE_HDR_AMOUNT.search(t) and _RE_HDR_THIRD.search(t)
+    )
+
+
 def _has_case_table_header(pages: list[PageRec], center: int, window: int) -> bool:
     lo, hi = center - window, center + window
     for p in pages:
         if lo <= p.page_no <= hi:
-            t = p.text or ""
-            if "项目名称" in t and ("合同金额" in t or "金额" in t):
+            if _is_case_header_text(p.text or ""):
                 return True
     return False
 
@@ -226,14 +241,11 @@ def _has_case_table_header(pages: list[PageRec], center: int, window: int) -> bo
 def _find_case_table_header_page(pages: list[PageRec]) -> int | None:
     for p in pages:
         t = p.text or ""
-        if "项目名称" in t and ("合同金额" in t or "金额" in t) and (
-            "业绩" in t or "案例" in t or "序号" in t
-        ):
+        if _is_case_header_text(t) and ("业绩" in t or "案例" in t):
             return p.page_no
-    # 退一步：只要有 项目名称+金额 表头
+    # 退一步：只要有三元组表头
     for p in pages:
-        t = p.text or ""
-        if "项目名称" in t and ("合同金额" in t or "金额" in t):
+        if _is_case_header_text(p.text or ""):
             return p.page_no
     return None
 
@@ -332,8 +344,9 @@ def _norm_cell(cell: str) -> str:
 
 
 def _is_header_row(cells: list[str]) -> bool:
-    joined = "".join(cells)
-    return "项目名称" in joined and ("金额" in joined) and ("序号" in joined or "委托" in joined or "时间" in joined)
+    # 2026-10-30 阶段3a：与 _has_case_table_header 同源的通用三元组（_HEADER 词组），
+    # 支持 业绩名称/案例名称/合同名称 + 中标金额 变体表头。
+    return _is_case_header_text("".join(cells))
 
 
 def _header_unit(cells: list[str]) -> int:
@@ -458,6 +471,35 @@ def parse_case_table(
     return cleaned
 
 
+def parse_case_table_at_section(
+    pdf_path: str,
+    section: SectionGuess,
+    pages: list[PageRec],
+    scan_pages: int = 8,
+) -> list[CaseRow]:
+    """证据段首窗解析业绩表；0 行且段来自索引定位时按表头就近重试（阶段3a，2026-10-30）。
+
+    索引「第X页到第Y页」映射的段首与真表头常差几页——首窗（section.start 起
+    scan_pages 页）0 行时，对 d∈[1,5] 中**恰有表头三元组**（window=0 单页命中）
+    的起点各重试一次；每次仍受 scan_pages 上限。
+    scoring_service 与 ingest_service 共用，避免两处复制重试逻辑。
+    只向段后重试（d≥1）：负偏移会扫到业绩段**之前**的设备清单/资格表，其表头
+    三元组（序号+名称+日期）可能命中，误绑到非业绩表（2026-10-30 审查 P2）。
+    """
+    rows = parse_case_table(pdf_path, section.start, section.end, scan_pages)
+    if rows or section.method not in ("index_offset", "index_offset_near"):
+        return rows
+    for d in range(1, 6):
+        st = section.start + d
+        if st <= 0 or not _has_case_table_header(pages, st, 0):
+            continue
+        # end 取 max：段短于重试起点时仍能扫满首窗（表在段首附近即可，不越段语义）
+        rows = parse_case_table(pdf_path, st, max(section.end, st), scan_pages)
+        if rows:
+            return rows
+    return []
+
+
 # ---------------------------------------------------------------------------
 # 案例 → 材料页绑定
 # ---------------------------------------------------------------------------
@@ -537,19 +579,26 @@ def classify_materials(
     blocks: list[CaseBlock],
     pages: list[PageRec],
     image_ratios: dict[int, float] | None = None,
+    tag_pages: dict | None = None,
 ) -> None:
     """对每个案例块按强信号判定 contract/invoice/acceptance 三态（就地修改）。
 
-    - 强信号命中且页可读 → True
+    - 强信号命中且页可读 → True(reason=signal)
+    - 材料索引页级强标签命中（`tag_pages`，阶段4 2026-10-30）→ True(reason=tag_signal)
     - 页在但低证据（短文本 + 图片占比≥0.10，`_low_evidence` 口径）→ None(reason=unreadable)
     - **扫描页无特征 → None(reason=scan_unverified)**：图占比高或 OCR 来源的页
       上找不到票据特征 = 不可见 ≠ 不存在（2026-10-27 训练集测试2 实证：有业主
       证明但发票是扫描件，旧口径判 False「确认缺失」→ 业绩全灭，人工照计）
-    - 全部页均为文字层可读且无信号 → False(reason=absent)
+    - 全部页均为文字层可读且无信号 → False(reason=absent)——absent 分支**永不**
+      被 tag_pages 翻转（标签只补"看不见"，不推翻"可读页已确认无"）
     - 案例未绑定页 → None(reason=unlinked, ambiguous)
+
+    `tag_pages`: page_no → {material: (tag, confidence)}（hints.page_material_tags
+    产出；rule 层 CONF_STRONG 页级标签）。None/空 = 无先验，行为与旧口径一致。
     """
     by_no = {p.page_no: p for p in pages}
     ratios = image_ratios or {}
+    tag_tp = tag_pages or {}
     for b in blocks:
         if b.ambiguous or not b.pages:
             for m in ("contract", "invoice", "acceptance"):
@@ -596,18 +645,32 @@ def classify_materials(
                 b.status[mat] = True
                 b.pages_by_material[mat] = hit_pages[:3]
                 b.reasons[mat] = "signal"
-            elif unreadable_pages:
-                b.status[mat] = None
-                b.pages_by_material[mat] = unreadable_pages[:3]
-                b.reasons[mat] = "unreadable"
-            elif scan_pages:
-                # 扫描页无特征：不可见 ≠ 缺失，留 null 走疑问/救援，不判 False
-                b.status[mat] = None
-                b.pages_by_material[mat] = scan_pages[:3]
-                b.reasons[mat] = "scan_unverified"
             else:
-                b.status[mat] = False
-                b.reasons[mat] = "absent"
+                # tag_signal（阶段4）：不可读/扫描候选页上有材料索引页级强标签 →
+                # 判 True（标签是入库时对同类页的确定性盖章，文本层看不见 ≠ 无）。
+                # 插在 unreadable/scan_unverified 分支判断前；absent 分支不受影响。
+                tag_hits = [no for no in unreadable_pages if mat in tag_tp.get(no, {})]
+                tag_hits += [
+                    no
+                    for no in scan_pages
+                    if no not in unreadable_pages and mat in tag_tp.get(no, {})
+                ]
+                if tag_hits:
+                    b.status[mat] = True
+                    b.pages_by_material[mat] = tag_hits[:3]
+                    b.reasons[mat] = "tag_signal"
+                elif unreadable_pages:
+                    b.status[mat] = None
+                    b.pages_by_material[mat] = unreadable_pages[:3]
+                    b.reasons[mat] = "unreadable"
+                elif scan_pages:
+                    # 扫描页无特征：不可见 ≠ 缺失，留 null 走疑问/救援，不判 False
+                    b.status[mat] = None
+                    b.pages_by_material[mat] = scan_pages[:3]
+                    b.reasons[mat] = "scan_unverified"
+                else:
+                    b.status[mat] = False
+                    b.reasons[mat] = "absent"
 
 
 def material_ocr_targets(

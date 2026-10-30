@@ -19,6 +19,8 @@ from app.evidence.case_evidence import (
     locate_section,
     material_ocr_targets,
     parse_amount_yuan,
+    parse_case_table,
+    parse_case_table_at_section,
 )
 
 
@@ -171,11 +173,106 @@ def test_link_case_blocks_searches_after_table() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 业绩表路径（阶段3a 2026-10-30）：表头变体 + 多起点重试
+# ---------------------------------------------------------------------------
+def _make_table_pdf(path, specs):
+    """合成 PDF（真实 PyMuPDF find_tables 路径）：specs=[(kind, payload)]。
+
+    kind='text' → payload 为页文本；kind='table' → payload=(header, data_rows)，
+    画线表格 + china-s 内置中文字体（helv 无 CJK 字形，2026-10-30 实测）。
+    """
+    import pymupdf
+
+    doc = pymupdf.open()
+    try:
+        for kind, payload in specs:
+            page = doc.new_page()
+            if kind == "text":
+                page.insert_text((50, 50), payload, fontname="china-s")
+                continue
+            header, data = payload
+            col_w, row_h = 120, 36  # 4 列 520pt < A4 宽 595，防末列被页边裁掉
+            for r, row in enumerate([header] + data):
+                for c, cell in enumerate(row):
+                    rect = pymupdf.Rect(
+                        40 + c * col_w, 40 + r * row_h,
+                        40 + (c + 1) * col_w, 40 + (r + 1) * row_h,
+                    )
+                    page.draw_rect(rect, color=(0, 0, 0), width=0.5)
+                    page.insert_textbox(rect, cell, fontsize=10, fontname="china-s")
+        doc.save(str(path))
+    finally:
+        doc.close()
+    return str(path)
+
+
+def test_parse_case_table_header_variant_zhongbiao_amount(tmp_path) -> None:
+    """表头变体「中标金额/签订日期」与「合同金额/合同签订时间」解析出同样 CaseRow。
+
+    旧 _is_header_row/_has_case_table_header 硬绑"项目名称"等词——真实标书常见
+    业绩名称/中标金额变体（阶段3a 放宽为通用三元组后必须行为一致）。
+    """
+    data = [
+        ["1", "甲项目", "160万元", "2024年1月1日"],
+        ["2", "乙项目", "80万元", "2024年3月5日"],
+    ]
+    pa = _make_table_pdf(
+        tmp_path / "classic.pdf",
+        [("table", (["序号", "项目名称", "合同金额", "合同签订时间"], data))],
+    )
+    pb = _make_table_pdf(
+        tmp_path / "variant.pdf",
+        [("table", (["序号", "项目名称", "中标金额", "签订日期"], data))],
+    )
+    rows_a = parse_case_table(pa, 1, 1, 4)
+    rows_b = parse_case_table(pb, 1, 1, 4)
+    assert len(rows_a) == 2 and len(rows_b) == 2
+    assert [(r.name, r.amount_yuan, r.sign_date) for r in rows_a] == [
+        (r.name, r.amount_yuan, r.sign_date) for r in rows_b
+    ]
+    assert rows_b[0].name == "甲项目"
+    assert rows_b[0].amount_yuan == Decimal("1600000")
+    assert rows_b[0].sign_date == "2024-01-01"
+
+
+def test_parse_case_table_at_section_retry_at_header_page(tmp_path) -> None:
+    """首窗 0 行且段来自索引定位 → 对「恰有表头」的邻近起点各重试一次并命中。
+
+    合成场景：段首（p1-2）无表、+2 页（p3）有表——旧逻辑首窗 0 行即放弃整条
+    表路径（业绩案例全灭）；多起点重试后解析出 CaseRow。
+    """
+    data = [["1", "甲项目", "160万元", "2024年1月1日"]]
+    pdf = _make_table_pdf(tmp_path / "late_table.pdf", [
+        ("text", "第1页正文"),
+        ("text", "第2页正文"),
+        ("table", (["序号", "项目名称", "中标金额", "签订日期"], data)),
+        ("text", "第4页正文"),
+        ("text", "第5页正文"),
+    ])
+    recs = [
+        PageRec(1, "第1页正文", "text"),
+        PageRec(2, "第2页正文", "text"),
+        PageRec(3, "序号 项目名称 中标金额 签订日期", "text"),
+        PageRec(4, "第4页正文", "text"),
+        PageRec(5, "第5页正文", "text"),
+    ]
+    sec = SectionGuess(1, 5, "index_offset", 0.5, 0)
+    # 首窗 scan_pages=2 只扫 p1-2（无表）→ 走 +2 表头页重试
+    rows = parse_case_table_at_section(pdf, sec, recs, scan_pages=2)
+    assert len(rows) == 1
+    assert rows[0].name == "甲项目"
+    assert rows[0].amount_yuan == Decimal("1600000")
+    # 首窗（scan_pages=8）本就覆盖 p3 → 不需要重试也应命中
+    rows2 = parse_case_table_at_section(pdf, sec, recs, scan_pages=8)
+    assert len(rows2) == 1
+
+
+# ---------------------------------------------------------------------------
 # 材料三态
 # ---------------------------------------------------------------------------
-def _run_classify(pages, ratios, block_pages):
+def _run_classify(pages, ratios, block_pages, tag_pages=None):
     block = CaseBlock(row=CaseRow(1, "某项目", Decimal("1000000"), None, 10), pages=block_pages)
-    classify_materials([block], pages, ratios)
+    classify_materials([block], pages, ratios, tag_pages=tag_pages)
     return block
 
 
@@ -242,6 +339,76 @@ def test_classify_real_invoice_form_page_is_true() -> None:
                         "发票号码 3300241130 开票日期 2024年6月 价税合计 58000", "ocr")]
     b = _run_classify(pages, {}, [10])
     assert b.status["invoice"] is True
+
+
+# ---------------------------------------------------------------------------
+# 材料索引页级标签先验（tag_signal，阶段4 2026-10-30）
+# ---------------------------------------------------------------------------
+def test_classify_tag_signal_on_scan_unverified_page() -> None:
+    """scan_unverified 候选页命中页级强标签 → True/reason=tag_signal。
+
+    扫描页文本层看不见 ≠ 不存在；material_tags 页级强标签（rule+CONF_STRONG）
+    是入库时对同类页的确定性盖章，借为三态先验。
+    """
+    pages = [
+        PageRec(10, "某某项目合同 甲方 乙方 合同金额", "text"),
+        # >800 字 + 图占比 0.5 → 只进 scan_pages（不进 unreadable）
+        PageRec(11, "整页扫描图占位" + "扫描件文字" * 160, "text"),
+    ]
+    b = _run_classify(pages, {11: 0.5}, [10, 11],
+                      tag_pages={11: {"invoice": ("发票", 0.85)}})
+    assert b.status["invoice"] is True
+    assert b.reasons["invoice"] == "tag_signal"
+    assert b.pages_by_material["invoice"] == [11]
+
+
+def test_classify_tag_signal_on_unreadable_low_evidence_page() -> None:
+    """低证据页（unreadable）命中 acceptance 标签 → True/tag_signal。"""
+    pages = [
+        PageRec(10, "某某项目合同 甲方 乙方 合同金额", "text"),
+        PageRec(11, "材料扫描件 - 120 -", "text"),  # 短文本 + 图 0.22 → unreadable
+    ]
+    b = _run_classify(pages, {11: 0.22}, [10, 11],
+                      tag_pages={11: {"acceptance": ("业主证明", 0.9)}})
+    assert b.status["acceptance"] is True
+    assert b.reasons["acceptance"] == "tag_signal"
+    assert b.pages_by_material["acceptance"] == [11]
+
+
+def test_classify_regex_signal_wins_over_tag() -> None:
+    """正则与标签同时命中（不同页）→ reason 仍 signal（正则优先）。"""
+    pages = [
+        PageRec(10, "某某项目合同 甲方 乙方 合同金额", "text"),
+        PageRec(11, "电子发票 发票号码 12345 开票日期 2024年1月1日 价税合计", "text"),
+        PageRec(12, "整页扫描图占位" + "扫描件文字" * 160, "text"),
+    ]
+    b = _run_classify(pages, {12: 0.5}, [10, 11, 12],
+                      tag_pages={11: {"invoice": ("发票", 0.9)},
+                                 12: {"invoice": ("发票", 0.85)}})
+    assert b.status["invoice"] is True
+    assert b.reasons["invoice"] == "signal"
+    assert b.pages_by_material["invoice"] == [11]
+
+
+def test_classify_tag_never_flips_absent() -> None:
+    """全页可读且无信号 + 标签注入 → 仍 False/absent（锁死 absent 不翻转）。"""
+    pages = [
+        PageRec(10, "甲方 乙方 项目合同", "text"),
+        PageRec(11, "本页只有技术方案正文，没有材料" + "x" * 300, "text"),
+    ]
+    b = _run_classify(pages, {}, [10, 11],
+                      tag_pages={11: {"invoice": ("发票", 0.9)}})
+    assert b.status["invoice"] is False
+    assert b.reasons["invoice"] == "absent"
+
+
+def test_classify_tag_pages_none_keeps_legacy_behavior() -> None:
+    """tag_pages=None → 与旧口径完全一致（低证据页 None/unreadable）。"""
+    pages = [PageRec(10, "某某合同 甲方 乙方", "text"), PageRec(11, "8.1 发票 - 120 -", "text")]
+    b = _run_classify(pages, {11: 0.22}, [10, 11], tag_pages=None)
+    assert b.status["contract"] is True
+    assert b.status["invoice"] is None
+    assert b.reasons["invoice"] == "unreadable"
 
 
 # ---------------------------------------------------------------------------

@@ -254,7 +254,7 @@ def rescue_material_pages(document_id: int, max_pages: int | None = None) -> dic
         locate_section,
         material_ocr_targets,
         page_image_ratios,
-        parse_case_table,
+        parse_case_table_at_section,
     )
     from app.parsing.pdf_pymupdf import ocr_pages_text
 
@@ -281,11 +281,14 @@ def rescue_material_pages(document_id: int, max_pages: int | None = None) -> dic
     # 全送 OCR 打爆远程服务（2026-10-21 doc24 实证）。
     blocks: list = []
     if sec.found:
-        table_rows = parse_case_table(
-            pdf_path, sec.start, sec.end, config.case_table_scan_pages()
+        # 阶段3a（2026-10-30）：首窗 0 行时按表头就近重试（公共辅助，与 scoring 同口径）
+        table_rows = parse_case_table_at_section(
+            pdf_path, sec, recs, config.case_table_scan_pages()
         )
         if table_rows:
             blocks = link_case_blocks(table_rows, recs, sec)
+            # 入库侧保持无标签先验（tag_pages=None）：标签是评分侧先验，入库
+            # 救援选靶仍按旧三态口径（避免标签改变 OCR 预算分配）。
             classify_materials(blocks, recs, ratios)
     # 预算传入选靶函数内部做块间公平轮转——外部 [:limit] 顺序截断会让排在
     # 后面的案例块整批饿死（run 60 实证）

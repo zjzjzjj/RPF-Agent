@@ -496,25 +496,21 @@ def execute_run(
     # （2026-10-27 测试2 实证：无效标进基准 → 价格分系统性 +4~7）。
     benchmark_ineligible: set[int] = set()
 
-    def _veto_cell(args):  # noqa: ANN001
-        bid_id, c = args
-        try:
-            return _eval_veto(  # type: ignore[arg-type]
-                c, facts_by_bidder[bid_id],
-                text=text_by_bidder.get(bid_id), gateway=gateway, data_class=data_class,
-                scan_hint=scan_hints.get(bid_id, False),
-                chunk_cats=chunk_cats_by_bidder.get(bid_id),
-                chunk_cat_confs=chunk_cat_confs_by_bidder.get(bid_id),
-            )
-        except Exception as exc:  # noqa: BLE001 —— 单格失败不让整场失败
-            if _is_fatal_llm_error(exc):
-                raise
-            log.warning("客观审查单元格失败 bid=%s criterion=%s：%s", bid_id, c.get("code"), exc)
-            return {"verdict": "need_human", "message": f"客观审查执行失败：{exc}"}
-
-    # Phase1：并行 LLM/判定（串行 329 格 ≈80min → 8 并发 ≈15min）
+    # 两段式（阶段 2，2026-10-30）：Phase0 全格确定性预检（无 LLM）→ Phase1
+    # human_only 组批（refine_with_llm_batch）+ single 单格 LLM 并行。开关
+    # BID_EVAL_VETO_HUMAN_ONLY_BATCH=0 回退全部走 single 旧路径。
     veto_cells = [(bid_id, c) for bid_id in bidder_ids for c in veto_items]
-    veto_results = _parallel_map(_veto_cell, veto_cells, ctx=ctx, message_fmt="客观审查 {done}/{total}")
+    veto_results = _resolve_veto_results(
+        veto_cells,
+        facts_by_bidder=facts_by_bidder,
+        text_by_bidder=text_by_bidder,
+        scan_hints=scan_hints,
+        gateway=gateway,
+        data_class=data_class,
+        chunk_cats_by_bidder=chunk_cats_by_bidder,
+        chunk_cat_confs_by_bidder=chunk_cat_confs_by_bidder,
+        ctx=ctx,
+    )
     # Phase2：串行落库（SQLite 单写者；顺序 = 提交序 = 旧串行循环序，行内容同构）
     for (bid_id, c), result in zip(veto_cells, veto_results):
         review_status = _review_status_for_verdict(result)
@@ -667,7 +663,7 @@ def execute_run(
             link_case_blocks,
             locate_section,
             page_image_ratios,
-            parse_case_table,
+            parse_case_table_at_section,
         )
 
         for bid_id in bidder_ids:
@@ -688,13 +684,32 @@ def execute_run(
                     ).scalar_one_or_none()
             if not pdf_path:
                 continue
-            table_rows = parse_case_table(
-                pdf_path, sec.start, sec.end, config.case_table_scan_pages()
+            # 阶段3a（2026-10-30）：首窗 0 行时按表头就近重试（索引段首偏移几页的
+            # 常见情形不再整条放弃表路径），公共辅助与 ingest_service 共用。
+            table_rows = parse_case_table_at_section(
+                pdf_path, sec, recs, config.case_table_scan_pages()
             )
             if not table_rows:
                 continue
             blocks = link_case_blocks(table_rows, recs, sec)
-            classify_materials(blocks, recs, page_image_ratios(pdf_path))
+            # 阶段4（2026-10-30）：材料索引页级强标签接入三态（tag_signal 先验）。
+            # 关断（material_index/case_tag_prior 任一为 0）或查询失败 → tag_pages
+            # 保持 None，classify_materials 行为与旧口径完全一致。
+            tag_pages = None
+            if config.material_index_enabled() and config.case_tag_prior_enabled():
+                try:
+                    from app.material_index.hints import page_material_tags
+
+                    tag_pages = page_material_tags(
+                        doc_id,
+                        {no for b in blocks for no in b.pages},
+                        {no: t for no, t, _s in rows},
+                    )
+                except Exception:  # noqa: BLE001 —— 标签先验失败不阻塞三态
+                    tag_pages = None
+            classify_materials(
+                blocks, recs, page_image_ratios(pdf_path), tag_pages=tag_pages
+            )
             case_evidence_by_bidder[bid_id] = {
                 "section": sec, "rows": table_rows, "blocks": blocks,
             }
@@ -1970,6 +1985,63 @@ def _load_material_maps(
     return page_cats, page_confs, chunk_cats, chunk_confs
 
 
+def _veto_precheck(  # noqa: ANN001
+    c: dict,
+    facts,
+    text: str | None = None,  # noqa: ARG001 —— 属 LLM 阶段输入，签名与 _eval_veto 对齐
+    scan_hint: bool = False,
+) -> tuple[object, str]:
+    """Phase0 确定性预检（无 LLM，2026-10-30 阶段 2）：run_check + 扫描件豁免
+    （原 _eval_veto :1985-2007 逻辑原样搬出），并给出该格的 LLM 去向 llm_kind：
+
+    - "human_batch"：human_only（或无 check_type）且需 LLM → 进组批裁决；
+    - "single"：其余 unknown/fail+need_human（冲突/信号命中）→ 逐格单条 LLM；
+    - "none"：终态（pass / 硬 fail），或 math_relation 冲突且跳 LLM 开关开
+      （结构化比对已定论，LLM 不改变结论 → 直接 verdict_for 出 conflict_flagged）。
+
+    返回 (PrimitiveResult, llm_kind)。
+    """
+    check_type = c.get("check_type")
+    params = c.get("params") or {}
+    if not check_type:
+        # 无检查定义 ≠ 永远人工死项：按 human_only 语义走（确定性判不了），
+        # auto 模式下 LLM 会接手语义裁决，LLM 也定不了才 need_human
+        # （2026-10-26 run 54 实证：c51/c57/c63 无 check → 7/7 恒 need_human）
+        check_type = "human_only"
+    result = run_check(check_type, params, facts)
+    if scan_hint and result.status == "fail" and not result.need_human:
+        # 「看不见≠不存在」豁免（6b 对称化）：标书含扫描件/OCR 页时，**检索/存在性
+        # 类**硬 fail 可能是文本层不可见造成——不硬否决，升级 LLM/人工裁决。
+        # 误否决=0 的机制保证之一（2026-10-26 run 54 c13 类误否决实证）。
+        # 2026-10-27 收窄：计数/算术类（count_at_least/math_relation）的输入是
+        # 结构化事实（facts 已抽取），不受扫描件文本可见性影响——确定性 fail 保留，
+        # 否则 LLM 触发率 60-76% 全是绕路（每格 +20s）且引入模型方差。
+        if check_type in ("document_present", "contains_phrase", "human_only"):
+            from app.engine.objective import PrimitiveResult
+
+            result = PrimitiveResult(
+                "unknown",
+                f"{result.message}（标书含扫描件/OCR 页，文本层不可见可能导致误判，不作为否决依据）",
+                need_human=True,
+            )
+    needs_llm = result.status == "unknown" or (result.status == "fail" and result.need_human)
+    if not needs_llm:
+        return result, "none"
+    # math_relation 冲突跳过 LLM（阶段 2，2026-10-30）：fail+need_human 来自结构化
+    # 数值比对（大小写/分项合计/限价），LLM 读同一文本无法改变结论——直接
+    # verdict_for 出 conflict_flagged 转人工；unknown（未抽到报价）仍需 LLM 语义兜底。
+    if (
+        config.math_skip_llm_enabled()
+        and check_type == "math_relation"
+        and result.status == "fail"
+        and result.need_human
+    ):
+        return result, "none"
+    if check_type == "human_only":
+        return result, "human_batch"
+    return result, "single"
+
+
 def _eval_veto(  # noqa: ANN001
     c: dict,
     facts,
@@ -2005,8 +2077,19 @@ def _eval_veto(  # noqa: ANN001
                 f"{result.message}（标书含扫描件/OCR 页，文本层不可见可能导致误判，不作为否决依据）",
                 need_human=True,
             )
+    # math_relation 冲突跳过 LLM（阶段 2，2026-10-30）：fail+need_human 来自结构化
+    # 数值比对（大小写/分项合计/限价），结论已定——不调 LLM 直接 verdict_for
+    # （fail+need_human → conflict_flagged 转人工）；unknown（未抽到报价）保留 LLM。
+    # 开关 BID_EVAL_MATH_SKIP_LLM=0 回退逐格 LLM 旧路径。
+    _skip_llm_math = (
+        config.math_skip_llm_enabled()
+        and check_type == "math_relation"
+        and result.status == "fail"
+        and result.need_human
+    )
     if (
-        config.auto_mode()
+        not _skip_llm_math
+        and config.auto_mode()
         and gateway is not None
         and (result.status == "unknown" or (result.status == "fail" and result.need_human))
     ):
@@ -2029,6 +2112,209 @@ def _eval_veto(  # noqa: ANN001
         }
     verdict = verdict_for(c["code"], c["name"], result, on_fail=on_fail)
     return {"verdict": verdict, "message": result.message, "evidence": result.evidence_quote}
+
+
+def _batch_cell_from_judgement(j) -> dict:  # noqa: ANN001 —— auto_judge.AutoJudgement
+    """批量 AutoJudgement → 落库单元格 dict。
+
+    消息口径与单条路径逐字一致：pass → "自动裁决（通过）：…"；fail →
+    "AI 存疑（不自动否决，转评标委员会认定）：自动裁决（不通过）：…"——
+    单条 _eval_veto 里 f"AI 存疑…：{refine_with_llm 的 message}" 的同款拼接。
+    """
+    prefix = "通过" if j.verdict == "pass" else "不通过"
+    quote = next(
+        (str(e.get("quote") or "").strip()
+         for e in j.evidence if str(e.get("quote") or "").strip()),
+        None,
+    )
+    if j.verdict == "pass":
+        return {
+            "verdict": "pass",
+            "message": f"自动裁决（{prefix}）：{j.reasoning}",
+            "evidence": quote,
+        }
+    return {
+        "verdict": "need_human",
+        "message": f"AI 存疑（不自动否决，转评标委员会认定）：自动裁决（{prefix}）：{j.reasoning}",
+        "evidence": quote,
+    }
+
+
+def _resolve_veto_results(
+    veto_cells: list,
+    *,
+    facts_by_bidder: dict,
+    text_by_bidder: dict,
+    scan_hints: dict,
+    gateway,
+    data_class: str,
+    chunk_cats_by_bidder: dict | None = None,
+    chunk_cat_confs_by_bidder: dict | None = None,
+    ctx=None,
+) -> list[dict]:
+    """客观审查两段式（阶段 2 否决提速，2026-10-30）。
+
+    Phase0：全格确定性预检（_veto_precheck，无 LLM）——终态格直接 verdict_for；
+    Phase1：human_only 格按投标人分组、组内按 config.veto_batch_size() 切块 →
+    refine_with_llm_batch 块间并行（样板 = _llm_verify_cases 批间并行；网关信号量
+    是真闸门）；其余 unknown/fail+need_human 格维持单格 _eval_veto LLM 路径；
+    组批开关关闭（BID_EVAL_VETO_HUMAN_ONLY_BATCH=0）→ human_only 格全部走 single。
+
+    返回与 veto_cells 同序的单元格 dict 列表。不变式 I3：落库顺序 = 调用方按
+    veto_cells 原序 zip，本函数内块间/格间的并行完成顺序不影响落库序。
+    """
+    import threading as _threading
+
+    chunk_cats_by_bidder = chunk_cats_by_bidder or {}
+    chunk_cat_confs_by_bidder = chunk_cat_confs_by_bidder or {}
+    total = len(veto_cells)
+    prog_lock = _threading.Lock()
+    done = [0]
+
+    def _advance(n: int, fmt: str = "客观审查 {done}/{total}") -> None:
+        with prog_lock:
+            done[0] += n
+            if ctx is not None:
+                ctx.advance(n=n, message=fmt.format(done=done[0], total=total))
+
+    results: dict[int, dict] = {}
+    llm_ok = config.auto_mode() and gateway is not None
+
+    # ---- Phase0：全格确定性预检（无 LLM） ----
+    none_idxs: list[int] = []
+    batch_idxs: list[int] = []
+    single_idxs: list[int] = []
+    pre_results: dict[int, object] = {}  # PrimitiveResult（组批 items 的机器预检信息）
+    for i, (bid_id, c) in enumerate(veto_cells):
+        try:
+            result, kind = _veto_precheck(
+                c, facts_by_bidder[bid_id],
+                text=text_by_bidder.get(bid_id),
+                scan_hint=scan_hints.get(bid_id, False),
+            )
+        except Exception as exc:  # noqa: BLE001 —— 单格失败不让整场失败
+            if _is_fatal_llm_error(exc):
+                raise
+            log.warning("客观审查单元格失败 bid=%s criterion=%s：%s", bid_id, c.get("code"), exc)
+            results[i] = {"verdict": "need_human", "message": f"客观审查执行失败：{exc}"}
+            none_idxs.append(i)
+            continue
+        if not llm_ok or kind == "none":
+            # 终态（pass/硬 fail，或 math 冲突跳 LLM）/人工模式无网关：直接判定映射
+            results[i] = {
+                "verdict": verdict_for(c["code"], c["name"], result),
+                "message": result.message,
+                "evidence": result.evidence_quote,
+            }
+            none_idxs.append(i)
+        elif kind == "human_batch" and config.veto_human_only_batch_enabled():
+            pre_results[i] = result
+            batch_idxs.append(i)
+        else:
+            single_idxs.append(i)
+    if none_idxs:
+        _advance(len(none_idxs))  # 终态格瞬时收敛，计入进度与取消检查点
+
+    # ---- Phase1a：human_only 组批（同一投标人共享选段/facts，一次 LLM 裁 N 条） ----
+    if batch_idxs:
+        from app.engine.auto_judge import (
+            facts_block_text,
+            price_block_line,
+            refine_with_llm_batch,
+        )
+
+        by_bid: dict[int, list[int]] = {}
+        for i in batch_idxs:
+            by_bid.setdefault(veto_cells[i][0], []).append(i)
+        bsize = config.veto_batch_size()
+        blocks: list[tuple[int, list[int]]] = []
+        for bid_id, idxs in by_bid.items():  # 插入序 = veto_cells 序（bidder 主序）
+            for s0 in range(0, len(idxs), bsize):
+                blocks.append((bid_id, idxs[s0 : s0 + bsize]))
+
+        def _run_batch_block(args):  # noqa: ANN001 —— (bid_id, 组内格下标列表)
+            bid_id, idxs = args
+            facts = facts_by_bidder[bid_id]
+            facts_text = facts_block_text(facts)
+            price_line = price_block_line(facts)
+            items = [
+                {
+                    "criterion": veto_cells[i][1],
+                    "facts_text": facts_text,
+                    "price_line": price_line,
+                    "machine_message": getattr(pre_results[i], "message", ""),
+                }
+                for i in idxs
+            ]
+            try:
+                judgements = refine_with_llm_batch(
+                    gateway, items, text_by_bidder.get(bid_id) or "",
+                    data_class=data_class,
+                    chunk_cats=chunk_cats_by_bidder.get(bid_id),
+                    chunk_cat_confs=chunk_cat_confs_by_bidder.get(bid_id),
+                )
+            except Exception as exc:  # noqa: BLE001 —— 单块失败不让整场失败
+                if _is_fatal_llm_error(exc):
+                    raise  # 配额/预算/涉密 fail-fast 穿透 pool
+                log.warning("客观审查批量块失败 bid=%s：%s", bid_id, exc)
+                _advance(len(idxs))
+                return {
+                    i: {"verdict": "need_human", "message": f"客观审查执行失败：{exc}"}
+                    for i in idxs
+                }
+            out: dict[int, dict] = {}
+            for i in idxs:
+                code = str(veto_cells[i][1].get("code") or "")
+                j = judgements.get(code)
+                out[i] = (
+                    _batch_cell_from_judgement(j)
+                    if j is not None
+                    else {"verdict": "need_human", "message": "客观审查执行失败：批量裁决结果缺失该条"}
+                )
+            _advance(len(idxs))
+            return out
+
+        workers = min(len(blocks), max(1, config.llm_max_concurrency()))
+        if workers <= 1:
+            block_outs = [_run_batch_block(b) for b in blocks]
+        else:
+            from concurrent.futures import ThreadPoolExecutor
+
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                block_outs = list(pool.map(_run_batch_block, blocks))
+        for bo in block_outs:
+            results.update(bo)
+
+    # ---- Phase1b：single 格（含组批开关关闭时的 human_only 全量）——单格 LLM 旧路径 ----
+    if single_idxs:
+
+        def _single_cell(args):  # noqa: ANN001 —— veto_cells 下标
+            i = args
+            bid_id, c = veto_cells[i]
+            try:
+                r = _eval_veto(  # type: ignore[arg-type]
+                    c, facts_by_bidder[bid_id],
+                    text=text_by_bidder.get(bid_id), gateway=gateway, data_class=data_class,
+                    scan_hint=scan_hints.get(bid_id, False),
+                    chunk_cats=chunk_cats_by_bidder.get(bid_id),
+                    chunk_cat_confs=chunk_cat_confs_by_bidder.get(bid_id),
+                )
+            except Exception as exc:  # noqa: BLE001 —— 单格失败不让整场失败
+                if _is_fatal_llm_error(exc):
+                    raise
+                log.warning("客观审查单元格失败 bid=%s criterion=%s：%s", bid_id, c.get("code"), exc)
+                r = {"verdict": "need_human", "message": f"客观审查执行失败：{exc}"}
+            return i, r
+
+        # 维持现有 _parallel_map 单格并行（含逐格 advance/取消检查）；
+        # 消息带「（单格）」与 Phase0/1a 的累计计数区分，避免显示数字回跳。
+        single_outs = _parallel_map(
+            _single_cell, single_idxs, ctx=ctx, message_fmt="客观审查（单格） {done}/{total}",
+        )
+        for i, r in single_outs:
+            results[i] = r
+
+    return [results[i] for i in range(total)]
 
 
 def _review_status_for_verdict(result: dict) -> str:

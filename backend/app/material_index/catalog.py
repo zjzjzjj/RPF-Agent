@@ -147,3 +147,14 @@ def material_category_for(criterion: dict) -> str:
     if cat in ("commercial", "technical", "price"):
         return cat
     return "other"
+
+
+# 业绩三态证据词 → 材料标签词（2026-10-30 阶段4）：派生自 TAG_NORMALIZE 归并目标
+# （合同复印件→合同、验收报告→验收、用户证明→业主证明），发票无归并词原样落 tags。
+# 页级强标签（material_index.rules.CONF_STRONG + method=rule）命中这些词时，
+# 业绩三态判定借为 tag_signal 先验（见 case_evidence.classify_materials）。
+EVIDENCE_TAG_WORDS: dict[str, tuple[str, ...]] = {
+    "contract": ("合同",),
+    "invoice": ("发票",),
+    "acceptance": ("验收", "业主证明"),
+}

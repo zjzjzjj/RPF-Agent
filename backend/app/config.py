@@ -352,8 +352,12 @@ def case_section_max_pages() -> int:
 
 
 def case_table_scan_pages() -> int:
-    """业绩表解析只扫证据段前几页（表通常在段首）。"""
-    return int(os.environ.get("BID_EVAL_CASE_TABLE_SCAN_PAGES", 4))
+    """业绩表解析只扫证据段前几页（表通常在段首）。
+
+    2026-10-30 阶段3a：默认 4→8——索引定位的段首与真表头常差 4 页以上
+    （首窗 4 页 0 行即放弃整条表路径），放宽扫描窗 + 表头就近重试提升命中率。
+    """
+    return int(os.environ.get("BID_EVAL_CASE_TABLE_SCAN_PAGES", 8))
 
 
 def case_evidence_pages_per_material() -> int:
@@ -403,6 +407,20 @@ def case_null_policy() -> str:
     避免"看不见就当没有"清零；skip：null 一律不计。见 objective.score_count。
     """
     return os.environ.get("BID_EVAL_CASE_NULL_POLICY", "count_with_contract").strip().lower()
+
+
+def case_tag_prior_enabled() -> bool:
+    """材料索引页级强标签接入业绩三态（tag_signal）开关（阶段4，默认开，2026-10-30）。
+
+    扫描/低证据页的文本层判不了合同/发票/验收，但 material_tags 页级标签
+    （rule 层 + CONF_STRONG）已在入库时对同类页盖过章——借用为三态先验：
+    unreadable/scan_unverified 候选页命中标签 → True(reason=tag_signal)。
+    absent（全页可读且无信号）分支不受影响、永不翻转。
+    置 0（BID_EVAL_CASE_TAG_PRIOR=0）回退无标签旧口径（tag_pages=None）。
+    """
+    return os.environ.get("BID_EVAL_CASE_TAG_PRIOR", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
 
 
 def max_upload_bytes() -> int:
@@ -493,9 +511,68 @@ def llm_daily_call_budget() -> int:
     return int(os.environ.get("BID_EVAL_LLM_DAILY_BUDGET", 0))
 
 
+def llm_disk_cache_enabled() -> bool:
+    """LLM 磁盘缓存开关。显式置 0 关、置 1 开；未设置时生产开、pytest 进程内关。
+
+    2026-10-30 阶段 1：chat_json 校验通过的结果落 data/llm_cache/，重启/新
+    Gateway 实例复用同 prompt 同参数的已验证输出，省调用与配额。
+    pytest 内默认关的实证（2026-10-30）：test_llm_json_repair.py 三个 chat_json
+    用例共用同一 (system,user,prompt_version) → 同一缓存键，且不隔离 data_dir；
+    缓存开时 test 1 落盘、test 2/3 磁盘命中同一份已验证文本，
+    `pytest.raises(LLMError)` 直接 DID NOT RAISE。需要磁盘缓存语义的用例
+    显式置 1（见 test_llm_disk_cache.py，配合临时 BID_EVAL_DATA_DIR）。
+    """
+    raw = os.environ.get("BID_EVAL_LLM_DISK_CACHE", "").strip().lower()
+    if raw in ("0", "false", "no", "off"):
+        return False
+    if raw in ("1", "true", "yes", "on"):
+        return True
+    return not os.environ.get("PYTEST_CURRENT_TEST")
+
+
 def llm_prompt_version() -> str:
-    """提示词版本号；进入缓存键与审计记录。改 prompt 必须同步改它。"""
-    return os.environ.get("BID_EVAL_PROMPT_VERSION", "2026-10-21.1")
+    """提示词版本号；进入缓存键与审计记录。改 prompt 必须同步改它。
+
+    2026-10-30 阶段 2：新增 human_only 批量裁决 prompt（auto_judge
+    AUTO_JUDGE_BATCH_SYSTEM_PROMPT）——批量 prompt 是新常量，但版本号统一升
+    以作废既有磁盘缓存键（新旧 prompt 不得共享缓存命中）。
+    """
+    return os.environ.get("BID_EVAL_PROMPT_VERSION", "2026-10-30.1")
+
+
+def veto_batch_size() -> int:
+    """human_only 否决格组批裁决的每批条款数（阶段 2 主杠杆，2026-10-30）。
+
+    同一投标人的多条 human_only 条款共享一次选段与 <bid> 块，N 条裁决合成
+    一次 LLM 调用（N 次 15k 上下文 → 1 次）。默认 6：单批 6 条 JSON 输出在
+    默认 4K 输出预算内稳定不截断（更大批次顶到 max_tokens 上限会整批降级）。
+    """
+    try:
+        n = int(os.environ.get("BID_EVAL_VETO_BATCH_SIZE", 6))
+    except ValueError:
+        return 6
+    return max(1, n)
+
+
+def veto_human_only_batch_enabled() -> bool:
+    """human_only 组批开关（阶段 2，2026-10-30）。默认开；置 0 回退逐格单条
+    LLM 旧路径（BID_EVAL_VETO_HUMAN_ONLY_BATCH=0 → 全部走 single 旧逻辑）。"""
+    return os.environ.get("BID_EVAL_VETO_HUMAN_ONLY_BATCH", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def math_skip_llm_enabled() -> bool:
+    """math_relation 冲突跳过 LLM 开关（阶段 2，2026-10-30）。默认开。
+
+    算术冲突（fail+need_human）由结构化事实比对确定（大小写不一致/超限价/
+    分项合计不符均来自 facts 数值比较），LLM 读同一文本无法改变结构化结论
+    ——跳过 LLM 直接 conflict_flagged 转人工；未抽到报价的 unknown 保留 LLM。
+    置 0（BID_EVAL_MATH_SKIP_LLM=0）回退冲突格逐格 LLM 旧路径。
+    """
+    return os.environ.get("BID_EVAL_MATH_SKIP_LLM", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
 
 
 def local_endpoint_hosts() -> list[str]:

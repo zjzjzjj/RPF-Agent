@@ -32,7 +32,15 @@ _RE_ITEM_LINE = re.compile(
     r"^[\s|｜、.．)）]*+(?:[（(]?\d{1,3}[）)]?)?[\s|｜、.．)）]*+"
     r"(.{2,60}?)[\s|｜]++([\d,，]+(?:\.\d+)?)[\s|｜]++(\d{4})\s*年"
 )
-_RE_CAPITAL = re.compile(r"注册资本[：:]*人民币?([\d,，]+(?:\.\d+)?)\s*万元")
+# 注册资本（阶段 2 补强，2026-10-30）：
+# - 标签与数字间允许连接字 为/计/系/共（真实营业执照/投标声明常见形态）；
+# - 单位支持「元」（值即元，不乘 10000）与「万 元」空格变体（OCR 拆字）；
+# - 允许数字后跟「整」（金额大写习惯）。
+# 宁缺勿错：不做中文大写数字（壹仟万…），不从「营业执照」标题邻近推断。
+# 首个 .search 命中语义不变（万元 ×10000；纯元不换算）。
+_RE_CAPITAL = re.compile(
+    r"注册资本[：:为计系共]*人民币?([\d,，]+(?:\.\d+)?)\s*(万\s*元|元)(整)?"
+)
 # 证书行（行级匹配）：与 _RE_ITEM_LINE 同理——占有量词消除回溯
 # （原 _ROW_PREFIX 版本在诚道 25 万字符文本上满载 CPU 不返回，2026-10-15）。
 # 2026-10-21 重做：OCR 后证书文本形态是"ISO/IEC 20000-1:2018""GB/T19001-2016/
@@ -352,11 +360,13 @@ def extract_bid_facts(text: str, documents: list[str] | None = None) -> BidFacts
     if m := _RE_ITEMS_TOTAL_ROW.search(text):
         facts.price_items_total = _money(m.group(1))
 
-    # 注册资本
+    # 注册资本（阶段 2 补强，2026-10-30）：单位「元」→ 值即元不换算；
+    # 「万元/万 元」→ ×10000（首个 .search 命中语义与旧版一致）
     if m := _RE_CAPITAL.search(text):
         cap = _money(m.group(1))
         if cap is not None:
-            facts.registered_capital = cap * Decimal(10_000)
+            unit = (m.group(2) or "").replace(" ", "").replace("　", "")
+            facts.registered_capital = cap if unit == "元" else cap * Decimal(10_000)
 
     # 业绩（表格行：编号 名称 金额 年份；管道或空格分隔）
     # 表头若声明"万元"单位，金额要做 ×10000 换算，否则出现 10000 倍低估。
