@@ -1471,7 +1471,17 @@ def _case_candidate_pages(
     batches: list[list[tuple[int, str]]] = []
     cur: list[tuple[int, str]] = []
     cur_chars = 0
-    _max_batches = _case_max_batches()
+    # 自适应送审（2026-10-30）：旧实现按固定批数截断（run 72 实证：87 候选页只
+    # 送审 71 页、16 页从没给核验模型看，模型"没找到材料"实为没看到）。改为按
+    # 内容算所需批数、只在超硬顶（ceiling=12）才截断；地板仍是 case_max_batches。
+    import math as _math
+
+    _total_chars = sum(len(pages[i][1] or "") for i in ordered)
+    _needed = _math.ceil(_total_chars / _CASE_BATCH_CHARS) if _total_chars else 1
+    _max_batches = max(
+        _case_max_batches(),
+        min(_needed, config.case_max_batches_ceiling()),
+    )
     for i in ordered:
         no, text = pages[i][0], pages[i][1] or ""
         if cur and cur_chars + len(text) > _CASE_BATCH_CHARS:
@@ -1637,6 +1647,22 @@ def _llm_verify_cases(
             if not case.get("page_hint"):
                 case["page_hint"] = batch[0][0]
             merged.append(case)
+    # 截断降级（2026-10-30）：候选页超硬顶被截断时，模型的"确认缺失"(False) 不可信
+    # ——它没看到省略页。把 sanitized=="ok"（非防作弊拒绝）案例的 False 降为 None
+    # （unverified），走窄版"计入+标注"而非 0。防作弊拒绝（sanitized!=ok）的 False
+    # 是"案例造假"不是"材料缺失"，不动。run 72 实证：87 页只送审 71、16 页没看，
+    # 模型"没找到材料"实为没看到 → 误判 0。
+    if stats_out is not None and stats_out.get("pages_omitted", 0) > 0:
+        _mat_keys = ("contract", "invoice", "acceptance",
+                     "work_proof", "experience_proof", "social_security")
+        for case in merged:
+            if case.get("sanitized") != "ok":
+                continue  # 防作弊拒绝的 False 不是材料缺失
+            if any(case.get(k) is False for k in _mat_keys):
+                for k in _mat_keys:
+                    if case.get(k) is False:
+                        case[k] = None  # False → 未核验（计入+标注）
+                case["truncated_review"] = True
     return merged
 
 

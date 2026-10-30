@@ -894,67 +894,40 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                     conflict = True
                     detail += f"；{unknown_amount} 个案例金额无法确认（需人工核对）"
             required_flags = _required_flags(artifacts, person_scope=person_scope, criterion_name=str(criterion.get("name") or ""))
-            # 硬闸门（2026-10-23 按真实评审校准）：因素明确列出的材料（发票/验收/
-            # 业主证明）**不可读(None)也不计**——真实评审"不提供或提供不全的不得分"
-            # 是逐材料硬执行（run 48 实证：诚道 2 个 inv=None 案例被 null_policy
-            # 放行 → 6 分，真实 4 分；先数 1 个同样放行 → 4 分，真实 0）。
-            # null 救援仅保留在**未明确点名**的材料键上。
-            # 2026-10-27 对齐人工口径（训练集测试2 p5 实证）：**业主证明/验收是
-            # 硬口径**（集服缺→0），发票 OCR 不可见≠缺失——发票移出 _strict_none，
-            # acceptance=True 时 invoice=None 走疑问不阻计。
-            _strict_none: set[str] = set()
-            if not person_scope:
-                if any(k in artifacts for k in ("验收", "业主证明", "用户证明", "用户报告")):
-                    _strict_none.add("acceptance")
-            # 三态材料：True=确认有；False=确认无（规则"不全不得分"→不计）；
-            # None=页不可读/未提供。None 不直接当 0——"机器看不见 ≠ 没有"
-            # （与确定性路径同一哲学）。仅当确定性业绩表依据 + 合同已确认 +
-            # 策略允许时计入并标疑问，避免"发票没 OCR 就整项清零"。
+            # 窄版材料闸门（2026-10-30）：三态材料 True=确认有 / False=确认无 /
+            # None=机器看不清或没绑上（页不可读、案例名没链到材料页、页没送审）。
+            # 旧口径把 None 也扣 0，等于把管线故障（OCR 没读出/没绑上/没送审）算在
+            # 投标人头上——用友 c54/c55 材料在却判 0、人工给 4 实证。窄版：
+            #   any False（可读文本确认缺失）→ 不计（规则"不全不得分"硬口径不变）
+            #   all True → 计
+            #   否则含 None → 计入并标"未核验"+进人工队列（不再打 0）
+            # 开关 config.case_unverified_count_enabled()（BID_EVAL_CASE_UNVERIFIED_COUNT）
+            # 关 → 回退"None 不计"（保守），供 eval_suite 锚点对比与回滚。
             complete: list[dict] = []
-            null_counted = 0
-            null_dropped = 0
+            unverified_counted = 0
+            null_dropped = 0  # 仅回退模式（None 不计）
             dropped_false = 0
-            null_policy = config.case_null_policy()
+            _unverified_on = config.case_unverified_count_enabled()
             for c in cases:
                 vals = {k: c.get(k) for k in required_flags}
                 if any(v is False for v in vals.values()):
-                    dropped_false += 1  # 确认缺失 → 不计
-                    continue
-                if any(v is None and k in _strict_none for k, v in vals.items()):
-                    # 明确要求的材料不可读 → 按"不全不得分"不计，但必须可见：
-                    # 不可读≠确认缺失（可能是扫描件），静默丢弃会把"OCR 没看见"
-                    # 伪装成"评分结论 0 分"（run 54 T5.1 19 案例仅计 1 的一环）
-                    null_dropped += 1
+                    dropped_false += 1  # 确认缺失 → 不计（规则硬口径）
                     continue
                 if all(v is True for v in vals.values()):
                     complete.append(c)  # 全部确认 → 计
                     continue
-                # 人工口径（训练集测试2）：有业主证明/验收（acceptance=True）时
-                # 发票 OCR 不可见（None）不阻计——按已提供计并标疑问。
-                if vals.get("acceptance") is True and vals.get("invoice") is None \
-                        and vals.get("contract") is not False:
+                # 无 False、非全 True → 存在 None（不可读/未绑上）
+                if _unverified_on:
+                    c["unverified"] = True
                     complete.append(c)
-                    null_counted += 1
+                    unverified_counted += 1
                     conflict = True
-                    continue
-                # B2 材料闸门校准：null_policy 从"仅 contract=True 即救"收紧为
-                # "至少 2 项确认 True"——先进数通只有合同无发票/验收（真实 0 分），
-                # 旧逻辑 count_with_contract 误放行 1 案得 2 分。
-                _confirmed = sum(1 for v in vals.values() if v is True)
-                if (
-                    c.get("case_source") == "table"
-                    and vals.get("contract") is True
-                    and _confirmed >= 2
-                    and null_policy == "count_with_contract"
-                ):
-                    complete.append(c)
-                    null_counted += 1
+                else:
+                    # 回退：None 不计（保守）
+                    null_dropped += 1
                     conflict = True
-                    continue
-                # 未命中任何救援（含 None 未计）→ 归"不可读丢弃"，不得混进
-                # "确认缺失"（旧口径 incomplete 混账让 OCR 没看见的 0 分
-                # 伪装成 confirmed_absent/pass，不转人工）
-                null_dropped += 1
+            if dropped_false:
+                conflict = True  # 确认缺失 → 0 也标疑问（规则"不全不得分"，留人工复核）
             effective = min(Decimal(len(complete)), Decimal(max_items)) if max_items else Decimal(len(complete))
             score = (effective * per_item).quantize(Decimal("0.01"))
             if max_score and score > max_score:  # 封顶：真实规则"最高得 M 分"
@@ -962,18 +935,14 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
             detail = (
                 f"逐案例核验：提供案例 {len(cases)} 个，其中可计 {len(complete)} 个"
                 + (f"（{dropped_false} 个缺证明材料不计分）" if dropped_false else "")
-                + (f"（{null_counted} 个材料页不可读，按已提供计并标疑问）" if null_counted else "")
+                + (f"（{unverified_counted} 个案例材料不可读/未绑上，按未核验计入并标疑问，建议人工核看）"
+                   if unverified_counted else "")
                 + (f"（{null_dropped} 个案例材料页不可读未计，可能为扫描件，建议人工核看）"
                    if null_dropped else "")
                 + _type_gate_note
             )
-            if dropped_false or null_dropped:
-                conflict = True
-            # 零分理由分离（W1-C，run 60 实证）："5 个案例材料页不可读未计"仍记
-            # 0 分——分数维持规则硬口径不改（不提供/不全不得分），但 0 的性质要
-            # 区分：材料页不可读(None)未计 → "unreadable"（机器不可见，非确认
-            # 缺失，强制转人工）；确认缺失(False)未计 → "confirmed_absent"。
-            # 优先 unreadable：只要存在不可读丢弃且总分 0，就不能伪装成确认缺失。
+            # 零分理由：unverified 案例已计入 → score>0，故下面只在回退模式/全 False/
+            # 类型剔空时可达。
             if score == 0:
                 if null_dropped:
                     zero_reason = "unreadable"

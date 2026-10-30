@@ -372,8 +372,31 @@ def case_digest_chars() -> int:
 
 
 def case_max_batches() -> int:
-    """无表回退（section-aware LLM 选页）时的批次数上限。"""
+    """无表回退（section-aware LLM 选页）时的批次数下限（自适应送审的地板）。"""
     return int(os.environ.get("BID_EVAL_CASE_MAX_BATCHES", 4))
+
+
+def case_max_batches_ceiling() -> int:
+    """自适应送审的批次数硬顶（2026-10-30 窄版+送审截断修复）。
+
+    旧实现按固定上限截断候选页（run 72 实证：87 候选页只送审 71 页、16 页
+    从没给核验模型看，模型"没找到材料"实为没看到）。改为按内容算所需批数、
+    只在超过此硬顶才截断；12 批 ≈ 覆盖绝大多数标书证据段。
+    """
+    return max(1, int(os.environ.get("BID_EVAL_CASE_MAX_BATCHES_CEILING", 12)))
+
+
+def case_unverified_count_enabled() -> bool:
+    """窄版材料闸门开关（2026-10-30）。
+
+    开（默认）：材料三态=None（机器看不清/没绑上/页没送审）的案例**计入分**
+    并标注"未核验"+进人工队列；只有三态=False（可读文本确认缺失）才维持 0。
+    窄版理由：机器"没找到"混着"真没有"和"管线故障"，一律扣 0 把管线故障算在
+    投标人头上（用友 c54/c55 材料在却判 0 实证）。关=回退旧闸门（None 不计）。
+    """
+    return os.environ.get("BID_EVAL_CASE_UNVERIFIED_COUNT", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
 
 
 def material_ocr_max_pages() -> int:

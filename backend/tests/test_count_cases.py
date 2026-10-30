@@ -122,10 +122,15 @@ def test_score_count_all_cases_sanitized_is_unresolved() -> None:
     assert result.conflict is True
 
 
-def test_score_count_legit_case_missing_material_scores_zero() -> None:
-    """合法案例但材料缺失 → 0 分是真实评审结论（先数业绩 0 = 确无发票/验收）。"""
+def test_score_count_legit_case_missing_material_scores_zero(monkeypatch) -> None:  # noqa: ANN001
+    """回退模式：合法案例但材料缺失 → 0 分是真实评审结论（先数业绩 0）。
+
+    窄版默认开时 None 计入+标注；此用例验证关闭开关（BID_EVAL_CASE_UNVERIFIED_COUNT=0）
+    的回退路径仍 None 不计 → 0。
+    """
     from app.engine.objective import score_count
 
+    monkeypatch.setenv("BID_EVAL_CASE_UNVERIFIED_COUNT", "0")
     facts = BidFacts(text="")
     crit = _count_crit(verified_cases=[
         {"name": "A", "role": "member", "contract": True, "invoice": False,
@@ -135,6 +140,84 @@ def test_score_count_legit_case_missing_material_scores_zero() -> None:
     assert result.unresolved is None
     assert result.score == Decimal("0")
     assert result.conflict is True
+
+
+def test_score_count_unverified_none_counted_and_marked(monkeypatch) -> None:  # noqa: ANN001
+    """窄版（默认开）：材料 None（不可读/未绑上）→ 计入 + unverified 标注 + conflict。
+
+    2026-10-30 用友 c54/c55 实证：材料在、机器核不上却判 0，人工给 4。窄版把
+    管线故障（OCR 没读出/没绑上/页没送审）与"确认缺失"区分开——None 计入+标注，
+    只有 False（可读文本确认缺失）才维持 0。
+    """
+    from app.engine.objective import score_count
+
+    crit = _perf_crit(verified_cases=[
+        {"name": "A", "contract": True, "invoice": None, "acceptance": None,
+         "sanitized": "ok"},
+    ])
+    res = score_count(crit, crit["params"], BidFacts(text=""))
+    assert res.score == Decimal("2.00")  # None 计入（旧口径 0）
+    assert res.conflict is True
+    assert res.zero_reason is None  # score>0 不携带零分理由
+    assert "未核验计入" in res.detail
+
+
+def test_score_count_false_stays_zero_in_narrow() -> None:
+    """窄版下 any False（确认缺失）仍 →0（规则"不全不得分"硬口径不变）。"""
+    from app.engine.objective import score_count
+
+    crit = _perf_crit(verified_cases=[
+        {"name": "A", "contract": True, "invoice": False, "acceptance": True,
+         "sanitized": "ok"},
+    ])
+    res = score_count(crit, crit["params"], BidFacts(text=""))
+    assert res.score == Decimal("0")
+    assert res.zero_reason == "confirmed_absent"
+
+
+def test_llm_verify_truncation_downgrades_false(monkeypatch):  # noqa: ANN001
+    """截断降级：候选页超硬顶被截断时，sanitized=="ok" 的 False→None（未核验）。
+
+    模型没看到省略页，"确认缺失"(False) 不可信——run 72 实证：87 页只送审 71、
+    16 页没看，模型"没找到材料"实为没看到 → 误判 0。防作弊拒绝（sanitized!=ok）
+    的 False 是"案例造假"不是"材料缺失"，不降级。
+    """
+    from types import SimpleNamespace
+
+    from app.services import scoring_service as ss
+
+    # fake gateway：返回2 个 contract=False 的案例，一个 ok、一个 requirement_shadow
+    class _GW:
+        def chat_json(self, system, user, out_model, data_class="synthetic"):  # noqa: ANN001
+            cases = [
+                {"name": "甲项目", "contract": False, "invoice": False, "acceptance": False,
+                 "quote": "我司承接该项目，合同金额捌拾万元整，服务期一年。"},
+                {"name": "乙项目", "contract": False, "invoice": False, "acceptance": False,
+                 "quote": REQ_TEXT},  # 照抄要求 → 防作弊降级
+            ]
+            return SimpleNamespace(cases=cases), None
+
+    # monkeypatch 切批：强制截断（pages_omitted=1），返回1 个批次（(页号,文本) 二元组）
+    def _fake_cand(pages, **kw):  # noqa: ANN001
+        if kw.get("stats_out") is not None:
+            kw["stats_out"]["pages_omitted"] = 1
+        return [[(1, "第1页正文合同项目名称甲方乙方")]]
+
+    monkeypatch.setattr(ss, "_case_candidate_pages", _fake_cand)
+    crit = _perf_crit()
+    stats = {}
+    out = ss._llm_verify_cases(
+        _GW(), crit, REQ_TEXT, ["合同复印件"], None,
+        [(1, "第1页正文合同项目名称甲方乙方", "text")],
+        "synthetic", bid_norm=None, stats_out=stats,
+    )
+    assert stats["pages_omitted"] == 1
+    by_name = {c["name"]: c for c in out}
+    # ok 案例：False→None + truncated_review
+    assert by_name["甲项目"]["contract"] is None
+    assert by_name["甲项目"].get("truncated_review") is True
+    # 防作弊案例：False 不降级
+    assert by_name["乙项目"]["contract"] is False
 
 
 def test_score_count_role_variants_not_zeroed() -> None:
@@ -689,10 +772,11 @@ def test_score_count_null_with_contract_counts_and_flags() -> None:
     assert res2.score == Decimal("2.00")
 
 
-def test_score_count_null_without_contract_does_not_count() -> None:
-    """合同都不可读 → 没有正向依据，不计（防通胀）。"""
+def test_score_count_null_without_contract_does_not_count(monkeypatch) -> None:  # noqa: ANN001
+    """回退模式：合同都不可读 → 没有正向依据，不计（防通胀）。"""
     from app.engine.objective import score_count
 
+    monkeypatch.setenv("BID_EVAL_CASE_UNVERIFIED_COUNT", "0")
     crit = _perf_crit(verified_cases=[
         {"name": "A", "contract": None, "invoice": None, "acceptance": None,
          "case_source": "table", "sanitized": "ok"},
@@ -854,14 +938,16 @@ def test_sanitize_explicit_scope_wins_over_null_keys():
 # ---- 零分理由 zero_reason（W1-C，2026-10-29）--------------------------------
 # run 60 实证："5 个案例材料页不可读未计"仍记 0——分数维持规则硬口径（不改分
 # 避免拟合），但 0 的性质必须可区分：机器看不见 ≠ 确认不符合。
-def test_score_count_unreadable_drop_zero_reason() -> None:
-    """点名材料页不可读(None)丢弃 → score=0 + zero_reason="unreadable"。
+def test_score_count_unreadable_drop_zero_reason(monkeypatch) -> None:  # noqa: ANN001
+    """回退模式：点名材料页不可读(None)丢弃 → score=0 + zero_reason="unreadable"。
 
     与 confirmed_absent 分离：不可读可能是扫描件（机器看不见），
     不是"确认未提供"；落库侧强制 need_human + conflict_flagged。
+    窄版默认开时 None 计入+标注；此用例验证关闭开关的回退路径。
     """
     from app.engine.objective import score_count
 
+    monkeypatch.setenv("BID_EVAL_CASE_UNVERIFIED_COUNT", "0")
     crit = _perf_crit(verified_cases=[
         {"name": "A", "contract": None, "invoice": None, "acceptance": None,
          "case_source": "table", "sanitized": "ok"},
@@ -1164,11 +1250,12 @@ def test_count_zero_warn_entry_confirmed_absent文案区分() -> None:
 
 
 # ---- 闸门丢弃分账（D1，2026-10-29）------------------------------------------
-def test_score_count_null_drop_without_strict_marks_unreadable() -> None:
-    """非严格键（未点名验收）上的 None 丢弃 → unreadable（旧口径混进
+def test_score_count_null_drop_without_strict_marks_unreadable(monkeypatch) -> None:  # noqa: ANN001
+    """回退模式：非严格键（未点名验收）上的 None 丢弃 → unreadable（旧口径混进
     incomplete → confirmed_absent/pass，OCR 没看见伪装成确认缺失）。"""
     from app.engine.objective import score_count
 
+    monkeypatch.setenv("BID_EVAL_CASE_UNVERIFIED_COUNT", "0")
     crit = _perf_crit(
         required_artifacts="合同复印件、发票复印件",  # 未点名验收 → 无 strict 键
         verified_cases=[
@@ -1196,10 +1283,11 @@ def test_score_count_false_drop_stays_confirmed_absent() -> None:
     assert "缺证明材料" in res.detail
 
 
-def test_score_count_mixed_drop_reasons_prefers_unreadable() -> None:
-    """False 与 None 混合丢弃且总分 0 → 优先 unreadable（不可读丢弃存在即转人工）。"""
+def test_score_count_mixed_drop_reasons_prefers_unreadable(monkeypatch) -> None:  # noqa: ANN001
+    """回退模式：False 与 None 混合丢弃且总分 0 → 优先 unreadable（不可读丢弃存在即转人工）。"""
     from app.engine.objective import score_count
 
+    monkeypatch.setenv("BID_EVAL_CASE_UNVERIFIED_COUNT", "0")
     crit = _perf_crit(verified_cases=[
         {"name": "A", "contract": True, "invoice": True, "acceptance": True,
          "sanitized": "ok"},
