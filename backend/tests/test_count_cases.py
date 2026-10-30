@@ -1022,6 +1022,79 @@ def test_score_count_iso_gate_no_facts_not_overridden_to_confirmed() -> None:
     assert res.zero_reason == "no_facts"
 
 
+def test_score_count_cmmi_field_counts_single_certificate() -> None:
+    """CMMI 独立计分项（field=cmmi）：有 CMMI 证书 → 得 per_item 满分 2；
+    无 → 0 且 confirmed_absent。真实细则「CMMI 二级以上得 2 分」独立于 ISO 项。
+
+    2026-10-30 run 66 实证：LLM 曾把 CMMI 编译成 match 判断项不计分，
+    四家 CMMI 2 分全丢；改 field=cmmi 独立计数。
+    """
+    from app.engine.objective import score_count
+
+    facts = BidFacts(text="")
+    facts.certificates = ["ISO9001", "ISO27001", "ISO20000", "CMMI 五级"]
+    crit = {
+        "name": "投标人认证（CMMI）", "max_score": Decimal("2"),
+        "required_artifacts": "证书复印件",
+    }
+    res = score_count(crit, {"field": "cmmi", "per_item": "2", "max_items": "1"}, facts)
+    assert res.score == Decimal("2")  # 有 CMMI → 1 项 × 2 分
+    assert res.zero_reason is None
+
+    facts2 = BidFacts(text="")
+    facts2.certificates = ["ISO9001", "ISO27001"]  # 有 ISO 但无 CMMI
+    res2 = score_count(crit, {"field": "cmmi", "per_item": "2", "max_items": "1"}, facts2)
+    assert res2.score == Decimal("0")
+    assert res2.zero_reason == "confirmed_absent"
+
+
+def test_score_count_certificates_merges_cmmi_only_when_text_names_it() -> None:
+    """certificates 分支：细则文本点名 CMMI 才与 ISO 合并计数；纯 ISO 项不吞 CMMI。
+
+    2026-10-30 run 66 实证：c47 箴文只列 ISO 三系（不含 CMMI 字样），旧逻辑
+    count=len(iso_set)+has_cmmi=4 被 max_items=3 cap 吞掉 CMMI 那 1 项，
+    四家 CMMI 2 分全丢。现在纯 ISO 项只数 ISO，CMMI 由独立 cmmi 条目计。
+    """
+    from app.engine.objective import score_count
+
+    facts = BidFacts(text="")
+    facts.certificates = ["ISO9001", "ISO27001", "ISO20000", "CMMI 五级"]
+
+    # 纯 ISO 项（文本不点名 CMMI）：只数 ISO 三系，CMMI 不被 cap 吞
+    crit_iso = {
+        "name": "投标人认证（管理体系认证）",
+        "description": "投标人具有有效期内的ISO9001、ISO27001、ISO20000证书的，每项得1分。最高得3分。",
+        "max_score": Decimal("3"),
+        "required_artifacts": "查询结果截图", "cert_section_present": True,
+    }
+    res = score_count(crit_iso, {"field": "certificates", "per_item": "1", "max_items": "3"}, facts)
+    assert res.score == Decimal("3")  # ISO 三系 3 项；CMMI 不进 cap
+
+    # 合并口径（文本点名 CMMI）：ISO + CMMI 一起计，向后兼容
+    crit_merged = {
+        "name": "投标人资质认证情况",
+        "description": "投标人具有ISO9001、ISO27001、ISO20000证书每项1分，CMMI认证二级以上1分。",
+        "max_score": Decimal("4"),
+        "required_artifacts": "证书复印件", "cert_section_present": True,
+    }
+    res2 = score_count(crit_merged, {"field": "certificates", "per_item": "1", "max_items": "4"}, facts)
+    assert res2.score == Decimal("4")  # ISO 3 + CMMI 1 = 4 项（max_items=4 不 cap）
+
+
+def test_score_type_for_row_cmmi_returns_count() -> None:
+    """reconcile：CMMI 存在性计分行 → count/field=cmmi（不再被 LLM 编成 match 丢分）。"""
+    from app.rules.reconcile import _score_type_for_row
+
+    row = type("R", (), {
+        "subjectivity": "objective",
+        "text": "具有有效期内CMMI 认证二级及以上得 2 分。",
+    })()
+    score_type, params = _score_type_for_row(row)
+    assert score_type == "count"
+    assert params.get("field") == "cmmi"
+    assert params.get("per_item") == "2"
+
+
 def test_count_zero_warn_entry_unreadable_forces_need_human() -> None:
     """落库映射：unreadable 零分 → 警告文案"机器不可见"+ unreadable_zero=True。
 

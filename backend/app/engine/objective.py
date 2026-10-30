@@ -600,6 +600,30 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                 iso_set.add(key)  # 任意 ISO 族（9001/14001/45001…）都计
             elif key == "CMMI":
                 has_cmmi = True
+    if field == "cmmi":
+        # CMMI 独立计分项（reconcile 生成的 field=cmmi）：「CMMI 二级以上 1 项
+        # 得 N 分」，存在性计分、与 ISO 项互斥。LLM 曾把此条标 match 丢失满分，
+        # 现按单一证书计数（remote_reconcile 2026-10-30）。
+        iso_set = set()
+        has_cmmi = any(normalize_cert(c) == "CMMI" for c in facts.certificates)
+        count = 1 if has_cmmi else 0
+        detail = f"提供 CMMI 认证 {count} 项（{('有' if has_cmmi else '无')}有效期内 CMMI 证书）"
+        if not facts.certificates and not facts.cert_claims:
+            detail = "未提取到证书清单（需人工核查）"
+            unresolved = "no_facts"
+            zero_reason = "no_facts"
+        effective = min(Decimal(count), Decimal(max_items)) if max_items else Decimal(count)
+        score = (effective * per_item).quantize(Decimal("0.01"))
+        if max_score and score > max_score:
+            score = max_score
+        if score == 0 and zero_reason is None:
+            # 证书清单非空但无 CMMI → 机器确认其无 CMMI 项（确认未提供）
+            zero_reason = "confirmed_absent"
+        return CountResult(
+            score=score, detail=detail, unresolved=unresolved, conflict=conflict,
+            zero_reason=zero_reason,
+        )
+    if field == "certificates":
         # ISO 型判定看规则文本是否点名体系；未点名的证件计数项（资质证/操作证/
         # 职称证等）按证书清单总数计——旧实现无条件走 ISO/CMMI 口径，非 ISO
         # 证件项恒 0（2026-10-26 run 54 通用证件类实证）。
@@ -616,7 +640,14 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
             _cert_text,
         ))
         if _iso_shaped:
-            count = len(iso_set) + (1 if has_cmmi else 0)
+            # 仅当细则文本点名 CMMI 才与 ISO 合并计数——纯 ISO 项（"ISO9001/
+            # 27001/20000 每项1分最高3分"）的 CMMI 由独立 field=cmmi 条目计，
+            # 混算会被 max_items/cap 吞掉（2026-10-30 run 66 实证：四家 CMMI
+            # 2 分全丢，c47 得 3.00 是 ISO3 被 cap 后 CMMI 挤不进去）。
+            if "CMMI" in _cert_text:
+                count = len(iso_set) + (1 if has_cmmi else 0)
+            else:
+                count = len(iso_set)
         else:
             count = len(facts.certificates)
         # 一条都没抽到 ≠ 一条都不合格：前者是抽取能力问题，必须与"确实 0 项"区分开，

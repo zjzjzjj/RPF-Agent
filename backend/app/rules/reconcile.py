@@ -192,6 +192,13 @@ def _score_type_for_row(row: SkeletonRow) -> tuple[str, dict]:
     if row.subjectivity == "subjective":
         return "subjective", {}
     text = row.text or ""
+    # CMMI 认证独立计分项（"具有有效期内CMMI 认证二级及以上得 N 分"）：
+    # 存在性即得分、单一证书。LLM 编译曾把此行标 match（判断项不计分）→
+    # CMMI 满分 2 分整项丢失（2026-10-30 run 66 实证：四家 CMMI 2 分全丢，
+    # 真实 云锦/拓扑/用友 5 = ISO3+CMMI2，系统只有 c47 ISO 的 3/3/3/1）。
+    _m_cmmi = re.search(r"(?:具有|具备|通过|获得|拥有|提供)[^。；]{0,30}?(?:得|计)\s*(\d+(?:\.\d+)?)\s*分", text)
+    if "CMMI" in text and _m_cmmi:
+        return "count", {"field": "cmmi", "per_item": str(Decimal(_m_cmmi.group(1)))}
     m = _RE_PER_ITEM.search(text)
     if m:
         if _RE_CERT_KW.search(text):
