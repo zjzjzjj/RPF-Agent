@@ -475,29 +475,17 @@ def parse_case_table_at_section(
     pdf_path: str,
     section: SectionGuess,
     pages: list[PageRec],
-    scan_pages: int = 8,
+    scan_pages: int = 4,
 ) -> list[CaseRow]:
-    """证据段首窗解析业绩表；0 行且段来自索引定位时按表头就近重试（阶段3a，2026-10-30）。
+    """证据段首窗解析业绩表（阶段3a 的多起点重试已移除，2026-10-30 run 69 实测）。
 
-    索引「第X页到第Y页」映射的段首与真表头常差几页——首窗（section.start 起
-    scan_pages 页）0 行时，对 d∈[1,5] 中**恰有表头三元组**（window=0 单页命中）
-    的起点各重试一次；每次仍受 scan_pages 上限。
-    scoring_service 与 ingest_service 共用，避免两处复制重试逻辑。
-    只向段后重试（d≥1）：负偏移会扫到业绩段**之前**的设备清单/资格表，其表头
-    三元组（序号+名称+日期）可能命中，误绑到非业绩表（2026-10-30 审查 P2）。
+    曾在首窗 0 行时按表头就近重试（scan_pages 4→8），run 69 实测表路径命中率
+    8→8 毫无收益、count 墙钟 11→14.8min 反而恶化——表解析失败根因是表格结构
+    解析不出，不是扫描窗/起点问题，重试纯加 PyMuPDF 解析开销。回退为单次首窗。
+    scoring_service 与 ingest_service 共用此入口（保留函数签名，便于将来有
+    真实命中的结构性修法时再接）。
     """
-    rows = parse_case_table(pdf_path, section.start, section.end, scan_pages)
-    if rows or section.method not in ("index_offset", "index_offset_near"):
-        return rows
-    for d in range(1, 6):
-        st = section.start + d
-        if st <= 0 or not _has_case_table_header(pages, st, 0):
-            continue
-        # end 取 max：段短于重试起点时仍能扫满首窗（表在段首附近即可，不越段语义）
-        rows = parse_case_table(pdf_path, st, max(section.end, st), scan_pages)
-        if rows:
-            return rows
-    return []
+    return parse_case_table(pdf_path, section.start, section.end, scan_pages)
 
 
 # ---------------------------------------------------------------------------

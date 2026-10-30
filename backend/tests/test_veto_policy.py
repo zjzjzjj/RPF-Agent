@@ -183,6 +183,7 @@ def test_veto_batch_three_human_only_cells(monkeypatch):
     """3 条 human_only 组批：FakeGateway 一次返回 3 条 judgements → 逐格
     verdict/message 与逐格预期一致；一次调用覆盖 3 格（组批杠杆）。"""
     monkeypatch.setenv("BID_EVAL_AUTO_MODE", "1")
+    monkeypatch.setenv("BID_EVAL_VETO_HUMAN_ONLY_BATCH", "1")
     from app.engine.facts import extract_bid_facts
     from app.services import scoring_service as ss
 
@@ -211,6 +212,7 @@ def test_veto_batch_three_human_only_cells(monkeypatch):
 def test_veto_batch_missing_code_degrades_that_cell(monkeypatch):
     """批量输出缺某个 code → 该条按契约降 fail（need_human 疑问），其余照常。"""
     monkeypatch.setenv("BID_EVAL_AUTO_MODE", "1")
+    monkeypatch.setenv("BID_EVAL_VETO_HUMAN_ONLY_BATCH", "1")
     from app.engine.auto_judge import AutoJudgements, BatchJudgementItem
     from app.engine.facts import extract_bid_facts
     from app.services import scoring_service as ss
@@ -293,6 +295,7 @@ def test_veto_batch_order_stable_across_blocks(monkeypatch):
     """
     monkeypatch.setenv("BID_EVAL_AUTO_MODE", "1")
     monkeypatch.setenv("BID_EVAL_VETO_BATCH_SIZE", "2")
+    monkeypatch.setenv("BID_EVAL_VETO_HUMAN_ONLY_BATCH", "1")
     from app.engine.facts import extract_bid_facts
     from app.services import scoring_service as ss
 

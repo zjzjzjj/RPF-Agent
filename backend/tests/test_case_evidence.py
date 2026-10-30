@@ -235,38 +235,6 @@ def test_parse_case_table_header_variant_zhongbiao_amount(tmp_path) -> None:
     assert rows_b[0].sign_date == "2024-01-01"
 
 
-def test_parse_case_table_at_section_retry_at_header_page(tmp_path) -> None:
-    """首窗 0 行且段来自索引定位 → 对「恰有表头」的邻近起点各重试一次并命中。
-
-    合成场景：段首（p1-2）无表、+2 页（p3）有表——旧逻辑首窗 0 行即放弃整条
-    表路径（业绩案例全灭）；多起点重试后解析出 CaseRow。
-    """
-    data = [["1", "甲项目", "160万元", "2024年1月1日"]]
-    pdf = _make_table_pdf(tmp_path / "late_table.pdf", [
-        ("text", "第1页正文"),
-        ("text", "第2页正文"),
-        ("table", (["序号", "项目名称", "中标金额", "签订日期"], data)),
-        ("text", "第4页正文"),
-        ("text", "第5页正文"),
-    ])
-    recs = [
-        PageRec(1, "第1页正文", "text"),
-        PageRec(2, "第2页正文", "text"),
-        PageRec(3, "序号 项目名称 中标金额 签订日期", "text"),
-        PageRec(4, "第4页正文", "text"),
-        PageRec(5, "第5页正文", "text"),
-    ]
-    sec = SectionGuess(1, 5, "index_offset", 0.5, 0)
-    # 首窗 scan_pages=2 只扫 p1-2（无表）→ 走 +2 表头页重试
-    rows = parse_case_table_at_section(pdf, sec, recs, scan_pages=2)
-    assert len(rows) == 1
-    assert rows[0].name == "甲项目"
-    assert rows[0].amount_yuan == Decimal("1600000")
-    # 首窗（scan_pages=8）本就覆盖 p3 → 不需要重试也应命中
-    rows2 = parse_case_table_at_section(pdf, sec, recs, scan_pages=8)
-    assert len(rows2) == 1
-
-
 # ---------------------------------------------------------------------------
 # 材料三态
 # ---------------------------------------------------------------------------

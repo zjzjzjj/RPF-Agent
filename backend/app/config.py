@@ -354,10 +354,11 @@ def case_section_max_pages() -> int:
 def case_table_scan_pages() -> int:
     """业绩表解析只扫证据段前几页（表通常在段首）。
 
-    2026-10-30 阶段3a：默认 4→8——索引定位的段首与真表头常差 4 页以上
-    （首窗 4 页 0 行即放弃整条表路径），放宽扫描窗 + 表头就近重试提升命中率。
+    2026-10-30 阶段3a 曾默认 4→8 + 多起点重试，run 69 实测表路径命中率
+    8→8 毫无收益、count 墙钟 11→14.8min 反而恶化（纯加 PyMuPDF 解析开销）
+    ——表解析失败根因是表格结构解析不出，不是扫描窗太小，故回退默认 4。
     """
-    return int(os.environ.get("BID_EVAL_CASE_TABLE_SCAN_PAGES", 8))
+    return int(os.environ.get("BID_EVAL_CASE_TABLE_SCAN_PAGES", 4))
 
 
 def case_evidence_pages_per_material() -> int:
@@ -555,9 +556,14 @@ def veto_batch_size() -> int:
 
 
 def veto_human_only_batch_enabled() -> bool:
-    """human_only 组批开关（阶段 2，2026-10-30）。默认开；置 0 回退逐格单条
-    LLM 旧路径（BID_EVAL_VETO_HUMAN_ONLY_BATCH=0 → 全部走 single 旧逻辑）。"""
-    return os.environ.get("BID_EVAL_VETO_HUMAN_ONLY_BATCH", "1").strip().lower() not in (
+    """human_only 组批开关（阶段 2，2026-10-30）。默认**关**。
+
+    run 69 实测：组批把 N 条 human_only 并成一次调用——调用数降了（省配额）
+    但单次输出 token ×N、并行变串行，veto 墙钟 6.5→9.3min 反而恶化（并发 4 下
+    N 个单条并行 < 1 个 N 倍长的批量）。提速目标下默认走单格并行；省 API
+    配额场景可置 BID_EVAL_VETO_HUMAN_ONLY_BATCH=1 开启组批。
+    """
+    return os.environ.get("BID_EVAL_VETO_HUMAN_ONLY_BATCH", "0").strip().lower() not in (
         "0", "false", "no", "off",
     )
 
