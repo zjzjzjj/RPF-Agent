@@ -639,6 +639,12 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
             r"|质量管理体系|信息安全管理体系|信息技术服务管理体系",
             _cert_text,
         ))
+        # 合并项（ISO+CMMI 同一 count）：CMMI 有独立分值（"CMMI…得 2 分"），
+        # 单 per_item 装不下两种规则——统一 per_item=1 会让 CMMI 只值 1 分
+        # （真实 2 分，run 66 实证 c41 得 4 而人工 5）。从文本解析 CMMI 分值，
+        # 解析不到则回退 per_item（保持旧行为，不猜默认值）。
+        _cmmi_pts_m = re.search(r"CMMI[^。；]{0,40}?得\s*(\d+(?:\.\d+)?)\s*分", _cert_text)
+        _cmmi_pts: Decimal | None = Decimal(_cmmi_pts_m.group(1)) if _cmmi_pts_m else None
         if _iso_shaped:
             # 仅当细则文本点名 CMMI 才与 ISO 合并计数——纯 ISO 项（"ISO9001/
             # 27001/20000 每项1分最高3分"）的 CMMI 由独立 field=cmmi 条目计，
@@ -691,8 +697,14 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
             detail = "未知计数字段（评分项未给出 field，且无法从名称安全推断）"
             unresolved = "field_missing"
 
-    effective = min(Decimal(count), Decimal(max_items)) if max_items else Decimal(count)
-    score = (effective * per_item).quantize(Decimal("0.01"))
+    if field == "certificates" and _iso_shaped and _cmmi_pts is not None and "CMMI" in _cert_text:
+        # 合并项（ISO+CMMI 同一 count）：ISO 按 per_item、CMMI 按文本分值分别计。
+        # 单 per_item 装不下两种规则，统一 per_item=1 会让 CMMI 只值 1 分（真实 2 分）。
+        _iso_n = min(len(iso_set), max_items) if max_items else len(iso_set)
+        score = ((_iso_n * per_item) + (_cmmi_pts if has_cmmi else Decimal(0))).quantize(Decimal("0.01"))
+    else:
+        effective = min(Decimal(count), Decimal(max_items)) if max_items else Decimal(count)
+        score = (effective * per_item).quantize(Decimal("0.01"))
     if max_score and score > max_score:
         score = max_score
 

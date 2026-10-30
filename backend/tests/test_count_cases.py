@@ -1081,6 +1081,36 @@ def test_score_count_certificates_merges_cmmi_only_when_text_names_it() -> None:
     assert res2.score == Decimal("4")  # ISO 3 + CMMI 1 = 4 项（max_items=4 不 cap）
 
 
+def test_score_count_merged_cmmi_uses_text_points() -> None:
+    """合并项（ISO+CMMI 同一 count）：CMMI 按文本分值计，不被 per_item=1 拉平。
+
+    run 66 实证 c41：真实「ISO 三系各1分 + CMMI 二级以上得2分」=5，旧逻辑
+    count=4×per_item=4 少 1 分（CMMI 被算成 1 分）。文本解析到"得2分"→
+    ISO 3×1 + CMMI 2 = 5，对齐人工。
+    """
+    from app.engine.objective import score_count
+
+    facts = BidFacts(text="")
+    facts.certificates = ["ISO9001", "ISO27001", "ISO20000", "CMMI 五级"]
+    crit = {
+        "name": "投标人认证及资质情况",
+        "description": (
+            "投标人具有有效期内的ISO9001、ISO27001、ISO20000证书的，每项得1分。"
+            "最高得3分。具有有效期内CMMI认证二级及以上得2分。"
+        ),
+        "max_score": Decimal("5"),
+        "required_artifacts": "查询结果截图", "cert_section_present": True,
+    }
+    res = score_count(crit, {"field": "certificates", "per_item": "1", "max_items": "5"}, facts)
+    assert res.score == Decimal("5")  # ISO 3×1 + CMMI 2 = 5（旧逻辑 4×1=4）
+
+    # 有 ISO 无 CMMI：只 ISO 3 分，CMMI 分值不误加
+    facts2 = BidFacts(text="")
+    facts2.certificates = ["ISO9001", "ISO27001", "ISO20000"]
+    res2 = score_count(crit, {"field": "certificates", "per_item": "1", "max_items": "5"}, facts2)
+    assert res2.score == Decimal("3")
+
+
 def test_score_type_for_row_cmmi_returns_count() -> None:
     """reconcile：CMMI 存在性计分行 → count/field=cmmi（不再被 LLM 编成 match 丢分）。"""
     from app.rules.reconcile import _score_type_for_row
