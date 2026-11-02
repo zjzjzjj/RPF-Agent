@@ -387,12 +387,16 @@ def case_max_batches_ceiling() -> int:
 
 
 def case_unverified_count_enabled() -> bool:
-    """窄版材料闸门开关（2026-10-30）。
+    """窄版材料闸门开关（2026-10-30；2026-11-02 排序收紧）。
 
     开（默认）：材料三态=None（机器看不清/没绑上/页没送审）的案例**计入分**
     并标注"未核验"+进人工队列；只有三态=False（可读文本确认缺失）才维持 0。
     窄版理由：机器"没找到"混着"真没有"和"管线故障"，一律扣 0 把管线故障算在
     投标人头上（用友 c54/c55 材料在却判 0 实证）。关=回退旧闸门（None 不计）。
+    2026-11-02 排序收紧（run77 c41 反向实证）：计入的未核验案例排 verified 之后，
+    max_items 封顶先砍未核验；warnings 附"剔除后为 X 分"双分值可复算，含未核验
+    的格 machine_status=need_human。双向防线：用友（材料在不许清零）+ 德勤
+    （材料不可读不许满额）。
     """
     return os.environ.get("BID_EVAL_CASE_UNVERIFIED_COUNT", "1").strip().lower() not in (
         "0", "false", "no", "off",
@@ -437,15 +441,6 @@ def classify_llm_max_pages() -> int:
 def case_name_prefix_min() -> int:
     """案例名前缀锚的最短长度（交错表全名常断裂）。"""
     return int(os.environ.get("BID_EVAL_CASE_NAME_PREFIX_MIN", 8))
-
-
-def case_null_policy() -> str:
-    """材料 null（页不可读/未提供）时的计分策略：count_with_contract | skip。
-
-    count_with_contract（默认）：仅当 案例来自确定性表 AND 合同已确认 才计分并标疑问，
-    避免"看不见就当没有"清零；skip：null 一律不计。见 objective.score_count。
-    """
-    return os.environ.get("BID_EVAL_CASE_NULL_POLICY", "count_with_contract").strip().lower()
 
 
 def case_tag_prior_enabled() -> bool:

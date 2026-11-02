@@ -21,6 +21,7 @@ from app.evidence.case_evidence import (
     parse_amount_yuan,
     parse_case_table,
     parse_case_table_at_section,
+    resolve_index_pages,
 )
 
 
@@ -128,6 +129,94 @@ def test_locate_section_paren_requires_业绩_line() -> None:
     sec = locate_section(pages)
     assert sec.found
     assert (sec.start, sec.end) == (45, 71), f"抢配到他模块区间：{sec}"
+
+
+# ---------------------------------------------------------------------------
+# resolve_index_pages（索引页码指针泛化，2026-11-02 run77 实证）
+# ---------------------------------------------------------------------------
+def test_resolve_index_pages_run77_service_commitment_split_lines() -> None:
+    """run77 c54 实形态：标签「服务承诺」与指针「见投标文件（342-344）页」被 PDF
+    表格拆行隔开 2 行，且该页无"索引"字样（只有"见投标文件"）。line_window=3
+    应能关联；旧口径（同线 + 索引门）整页扑空。"""
+    pages = [
+        PageRec(26,
+                "针对本项目的服务承诺、服务响应，当系统发生\n"
+                "驻厂人员不能解决的重大故障时，承诺远程服务\n"
+                "团队在4 小时内到达现场得4 分,承诺5 小时内到\n"
+                "服务承诺\n"
+                "达现场得3 分,承诺6 小时内到达现场得2 分,承\n"
+                "17 客观分 见投标文件（342-344）页\n"
+                "诺7 小时内到达现场得1 分，其他不得分。\n"
+                "书面承诺函为准，承诺函需加盖投标人公章，并\n"
+                "附具体实施方案。响应地点为：\n"
+                "26", "text"),
+    ]
+    sec = resolve_index_pages(pages, "服务承诺", line_window=3)
+    assert sec.found
+    assert (sec.start, sec.end) == (342, 344)
+    assert sec.offset == 0  # 印刷页码 26 == 物理页 26
+
+
+def test_resolve_index_pages_single_page_paren() -> None:
+    """单页指针变体「见投标文件（39）页」（run77 c38 ITSS 形态）→ (39, 39)。"""
+    pages = [
+        PageRec(26,
+                "1 投标人综合实力-ITSS信息技术服务标准符合性证书\n"
+                "17 客观分 见投标文件（39）页\n26", "text"),
+    ]
+    sec = resolve_index_pages(pages, "ITSS", line_window=3)
+    assert sec.found
+    assert (sec.start, sec.end) == (39, 39)
+
+
+def test_resolve_index_pages_prefers_keyword_line_over_other_modules() -> None:
+    """同页多模块指针：不得抢配邻近行其他模块的（X-Y）页——取关键词行距最小者。"""
+    pages = [
+        PageRec(10,
+                "详细评审索引表\n"
+                "技术文件（112-127）页\n"
+                "16 质量保障措施 见投标文件（322-342）页\n"
+                "17 服务承诺 见投标文件（342-344）页\n"
+                "10", "text"),
+    ]
+    sec = resolve_index_pages(pages, "服务承诺", line_window=3)
+    assert sec.found
+    assert (sec.start, sec.end) == (342, 344), f"抢配到他模块区间：{sec}"
+
+
+def test_resolve_index_pages_line_window_zero_requires_same_line() -> None:
+    """line_window=0（业绩旧口径）：指针与关键词必须同线，拆行形态不认。"""
+    pages = [
+        PageRec(26,
+                "服务承诺\n"
+                "17 客观分 见投标文件（342-344）页\n26", "text"),
+    ]
+    assert not resolve_index_pages(pages, "服务承诺", line_window=0).found
+    # 同线形态照认
+    pages2 = [
+        PageRec(26, "服务承诺 见投标文件（342-344）页\n26", "text"),
+    ]
+    sec = resolve_index_pages(pages2, "服务承诺", line_window=0)
+    assert sec.found and (sec.start, sec.end) == (342, 344)
+
+
+def test_resolve_index_pages_no_index_gate_page_ignored() -> None:
+    """非索引页（无"索引/详细评审/见投标文件"字样）不解析。"""
+    pages = [
+        PageRec(5, "服务承诺（342-344）页随便写写", "text"),
+    ]
+    assert not resolve_index_pages(pages, "服务承诺", line_window=3).found
+
+
+def test_resolve_index_pages_offset_shifts_physical() -> None:
+    """印刷页码与物理页错位时按 offset 换算（页脚 - 86 - @物理 94）。"""
+    pages = [
+        PageRec(94, "详细评审索引表\n服务承诺 见投标文件（342-344）页\n- 86 -", "text"),
+    ]
+    sec = resolve_index_pages(pages, "服务承诺", line_window=3)
+    assert sec.found
+    assert (sec.start, sec.end) == (350, 352)
+    assert sec.offset == 8
 
 
 def test_locate_section_boundary_body_hit_not_truncated() -> None:

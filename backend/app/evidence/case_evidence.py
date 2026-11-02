@@ -45,14 +45,11 @@ _RE_ACCEPTANCE = re.compile(
 _RE_MATERIAL_HEADING = re.compile(r"发票|验收|业主证明|用户证明|合同|证书|扫描件")
 
 _RE_DATE = re.compile(r"(\d{4})\s*[年.\-/]\s*(\d{1,2})\s*[月.\-/]\s*(\d{1,2})\s*日?")
+# 索引行主正则已泛化为 _re_index_range_kw(keyword)（见下），保留沿革注释：
 # 索引行：业绩案例 …… 第118页到第167页 / 第45页到第71页 …… 业绩案例（7.10 实证：
 # 真实行文是"第45 页到第71 页 2.8 投标人类似项目业绩案例"——**页码在前、业绩在后**，
 # 旧正则只认"业绩在前"→不命中，随后被无邻近约束的 PAREN 变体抢配到同页其他模块的
 # （112-127）页 → 段错位到技术方案章节）。故双向支持；分组 (1,2)=(前,后)。
-_RE_INDEX_RANGE = re.compile(
-    r"(?:业绩[^\n]{0,40}?第?\s*(\d{1,4})\s*页?\s*(?:到|至|—|－|-|~|～)\s*第?\s*(\d{1,4})\s*页"
-    r"|第?\s*(\d{1,4})\s*页?\s*(?:到|至|—|－|-|~|～)\s*第?\s*(\d{1,4})\s*页[^\n]{0,40}?业绩)"
-)
 # 括号变体**必须**限定在含"业绩"的行内匹配（同页其他模块的（X-Y）页不得抢配）
 _RE_INDEX_RANGE_PAREN = re.compile(r"[（(]\s*(\d{1,4})\s*[-—~～至到]\s*(\d{1,4})\s*[）)]\s*页")
 # 页脚印刷页码： ``- 118 -`` / ``第16 页`` / 裸数字行
@@ -283,6 +280,100 @@ def _extend_until_boundary(pages: list[PageRec], start: int, max_pages: int) -> 
     return end
 
 
+# 索引页页型判据：含"索引/详细评审/评审索引"字样，或本身就是"见投标文件（X-Y）页"
+# 指针表（run77 实证：真实索引行页 p26 只有"见投标文件（342-344）页"，无"索引"字样——
+# 旧门只认前三词会整页跳过）。
+_RE_INDEX_GATE = re.compile(r"索引|详细评审|评审索引|见投标文件")
+
+
+def _re_index_range_kw(kw: str) -> re.Pattern:
+    """主正则泛化：「<kw>…第X页到第Y页」/「第X页到第Y页…<kw>」双向，同线 40 字符窗。"""
+    k = re.escape(kw)
+    return re.compile(
+        rf"(?:{k}[^\n]{{0,40}}?第?\s*(\d{{1,4}})\s*页?\s*(?:到|至|—|－|-|~|～)\s*第?\s*(\d{{1,4}})\s*页"
+        rf"|第?\s*(\d{{1,4}})\s*页?\s*(?:到|至|—|－|-|~|～)\s*第?\s*(\d{{1,4}})\s*页[^\n]{{0,40}}?{k})"
+    )
+
+
+# 单页指针变体：「见投标文件（39）页」（run77 c38 ITSS 实证形态）
+_RE_INDEX_PAREN_SINGLE = re.compile(r"[（(]\s*(\d{1,4})\s*[）)]\s*页")
+
+
+def _pointer_candidates(t: str, kw: str, line_window: int) -> list[tuple]:
+    """页文本内的页码指针候选。
+
+    返回 ``[(kind, kw_distance, order, (printed_start, printed_end))]``，升序优先。
+    kind=0 主正则（同线双向）；kind=1 括号/单页变体。``kw_distance`` 是指针行与
+    关键词行的行距（同线=0）——PDF 表格行常被拆行（run77：标签「服务承诺」与指针
+    「见投标文件（342-344）页」隔 2 行），line_window>0 时容许邻近行关联；
+    line_window=0 退化为"指针与关键词必须同线"（业绩旧口径）。
+    防抢配：取 (kind, kw_distance) 最小者，同距取文本序最前。
+    """
+    out: list[tuple] = []
+    m = _re_index_range_kw(kw).search(t)
+    if m:
+        g = (m.groups() + (None,) * 4)[:4]
+        try:
+            out.append((0, 0, 0, (int(g[0] or g[2]), int(g[1] or g[3]))))
+        except (TypeError, ValueError):
+            pass
+    lines = t.splitlines()
+    order = 0
+    for i, ln in enumerate(lines):
+        if kw in ln:
+            dist = 0
+        else:
+            dist = None
+            for d in range(1, line_window + 1):
+                if any(
+                    0 <= j < len(lines) and kw in lines[j]
+                    for j in (i - d, i + d)
+                ):
+                    dist = d
+                    break
+            if dist is None:
+                continue
+        for pm in _RE_INDEX_RANGE_PAREN.finditer(ln):
+            order += 1
+            out.append((1, dist, order, (int(pm.group(1)), int(pm.group(2)))))
+        for pm in _RE_INDEX_PAREN_SINGLE.finditer(ln):
+            order += 1
+            v = int(pm.group(1))
+            out.append((1, dist, order, (v, v)))
+    out.sort(key=lambda x: (x[0], x[1], x[2]))
+    return out
+
+
+def resolve_index_pages(
+    pages: list[PageRec], keyword: str, *, line_window: int = 0
+) -> SectionGuess:
+    """索引页码指针泛化：在索引表页找「<keyword> …（X-Y）页 / 第X页到第Y页」指针，
+    借同页页脚印刷页码换算物理页区间。供任意评分项复用（业绩/服务承诺/证书…）。
+
+    ``line_window=0``：指针与关键词必须同线（旧口径）；>0：容许表格拆行的邻近行关联。
+    只解析指针，不含业绩表头核验（那是 locate_section 的后置细化）。
+    """
+    kw = (keyword or "").strip()
+    if not kw:
+        return SectionGuess(0, 0, "none", 0.0, None)
+    for p in pages:
+        t = p.text or ""
+        if kw not in t or not _RE_INDEX_GATE.search(t):
+            continue
+        cands = _pointer_candidates(t, kw, line_window)
+        if not cands:
+            continue
+        kind, dist, _order, (printed_start, printed_end) = cands[0]
+        printed_here = _printed_page(t)
+        offset = (p.page_no - printed_here) if printed_here else 0
+        start, end = printed_start + offset, printed_end + offset
+        if start <= 0 or end < start:
+            continue
+        conf = 0.9 if kind == 0 or dist == 0 else 0.7
+        return SectionGuess(start, end, "index_offset", conf, offset)
+    return SectionGuess(0, 0, "none", 0.0, None)
+
+
 def locate_section(
     pages: list[PageRec], criterion_name: str = "", required_artifacts: str = ""
 ) -> SectionGuess:
@@ -291,35 +382,10 @@ def locate_section(
     主判据：索引页「业绩…第X页到第Y页」+ 同页页脚印刷页码求 offset。
     回退：找表头页（项目名称+合同金额）后向前扩展到章节边界。
     """
-    # 1) 索引 + 页脚 offset
-    for p in pages:
-        t = p.text or ""
-        if "业绩" not in t:
-            continue
-        if not ("索引" in t or "详细评审" in t or "评审索引" in t):
-            continue
-        m = _RE_INDEX_RANGE.search(t)
-        if not m:
-            # 括号变体只在"业绩行"内匹配——同页其他模块的（X-Y）页不得抢配
-            for ln in t.splitlines():
-                if "业绩" in ln:
-                    m = _RE_INDEX_RANGE_PAREN.search(ln)
-                    if m:
-                        break
-        if not m:
-            continue
-        try:
-            # 双向主正则：前向（业绩…范围）用组 1/2，反向（范围…业绩）用组 3/4；
-            # PAREN 变体只有组 1/2（后两组为 None）。注意 re.Match.group 无默认值
-            # 参数——m.group(3, None) 会被当成请求两个分组而抛 "no such group"。
-            g1, g2, g3, g4 = (m.groups() + (None, None, None, None))[:4]
-            printed_start = int(g1 or g3)
-            printed_end = int(g2 or g4)
-        except Exception:
-            continue
-        printed_here = _printed_page(t)
-        offset = (p.page_no - printed_here) if printed_here else 0
-        start, end = printed_start + offset, printed_end + offset
+    # 1) 索引 + 页脚 offset（行距 0 = 旧口径，业绩指针与关键词同线）
+    guess = resolve_index_pages(pages, "业绩", line_window=0)
+    if guess.found:
+        start, end, offset = guess.start, guess.end, guess.offset
         if _has_case_table_header(pages, start, 3):
             return SectionGuess(start, end, "index_offset", 0.95, offset)
         for d in (-4, -3, -2, -1, 1, 2, 3, 4, 5, -5):

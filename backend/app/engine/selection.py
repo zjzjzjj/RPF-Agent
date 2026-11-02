@@ -532,6 +532,7 @@ def select_chunks_for_criterion(
     *,
     chunk_cats: list[str | None] | None = None,
     chunk_cat_confs: list[float] | None = None,
+    score_scale_extra: list[float] | None = None,
 ) -> tuple[list[Chunk], dict]:
     """统一入口：vector 模式优先（BID_EVAL_SELECTION=vector），失败回退关键词分档。
 
@@ -542,12 +543,25 @@ def select_chunks_for_criterion(
       且类内块分数 ×1.3（低置信继承页 ×1.1）；meta.soft_fallback=True。
     chunk_cats=None（默认）→ 与旧实现逐字节一致（兼容门禁）。
     chunk_cat_confs：每块类别置信度（可选，控制加成幅度）。
+    score_scale_extra：调用方附加乘数（2026-11-02 P1-6：索引指针窗口页 ×1.3、
+    偏离表通用条款块 ×0.25——run77 c54 实证：偏离表"8小时"抢掉承诺函"4小时"），
+    与类别加成同位相乘。
     """
     meta_keys: dict = {}
+    if score_scale_extra is not None and len(score_scale_extra) != len(chunks):
+        score_scale_extra = None  # 长度不符不猜（同 chunk_cats 口径）
+
+    def _merge(scale: list[float] | None) -> list[float] | None:
+        if score_scale_extra is None:
+            return scale
+        if scale is None:
+            return list(score_scale_extra)
+        return [a * b for a, b in zip(scale, score_scale_extra)]
+
     if chunk_cats is None or len(chunk_cats) != len(chunks) or not chunks:
         picked, meta = _select_once(
             chunks, criterion, budget, fallback_diffuse,
-            score_scale=None, pool=None,
+            score_scale=_merge(None), pool=None,
         )
         return picked, meta
 
@@ -571,7 +585,7 @@ def select_chunks_for_criterion(
         if in_class:
             picked, meta = _select_once(
                 chunks, criterion, budget, fallback_diffuse,
-                score_scale=None, pool=in_class,
+                score_scale=_merge(None), pool=in_class,
             )
             meta.update(meta_keys)
             return picked, meta
@@ -579,7 +593,7 @@ def select_chunks_for_criterion(
         meta_keys["soft_fallback"] = True
         picked, meta = _select_once(
             chunks, criterion, budget, fallback_diffuse,
-            score_scale=None, pool=None,
+            score_scale=_merge(None), pool=None,
         )
         meta.update(meta_keys)
         return picked, meta
@@ -588,7 +602,7 @@ def select_chunks_for_criterion(
         meta_keys["soft_fallback"] = True
         picked, meta = _select_once(
             chunks, criterion, budget, fallback_diffuse,
-            score_scale=None, pool=None,
+            score_scale=_merge(None), pool=None,
         )
         meta.update(meta_keys)
         return picked, meta
@@ -596,7 +610,7 @@ def select_chunks_for_criterion(
     # 阶段 1：类内选
     picked, meta = _select_once(
         chunks, criterion, budget, fallback_diffuse,
-        score_scale=None, pool=in_class,
+        score_scale=_merge(None), pool=in_class,
     )
     # 充足性只看类内产出量（truncated=False 只说明池内全选完，池本身可能很小）
     if meta.get("chars", 0) >= budget * _SOFT_FILL_RATIO:
@@ -607,7 +621,7 @@ def select_chunks_for_criterion(
     meta_keys["soft_fallback"] = True
     picked, meta = _select_once(
         chunks, criterion, budget, fallback_diffuse,
-        score_scale=_scale(), pool=None,
+        score_scale=_merge(_scale()), pool=None,
     )
     meta.update(meta_keys)
     return picked, meta
@@ -619,6 +633,7 @@ def build_evidence_map(
     *,
     min_gap: int = 2,
     chunk_cats: list[str | None] | None = None,
+    score_scale_extra: list[float] | None = None,
 ) -> tuple[list[dict], str] | None:
     """证据地图：全量分块按相关性排序并聚类为不相交证据簇（零 LLM 成本）。
 
@@ -665,6 +680,10 @@ def build_evidence_map(
         for i, c in enumerate(chunk_cats):
             if c == target:
                 scores[i] = round(scores[i] * _IN_CLASS_BOOST, 6)
+    if score_scale_extra is not None and len(score_scale_extra) == len(chunks):
+        # 附加乘数（2026-11-02 P1-6：索引指针窗口 ×1.3 / 偏离表通用条款 ×0.25）——
+        # 同类内加成口径：只影响种子排序（scores），不进 raw 阈值与簇资格。
+        scores = [round(s * w, 6) for s, w in zip(scores, score_scale_extra)]
     order = sorted(range(len(chunks)), key=lambda i: -scores[i])
 
     # 贪心聚类：从最高分块起，双向行走吸收「相对高分」相邻块成簇。

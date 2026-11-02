@@ -283,12 +283,16 @@ def _is_fatal_llm_error(exc: BaseException) -> bool:
 
 
 def _forced_zero_reason(cname: str, ps: dict, c: dict | None = None) -> str | None:
-    """人员经验材料门槛（确定性，规则执行）：细则明文「不得分」且材料确认不存在 → 0。
+    """人员经验材料门槛（确定性，规则执行）：细则明文「不得分」且材料**确认**不存在 → 0。
 
-    两个条件缺一不可——细则没写罚则的不越权置 0；材料只是"没看见"（扫描件/
-    OCR 漏检）不等于不存在。Phase1（跳过 LLM 短路）与 Phase2（权威置 0）共用
-    本函数，单一来源防口径漂移。页数阈值（五年<3 页/社保<16 页）是按旧项目
-    4 家拟合的产物，换项目即误杀，已删除（2026-10-26 run 54 实证）。
+    两个条件缺一不可——细则没写罚则的不越权置 0。材料存在性是**三态**（2026-11-02）：
+    True=材料确认在 / False=材料确认不在（积极确认缺失）/ None=机器看不见（扫描件/
+    OCR 漏读/正则未覆盖）。**只有 False 才强制 0**——"没看见"不等于"没有"（run77
+    c48 实证：简历+职称证书在 p121-122 文本层，旧正则未覆盖"简历"→误判无材料→
+    清零，人工给满分）。None 不短路，"未见材料"提示并入 LLM 输入由其判档。
+    Phase1（跳过 LLM 短路）与 Phase2（权威置 0）共用本函数，单一来源防口径漂移。
+    页数阈值（五年<3 页/社保<16 页）是按旧项目 4 家拟合的产物，换项目即误杀，
+    已删除（2026-10-26 run 54 实证）。
     """
     rule_text = ""
     if c is not None:
@@ -299,13 +303,31 @@ def _forced_zero_reason(cname: str, ps: dict, c: dict | None = None) -> str | No
         )
     if "不得分" not in rule_text:
         return None
-    if "项目负责人" in cname and not ps.get("exp_material"):
-        return "未见工作经验证明材料，按评分因素「无证明材料不得分」计 0"
-    if "团队成员" in cname and not ps.get("social_material"):
+    if "项目负责人" in cname and ps.get("exp_material") is False:
+        return "已确认未提供工作经验证明材料，按评分因素「无证明材料不得分」计 0"
+    if "团队成员" in cname and ps.get("social_material") is False:
         return (
-            "未见团队成员社保证明材料，"
+            "已确认未提供团队成员社保证明材料，"
             "按评分因素「不提供或不能提供有效证明的不得分」计 0"
         )
+    return None
+
+
+def _missing_material_hint(cname: str, ps: dict, c: dict | None = None) -> str | None:
+    """材料存在性 None（机器看不见）时给 LLM 的提示：尽力定位、定位不到按低档并标疑问。"""
+    rule_text = ""
+    if c is not None:
+        rule_text = (
+            f"{c.get('required_evidence') or ''}"
+            f"{c.get('source_quote') or ''}"
+            f"{c.get('description') or ''}"
+        )
+    if "不得分" not in rule_text:
+        return None
+    if "项目负责人" in cname and ps.get("exp_material") is None:
+        return "【材料提示】工作经验证明材料未在文本层检出（可能为扫描件/图片页），请在选段中尽力定位；确认无材料按细则「不得分」判低档或 0"
+    if "团队成员" in cname and ps.get("social_material") is None:
+        return "【材料提示】团队成员社保证明材料未在文本层检出（可能为扫描件/图片页），请在选段中尽力定位；确认无材料按细则「不得分」判低档或 0"
     return None
 
 
@@ -475,6 +497,7 @@ def execute_run(
     page_cat_confs_by_bidder: dict[int, dict[int, float]] = {}
     chunk_cats_by_bidder: dict[int, list[str | None]] = {}
     chunk_cat_confs_by_bidder: dict[int, list[float]] = {}
+    chunk_srcs_by_bidder: dict[int, list[tuple[int, int]]] = {}  # P1-6 选段加成用
     if config.material_index_enabled():
         try:
             (
@@ -482,6 +505,7 @@ def execute_run(
                 page_cat_confs_by_bidder,
                 chunk_cats_by_bidder,
                 chunk_cat_confs_by_bidder,
+                chunk_srcs_by_bidder,
             ) = _load_material_maps(doc_ids_by_bidder, main_doc_by_bidder, bidder_ids)
         except Exception:  # noqa: BLE001 —— 分类是增强不是主链
             log.warning("材料类别映射构建失败，选段退化为无过滤", exc_info=True)
@@ -645,6 +669,7 @@ def execute_run(
                 page_cat_confs_by_bidder,
                 chunk_cats_by_bidder,
                 chunk_cat_confs_by_bidder,
+                chunk_srcs_by_bidder,
             ) = _load_material_maps(doc_ids_by_bidder, main_doc_by_bidder, bidder_ids)
         except Exception:  # noqa: BLE001
             log.warning("材料类别映射重建失败", exc_info=True)
@@ -751,6 +776,69 @@ def execute_run(
     for bid_id in bidder_ids:
         rows = bid_pages.get(bid_id) or []
         cert_sections[bid_id] = cert_evidence_present([(src, t) for _p, t, src in rows])
+
+    # 承诺值抽取窗口（2026-11-02 run77 c54 实证）：偏离表通用条款"8小时"首匹配
+    # 抢掉承诺函"4小时"。窗口 = 索引页码指针（"服务承诺…见投标文件（342-344）页"）
+    # 解析出的目标页文本；指针缺失回退承诺章节（页首标题区命中 承诺函|服务承诺|
+    # 响应承诺|售后…承诺）文本。都没解析到 → None（抽取侧回退全文语境分排序）。
+    _RE_COMMIT_HEADING = re.compile(r"承诺函|服务承诺|响应承诺|售后.{0,6}承诺")
+
+    def _window_pages_for(bid_id: int, c) -> set[int]:  # noqa: ANN001
+        """评分项索引指针窗口的页码集合（P1-6 选段加成用；空集=无指针）。"""
+        from app.evidence.case_evidence import PageRec, resolve_index_pages
+
+        rows = bid_pages.get(bid_id) or []
+        if not rows:
+            return set()
+        recs = [PageRec(no, t, src) for no, t, src in rows]
+        name = str(c.get("name") or "")
+        kws = [name] if name else []
+        kws += [k for k in re.split(r"[-—–、（）()：:（）\s]+", name) if len(k) >= 2]
+        for kw in kws:
+            guess = resolve_index_pages(recs, kw, line_window=3)
+            if guess.found:
+                return {p for p in range(guess.start, guess.end + 1)}
+        return set()
+
+    def _value_window_for(bid_id: int, c) -> str | None:  # noqa: ANN001
+        rows = bid_pages.get(bid_id) or []
+        if not rows:
+            return None
+        pages = _window_pages_for(bid_id, c)
+        if pages:
+            picked = [t for no, t, _s in rows if no in pages]
+            text = "\n".join(x for x in picked if x).strip()
+            if text:
+                return text
+        # 回退：承诺章节页（页首标题区命中）
+        picked = [t for _no, t, _s in rows if _RE_COMMIT_HEADING.search(t[:300])]
+        return "\n".join(x for x in picked if x).strip() or None
+
+    # P1-6 选段加成（2026-11-02 run77 c54）：索引指针窗口页 chunk ×1.3（优先
+    # 送审），偏离表/偏差表页 chunk ×0.25（通用条款降权不移除——真承诺写在
+    # 偏离表的标书保留入选资格）。与 chunk_srcs（split_page_chunks 同口径）对齐。
+    _RE_DEV_PAGE = re.compile(r"技术偏离表|技术响应偏离表|偏离表|偏差表")
+
+    def _score_scale_extra_for(bid_id: int, c) -> list[float] | None:  # noqa: ANN001
+        srcs = chunk_srcs_by_bidder.get(bid_id)
+        if not srcs:
+            return None
+        win = _window_pages_for(bid_id, c)
+        main_id = main_doc_by_bidder.get(bid_id)
+        dev_pages = {
+            no for no, t, _s in (bid_pages.get(bid_id) or [])
+            if _RE_DEV_PAGE.search(t[:600] or "")
+        }
+        out: list[float] = []
+        for d, pno in srcs:
+            w = 1.0
+            if d == main_id:
+                if win and pno in win:
+                    w *= 1.3
+                if pno in dev_pages:
+                    w *= 0.25
+            out.append(w)
+        return out
 
     def _count_cell(args):  # noqa: ANN001
         """count 格计算（无 DB 写）：参数装配 → 确定性/LLM 核验 → 计分 → 审计。"""
@@ -879,6 +967,21 @@ def execute_run(
         # P1-E 新计分原语：与业绩案例三态机器无关的确定性评分，直接分发。
         # CountResult 同构 → 下面的 unresolved/doubt/落库路径完全复用。
         _engine = params.get("engine")
+        if _engine in ("value_tier", "value_linear"):
+            # 承诺值抽取窗口：索引指针页/承诺章节文本（防偏离表通用条款首匹配抢值）
+            _vw = _value_window_for(bid_id, c)
+            if _vw:
+                c_scoring = {**c_scoring, "value_window_text": _vw}
+        if _engine in ("count_tier", "attribute_tier"):
+            # 证书背书三态（P0-5）：count_tier/attribute_tier 的软证据闸门
+            from app.engine.objective import classify_cert_backing
+
+            _pages2 = [(src, t) for _p, t, src in (bid_pages.get(bid_id) or [])]
+            _backing = classify_cert_backing(
+                facts, _pages2, cert_sections.get(bid_id)
+            )
+            if _backing:
+                c_scoring = {**c_scoring, "cert_backing": _backing}
         if _engine in _P1E_ENGINES:
             result = _P1E_ENGINES[_engine](c_scoring, params, facts)  # type: ignore[arg-type]
         else:
@@ -910,14 +1013,7 @@ def execute_run(
                     {
                         k: (str(v)[:160] if isinstance(v, str) else v)
                         for k, v in cs.items()
-                        if k in (
-                            "name", "person", "role", "quote", "sanitized",
-                            "match_tier", "quote_source", "case_source", "page_hint",
-                            "amount_yuan", "sign_date", "table_page", "material_pages",
-                            "material_reasons", "contract", "invoice", "acceptance",
-                            "work_proof", "experience_proof", "social_security",
-                            "person_name", "duplicate",
-                        )
+                        if k in _AUDIT_CASE_KEYS
                     }
                     for cs in _vc
                 ],
@@ -926,6 +1022,11 @@ def execute_run(
         if result.score == 0 and (zero_reason or audit):
             audit = dict(audit or {})
             audit["zero_reason"] = zero_reason
+        # 双分值可复算（2026-11-02）：剔除未核验案例的分数落审计，人工一眼算账
+        _sv = getattr(result, "score_verified_only", None)
+        if _sv is not None:
+            audit = dict(audit or {})
+            audit["score_verified_only"] = str(_sv)
         return bid_id, c, result, unresolved, doubt, audit
 
     # Phase1：并行计算（业绩表快路径不走 LLM；LLM 逐案例核验 4 并发→8 并发）
@@ -934,12 +1035,14 @@ def execute_run(
     # Phase2：串行落库（SQLite 单写者）
     for bid_id, c, result, unresolved, doubt, audit in count_results:
         _warn_entry, _unreadable_zero = _count_zero_warn_entry(result, audit)
+        _unverified_n = getattr(result, "unverified_counted", 0) or 0
         _upsert_score(
             run_id, bid_id, c,
             machine_score=result.score,
             # unreadable 零分：机器不可见 ≠ 确认缺失 → 强制转人工（不因
-            # 全自动模式被收敛成 auto_confirmed——doubt=True 已保住复核态）
-            machine_status="need_human" if _unreadable_zero else "pass",
+            # 全自动模式被收敛成 auto_confirmed——doubt=True 已保住复核态）。
+            # 含未核验案例（>0）同理转人工：分数进了总分但口径未定（双分值）。
+            machine_status="need_human" if (_unreadable_zero or _unverified_n) else "pass",
             review_status="conflict_flagged" if doubt else "pending",
             # 全自动化评分（用户要求零未定分）：计分项**一律写分**。
             # unresolved 只作疑问标记（落 warnings 供报告判读），不再决定弃评；
@@ -998,27 +1101,56 @@ def execute_run(
         # （经验证明/社保证明类页面出现与否），不数页数。旧实现的 <3 页/<16 页
         # 阈值是按旧项目 4 家校准的拟合产物，换项目即误杀（2026-10-26 run 54
         # 实证），已删除；claim 句（"具有五年工作经验"）不是证明材料。
-        person_stats: dict[int, dict[str, bool]] = {}
+        # **三态**（2026-11-02 run77 c48 实证）：True=检出 / False=可读文本层
+        # 确认无（且无扫描页遮挡）/ None=机器看不见（有扫描/OCR 页，不能确认
+        # 缺失）。旧二态把"没扫到"当"确认没有"→ 清零误杀。正则补 简历|职称证|
+        # 人员情况表|履历（c48 实证：p121-122"简历+职称证书"旧正则匹配不到），
+        # 并消费 material_tags 页级标签作存在性信号（目录式页被跳过条件误跳时的补救）。
+        person_stats: dict[int, dict[str, bool | None]] = {}
         with session_scope() as s:
-            from app.db.models import DocumentPage
+            from app.db.models import DocumentPage, MaterialTag
 
             for bid_id in bidder_ids:
                 doc_id = main_doc_by_bidder.get(bid_id)
-                exp_mat, social_mat = False, False
+                exp_mat: bool | None = None
+                social_mat: bool | None = None
                 if doc_id is not None:
-                    for ptext in s.execute(
-                        select(DocumentPage.text).where(DocumentPage.document_id == doc_id)
-                    ).scalars():
+                    exp_hit = social_hit = False
+                    has_scan = False
+                    for ptext, psrc in s.execute(
+                        select(DocumentPage.text, DocumentPage.source)
+                        .where(DocumentPage.document_id == doc_id)
+                    ):
                         t = ptext or ""
+                        if (psrc or "text") != "text":
+                            has_scan = True  # 扫描/OCR 页 → 文本层不可信，缺席不可确认
                         if "【证明材料】" in t or t.count("....") >= 3:
                             continue  # 目录/要求页不算材料页
                         if re.search(
-                            r"工作经验证明|工作证明|工作经历证明|劳动合同|聘书|任职证明|工作履历",
+                            r"工作经验证明|工作证明|工作经历证明|劳动合同|聘书|任职证明"
+                            r"|工作履历|简历|职称证|职称|人员情况表|履历",
                             t,
                         ):
-                            exp_mat = True
+                            exp_hit = True
                         if re.search(r"社会保险|社保|参保缴费|参保人员|参保证明|缴费证明", t):
-                            social_mat = True
+                            social_hit = True
+                    if not (exp_hit and social_hit):
+                        # material_tags 页级标签存在性信号（补救目录式页误跳）
+                        for (tags_json,) in s.execute(
+                            select(MaterialTag.tags_json).where(
+                                MaterialTag.document_id == doc_id,
+                                MaterialTag.seg_kind == "page",
+                            )
+                        ):
+                            joined = "、".join(str(x) for x in (tags_json or []))
+                            if re.search(r"工作|经验证明|简历|职称|人员", joined):
+                                exp_hit = True
+                            if re.search(r"社保|参保", joined):
+                                social_hit = True
+                    # 三态归位：命中→True；未命中且文本层可读（无扫描页）→False；
+                    # 未命中但有扫描页 → None（机器看不见，不确认缺失）
+                    exp_mat = True if exp_hit else (False if not has_scan else None)
+                    social_mat = True if social_hit else (False if not has_scan else None)
                 person_stats[bid_id] = {"exp_material": exp_mat, "social_material": social_mat}
 
         use_hierarchical = config.review_mode() == "hierarchical"
@@ -1070,36 +1202,49 @@ def execute_run(
                 str(c.get("name") or ""), person_stats.get(bid_id, {}), c
             )
             if _zero_reason is not None:
-                # 确定性短路：材料门槛已判定强制 0 的格跳过全部 LLM——Phase2 会
+                # 确定性短路：材料**确认**缺失（三态 False）才跳过 LLM——Phase2 会
                 # 权威置 0，3 次簇调用跑完也是白跑（省 0-40% 主观分 LLM 调用）。
                 # 注意返回形状必须与主路径一致（code 而非 dict）——单出口统一在
                 # 函数末尾，防止形状漂移（审查实锤：dict 当键 → unhashable 崩整场）。
                 suggestion, committee = SubjectiveSuggestion(
                     status="ai_suggested", score=Decimal(0), level_label=None,
                     reasoning=_zero_reason, evidence=[], warnings=[],
+                    zero_reason="confirmed_absent",
                 ), None
             else:
                 hint = material_hints.get(bid_id)
+                # 材料存在性 None（机器看不见）→ 提示并入 LLM 输入（三态哲学：
+                # 没看见≠不符合，让 LLM 带提示判档而不是被硬门槛短路清零）
+                _miss = _missing_material_hint(
+                    str(c.get("name") or ""), person_stats.get(bid_id, {}), c
+                )
+                if _miss:
+                    hint = f"{hint}；{_miss}" if hint else _miss
                 _cc = chunk_cats_by_bidder.get(bid_id)
                 _cf = chunk_cat_confs_by_bidder.get(bid_id)
+                # P1-6 选段加成：索引指针窗口页优先 / 偏离表通用条款降权
+                _sce = _score_scale_extra_for(bid_id, c)
                 try:
                     if use_hierarchical:
                         suggestion, committee = suggest_score_hierarchical(
                             gateway, c, text_by_bidder[bid_id], data_class=data_class,
                             material_pages=hint, verify_quote=verifiers.get(bid_id),
                             chunk_cats=_cc, chunk_cat_confs=_cf,
+                            score_scale_extra=_sce,
                         )
                         if suggestion is None:
                             suggestion, committee = suggest_score_committee(
                                 gateway, c, text_by_bidder[bid_id], data_class=data_class,
                                 material_pages=hint, verify_quote=verifiers.get(bid_id),
                                 chunk_cats=_cc, chunk_cat_confs=_cf,
+                                score_scale_extra=_sce,
                             )
                     else:
                         suggestion, committee = suggest_score_committee(
                             gateway, c, text_by_bidder[bid_id], data_class=data_class,
                             material_pages=hint, verify_quote=verifiers.get(bid_id),
                             chunk_cats=_cc, chunk_cat_confs=_cf,
+                            score_scale_extra=_sce,
                         )
                 except Exception as exc:  # noqa: BLE001 —— 单格失败不让整场失败
                     if _is_fatal_llm_error(exc):
@@ -1147,6 +1292,7 @@ def execute_run(
                         reasoning=forced_zero,
                         evidence=[],
                         warnings=[forced_zero] + list(suggestion.warnings),
+                        zero_reason="confirmed_absent",
                     )
 
                 _persist_subjective(run_id, bid_id, c, suggestion, main_doc_by_bidder.get(bid_id), stats,
@@ -1996,16 +2142,33 @@ def _overlay_leader_table_proof(cases: list[dict], pages: list[tuple[int, str, s
             c["work_proof"] = True
 
 
+
+# ai_raw_json["verified_cases"] 白名单：落库保留的案例键。三态/审计补键（2026-11-02）：
+# unverified 标记与三因细分曾不在白名单、落库即丢，只能从 warnings 中文文案反读。
+_AUDIT_CASE_KEYS = (
+    "name", "person", "role", "quote", "sanitized",
+    "match_tier", "quote_source", "case_source", "page_hint",
+    "amount_yuan", "sign_date", "table_page", "material_pages",
+    "material_reasons", "contract", "invoice", "acceptance",
+    "work_proof", "experience_proof", "social_security",
+    "person_name", "duplicate",
+    "unverified", "unverified_reason", "truncated_review",
+)
+
+
 def _load_material_maps(
     doc_ids_by_bidder: dict[int, list[int]],
     main_doc_by_bidder: dict[int, int | None],
     bidder_ids: list[int],
 ) -> tuple[dict[int, dict[int, str]], dict[int, dict[int, float]],
-          dict[int, list[str | None]], dict[int, list[float]]]:
+          dict[int, list[str | None]], dict[int, list[float]],
+          dict[int, list[tuple[int, int]]]]:
     """材料类别映射：页级 (page→cat/conf) + chunk 级（与 split_text_chunks 同口径）。
 
     只认 text_sha 未失效的页级标签；无标签的投标人不进映射（调用方退化无过滤）。
     重建是廉价操作（字符串切分 + 一次索引表读），rescue 后可重跑。
+    第 5 返回值 chunk_srcs（(doc_id, page_no) 逐 chunk）：**无标签也返回**——
+    P1-6 选段加成（窗口页/偏离表页）不依赖标签，只依赖页出处。
     """
     from app.engine.selection import split_page_chunks
     from app.material_index.service import text_sha as _tsha
@@ -2014,6 +2177,7 @@ def _load_material_maps(
     page_confs: dict[int, dict[int, float]] = {}
     chunk_cats: dict[int, list[str | None]] = {}
     chunk_confs: dict[int, list[float]] = {}
+    chunk_srcs: dict[int, list[tuple[int, int]]] = {}
     with session_scope() as s:
         from app.db.models import DocumentPage as _DP
         from app.db.models import MaterialTag
@@ -2043,11 +2207,14 @@ def _load_material_maps(
                         continue  # 标签已过期
                     cats[pno_i] = cat
                     confs[pno_i] = float(conf or 0)
-            if not cats or not pages_seq:
+            if not pages_seq:
+                continue
+            _chunks, srcs = split_page_chunks(pages_seq)
+            chunk_srcs[bid_id] = srcs
+            if not cats:
                 continue
             page_cats[bid_id] = cats
             page_confs[bid_id] = confs
-            _chunks, srcs = split_page_chunks(pages_seq)
             main_id = main_doc_by_bidder.get(bid_id)
             chunk_cats[bid_id] = [
                 cats.get(pno) if d == main_id else None for d, pno in srcs
@@ -2055,7 +2222,7 @@ def _load_material_maps(
             chunk_confs[bid_id] = [
                 confs.get(pno, 0.0) if d == main_id else 0.0 for d, pno in srcs
             ]
-    return page_cats, page_confs, chunk_cats, chunk_confs
+    return page_cats, page_confs, chunk_cats, chunk_confs, chunk_srcs
 
 
 def _veto_precheck(  # noqa: ANN001
@@ -2531,6 +2698,17 @@ def _persist_subjective(
     stats: dict,
     committee: list[dict] | None = None,
 ) -> None:
+    # 0 分无证据区分（2026-11-02 三态口径，先算供落库）：confirmed_absent=
+    # 材料确认缺失（规则硬口径「不得分」）照 0；其余 0 分且零引文 = 机器没依据
+    # （LLM 判 0 却给不出引用/材料未见非确认缺失）→ zero_reason=no_facts +
+    # need_human，不落 auto_confirmed（对齐 run_check 的 unknown 哲学，run77
+    # c48：材料在 p121-122 却被"未见材料"静默清零，人工给满分）。
+    _zr = getattr(suggestion, "zero_reason", None)
+    zero_no_basis = (
+        suggestion.score == 0 and _zr != "confirmed_absent" and not suggestion.evidence
+    )
+    if zero_no_basis:
+        _zr = "no_facts"
     # 人工已确认/改分的主观项：重跑时不得被新的 AI 建议覆盖
     with session_scope() as s:
         existing = s.execute(
@@ -2581,6 +2759,9 @@ def _persist_subjective(
             # 证明材料链核对与复合因素子项得分（评分透明度）
             "artifacts_check": suggestion.artifacts_check,
             "sub_scores": suggestion.sub_scores,
+            # 0 分理由（W1-C 对齐 count 路径）：confirmed_absent=材料确认缺失
+            # （规则硬口径）/ no_facts=机器没依据（转人工）
+            "zero_reason": _zr,
         }
         row.warnings_json = [{"message": w} for w in suggestion.warnings]
         row.review_status = "ai_suggested" if suggestion.status == "ai_suggested" else "pending"
@@ -2638,7 +2819,7 @@ def _persist_subjective(
                 isinstance(w, dict) and w.get("message") in ("parse_failed", "llm_failed")
                 for w in (row.warnings_json or [])
             )
-            doubt_flag = bool(getattr(suggestion, "doubt", False))
+            doubt_flag = bool(getattr(suggestion, "doubt", False)) or zero_no_basis
             if gate_not_executed:
                 # 保留分值（进总分，不影响排名），但标疑问进复核清单：
                 # 若整项直接判未定分，8B 偶尔不给逐子项引文就会让整份报告失效

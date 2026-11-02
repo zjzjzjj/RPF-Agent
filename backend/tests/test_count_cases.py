@@ -175,6 +175,64 @@ def test_score_count_false_stays_zero_in_narrow() -> None:
     assert res.zero_reason == "confirmed_absent"
 
 
+def test_score_count_max_items_cuts_unverified_first() -> None:
+    """排序收紧（2026-11-02 run77 c41）：max_items 封顶先砍未核验案例——
+    verified（材料全 True）优先计满，unverified（材料 None）排尾被截。
+
+    run77 实证：德勤 11 个不可读案例全部计入被 max_score 封顶得 4/4 满分，
+    人工只认 3 个有效业绩。双防（用友/德勤）：verified 案例不受影响，未核验
+    案例不再挤占 verified 的名额。
+    """
+    from app.engine.objective import score_count
+
+    cases = (
+        # 3 个未核验（排尾）
+        [{"name": f"U{i}", "contract": True, "invoice": None, "acceptance": None,
+          "sanitized": "ok"} for i in range(3)]
+        +  # 2 个 verified（排前）
+        [{"name": f"V{i}", "contract": True, "invoice": True, "acceptance": True,
+          "sanitized": "ok"} for i in range(2)]
+    )
+    # max_items=3：verified 2 个 + unverified 1 个 = 3 × 2 = 6；剔除未核验 = 4
+    crit = _perf_crit(verified_cases=cases)
+    res = score_count(crit, crit["params"], BidFacts(text=""))
+    assert res.score == Decimal("6.00")
+    assert res.score_verified_only == Decimal("4.00")
+    assert res.unverified_counted == 1  # 只有 1 个未核验挤进名额
+    assert "剔除后为 4.00 分" in res.detail
+
+
+def test_score_count_unverified_dual_score_recomputable() -> None:
+    """双分值可复算：score（含未核验）与 score_verified_only（剔除后）并存。"""
+    from app.engine.objective import score_count
+
+    crit = _perf_crit(verified_cases=[
+        {"name": "V", "contract": True, "invoice": True, "acceptance": True,
+         "sanitized": "ok"},
+        {"name": "U", "contract": True, "invoice": None, "acceptance": None,
+         "sanitized": "ok"},
+    ])
+    res = score_count(crit, crit["params"], BidFacts(text=""))
+    assert res.score == Decimal("4.00")           # 2 个可计 × 2
+    assert res.score_verified_only == Decimal("2.00")  # 剔除未核验后
+    assert res.unverified_counted == 1
+    assert res.conflict is True
+
+
+def test_score_count_all_verified_no_dual_score() -> None:
+    """全 verified 时 score_verified_only=None（score 即结论，不制造噪音）。"""
+    from app.engine.objective import score_count
+
+    crit = _perf_crit(verified_cases=[
+        {"name": "V", "contract": True, "invoice": True, "acceptance": True,
+         "sanitized": "ok"},
+    ])
+    res = score_count(crit, crit["params"], BidFacts(text=""))
+    assert res.score == Decimal("2.00")
+    assert res.score_verified_only is None
+    assert res.unverified_counted == 0
+
+
 def test_llm_verify_truncation_downgrades_false(monkeypatch):  # noqa: ANN001
     """截断降级：候选页超硬顶被截断时，sanitized=="ok" 的 False→None（未核验）。
 
@@ -1469,3 +1527,13 @@ def test_case_candidate_pages_section_includes_non_anchor_pages() -> None:
     sent = [no for b in batches for no, _t in b]
     assert 50 in sent and 46 in sent and 54 in sent, "section 内页必须并入候选"
     assert sent.index(50) < sent.index(46), "锚点页应排在 section 非锚点页之前"
+
+
+def test_audit_whitelist_keeps_tristate_keys() -> None:
+    """审计白名单必须保留三态键（2026-11-02）：unverified/unverified_reason/
+    truncated_review 曾被丢弃，落库后只能从 warnings 中文文案反读。"""
+    from app.services.scoring_service import _AUDIT_CASE_KEYS
+
+    for key in ("unverified", "unverified_reason", "truncated_review",
+                "sanitized", "material_reasons", "quote", "name"):
+        assert key in _AUDIT_CASE_KEYS, key

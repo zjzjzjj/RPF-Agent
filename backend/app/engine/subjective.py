@@ -207,6 +207,9 @@ class SubjectiveSuggestion:
     # 疑问标记（2026-10-29 弃权语义）：all-abstain 子项、证据闸门未核验、
     # 或整项全簇弃权时置位——消费方（scoring_service）据此强制 conflict_flagged
     doubt: bool = False
+    # 0 分理由（W1-C 对齐 count 路径）：confirmed_absent=材料确认缺失（规则硬口径）
+    # / no_facts=机器没依据（转人工）。None=非 0 分或正常评审。
+    zero_reason: str | None = None
     # 聚合算式（可复算不变式 I1）：{rule, inputs:[{source,score,provisional}], arithmetic}
     # 持久化进 ai_raw_json["aggregation_v2"]，final_score 可由它重算核对
     aggregation: dict | None = None
@@ -248,6 +251,7 @@ def suggest_score(
     *,
     chunk_cats: list[str | None] | None = None,
     chunk_cat_confs: list[float] | None = None,
+    score_scale_extra: list[float] | None = None,
 ) -> SubjectiveSuggestion:
     """对一家投标人的一个主观评分项给出建议分。
 
@@ -274,6 +278,7 @@ def suggest_score(
         picked, meta = select_chunks_for_criterion(
             split_text_chunks(bid_text), criterion, MAX_BID_CHARS,
             chunk_cats=chunk_cats, chunk_cat_confs=chunk_cat_confs,
+            score_scale_extra=score_scale_extra,
         )
         truncated = "\n".join(t for _i, t in picked)
         _sf = "；类内优先" if meta.get("in_class") else ""
@@ -463,6 +468,7 @@ def suggest_score_committee(
     *,
     chunk_cats: list[str | None] | None = None,
     chunk_cat_confs: list[float] | None = None,
+    score_scale_extra: list[float] | None = None,
 ) -> tuple[SubjectiveSuggestion, list[dict]]:
     """size 个 AI 评委独立评分，去尾平均聚合。返回 (聚合建议, 评委明细)。
 
@@ -480,7 +486,8 @@ def suggest_score_committee(
     if size <= 1:
         s = suggest_score(gateway, criterion, bid_text, data_class=data_class,
                           material_pages=material_pages, verify_quote=verify_quote,
-                          chunk_cats=chunk_cats, chunk_cat_confs=chunk_cat_confs)
+                          chunk_cats=chunk_cats, chunk_cat_confs=chunk_cat_confs,
+                          score_scale_extra=score_scale_extra)
         committee = [{
             "judge_no": 1,
             "score": str(s.score) if s.score is not None else None,
@@ -500,7 +507,8 @@ def suggest_score_committee(
                                      material_pages=material_pages,
                                      verify_quote=verify_quote,
                                      chunk_cats=chunk_cats,
-                                     chunk_cat_confs=chunk_cat_confs),
+                                     chunk_cat_confs=chunk_cat_confs,
+                                     score_scale_extra=score_scale_extra),
             range(size),
         ))
 
@@ -665,6 +673,7 @@ def suggest_score_hierarchical(
     *,
     chunk_cats: list[str | None] | None = None,
     chunk_cat_confs: list[float] | None = None,
+    score_scale_extra: list[float] | None = None,
 ) -> tuple[SubjectiveSuggestion, list[dict]] | None:
     """分层评审：证据地图定位 K 个不相交证据簇，逐簇深评后聚合。
 
@@ -678,7 +687,9 @@ def suggest_score_hierarchical(
     k = k or config.review_clusters()
     max_score = Decimal(str(criterion.get("max_score") or 0))
     chunks = split_text_chunks(bid_text)
-    emap = build_evidence_map(chunks, criterion, chunk_cats=chunk_cats)
+    emap = build_evidence_map(
+        chunks, criterion, chunk_cats=chunk_cats, score_scale_extra=score_scale_extra
+    )
     if emap is None:
         return None
     clusters, _query = emap

@@ -360,6 +360,35 @@ class CountResult:
     # - "no_facts"          机器没抽到事实（no_facts/cases_unverified/口径缺失）
     # - "gate_named_missing" 点名材料闸门未核验/未通过（材料要求存在但核验未执行）
     zero_reason: str | None = None
+    # 双分值（2026-11-02）：剔除未核验案例后的可复算分（人工复核一眼算账）。
+    # None=本格无未核验案例（score 即结论）。
+    score_verified_only: Decimal | None = None
+    # 未核验案例数（>0 → 机器状态 need_human，不得落 auto_confirmed）
+    unverified_counted: int = 0
+
+
+def _unverified_reason_of(case: dict, required_keys) -> str:
+    """案例材料 None 的三因归一（audit 用）：unreadable / scan_unverified / unlinked。
+
+    classify_materials 的 reasons（CaseBlock.reasons）记录每个材料键的来源原因，
+    取 required_flags 对应键中最严重者；信息缺失回退 unlinked（最保守）。
+    """
+    reasons = case.get("material_reasons") or {}
+    seen: list[str] = []
+    for k in required_keys:
+        if case.get(k) is None:
+            r = str(reasons.get(k) or "")
+            if r and r not in seen:
+                seen.append(r)
+    if not seen:
+        # LLM 路径案例无 material_reasons：引文定位失败型已标 unverified
+        v = str(case.get("unverified") or "")
+        return v if v in ("unreadable", "scan_unverified", "unlinked") else "unlinked"
+    # 优先级：unreadable（页面不可读）> scan_unverified（扫描无特征）> unlinked
+    for pref in ("unreadable", "scan_unverified", "unlinked"):
+        if pref in seen:
+            return pref
+    return seen[0]
 
 
 def _infer_count_field(criterion: dict) -> str | None:
@@ -516,6 +545,47 @@ def cert_evidence_present(pages: list[tuple[str, str]]) -> tuple[bool, str]:
 
 
 
+# 证书 backing 三态（2026-11-02 P0-5）：count_tier/attribute_tier 的证据闸门。
+# True=计数证书有可读复印件/截图页背书；None=候选页不可读/截图页 OCR 只剩标题
+# （c38 实证：p39 只有标题、证书是扫描图）——**计入并标疑问**（防"截图文本层
+# 看不见→误杀"，历史实证）；False=可读文本确认无背书页。
+def classify_cert_backing(
+    facts, pages: list[tuple[str, str]] | None, cert_section: tuple[bool, str] | None = None
+) -> dict[str, bool | None]:
+    """每本计数证书的背书三态：{归一化证书键: True/None/False}。
+
+    - ``facts.certificates`` 里有、且对应背书页可读 → True；
+    - 证书清单页/截图页存在但低证据（图片占比高、OCR 输出过少）→ None；
+    - 无背书页且文本层可读（cert_section 明示未见截图/指纹）→ False；
+    - 信息不足（cert_section 未提供/None）→ None（不猜）。
+    """
+    out: dict[str, bool | None] = {}
+    certs = list(getattr(facts, "certificates", None) or [])
+    if not certs:
+        return out
+    # 背书页可见性：cert_section_present 双通道（文本标题/OCR 平台指纹）
+    section_ok, section_why = cert_section if cert_section else (None, "")
+    low_evidence = False
+    if pages:
+        for _src, t in pages:
+            # 低证据页判定（与 case_evidence._low_evidence 同口径精神）：OCR 只
+            # 输出极少字（截图页常见）→ 看不见≠没有
+            if len((t or "").strip()) < 30:
+                low_evidence = True
+                break
+    for name in certs:
+        key = normalize_cert(str(name))
+        if section_ok is True:
+            out[key] = True  # 查询截图/平台指纹确认存在背书
+        elif low_evidence:
+            out[key] = None  # 有候选页但不可读 → 计入+疑问
+        elif section_ok is False and "未见" in (section_why or ""):
+            out[key] = False  # 可读文本确认无背书页
+        else:
+            out[key] = None  # 信息不足 → 不猜
+    return out
+
+
 def recover_artifacts_from_tender(
     criterion: dict, tender_pages: list[tuple[int, str]]
 ) -> str:
@@ -568,6 +638,8 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
     inferred = ""
     unresolved: str | None = None
     zero_reason: str | None = None  # 0 分理由（见 CountResult.zero_reason）
+    score_verified_only: Decimal | None = None  # 剔除未核验案例的可复算分
+    unverified_counted = 0  # 未核验案例数（>0 → need_human）
     if person_scope:
         # 人员级项：facts.performance_amounts 是公司级业绩，按它计数会让人人封顶。
         # 强制走 verified_cases（LLM 按人核验）；无案例则 unresolved。
@@ -904,6 +976,7 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
             # 开关 config.case_unverified_count_enabled()（BID_EVAL_CASE_UNVERIFIED_COUNT）
             # 关 → 回退"None 不计"（保守），供 eval_suite 锚点对比与回滚。
             complete: list[dict] = []
+            unverified_pool: list[dict] = []
             unverified_counted = 0
             null_dropped = 0  # 仅回退模式（None 不计）
             dropped_false = 0
@@ -919,7 +992,10 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                 # 无 False、非全 True → 存在 None（不可读/未绑上）
                 if _unverified_on:
                     c["unverified"] = True
-                    complete.append(c)
+                    # None 细分三因（audit）：unreadable=低证据页 / scan_unverified=
+                    # 扫描页无特征 / unlinked=案例没绑上材料页（classify_materials 口径）
+                    c["unverified_reason"] = _unverified_reason_of(c, required_flags)
+                    unverified_pool.append(c)
                     unverified_counted += 1
                     conflict = True
                 else:
@@ -928,14 +1004,29 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                     conflict = True
             if dropped_false:
                 conflict = True  # 确认缺失 → 0 也标疑问（规则"不全不得分"，留人工复核）
-            effective = min(Decimal(len(complete)), Decimal(max_items)) if max_items else Decimal(len(complete))
+            # 排序收紧（2026-11-02 用户确认口径，次序规则非折扣系数）：verified 在前、
+            # unverified 在后——max_items 封顶先砍未核验案例，锚定且材料确认的案例
+            # 优先计满（run77 c41：11 个不可读案例全计满 4 分，人工只认 3 个有效）。
+            complete = complete + unverified_pool
+            _verified_n = len(complete) - unverified_counted
+            kept = complete[:max_items] if max_items else complete
+            # 计入的未核验数（被封顶砍掉的不计入、不触发 need_human）——语义是
+            # "有多少未核验案例的分数进了总分"，双分值/机器状态都以它为准。
+            unverified_counted = sum(1 for c in kept if c.get("unverified"))
+            effective = Decimal(len(kept))
             score = (effective * per_item).quantize(Decimal("0.01"))
             if max_score and score > max_score:  # 封顶：真实规则"最高得 M 分"
                 score = max_score
+            # 可复算双分值：剔除全部未核验案例后的分数（warnings 附给人工一眼复算）
+            _kept_verified = min(_verified_n, max_items) if max_items else _verified_n
+            score_verified_only = (_kept_verified * per_item).quantize(Decimal("0.01"))
+            if max_score and score_verified_only > max_score:
+                score_verified_only = max_score
             detail = (
                 f"逐案例核验：提供案例 {len(cases)} 个，其中可计 {len(complete)} 个"
                 + (f"（{dropped_false} 个缺证明材料不计分）" if dropped_false else "")
-                + (f"（{unverified_counted} 个案例材料不可读/未绑上，按未核验计入并标疑问，建议人工核看）"
+                + (f"（{unverified_counted} 个案例材料不可读/未绑上，按未核验计入并标疑问，"
+                   f"剔除后为 {score_verified_only} 分，建议人工核看）"
                    if unverified_counted else "")
                 + (f"（{null_dropped} 个案例材料页不可读未计，可能为扫描件，建议人工核看）"
                    if null_dropped else "")
@@ -974,6 +1065,8 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
         score=score, detail=f"{detail}，得 {score} 分{inferred}", conflict=conflict,
         unresolved=unresolved,
         zero_reason=zero_reason,
+        score_verified_only=score_verified_only if unverified_counted else None,
+        unverified_counted=unverified_counted,
     )
 
 
@@ -1113,30 +1206,116 @@ def _units_to_months(value: Decimal, unit: str) -> Decimal:
     return value * 12 if unit == "年" else value
 
 
-def _extract_response_hours(text: str) -> tuple[Decimal | None, str]:
-    """投标人响应时间承诺（小时）。带标签首匹配优先；返回 (值, 原文片段)。"""
-    m = _RE_HOURS_LABELED.search(text) or _RE_HOURS.search(text)
-    if not m:
-        return None, ""
-    try:
-        return Decimal(m.group(1)), m.group(0)
-    except Exception:  # noqa: BLE001
-        return None, ""
+# 承诺语境/偏离表语境判定（值抽取的语境分用，通用结构性判据非项目拟合）
+_RE_COMMIT_CTX = re.compile(r"承诺|保证|书面承诺")
+_RE_CLAUSE_SPLIT = re.compile(r"[。；;！!？?\n]")
 
 
-def _extract_warranty_months(text: str) -> tuple[Decimal | None, str]:
-    """投标人质保期承诺（统一换算月）。返回 (月数, 原文片段)。"""
-    m = _RE_WARRANTY_LABELED.search(text) or _RE_WARRANTY.search(text)
-    if not m:
+def _deviation_regions(text: str) -> list[tuple[int, int]]:
+    """偏离表/偏差表所在区间（表题起 4000 字符内到下一章节标题），同
+    _extract_deviation_counts 的窗口口径。区间内出现的通用条款值要降序。"""
+    regions: list[tuple[int, int]] = []
+    for m in _RE_DEV_SECTION.finditer(text):
+        tail = text[m.end(): m.end() + 4000]
+        stop = re.search(r"\n\s*(?:表\s*\d|[一二三四五六]、|第[一二三四五六][章节部分])", tail)
+        window = tail[: stop.start()] if stop else tail
+        regions.append((m.end(), m.end() + len(window)))
+    return regions
+
+
+def _value_candidates(
+    text: str, labeled: re.Pattern, plain: re.Pattern, to_value
+) -> list[tuple[Decimal, str, int, int]]:
+    """全量收集候选值：(值, 原文片段, 位置, 语境分)。
+
+    2026-11-02 run77 实证：**全文首匹配**会被商务技术偏离表的通用条款
+    （"派遣高级技术人员8 小时到达现场"）抢走，而正文服务承诺章节的正式承诺
+    （"承诺远程服务团队在4 小时到达现场"）被无视 → 0 分误判。改为全量收集 +
+    语境分排序：带标签 +3；与"承诺/保证"同句（句读切分）+2；落在偏离表
+    区间内 −5（偏离表行是逐条响应格式文本，不是承诺函）。
+    """
+    out: list[tuple[Decimal, str, int, int]] = []
+    regions = _deviation_regions(text)
+    seen: set[tuple[Decimal, int]] = set()
+    for regex, base in ((labeled, 3), (plain, 0)):
+        for m in regex.finditer(text):
+            try:
+                value = to_value(m)
+            except Exception:  # noqa: BLE001
+                continue
+            if value is None:
+                continue
+            key = (value, m.start())
+            if key in seen:
+                continue
+            seen.add(key)
+            score = base
+            # 承诺同句：从上一个句读到本匹配的区间含"承诺/保证"
+            prev = max(
+                (mm.end() for mm in _RE_CLAUSE_SPLIT.finditer(text[: m.start()])),
+                default=0,
+            )
+            if _RE_COMMIT_CTX.search(text[prev : m.start() + len(m.group(0))]):
+                score += 2
+            if any(lo <= m.start() < hi for lo, hi in regions):
+                score -= 5
+            out.append((value, m.group(0), m.start(), score))
+    return out
+
+
+def _pick_value(cands: list[tuple[Decimal, str, int, int]]) -> tuple[Decimal | None, str]:
+    """按语境分取最优候选；同分取文本序最前。多值分歧并列进片段（conflict
+    由调用方恒置 True，此处只保证分歧可见、可复算）。"""
+    if not cands:
         return None, ""
-    try:
-        if m.lastindex and m.lastindex >= 2 and m.group(2):
-            return _units_to_months(Decimal(m.group(1)), m.group(2)), m.group(0)
-        raw = m.group(0)
-        unit = "月" if "个月" in raw else "年"
-        return _units_to_months(Decimal(m.group(1)), unit), raw
-    except Exception:  # noqa: BLE001
-        return None, ""
+    best_score = max(c[3] for c in cands)
+    top = [c for c in cands if c[3] == best_score]
+    value, snippet = top[0][0], top[0][1]
+    distinct = sorted({c[0] for c in cands})
+    if len(distinct) > 1:
+        alts = "、".join(f"{v}（{s[:16]}）" for v, s, _p, _sc in cands[:4])
+        snippet = f"{snippet}｜多值分歧：{alts}，取语境最优 {value}"
+    return value, snippet
+
+
+def _extract_response_hours(text: str, window: str | None = None) -> tuple[Decimal | None, str]:
+    """投标人响应时间承诺（小时）。
+
+    ``window``（索引指针/承诺章节解析出的文本）非空时只在窗口内收集——投标人的
+    索引表自报"服务承诺…见投标文件（N-M）页"，窗口是材料自声明位置，权威且零拟合；
+    窗口无匹配回退全文。返回 (值, 原文片段)。
+    """
+    src = window if (window and window.strip()) else (text or "")
+    cands = _value_candidates(
+        src, _RE_HOURS_LABELED, _RE_HOURS,
+        lambda m: Decimal(m.group(1)),
+    )
+    if not cands and window and window.strip() and text:
+        cands = _value_candidates(
+            text, _RE_HOURS_LABELED, _RE_HOURS,
+            lambda m: Decimal(m.group(1)),
+        )
+    return _pick_value(cands)
+
+
+def _extract_warranty_months(text: str, window: str | None = None) -> tuple[Decimal | None, str]:
+    """投标人质保期承诺（统一换算月）。窗口语义同 _extract_response_hours。"""
+
+    def _to_months(m: re.Match) -> Decimal | None:
+        try:
+            if m.lastindex and m.lastindex >= 2 and m.group(2):
+                return _units_to_months(Decimal(m.group(1)), m.group(2))
+            raw = m.group(0)
+            unit = "月" if "个月" in raw else "年"
+            return _units_to_months(Decimal(m.group(1)), unit)
+        except Exception:  # noqa: BLE001
+            return None
+
+    src = window if (window and window.strip()) else (text or "")
+    cands = _value_candidates(src, _RE_WARRANTY_LABELED, _RE_WARRANTY, _to_months)
+    if not cands and window and window.strip() and text:
+        cands = _value_candidates(text, _RE_WARRANTY_LABELED, _RE_WARRANTY, _to_months)
+    return _pick_value(cands)
 
 
 def _extract_deviation_counts(text: str) -> tuple[dict | None, str]:
@@ -1208,10 +1387,13 @@ def score_value_tier(
             Decimal(0), f"值档位参数不完备（field={field!r}）", True,
             unresolved="field_missing",
         )
+    # 窗口文本（索引指针/承诺章节解析）优先——criterion 由 scoring_service 注入
+    # value_window_text（2026-11-02 run77：偏离表"8小时"首匹配抢掉承诺函"4小时"）
+    _window = criterion.get("value_window_text") if isinstance(criterion, dict) else None
     if field == "response_hours":
-        value, snippet = _extract_response_hours(facts.text or "")
+        value, snippet = _extract_response_hours(facts.text or "", window=_window)
     else:
-        value, snippet = _extract_warranty_months(facts.text or "")
+        value, snippet = _extract_warranty_months(facts.text or "", window=_window)
     if value is None:
         return CountResult(
             Decimal(0),
@@ -1270,10 +1452,11 @@ def score_value_linear(
             Decimal(0), f"线性计分参数不完备（field={field!r}）", True,
             unresolved="field_missing",
         )
+    _window = criterion.get("value_window_text") if isinstance(criterion, dict) else None
     if field == "warranty_months":
-        value, snippet = _extract_warranty_months(facts.text or "")
+        value, snippet = _extract_warranty_months(facts.text or "", window=_window)
     else:
-        value, snippet = _extract_response_hours(facts.text or "")
+        value, snippet = _extract_response_hours(facts.text or "", window=_window)
     if value is None:
         return CountResult(
             Decimal(0),
@@ -1320,6 +1503,27 @@ def score_attribute_tier(
                 Decimal(0), "未在证书表/正文中抽取到证书清单（按 0 分记，待人工核对）",
                 True, unresolved="no_facts",
             )
+        # 证书背书三态软闸门（同 score_count_tier）：False 不计，None 计入+疑问
+        _backing = criterion.get("cert_backing") or {}
+        _unbacked = 0
+        _unverified = 0
+        if _backing:
+            kept: list[str] = []
+            for obj in objects:
+                state = _backing.get(normalize_cert(str(obj)))
+                if state is False:
+                    _unbacked += 1
+                    continue
+                if state is None:
+                    _unverified += 1
+                kept.append(obj)
+            objects = kept
+            if not objects:
+                return CountResult(
+                    Decimal(0),
+                    f"证书 {_unbacked} 项确认无背书页不计（可读文本确认缺失），0 分",
+                    True,
+                )
         total = Decimal(0)
         detail_parts: list[str] = []
         for obj in objects:
@@ -1349,7 +1553,15 @@ def score_attribute_tier(
                 f"证书 {len(objects)} 项均不命中任何分档（tiers 按名称匹配），0 分",
                 True,
             )
-        return CountResult(total, "；".join(detail_parts) + f"，合计 {total}", True)
+        _note = ""
+        if _unbacked:
+            _note += f"（{_unbacked} 本证书确认无背书页不计）"
+        if _unverified:
+            _note += f"（{_unverified} 本证书背书页不可读，计入并标疑问）"
+        return CountResult(
+            total, "；".join(detail_parts) + f"，合计 {total}{_note}", True,
+            unverified_counted=_unverified,
+        )
 
     # years / title：人员属性表（facts.person_attributes，表解析/LLM 填充）
     attrs = list(getattr(facts, "person_attributes", None) or [])
@@ -1419,6 +1631,8 @@ def score_count_tier(criterion: dict, params: dict, facts: BidFacts) -> CountRes
             Decimal(0), "分档计数参数缺 tiers", True, unresolved="field_missing"
         )
     max_score = criterion.get("max_score")
+    _unbacked = 0
+    conflict_unverified = False
 
     if field == "performance":
         amounts = list(getattr(facts, "performance_amounts", None) or [])
@@ -1435,6 +1649,30 @@ def score_count_tier(criterion: dict, params: dict, facts: BidFacts) -> CountRes
                 Decimal(0), "未抽取到证书清单（分档计数按 0 记，待人工核对）",
                 True, unresolved="no_facts",
             )
+        # 证书背书三态软闸门（2026-11-02 P0-5）：True 计入；None 计入+疑问
+        # （防截图文本层看不见→误杀）；False 不计入（可读文本确认无背书页）。
+        # 无 backing 信息（旧链路/分类未跑）→ 照计 + conflict（不误杀）。
+        _backing = criterion.get("cert_backing") or {}
+        if _backing:
+            counted = []
+            _unbacked = 0
+            _unverified = 0
+            for name in certs:
+                state = _backing.get(normalize_cert(str(name)))
+                if state is False:
+                    _unbacked += 1
+                    continue
+                counted.append(name)
+                if state is None:
+                    _unverified += 1
+            certs = counted
+            if _unverified:
+                conflict_unverified = True
+            else:
+                conflict_unverified = False
+        else:
+            _unbacked = 0
+            conflict_unverified = False
         n = len(certs)
 
     best: Decimal | None = None
@@ -1455,8 +1693,14 @@ def score_count_tier(criterion: dict, params: dict, facts: BidFacts) -> CountRes
         )
     if max_score is not None:
         best = min(best, Decimal(str(max_score)))
+    _note = ""
+    if _unbacked:
+        _note += f"（{_unbacked} 本证书确认无背书页不计）"
+    if conflict_unverified:
+        _note += f"（{_unverified} 本证书背书页不可读，计入并标疑问）"
     return CountResult(
         best,
-        f"计数 {n} 项命中「≥{best_min} 项」档 → {best} 分",
+        f"计数 {n} 项命中「≥{best_min} 项」档 → {best} 分{_note}",
         conflict=True,  # 计数来自 facts 抽取 → 人工复核
+        unverified_counted=_unverified if conflict_unverified else 0,
     )

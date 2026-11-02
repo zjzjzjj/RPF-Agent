@@ -58,7 +58,7 @@ def test_is_fatal_llm_error_classification():
 
 
 def test_forced_zero_requires_rule_text_and_absent_material():
-    """双条件：细则明文「不得分」+ 材料确认不在，缺一不置 0（页数阈值已删）。"""
+    """双条件：细则明文「不得分」+ 材料**确认**不在（三态 False），缺一不置 0。"""
     c_demands = {"required_evidence": "提供社保证明，不提供或不能提供有效证明的不得分",
                  "source_quote": "", "description": ""}
     c_silent = {"required_evidence": "提供社保证明", "source_quote": "", "description": ""}
@@ -67,7 +67,7 @@ def test_forced_zero_requires_rule_text_and_absent_material():
     assert _forced_zero_reason("团队成员经验", {"social_material": True}, c_demands) is None
     # 材料不在但细则无罚则 → 不越权置 0
     assert _forced_zero_reason("团队成员经验", {"social_material": False}, c_silent) is None
-    # 双条件齐 → 置 0
+    # 双条件齐 → 置 0（False=确认缺失）
     reason = _forced_zero_reason("团队成员经验", {"social_material": False}, c_demands)
     assert reason is not None and "社保" in reason
     # 负责人经验同构
@@ -77,6 +77,32 @@ def test_forced_zero_requires_rule_text_and_absent_material():
     assert _forced_zero_reason("项目负责人经验", {"exp_material": False}, c2) is not None
     # 非人员条目不受门槛影响
     assert _forced_zero_reason("运维方案", {"exp_material": False}, c2) is None
+
+
+def test_forced_zero_tristate_unknown_not_zeroed():
+    """三态 None（机器看不见：扫描件/OCR 漏读/正则未覆盖）不短路不清零（run77 c48 实证：
+    简历+职称证书在文本层 p121-122，旧二态"没扫到=没有"→误清零，人工满分）。
+
+    None → _forced_zero_reason 返回 None（不短路），由 _missing_material_hint 出提示
+    并入 LLM 输入；只有 False（积极确认缺失）才强制 0。"""
+    from app.services.scoring_service import _missing_material_hint
+
+    c2 = {"required_evidence": "五年及以上工作经验证明，无证明材料不得分",
+          "source_quote": "", "description": ""}
+    # None：不强制 0
+    assert _forced_zero_reason("项目负责人经验", {"exp_material": None}, c2) is None
+    # 缺键同 None 口径（旧实现 not ps.get() 把缺键当缺失清零）
+    assert _forced_zero_reason("项目负责人经验", {}, c2) is None
+    # None → 提示语非空（并入 LLM 输入）
+    hint = _missing_material_hint("项目负责人经验", {"exp_material": None}, c2)
+    assert hint and "材料提示" in hint
+    # True → 无提示；False → 已由 forced_zero 短路，提示也应为空
+    assert _missing_material_hint("项目负责人经验", {"exp_material": True}, c2) is None
+    assert _missing_material_hint("项目负责人经验", {"exp_material": False}, c2) is None
+    # 无罚则细则不出提示（不干扰正常评分）
+    assert _missing_material_hint("项目负责人经验", {"exp_material": None},
+                                 {"required_evidence": "提供经验证明", "source_quote": "",
+                                  "description": ""}) is None
 
 
 def test_forced_zero_zero_score_shape():

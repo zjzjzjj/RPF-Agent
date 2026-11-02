@@ -10,6 +10,7 @@ from decimal import Decimal
 
 from app.engine.facts import BidFacts
 from app.engine.objective import (
+    _extract_response_hours,
     score_attribute_tier,
     score_deviation_deduct_table,
     score_value_linear,
@@ -172,6 +173,74 @@ def test_value_linear_warranty_capped() -> None:
         _facts("免费保修 5 年。"),
     )
     assert r3.score == Decimal("2")
+
+
+# --- 承诺值抽取窗口化（2026-11-02 run77 c54 实证） ----------------------------
+
+RUN77_FULL = (
+    "商务技术偏离表\n"
+    "应急服务：根据实际情况，在现场运维人员无法处理用户提出的问题时，"
+    "派遣高级技术人员8 小时到达现场，24 小时之内系统恢复正常；\n"
+    "…（中间 300 页正文）…\n"
+    "2.11.4.2.服务承诺\n"
+    "7.我公司承诺提供应急服务：根据实际情况，在系统发生驻场运维人员无法解决的"
+    "重大故障时，派遣远程服务团队在4 小时到达现场，24 小时之内系统恢复正常。"
+)
+RUN77_WINDOW = (
+    "2.11.4.2.服务承诺\n"
+    "7.我公司承诺提供应急服务：根据实际情况，在系统发生驻场运维人员无法解决的"
+    "重大故障时，派遣远程服务团队在4 小时到达现场，24 小时之内系统恢复正常。"
+)
+
+_TIERS = {
+    "engine": "value_tier", "field": "response_hours", "direction": "lower_better",
+    "tiers": [
+        {"max_value": "4", "score": "4"},
+        {"max_value": "5", "score": "3"},
+        {"max_value": "6", "score": "2"},
+        {"max_value": "7", "score": "1"},
+    ],
+}
+
+
+def test_value_tier_window_beats_deviation_first_match() -> None:
+    """run77 c54：偏离表"8小时"在前、承诺函"4小时"在后。窗口（承诺函页）
+    必须选出 4 → 满分；旧首匹配拿走 8 → 0 分误判。"""
+    r = score_value_tier(
+        {"max_score": Decimal("4"), "value_window_text": RUN77_WINDOW},
+        _TIERS, _facts(RUN77_FULL),
+    )
+    assert r.score == Decimal("4"), r.detail
+
+
+def test_value_tier_no_window_context_priority() -> None:
+    """无窗口时弃首匹配改语境排序：承诺同句的"4小时"胜过偏离表的"8小时"。"""
+    r = score_value_tier({"max_score": Decimal("4")}, _TIERS, _facts(RUN77_FULL))
+    assert r.score == Decimal("4"), r.detail
+
+
+def test_value_tier_window_miss_falls_back_full_text() -> None:
+    """窗口里没有值（索引指针解析错位）→ 回退全文，仍按语境取值。"""
+    r = score_value_tier(
+        {"max_score": Decimal("4"), "value_window_text": "窗口里只有培训计划没有承诺"},
+        _TIERS, _facts(RUN77_FULL),
+    )
+    assert r.score == Decimal("4"), r.detail
+
+
+def test_response_hours_divergent_values_visible() -> None:
+    """多值分歧并列进片段（可复算），取语境最优。"""
+    value, snippet = _extract_response_hours(RUN77_FULL)
+    assert value == Decimal("4")
+    assert "多值分歧" in snippet
+
+
+def test_response_hours_labeled_preferred() -> None:
+    """带标签值（响应时间：2 小时）语境分最高。"""
+    value, _ = _extract_response_hours(
+        "服务承诺书：我方承诺重大故障远程服务团队在4 小时到达现场。响应时间：2 小时。"
+    )
+    assert value == Decimal("2")
 
 
 # --- score_attribute_tier -----------------------------------------------------

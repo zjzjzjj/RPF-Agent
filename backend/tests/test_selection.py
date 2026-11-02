@@ -4,6 +4,7 @@ from __future__ import annotations
 from app.engine.selection import (
     derive_keywords,
     select_chunks_by_tier,
+    select_chunks_for_criterion,
     split_text_chunks,
 )
 
@@ -388,3 +389,35 @@ def test_keyword_selection_restatement_downweighted(monkeypatch):  # noqa: ANN00
     assert meta["mode"] == "keyword"
     assert 2 in picked_ids, picked_ids
     assert 0 not in picked_ids, picked_ids
+
+
+def test_score_scale_extra_promotes_window_chunks() -> None:
+    """P1-6（2026-11-02 run77 c54）：窗口页 chunk 加成后优先入选。
+
+    场景镜像 run77：偏离表"8小时"块在前、承诺函"4小时"块在后，同命中关键词；
+    窗口加成后承诺函块先入选（旧实现偏离表块按文本序霸占预算）。
+    """
+    chunks = [(i, "正" * 100) for i in range(6)]
+    chunks[1] = (1, "应急服务：派遣高级技术人员8 小时到达现场" + "正" * 60)  # 偏离表页
+    chunks[4] = (4, "服务承诺：承诺远程服务团队在4 小时到达现场" + "正" * 60)  # 窗口页
+    scale = [1.0, 0.25, 1.0, 1.0, 1.3, 1.0]
+    picked, meta = select_chunks_for_criterion(
+        chunks, {"name": "服务承诺", "description": "到达现场"}, 150,
+        score_scale_extra=scale,
+    )
+    ids = [i for i, _t in picked]
+    assert 4 in ids, f"窗口块必须入选：{ids}"
+    # 预算 150 只容 1-2 块：窗口块排在偏离表块之前
+    assert ids.index(4) < (ids.index(1) if 1 in ids else 99), ids
+
+
+def test_score_scale_extra_dev_downweighted_not_removed() -> None:
+    """偏离表块降权但保留入选资格（真承诺写在偏离表的标书不许被挤掉）。"""
+    chunks = [(i, "正" * 100) for i in range(4)]
+    chunks[1] = (1, "服务承诺：4 小时内到达现场" + "正" * 70)
+    scale = [0.25, 0.25, 0.25, 0.25]
+    picked, _ = select_chunks_for_criterion(
+        chunks, {"name": "服务承诺", "description": "到达现场"}, 100,
+        score_scale_extra=scale,
+    )
+    assert 1 in [i for i, _t in picked], "降权不移除"
