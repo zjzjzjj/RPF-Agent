@@ -453,6 +453,68 @@ def test_overlay_work_proof_requires_evidence_page() -> None:
     assert cases[3]["work_proof"] is None
 
 
+def _leader_table_pages() -> list[tuple[int, str, str]]:
+    """用友 c73 形态：表头 + 明细列 + 姓名（三条件齐）。"""
+    return [
+        (73, "项目负责人情况表\n业绩及承担的主要工作情况，曾担任项目经理的项目应列明细\n"
+             "吴丽君 页码 姓名 2018.07-2019.12 供应链协", "text"),
+        (99, "个人简历\n宋宏 男 硕士 高级工程师", "ocr"),  # 简历页（无表头）
+    ]
+
+
+def test_overlay_leader_table_proof_upgrades() -> None:
+    """leader 表证宽松口径：表头+明细列+姓名 三条件齐 → False/None 升 True，已是 True 保持。"""
+    from app.services.scoring_service import _overlay_leader_table_proof
+
+    cases = [
+        {"person_name": "吴丽君", "work_proof": False},  # LLM 严判 → 升 True
+        {"person_name": "吴丽君", "work_proof": None},   # None → 升 True
+        {"person_name": "吴丽君", "work_proof": True},   # 已 True → 保持
+    ]
+    _overlay_leader_table_proof(cases, _leader_table_pages())
+    assert cases[0]["work_proof"] is True
+    assert cases[1]["work_proof"] is True
+    assert cases[2]["work_proof"] is True
+
+
+def test_overlay_leader_table_proof_narrow_no_false_positive() -> None:
+    """窄词表：只有姓名无表头（简历页）/无明细列/无该人名 → 不升（保持原判）。"""
+    from app.services.scoring_service import _overlay_leader_table_proof
+
+    pages = [
+        (1, "个人简历 宋宏 男 硕士 高级工程师", "ocr"),          # 姓名在，无表头
+        (2, "人员情况表\n姓名 部门 职务", "text"),                # 表头在，无明细列
+        (3, "项目负责人情况表\n曾担任项目经理的项目\n张三 2020项目", "text"),  # 三条件齐但人名是张三
+    ]
+    cases = [
+        {"person_name": "宋宏", "work_proof": False},   # 简历页 → 不升
+        {"person_name": "张三", "work_proof": False},   # 人名在表页 → 升 True
+        {"person_name": "李四", "work_proof": None},    # 表页无此人 → 不改写 None
+    ]
+    _overlay_leader_table_proof(cases, pages)
+    assert cases[0]["work_proof"] is False  # 无表头
+    assert cases[1]["work_proof"] is True   # 三条件齐（张三在明细表页）
+    assert cases[2]["work_proof"] is None   # 无该人名 → 保持原判不强 False
+
+
+def test_overlay_leader_table_proof_only_upgrades_and_switch(monkeypatch) -> None:  # noqa: ANN001
+    """只升不降：无表页时 True 不被改；开关关 → 全程不动。"""
+    from app.services.scoring_service import _overlay_leader_table_proof
+
+    # 无表页 → 直接 return，True 保持、False 保持
+    cases = [{"person_name": "吴丽君", "work_proof": True},
+             {"person_name": "吴丽君", "work_proof": False}]
+    _overlay_leader_table_proof(cases, [(1, "纯正文无表", "text")])
+    assert cases[0]["work_proof"] is True
+    assert cases[1]["work_proof"] is False
+
+    # 开关关 → 即使表页命中也不动
+    monkeypatch.setenv("BID_EVAL_LEADER_TABLE_PROOF", "0")
+    cases2 = [{"person_name": "吴丽君", "work_proof": False}]
+    _overlay_leader_table_proof(cases2, _leader_table_pages())
+    assert cases2[0]["work_proof"] is False
+
+
 # ---------------------------------------------------------------------------
 # 材料清单解析（required_evidence 整句 → 清单）
 # ---------------------------------------------------------------------------

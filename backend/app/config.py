@@ -399,6 +399,21 @@ def case_unverified_count_enabled() -> bool:
     )
 
 
+def leader_table_proof_enabled() -> bool:
+    """负责人业绩 work_proof 宽松口径开关（2026-11-02）。
+
+    开（默认）：认通用「项目负责人情况表/人员情况表」（正式表格，表头+明细列+
+    含该人员姓名）作 leader 佐证——work_proof=False/None 升 True；prompt 同步
+    加第④种 true 形态。用友 c47 实证：吴丽君在 p73 情况表、人工给 4、LLM 严判
+    0。真实评委认这种形态，与 member「项目团队人员情况表」放宽（prompts :201）
+    对称。关=回退纯 LLM 严判（overlay 早退 + prompt 不拼 CLAUSE），供 eval_suite
+    锚点对比与回滚。词表窄（表头+明细列+姓名三条件）防先数/西川虚高。
+    """
+    return os.environ.get("BID_EVAL_LEADER_TABLE_PROOF", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
 def material_ocr_max_pages() -> int:
     """单个投标文档材料页 OCR 救援的页数上限。
 

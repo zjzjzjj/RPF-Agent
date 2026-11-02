@@ -871,6 +871,11 @@ def execute_run(
                 _overlay_experience_proof(
                     c_scoring["verified_cases"], bid_pages.get(bid_id) or []
                 )
+                # 负责人情况表宽松口径（2026-11-02）：通用「项目负责人情况表」
+                # 含该人姓名 → work_proof 升 True（用友 c47：吴丽君 p73 情况表）
+                _overlay_leader_table_proof(
+                    c_scoring["verified_cases"], bid_pages.get(bid_id) or []
+                )
         # P1-E 新计分原语：与业绩案例三态机器无关的确定性评分，直接分发。
         # CountResult 同构 → 下面的 unresolved/doubt/落库路径完全复用。
         _engine = params.get("engine")
@@ -1599,8 +1604,14 @@ def _llm_verify_cases(
             bid_text=text,
         )
         try:
+            # 负责人宽松口径 CLAUSE 只对 leader 拼接（条款只讲负责人佐证；
+            # 开关/范围天然进缓存键——system 全文参与键，leader 格换键、
+            # 其余格照常命中缓存，不作废无关调用）
+            _system = prompts.MATERIAL_COUNT_SYSTEM_PROMPT
+            if person_scope_raw == "leader" and config.leader_table_proof_enabled():
+                _system += prompts.LEADER_TABLE_PROOF_CLAUSE
             out, _res = gateway.chat_json(
-                prompts.MATERIAL_COUNT_SYSTEM_PROMPT, user, CaseList,
+                _system, user, CaseList,
                 data_class=data_class,
             )
             return batch_no, batch, out.cases, None
@@ -1947,6 +1958,42 @@ def _overlay_experience_proof(cases: list[dict], pages: list[tuple[int, str, str
             continue
         if any(person in t for t in proof_pages):
             c["experience_proof"] = True
+
+
+# 负责人情况表（表头 + 明细列信号，两词同页才认定——防泛员工花名册）
+_LEADER_TABLE_PAGE = re.compile(r"项目负责人情况表|负责人情况表|人员情况表")
+_LEADER_TABLE_DETAIL = re.compile(r"担任|项目经理|项目经历|类似项目|业绩")
+
+
+def _overlay_leader_table_proof(cases: list[dict], pages: list[tuple[int, str, str]]) -> None:
+    """leader work_proof 宽松口径（2026-11-02，**只升不降**）。
+
+    认通用「项目负责人情况表/人员情况表」作 leader 佐证：页面同时命中
+    (a) 表头词表 (b) 明细列信号 (c) 含该人员姓名 → 该人员案例 work_proof 升 True。
+    用友 c47 实证：吴丽君在 p73 情况表（枚举她担任项目经理的项目）+ p74 身份证 +
+    p75 社保，LLM 严判"姓名须出现在该案例证明页"→ False → 0，人工给 4。
+    真实评委认这种正式表格形态，与 member「项目团队人员情况表」放宽（prompts
+    :201-203）对称口径；不纳入身份证/社保页（证明身份/在职不证明业绩）。
+    只升不降（与 _overlay_experience_proof 同构，与 member 严口径 _overlay_work_proof
+    刻意区分）；无表页 → return 不强 False；person 空 → 不改写。
+    窄词表三条件防先数/西川虚高（test1 先数负责人=0 由类型门槛结构性保护）。
+    """
+    if not config.leader_table_proof_enabled():
+        return
+    table_pages = [
+        t for _n, t, _s in pages
+        if t and _LEADER_TABLE_PAGE.search(t) and _LEADER_TABLE_DETAIL.search(t)
+    ]
+    if not table_pages:
+        return
+    for c in cases:
+        if c.get("work_proof") is True:
+            continue
+        person = str(c.get("person_name") or c.get("person") or "").strip()
+        if len(person) < 2:
+            continue
+        if any(person in t for t in table_pages):
+            c["work_proof"] = True
 
 
 def _load_material_maps(
