@@ -1537,3 +1537,85 @@ def test_audit_whitelist_keeps_tristate_keys() -> None:
     for key in ("unverified", "unverified_reason", "truncated_review",
                 "sanitized", "material_reasons", "quote", "name"):
         assert key in _AUDIT_CASE_KEYS, key
+
+
+# --- R0-3 人员经验档表（2026-11-03 run78）+ R3-1 flags + R3-2 prompt 契约 ----
+
+def test_score_count_person_tiers_by_min_count() -> None:
+    """用友式：「2个经验得1分；4个得2分」档表——2 个 verified 案例→1 分、4 个→2 分。"""
+    from app.engine.objective import score_count
+
+    def _cases(n):
+        return [{"name": f"P{i}", "role": "leader", "work_proof": True,
+                 "experience_proof": True, "social_security": True,
+                 "quote": f"项目{i} 运维负责人：某人", "sanitized": "ok"}
+                for i in range(n)]
+
+    crit = _count_crit(
+        name="项目负责人",
+        params={"person_scope": "leader", "field": "performance",
+                "tiers": [{"min_count": 2, "score": "1"}, {"min_count": 4, "score": "2"}]},
+        required_artifacts="社保证明、业绩证明材料",
+    )
+    r2 = score_count({**crit, "verified_cases": _cases(2)}, crit["params"], BidFacts(text=""))
+    assert r2.score == Decimal("1")
+    r4 = score_count({**crit, "verified_cases": _cases(4)}, crit["params"], BidFacts(text=""))
+    assert r4.score == Decimal("2")
+    r1 = score_count({**crit, "verified_cases": _cases(1)}, crit["params"], BidFacts(text=""))
+    assert r1.score == Decimal("0")  # 1 个不满足任何档
+
+
+def test_score_count_person_tiers_unverified_double_value() -> None:
+    """德勤式：案例材料不可读（None）→ 计入+疑问+双分值（剔除后口径可复算）。"""
+    from app.engine.objective import score_count
+
+    cases = [
+        {"name": "A", "role": "leader", "work_proof": True,
+         "experience_proof": None, "social_security": True,
+         "quote": "项目A 运维负责人：某人", "sanitized": "ok"},
+        {"name": "B", "role": "leader", "work_proof": True,
+         "experience_proof": None, "social_security": True,
+         "quote": "项目B 运维负责人：某人", "sanitized": "ok"},
+    ]
+    crit = _count_crit(
+        name="项目负责人",
+        params={"person_scope": "leader", "field": "performance",
+                "tiers": [{"min_count": 2, "score": "1"}, {"min_count": 4, "score": "2"}]},
+        required_artifacts="社保证明、业绩证明材料",
+    )
+    r = score_count({**crit, "verified_cases": cases}, crit["params"], BidFacts(text=""))
+    assert r.score == Decimal("1")          # 2 个计入命中「≥2」档
+    assert r.unverified_counted == 2        # 全部计入的都是未核验 → need_human
+    assert r.score_verified_only == Decimal("0")  # 剔除后 0 分可复算
+
+
+def test_required_flags_experience_three_years_and_cert() -> None:
+    """R3-1：「3年以上经验」触发 experience_proof（旧只认五年/负责人）；
+    细则点名证书（认证/职称/PMP）触发 cert_proof；无点名材料不越权。"""
+    from app.engine.objective import _required_flags
+
+    flags = _required_flags(
+        "近6 个月社保证明、相关业绩证明材料",
+        person_scope="member",
+        criterion_name="驻厂运维人员",
+        rule_text="驻厂运维人员具有本项目运维所需云平台的产品认证或培训证书，"
+                  "并有3 年以上信息系统项目实施经验，每1 人得1 分",
+    )
+    assert "cert_proof" in flags
+    assert "experience_proof" in flags
+    assert "social_security" in flags
+    assert "work_proof" in flags
+
+    plain = _required_flags("", person_scope="member", criterion_name="团队成员",
+                            rule_text="有类似项目经验的成员每1 人得1 分")
+    assert "cert_proof" not in plain
+    assert "experience_proof" not in plain
+
+
+def test_material_count_prompt_cert_proof_contract() -> None:
+    """R3-2 prompt 契约：cert_proof 字段 + 逐人四链句必须在提示词里。"""
+    from app.rules.prompts import MATERIAL_COUNT_SYSTEM_PROMPT as P
+
+    assert '"cert_proof":布尔|null' in P
+    assert "逐人核验四链" in P
+    assert "证书名+人名同现" in P

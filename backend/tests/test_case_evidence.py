@@ -584,3 +584,57 @@ def test_build_case_digest_bounded_and_has_index() -> None:
     digest = build_case_digest([b], pages, max_chars=500)
     assert "【案例3】" in digest
     assert len(digest) <= 800  # 允许最后一小段略超
+
+
+# --- R1-1 窗口延伸（2026-11-03 run78 ITSS 实证）：双向防线 -------------------
+
+def _pages_with_single_pointer() -> list[PageRec]:
+    """「见投标文件（39）页」指针：p39 标题页、p40-42 证书内容、p43 下一节。"""
+    pages = [
+        PageRec(21, "详细评审索引表\nITSS 信息技术服务标准符合性证书 见投标文件（39）页\n", "text"),
+        PageRec(39, "2.7 投标人相关资质文件\n2.7.1 ITSS 信息技术服务标准符合性证书\n39", "text"),
+        PageRec(40, "证书编号 ITSS-123 有效期至 2027年 发证机构 中国电子工业标准化技术协会", "ocr"),
+        PageRec(41, "复印件加盖投标人公章 备查", "text"),
+        PageRec(42, "2.7.2 营业执照复印件 统一社会信用代码 91330100XXXXXXXX", "text"),
+        PageRec(43, "售后服务方案\n" + "本投标人承诺提供全面的售后服务体系与培训服务保障。" * 30, "text"),
+        PageRec(44, "售后服务方案续页正文" + "内容" * 300, "text"),
+    ]
+    return pages
+
+
+def test_resolve_index_pages_extend_single_pointer_title_page() -> None:
+    """用友式：单页指针落标题页 → 延伸到下节边界，证书页进窗口（(39,42)）。"""
+    sec = resolve_index_pages(_pages_with_single_pointer(), "ITSS",
+                              line_window=3, extend=True)
+    assert sec.found
+    assert (sec.start, sec.end) == (39, 42)
+
+
+def test_resolve_index_pages_default_no_extend() -> None:
+    """兼容门：默认 extend=False 行为逐字节不变（单页指针仍是 (39,39)）。"""
+    sec = resolve_index_pages(_pages_with_single_pointer(), "ITSS", line_window=3)
+    assert sec.found
+    assert (sec.start, sec.end) == (39, 39)
+
+
+def test_resolve_index_pages_extend_skips_non_title_page() -> None:
+    """德勤式：目标页是长正文（非标题页）→ 不延伸（延伸只救标题页死区间）。"""
+    pages = _pages_with_single_pointer()
+    pages = [p for p in pages if p.page_no != 39]
+    pages.insert(1, PageRec(39, "本节收录证书资料。" + "详细内容" * 200, "text"))
+    sec = resolve_index_pages(pages, "ITSS", line_window=3, extend=True)
+    assert sec.found
+    assert (sec.start, sec.end) == (39, 39)
+
+
+def test_resolve_index_pages_extend_capped() -> None:
+    """15 页封顶：无下节边界时不得吞掉后续大半本。"""
+    pages = [
+        PageRec(21, "详细评审索引表\nITSS 见投标文件（39）页\n", "text"),
+        PageRec(39, "2.7 资质文件\n39", "text"),
+    ]
+    for pno in range(40, 80):
+        pages.append(PageRec(pno, f"第{pno}页正文" + "内容" * 100, "text"))
+    sec = resolve_index_pages(pages, "ITSS", line_window=3, extend=True)
+    assert sec.found
+    assert sec.end == 39 + 15 - 1  # extend_max_pages=15 封顶（含起始页 39..53）

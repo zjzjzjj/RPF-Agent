@@ -133,3 +133,151 @@ def test_score_count_tier_hits_highest():
     facts3.certificates = ["ISO9001"]
     r3 = score_count_tier({"max_score": 4}, params, facts3)
     assert r3.score == 0  # 1 项不满足任何档
+
+
+# --- R0 客观分路由（2026-11-03 run78）：主观格的明示档表 → 客观引擎 ----------
+# 双向防线：用友式（明示档表必须路由到确定性引擎）+ 德勤式（歧义不许路由）。
+
+def test_infer_objective_route_service_promise_value_tier():
+    """用友式：服务承诺「4小时内到达得4分,5小时得3分…」+「客观分」标注 → value_tier。"""
+    from app.rules.check_infer import infer_objective_route
+
+    c = {
+        "name": "服务承诺",
+        "description": "承诺远程服务团队在4 小时内到达现场得4 分,承诺5 小时内到达现场得3 分,"
+                       "承诺6 小时内到达现场得2 分,承诺7 小时内到达现场得1 分，其他不得分。",
+        "source_quote": "5  服务承诺  客观分 0-4 分  分,承诺7 小时内到达现场得1 分",
+    }
+    route = infer_objective_route(c)
+    assert route is not None
+    kind, params = route
+    assert kind == "value_tier"
+    assert params["field"] == "response_hours"
+    assert [t["max_value"] for t in params["tiers"]] == ["4", "5", "6", "7"]
+    assert [t["score"] for t in params["tiers"]] == ["4", "3", "2", "1"]
+
+
+def test_infer_objective_route_service_promise_no_marker_closed_table():
+    """闭合档表（所有「得N分」都被解析）同样可路由：无「客观分」字样也算客观形态。"""
+    from app.rules.check_infer import infer_objective_route
+
+    c = {
+        "name": "服务承诺",
+        "description": "承诺远程服务团队在4 小时内到达现场得4 分,承诺5 小时内到达现场得3 分,"
+                       "承诺6 小时内到达现场得2 分,承诺7 小时内到达现场得1 分，其他不得分。",
+        "source_quote": "",
+    }
+    assert infer_objective_route(c) is not None  # 闭合 → 路由
+
+
+def test_infer_objective_route_cert_level_attribute_tier():
+    """用友式：ITSS「四级得1分，三级及以上得2分」→ attribute_tier(cert_level)，
+    「三级及以上」按语言学语义展开为 优于/等于三级 的显式列表。"""
+    from app.rules.check_infer import infer_objective_route
+
+    c = {
+        "name": "投标人综合实力-ITSS信息技术服务标准符合性证书",
+        "description": "投标人具有ITSS 信息技术服务标准符合性证书（业务领域：运行维护），"
+                       "四级得1 分，三级及以上得2 分。",
+        "source_quote": "投标人具有ITSS 信息技术服务标准符合性证书，四级得1 分，三级及以上得2 分。",
+    }
+    route = infer_objective_route(c)
+    assert route is not None
+    kind, params = route
+    assert kind == "attribute_tier"
+    assert params["attr"] == "cert_level"
+    by_score = {t["score"]: set(t["match_any"]) for t in params["tiers"]}
+    assert by_score["2"] == {"一级", "二级", "三级"}
+    assert by_score["1"] == {"四级"}
+
+
+def test_infer_objective_route_person_experience_tiers():
+    """用友式：项目负责人「2个经验得1分；4个得2分」→ count(person_scope=leader)，
+    计数源按档位短语量词后名词（经验）判定，防证书词抢 field。"""
+    from app.rules.check_infer import infer_objective_route
+
+    c = {
+        "name": "项目负责人",
+        "description": "项目负责人具有项目经理PMP 证书或工程师职称证书，且具有2 个及以上"
+                       "信息系统项目实施经验，得1 分；项目负责人具有项目经理PMP 证书或"
+                       "工程师职称证书，且具有4 个及以上信息系统项目实施经验，得2 分。",
+        "source_quote": "客观分 0-2 分",
+    }
+    route = infer_objective_route(c)
+    assert route is not None
+    kind, params = route
+    assert kind == "count"
+    assert params.get("person_scope") == "leader"
+    assert params["tiers"] == [{"min_count": 2, "score": "1"}, {"min_count": 4, "score": "2"}]
+
+
+def test_infer_objective_route_cert_count_tier():
+    """用友式：云平台证书「提供两项得1分，提供四项得2分」→ count_tier(certificates)。"""
+    from app.rules.check_infer import infer_objective_route
+
+    c = {
+        "name": "投标人综合实力-云平台开发或运维经验及认证/培训证书",
+        "description": "投标人具有相应云平台开发或运维经验，可提供运维团队具有相应云平台产品"
+                       "认证或培训证书，提供两项得1 分，提供四项得2 分，未提供不得分。",
+        "source_quote": "客观分 0-2 分",
+    }
+    route = infer_objective_route(c)
+    assert route is not None
+    kind, params = route
+    assert kind == "count_tier"
+    assert params["field"] == "certificates"
+    assert params["tiers"] == [{"min_count": 2, "score": "1"}, {"min_count": 4, "score": "2"}]
+
+
+def test_infer_objective_route_per_item_linear():
+    """「每1人得1分，最高不超过3分」→ count(per_item=1, max_items=3)。"""
+    from app.rules.check_infer import infer_objective_route
+
+    c = {
+        "name": "驻厂运维人员（每人计分）",
+        "description": "驻厂运维人员具有云平台认证或培训证书并有项目实施经验，"
+                       "同时具备以上条件的驻场运维人员每1 人得1 分，最高不超过3 分。",
+        "source_quote": "客观分 0-3 分",
+    }
+    route = infer_objective_route(c)
+    assert route is not None
+    kind, params = route
+    assert kind == "count"
+    assert params["per_item"] == "1"
+    assert params["max_items"] == "3"
+
+
+def test_infer_objective_route_guard_single_tier_none():
+    """德勤式守卫：只有 1 个「得N分」档 → 不路由（回退 subjective，歧义不猜）。"""
+    from app.rules.check_infer import infer_objective_route
+
+    c = {
+        "name": "服务承诺",
+        "description": "承诺4 小时内到达现场得4 分。",
+        "source_quote": "客观分 0-4 分",
+    }
+    assert infer_objective_route(c) is None
+
+
+def test_infer_objective_route_guard_unclosed_none():
+    """德勤式守卫：档表被解析但文本另有散文计分提及（不闭合）且无客观标注 → 不路由。"""
+    from app.rules.check_infer import infer_objective_route
+
+    c = {
+        "name": "需求理解",
+        "description": "对需求理解深刻得3 分，理解较深刻得2 分；整体方案优秀的再酌情得1 分。",
+        "source_quote": "",
+    }
+    assert infer_objective_route(c) is None
+
+
+def test_infer_objective_route_guard_prose_none():
+    """德勤式守卫：主观散文（区间档/无明示档表）→ None，绝不客观化。"""
+    from app.rules.check_infer import infer_objective_route
+
+    c = {
+        "name": "系统维护服务方案",
+        "description": "方案完整、可行得 8-10 分，较完整得 4-7 分，一般得 0-3 分。",
+        "source_quote": "主观分 0-10 分",
+    }
+    assert infer_objective_route(c) is None

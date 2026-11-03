@@ -549,32 +549,96 @@ def cert_evidence_present(pages: list[tuple[str, str]]) -> tuple[bool, str]:
 # True=计数证书有可读复印件/截图页背书；None=候选页不可读/截图页 OCR 只剩标题
 # （c38 实证：p39 只有标题、证书是扫描图）——**计入并标疑问**（防"截图文本层
 # 看不见→误杀"，历史实证）；False=可读文本确认无背书页。
+# 2026-11-03 R3-4（run78 云平台证书 5/5 全计满实证）：section 级一票让全部证书
+# 共享同一判定 → 升级逐本定位 find_cert_copy_pages；section 信号只作先验。
+
+# 复印件页特征（证书名/编号之外的背书指纹）
+_RE_CERT_COPY_FP = re.compile(r"复印件|证书编号|发证|有效期|认证日期|颁证")
+
+
+def find_cert_copy_pages(
+    pages: list[tuple[str, str]], cert_name: str
+) -> list[tuple[str, int]]:
+    """按证书名搜复印件页，返回 [(kind, 页下标)]。
+
+    kind: "copy"=材料页特征命中（复印件/证书编号/发证/OCR 源）；
+    "low"=命中但页文本过少（扫描图）；"claim"=仅清单声称/标题行。
+    名称取归一化尾段（≥6 字）匹配，防全名跨行/空格漂移。
+    """
+    from app.parsing.normalize import normalize_no_ws
+
+    name_raw = str(cert_name or "").strip()
+    if not name_raw:
+        return []
+    norm_name = normalize_no_ws(normalize_cert(name_raw))
+    tail = norm_name[-6:] if len(norm_name) >= 6 else norm_name
+    if not tail:
+        return []
+    out: list[tuple[str, int]] = []
+    for idx, (src, text) in enumerate(pages or []):
+        t = text or ""
+        nt = normalize_no_ws(t)
+        if tail not in nt and norm_name not in nt:
+            continue
+        if len(t.strip()) < 30:
+            out.append(("low", idx))
+        elif _RE_CERT_COPY_FP.search(t) or src in ("ocr", "ocr_img"):
+            out.append(("copy", idx))
+        else:
+            out.append(("claim", idx))
+    return out
+
+
 def classify_cert_backing(
     facts, pages: list[tuple[str, str]] | None, cert_section: tuple[bool, str] | None = None
 ) -> dict[str, bool | None]:
     """每本计数证书的背书三态：{归一化证书键: True/None/False}。
 
-    - ``facts.certificates`` 里有、且对应背书页可读 → True；
-    - 证书清单页/截图页存在但低证据（图片占比高、OCR 输出过少）→ None；
-    - 无背书页且文本层可读（cert_section 明示未见截图/指纹）→ False；
-    - 信息不足（cert_section 未提供/None）→ None（不猜）。
+    逐本模式（默认，BID_EVAL_CERT_BACKING_PER_CERT=0 回退 section 级一票）：
+    - 复印件页（材料特征/OCR 源）可读 → True；
+    - 命中候选页但低证据（扫描图看不清）→ None；
+    - 仅声称行命中、且文档有扫描/低证据页 → None（复印件可能在没进文本层的
+      图里——看不见≠没有，用友防线）；
+    - 仅声称行命中、全文层可读 → False（可读确认无复印件，"须提供有效证书
+      复印件，未提供不得分"硬口径，德勤防线）；
+    - 完全无命中（名称抽取异常）→ section 级先验兜底，不猜。
+    section 级（旧口径）：cert_section_present 双通道一票通/一票否。
     """
     out: dict[str, bool | None] = {}
     certs = list(getattr(facts, "certificates", None) or [])
     if not certs:
         return out
-    # 背书页可见性：cert_section_present 双通道（文本标题/OCR 平台指纹）
     section_ok, section_why = cert_section if cert_section else (None, "")
     low_evidence = False
+    has_scan = False
     if pages:
         for _src, t in pages:
             # 低证据页判定（与 case_evidence._low_evidence 同口径精神）：OCR 只
             # 输出极少字（截图页常见）→ 看不见≠没有
             if len((t or "").strip()) < 30:
                 low_evidence = True
-                break
+                has_scan = True
+            if _src in ("ocr", "ocr_img"):
+                has_scan = True
+    per_cert = config.cert_backing_per_cert_enabled() and bool(pages)
     for name in certs:
         key = normalize_cert(str(name))
+        if per_cert:
+            hits = find_cert_copy_pages(pages or [], str(name))
+            kinds = [k for k, _i in hits]
+            if "copy" in kinds:
+                out[key] = True
+                continue
+            if "low" in kinds:
+                out[key] = None
+                continue
+            if "claim" in kinds and not has_scan:
+                out[key] = False  # 全文可读、只有声称行 → 确认无复印件
+                continue
+            if "claim" in kinds:
+                out[key] = None  # 扫描页可能藏复印件 → 计入+疑问
+                continue
+            # 零命中（名称抽取异常）→ 落 section 先验兜底，不猜
         if section_ok is True:
             out[key] = True  # 查询截图/平台指纹确认存在背书
         elif low_evidence:
@@ -624,6 +688,24 @@ def recover_artifacts_from_tender(
     return ""
 
 
+def _tier_score(tiers, n: Decimal) -> Decimal | None:
+    """按 min_count 档表查 n 的分值（命中最高档）；无命中返回 None（不猜 0 档）。
+
+    R0 客观路由的人员经验档（"2个及以上经验得1分；4个及以上得2分"）与
+    score_count_tier 同语义，抽共用避免两处口径漂移。
+    """
+    best: Decimal | None = None
+    for t in tiers or []:
+        try:
+            if n >= Decimal(str(t["min_count"])):
+                sc = Decimal(str(t["score"]))
+                if best is None or sc > best:
+                    best = sc
+        except Exception:  # noqa: BLE001
+            continue
+    return best
+
+
 def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
     """count 类评分项。
 
@@ -660,13 +742,37 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
         for claim in facts.cert_claims:
             if normalize_cert(claim) not in cert_keys:
                 conflict = True
+        # R3-4 证书背书三态（cert_backing 由 scoring_service 逐本定位注入，
+        # 与 score_count_tier 同语义）：False=可读确认无复印件不计（细则"须提供
+        # 有效证书复印件，未提供不得分"硬口径）；None=复印件看不清/未绑上 →
+        # 计入并标疑问（看不见≠没有，用友防线）。
+        _backing = criterion.get("cert_backing") or {}
+        _unbacked = 0
+        _unverified_c = 0
+        certs_for_count = list(facts.certificates)
+        if _backing:
+            _kept_c = []
+            for cert in certs_for_count:
+                state = _backing.get(normalize_cert(str(cert)))
+                if state is False:
+                    _unbacked += 1
+                    continue
+                if state is None:
+                    _unverified_c += 1
+                _kept_c.append(cert)
+            certs_for_count = _kept_c
+            if _unbacked:
+                conflict = True  # 确认缺失剔除 → 疑问留人工复核
+            if _unverified_c:
+                conflict = True
+                unverified_counted = _unverified_c
         # ISO 三体系与 CMMI 分开计数（ISO 型认证项的计分结构：
         # ISO9001/27001/20000 每项 1 分上限 3，CMMI 二级以上 1 分）。
         # 证书名必须先归一化：OCR 形态（ISO/IEC 20000-1:2018、中文证书名）与
         # 同一体系的两种写法（GB/T19001 与 质量管理体系）旧实现全部匹配不上。
         iso_set: set[str] = set()
         has_cmmi = False
-        for cert in facts.certificates:
+        for cert in certs_for_count:
             key = normalize_cert(cert)
             if key.startswith("ISO"):
                 iso_set.add(key)  # 任意 ISO 族（9001/14001/45001…）都计
@@ -727,7 +833,7 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
             else:
                 count = len(iso_set)
         else:
-            count = len(facts.certificates)
+            count = len(certs_for_count)
         # 一条都没抽到 ≠ 一条都不合格：前者是抽取能力问题，必须与"确实 0 项"区分开，
         # 否则 0 分会被当成评分结论进入总分。
         if not facts.certificates and not facts.cert_claims:
@@ -741,9 +847,18 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
             if conflict:
                 detail += "；正文声称的认证中有未附证书复印件的（待人工核查）"
         else:
-            detail = f"提供证书 {len(facts.certificates)} 项（按证书清单计数）"
+            detail = f"提供证书 {count} 项（按证书清单计数）"
             if conflict:
                 detail += "；正文声称的证书中有未附复印件的（待人工核查）"
+        _bk_note = ""
+        if _unbacked:
+            _bk_note += f"（{_unbacked} 本确认无复印件不计）"
+        if _unverified_c:
+            _bk_note += (
+                f"（{_unverified_c} 本复印件不可读/未绑上，按未核验计入并标疑问，"
+                f"仅计可核验 {len(certs_for_count) - _unverified_c} 本的剔除后口径）"
+            )
+        detail += _bk_note
     elif field == "performance":
         min_amount = Decimal(str(params.get("min_amount_yuan") or 0))
         count = len([a for a in facts.performance_amounts if a >= min_amount])
@@ -776,7 +891,12 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
         score = ((_iso_n * per_item) + (_cmmi_pts if has_cmmi else Decimal(0))).quantize(Decimal("0.01"))
     else:
         effective = min(Decimal(count), Decimal(max_items)) if max_items else Decimal(count)
-        score = (effective * per_item).quantize(Decimal("0.01"))
+        if params.get("tiers"):
+            # R0 客观路由档表（"提供两项得1分，四项得2分"）：命中最高档
+            _ts = _tier_score(params.get("tiers"), effective)
+            score = _ts if _ts is not None else Decimal(0)
+        else:
+            score = (effective * per_item).quantize(Decimal("0.01"))
     if max_score and score > max_score:
         score = max_score
 
@@ -965,7 +1085,12 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                 if unknown_amount:
                     conflict = True
                     detail += f"；{unknown_amount} 个案例金额无法确认（需人工核对）"
-            required_flags = _required_flags(artifacts, person_scope=person_scope, criterion_name=str(criterion.get("name") or ""))
+            required_flags = _required_flags(
+                artifacts,
+                person_scope=person_scope,
+                criterion_name=str(criterion.get("name") or ""),
+                rule_text=str(criterion.get("name") or "") + "\n" + str(criterion.get("description") or ""),
+            )
             # 窄版材料闸门（2026-10-30）：三态材料 True=确认有 / False=确认无 /
             # None=机器看不清或没绑上（页不可读、案例名没链到材料页、页没送审）。
             # 旧口径把 None 也扣 0，等于把管线故障（OCR 没读出/没绑上/没送审）算在
@@ -1014,12 +1139,21 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
             # "有多少未核验案例的分数进了总分"，双分值/机器状态都以它为准。
             unverified_counted = sum(1 for c in kept if c.get("unverified"))
             effective = Decimal(len(kept))
-            score = (effective * per_item).quantize(Decimal("0.01"))
+            # R0 客观路由档表（"2个经验得1分；4个得2分"）：命中最高档，非 per_item 线性
+            if params.get("tiers"):
+                _ts = _tier_score(params.get("tiers"), effective)
+                score = _ts if _ts is not None else Decimal(0)
+            else:
+                score = (effective * per_item).quantize(Decimal("0.01"))
             if max_score and score > max_score:  # 封顶：真实规则"最高得 M 分"
                 score = max_score
             # 可复算双分值：剔除全部未核验案例后的分数（warnings 附给人工一眼复算）
             _kept_verified = min(_verified_n, max_items) if max_items else _verified_n
-            score_verified_only = (_kept_verified * per_item).quantize(Decimal("0.01"))
+            if params.get("tiers"):
+                _tsv = _tier_score(params.get("tiers"), Decimal(_kept_verified))
+                score_verified_only = _tsv if _tsv is not None else Decimal(0)
+            else:
+                score_verified_only = (_kept_verified * per_item).quantize(Decimal("0.01"))
             if max_score and score_verified_only > max_score:
                 score_verified_only = max_score
             detail = (
@@ -1070,7 +1204,9 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
     )
 
 
-def _required_flags(artifacts: str, person_scope: str = "", criterion_name: str = "") -> tuple[str, ...]:
+def _required_flags(
+    artifacts: str, person_scope: str = "", criterion_name: str = "", rule_text: str = "",
+) -> tuple[str, ...]:
     """材料要求段 → 案例核验布尔键（**只闸细则点名的材料**，规则文本驱动）。
 
     项目级：见"合同"查合同；见"发票"查发票；见"验收/业主证明"查验收；
@@ -1078,14 +1214,27 @@ def _required_flags(artifacts: str, person_scope: str = "", criterion_name: str 
     无条件恒查 social_security，是按旧项目假设的隐性拟合，换项目就误杀——
     2026-10-26 run 54 T5.1 19 案例仅计 1 的放大器之一）。
     人员级：work_proof（人在材料表行出现）恒查——人员证据的存在性锚；
-    experience_proof/social_security 仅细则点名时查。
+    experience_proof/social_security/cert_proof 仅细则点名时查。
     2026-10-22 修复：旧实现对人员级硬编码 contract → 全部"缺证明材料"→ 0 分。
+    2026-11-03 R3（run78 驻厂运维人员 12/12 假通过实证）：
+    - experience_proof 触发补「N年以上…经验」措辞（旧只认"五年/负责人"，
+      "3年以上经验"漏闸）；
+    - cert_proof 新 flag：细则点名证书（认证/培训证书/职称/PMP）是**评分条件**
+      （"具有…证书并有…经验的人员每1人得1分"），条件词常在主句而非【证明材料】，
+      故 rule_text 一并扫；不做宽松 overlay（work/experience 的宽松是防误杀，
+      证书是硬条件）。
     """
     if person_scope:
         flags: list[str] = ["work_proof"]
         # 项目负责人经验要求"五年及以上工作经验证明"（独立文档）
-        if "负责人" in criterion_name or "五年" in artifacts or "5年" in artifacts:
+        _exp_re = re.compile(r"\d+\s*年(?:以上|及以上)?[^。；]{0,12}(?:工作)?经验|经验证明")
+        if (
+            "负责人" in criterion_name or "五年" in artifacts or "5年" in artifacts
+            or _exp_re.search(artifacts) or _exp_re.search(rule_text)
+        ):
             flags.append("experience_proof")
+        if re.search(r"认证|培训证书|职称|PMP", artifacts + "\n" + rule_text):
+            flags.append("cert_proof")
         if "社保" in artifacts or "社会保险" in artifacts or "缴纳" in artifacts:
             flags.append("social_security")
         return tuple(flags)
@@ -1496,7 +1645,7 @@ def score_attribute_tier(
         )
     max_score = criterion.get("max_score")
 
-    if attr in ("cert_name", "count"):
+    if attr in ("cert_name", "count", "cert_level"):
         objects: list[str] = list(facts.certificates or [])
         if not objects:
             return CountResult(
@@ -1533,13 +1682,23 @@ def score_attribute_tier(
                     score_t = Decimal(str(t.get("score")))
                 except Exception:  # noqa: BLE001
                     continue
-                match = str(t.get("match") or "")
-                if match:
-                    nm = normalize_cert(match)
-                    if nm and nm in normalize_cert(obj):
-                        if best is None or score_t > best:
-                            best = score_t
-                elif attr == "count":
+                # match_any（R0 cert_level 档："三级及以上"→["一级","二级","三级"]）
+                # 等级词是中文专名，对原始名与归一名双向包含匹配；match 单键语义不变。
+                cands = [str(t.get("match") or "")] + [
+                    str(x) for x in (t.get("match_any") or [])
+                ]
+                hit = False
+                for m in cands:
+                    if not m:
+                        continue
+                    nm = normalize_cert(m)
+                    if (nm and nm in normalize_cert(obj)) or (m in str(obj)):
+                        hit = True
+                        break
+                if hit:
+                    if best is None or score_t > best:
+                        best = score_t
+                elif attr == "count" and not any(cands):
                     if best is None or score_t > best:
                         best = score_t
             if best is not None:

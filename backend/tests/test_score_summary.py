@@ -473,3 +473,18 @@ def test_sample_in_total_false_excluded_from_ranking(client, summary_chain):  # 
     ranking = compute_ranking(chain["pid"], chain["run_id"])
     for row in ranking["rows"]:
         assert Decimal(str(row["total"])) == expected.get(row["bidder_id"], Decimal(0)), row["name"]
+
+
+def test_fallback_score_structured_key():
+    """R3-5：reason.fallback_score 读 warnings 结构化键（无键时 None）。"""
+    from types import SimpleNamespace
+
+    from app.services.score_summary_service import _fallback
+
+    score = SimpleNamespace(warnings_json=[
+        {"message": "……按最低档兜底（0 分）……",
+         "fallback_score": {"kind": "min_level_floor", "value": "0", "basis": "no_valid_output"}},
+    ])
+    fb = _fallback(score)
+    assert fb == {"kind": "min_level_floor", "value": "0", "basis": "no_valid_output"}
+    assert _fallback(SimpleNamespace(warnings_json=[{"message": "正常"}])) is None

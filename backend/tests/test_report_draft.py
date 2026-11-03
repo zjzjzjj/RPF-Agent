@@ -229,3 +229,46 @@ def test_infer_count_field_company_level_only():
     assert _infer_count_field({"name": "项目驻场运维工程师经验", "description": ""}) is None
     assert _infer_count_field({"name": "增值服务", "description": "每项1分"}) is None
 
+
+
+# ---- R3-5 兜底分清单（2026-11-03） -------------------------------------------
+
+def test_fallback_marker_classified_machine_fallback():
+    """兜底格定性 machine_fallback（压过 conflict/needs_judgment），高危。"""
+    from app.services.report_service import _classify_question
+
+    score = _Score(
+        review_status="conflict_flagged", machine_status="need_human",
+        final_score=Decimal("0"),
+        warnings=[{"message": "全自动模式：……按最低档兜底（0 分）……",
+                   "fallback_score": {"kind": "min_level_floor", "value": "0",
+                                      "basis": "no_valid_output"}}],
+    )
+    assert _classify_question(score, _Crit(score_type="subjective")) == "machine_fallback"
+    assert QUESTION_KINDS["machine_fallback"]["severity"] == "high"
+
+
+def test_fallback_items_collects_marker_and_zero_no_facts():
+    """兜底清单收 ①fallback_score 标记 ②zero_reason=no_facts 的 0 分；
+    正常分不入清单。旧数据（仅文案无键）兼容识别。"""
+    from app.services.report_service import _fallback_items
+
+    fb_score = _Score(
+        review_status="conflict_flagged", machine_status="need_human",
+        final_score=Decimal("0"),
+        warnings=[{"message": "全自动模式：……按最低档兜底（0 分）……"}],  # 旧数据形态
+    )
+    zero_score = _Score(
+        review_status="conflict_flagged", machine_status="need_human",
+        final_score=Decimal("0"),
+        warnings=[{"message": "未提取到业绩清单", "unresolved": "no_facts",
+                   "zero_reason": "no_facts"}],
+    )
+    normal = _Score(final_score=Decimal("2"), warnings=[{"message": "计数 2 项"}])
+    items = _fallback_items(_rows(fb_score, _Crit()) + _rows(zero_score, _Crit(code="c2"))
+                            + _rows(normal, _Crit(code="c3")))
+    codes = {i["code"] for i in items}
+    assert codes == {"c1", "c2"}
+    kinds = {i["code"]: i["kind"] for i in items}
+    assert kinds["c1"] == "min_level_floor"
+    assert kinds["c2"] == "zero_no_facts"

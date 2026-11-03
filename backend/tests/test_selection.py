@@ -421,3 +421,78 @@ def test_score_scale_extra_dev_downweighted_not_removed() -> None:
         score_scale_extra=scale,
     )
     assert 1 in [i for i, _t in picked], "降权不移除"
+
+
+# --- R1-2 强制入选（2026-11-03 run78）：双向防线 ----------------------------
+
+def test_select_chunks_must_include_forced_low_rank() -> None:
+    """用友式：窗口块关键词垫底（无任何关键词）仍必进选段。"""
+    chunks = [(i, "普通段落填充" + "x" * 100) for i in range(10)]
+    chunks[0] = (0, "ITSS 信息技术服务标准符合性证书 证书复印件 说明。" + "x" * 60)
+    chunks[1] = (1, "ITSS 证书资质介绍与证书等级说明。" + "x" * 70)
+    chunks[2] = (2, "证书清单与认证情况：ITSS 证书等。" + "x" * 70)
+    chunks[9] = (9, "窗口材料页扫描文本 abcdefg" + "z" * 80)  # 无关键词、尾部
+    picked, meta = select_chunks_for_criterion(
+        chunks, {"name": "ITSS 证书", "description": "ITSS"}, 350,
+        must_include=[9],
+    )
+    ids = [i for i, _t in picked]
+    assert 9 in ids, ids
+    assert meta.get("must_include", 0) >= 1
+
+
+def test_select_chunks_must_include_overflow_keeps_forced() -> None:
+    """超预算砍常规保强制：forced 一定在，常规尾部被挤出（meta 记溢出数）。"""
+    chunks = [(i, "内容" + "y" * 190) for i in range(8)]
+    chunks[7] = (7, "窗口材料页 " + "z" * 190)
+    picked, meta = select_chunks_for_criterion(
+        chunks, {"name": "服务承诺", "description": "承诺"}, 400,
+        must_include=[7],
+    )
+    ids = [i for i, _t in picked]
+    assert 7 in ids, ids
+    assert meta.get("must_include_overflow", 0) >= 1
+
+
+def test_evidence_map_must_include_forced_cluster_first(monkeypatch):
+    """用友式：窗口块 raw 垫底仍成簇且占 top-K 首位（分层评审只取前 K 簇）。"""
+    from app.evidence import embed_client
+    from app.engine.selection import build_evidence_map
+
+    criterion = {
+        "name": "ITSS 信息技术服务标准符合性证书",
+        "description": "具有 ITSS 证书，四级得1分，三级及以上得2分。",
+        "category": "commercial",
+        "max_score": "2",
+    }
+    cos_by_marker = {
+        "强相关块": 0.80,
+        "次相关块甲": 0.70,
+        "次相关块乙": 0.65,
+        "窗口材料块": 0.10,  # 扫描件文本少 → 余弦垫底
+    }
+    chunks = [
+        (0, "强相关块：ITSS 信息技术服务标准符合性证书业务领域运行维护。" + "x" * 40),
+        (1, "次相关块甲：公司资质概况介绍。" + "x" * 60),
+        (2, "次相关块乙：认证情况综述。" + "x" * 60),
+        (3, "窗口材料块：证书编号 ITSS-456 有效期至2027年 发证机构。" + "x" * 40),
+    ]
+
+    def fake_embed_batch(texts):
+        out = []
+        for t in texts:
+            s = next((v for m, v in cos_by_marker.items() if m in t), 0.1)
+            out.append([s, 0.0])
+        return out
+
+    monkeypatch.setattr(embed_client, "embed_one", lambda t: [1.0, 0.0])
+    monkeypatch.setattr(embed_client, "embed_batch", fake_embed_batch)
+
+    emap = build_evidence_map(chunks, criterion, must_include=[3])
+    assert emap is not None
+    clusters, _q = emap
+    # 强制簇在最前（K=3 的 top-3 必含），且标记 forced
+    assert clusters[0].get("forced") is True
+    assert 3 in clusters[0]["ids"]
+    top3_ids = [i for cl in clusters[:3] for i in cl["ids"]]
+    assert 3 in top3_ids

@@ -105,6 +105,12 @@ QUESTION_KINDS: dict[str, dict[str, str]] = {
         "label": "尚未定分",
         "action": "补录分值；未定分项不计入总分",
     },
+    "machine_fallback": {
+        "severity": "high",
+        "label": "兜底分（非评审结论）",
+        "action": "机器故障/无有效输出，按最低档兜底 0 分计入总分（零未定分政策）。"
+                  "兜底分不是评审结论——请人工核看原件后改分，或重跑该格。",
+    },
     "batch_confirmable": {
         "severity": "low",
         "label": "机器判定通过（待浏览确认）",
@@ -124,6 +130,21 @@ def _machine_message(score) -> str:
             if msg:
                 return msg
     return ""
+
+
+def _fallback_marker(score) -> dict | None:
+    """兜底分标记（R3-5，2026-11-03）：读 warnings 的结构化 fallback_score 键；
+    旧数据兼容：message 含「按最低档兜底」。返回标记 dict 或 None。
+    """
+    for w in score.warnings_json or []:
+        if not isinstance(w, dict):
+            continue
+        fb = w.get("fallback_score")
+        if isinstance(fb, dict):
+            return fb
+        if "按最低档兜底" in str(w.get("message") or ""):
+            return {"kind": "min_level_floor", "value": None, "basis": "legacy_text"}
+    return None
 
 
 def _count_problem(score) -> str | None:
@@ -149,6 +170,11 @@ def _classify_question(score, crit) -> str | None:
         return None
     if score.review_status in SETTLED_STATUSES:
         return None
+
+    # 兜底分优先定性（R3-5，2026-11-03）：机器故障按最低档兜底的格不是评审
+    # 结论，压过 conflict/needs_judgment 的归类，报告「兜底分清单」直接可读。
+    if _fallback_marker(score):
+        return "machine_fallback"
 
     # 否决类优先：建议否决是最高级别的待裁决事项
     if crit.score_type == "veto" or score.veto_flag:
@@ -206,6 +232,46 @@ def _classify_question(score, crit) -> str | None:
         return problem
     # 机器已给出分值且计算可复算，只是按设计走复核流
     return "batch_confirmable"
+
+
+def _fallback_row(score, crit, bidder) -> dict | None:
+    """单格兜底分标记（R3-5）；非兜底格返回 None。结构化键读取，旧数据兼容文案。"""
+    marker = _fallback_marker(score)
+    zero_reason = None
+    for w in score.warnings_json or []:
+        if isinstance(w, dict) and w.get("zero_reason") in (
+            "no_facts", "field_missing", "unreadable",
+        ):
+            zero_reason = w["zero_reason"]
+            break
+    if marker is None and not (
+        zero_reason and score.final_score is not None
+        and float(score.final_score) == 0.0
+    ):
+        return None
+    return {
+        "bidder": bidder.name,
+        "bidder_id": bidder.id,
+        "code": crit.code,
+        "criterion": crit.name,
+        "final_score": str(score.final_score) if score.final_score is not None else None,
+        "kind": (marker or {}).get("kind") or f"zero_{zero_reason}",
+        "basis": (marker or {}).get("basis") or zero_reason,
+        "machine_message": _machine_message(score),
+    }
+
+
+def _fallback_items(rows: list) -> list[dict]:
+    """兜底分清单（R3-5，2026-11-03）：零未定分政策下「按最低档兜底」与
+    「机器没抽到事实按 0 计」的格——分数进了总分但**非评审结论**，单列供人工
+    一眼看到哪些 0 分是能力缺失而非投标人水平。
+    """
+    out: list[dict] = []
+    for score, crit, bidder in rows:
+        item = _fallback_row(score, crit, bidder)
+        if item is not None:
+            out.append(item)
+    return out
 
 
 def _build_open_questions(rows: list, run_id: int) -> tuple[list[dict], dict]:
@@ -414,6 +480,7 @@ def build_report(project_id: str, run_id: int | None = None) -> dict:
             "status_label": "报告定稿" if report_status == "final" else "报告草稿（待复核）",
             "progress": progress,
             "open_questions": open_questions,
+            "fallback_scores": _fallback_items(rows),
             "open_by_criterion": by_criterion,
             "run": {
                 "id": run.id, "status": run.status,
@@ -667,6 +734,17 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
         if items:
             review_notes.append({"bidder": bidder.name, "items": items})
 
+    # ---- 兜底分清单（R3-5，2026-11-03）：兜底/无事实 0 分，非评审结论 ----
+    fallback_scores = []
+    for bidder in bidders:
+        for crit in criteria:
+            entry = score_by_key.get((bidder.id, crit.id))
+            if entry is None:
+                continue
+            item = _fallback_row(entry[0], crit, bidder)
+            if item is not None:
+                fallback_scores.append(item)
+
     # ---- 资格 / 符合性审查表（因素原文 × 各家判定） ----
     def _review_table(category: str) -> dict:
         crits = [c for c in criteria if c.category == category]
@@ -821,6 +899,7 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
         "judge_labels": judge_labels,
         "summary_rows": summary_rows,
         "review_notes": review_notes,
+        "fallback_scores": fallback_scores,
         "qualification_table": qualification_table,
         "compliance_table": compliance_table,
         "score_groups": score_groups,
@@ -927,6 +1006,12 @@ def render_docx(report: dict) -> bytes:
             para(f"　· {it['criterion']}（{it['category']}）：{it['verdict']}"
                  + (f"，得 {it['final']} 分" if it["final"] is not None else "")
                  + f"。依据：{it['reason']}")
+    if report.get("fallback_scores"):
+        para("兜底分清单（非评审结论）：以下格为全自动模式最低档兜底或机器未抽到事实的 "
+             "0 分，已按零未定分政策计入总分，请人工核看原件后改分或重跑：")
+        for f in report["fallback_scores"]:
+            para(f"　· {f['bidder']}：{f['criterion']}（当前 {f['final_score']} 分，"
+                 f"类型 {f['kind']}）")
     heading("四、评标结论", 1)
     ordered = [r for r in report["summary_rows"] if r["rank"]]
     ordered.sort(key=lambda r: r["rank"])

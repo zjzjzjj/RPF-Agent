@@ -293,3 +293,70 @@ def test_attribute_tier_person_years_scoring() -> None:
     r = score_attribute_tier({"max_score": Decimal("6")}, params, facts)
     assert r.score == Decimal("5")  # 3 + 2
     assert r.unresolved is None
+
+
+# --- R0 客观分路由执行（2026-11-03 run78）：双向防线 -------------------------
+# 用友式（材料/承诺在不许清零）+ 德勤式（抽不到事实不许满额）。
+
+def test_value_tier_window_promise_scores_full() -> None:
+    """用友式：承诺函窗口「4小时内到达」→ 4 分（偏离表干扰值不再首匹配抢分）。"""
+    from decimal import Decimal as D
+
+    crit = {"max_score": D("4"),
+            "value_window_text": "服务承诺函：我公司承诺远程服务团队在4 小时内到达现场。"}
+    params = {"engine": "value_tier", "field": "response_hours",
+              "direction": "lower_better",
+              "tiers": [{"max_value": "4", "score": "4"}, {"max_value": "5", "score": "3"},
+                        {"max_value": "6", "score": "2"}, {"max_value": "7", "score": "1"}]}
+    facts = _facts("偏离表：响应时间 8 小时（通用条款）")  # 全文只有干扰值
+    r = score_value_tier(crit, params, facts)
+    assert r.score == D("4")  # 窗口优先于全文
+
+
+def test_value_tier_no_promise_value_zero_no_facts() -> None:
+    """德勤式：抽不到承诺值 → 0 + no_facts（不猜、不给印象分）。"""
+    from decimal import Decimal as D
+
+    crit = {"max_score": D("4")}
+    params = {"engine": "value_tier", "field": "response_hours",
+              "tiers": [{"max_value": "4", "score": "4"}]}
+    facts = _facts("我公司提供周到的现场服务。")  # 无任何小时承诺
+    r = score_value_tier(crit, params, facts)
+    assert r.score == D("0")
+    assert r.unresolved == "no_facts"
+
+
+def test_attribute_tier_cert_level_scoring() -> None:
+    """用友式：证书名带等级「（三级）」→ 命中「三级及以上」档 2 分。"""
+    from decimal import Decimal as D
+
+    from app.engine.facts import BidFacts
+
+    crit = {"max_score": D("2")}
+    params = {"engine": "attribute_tier", "attr": "cert_level",
+              "tiers": [{"match_any": ["一级", "二级", "三级"], "score": "2"},
+                        {"match_any": ["四级"], "score": "1"}]}
+    facts = BidFacts(text="")
+    facts.certificates = ["ITSS信息技术服务标准符合性证书（三级）"]
+    r = score_attribute_tier(crit, params, facts)
+    assert r.score == D("2")
+
+    facts4 = BidFacts(text="")
+    facts4.certificates = ["ITSS信息技术服务标准符合性证书（四级）"]
+    r4 = score_attribute_tier(crit, params, facts4)
+    assert r4.score == D("1")
+
+
+def test_attribute_tier_cert_level_no_certs_zero_no_facts() -> None:
+    """德勤式：无证书清单 → 0 + no_facts。"""
+    from decimal import Decimal as D
+
+    from app.engine.facts import BidFacts
+
+    crit = {"max_score": D("2")}
+    params = {"engine": "attribute_tier", "attr": "cert_level",
+              "tiers": [{"match_any": ["三级"], "score": "2"}]}
+    facts = BidFacts(text="")
+    r = score_attribute_tier(crit, params, facts)
+    assert r.score == D("0")
+    assert r.unresolved == "no_facts"

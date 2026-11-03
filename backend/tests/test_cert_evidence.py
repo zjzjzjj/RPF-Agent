@@ -172,3 +172,55 @@ def test_score_count_tier_backing_gate() -> None:
     crit2 = {"max_score": 2}
     r2 = score_count_tier(crit2, params, facts)
     assert r2.score == Decimal("2")
+
+
+# --- R3-4 逐本证书背书（2026-11-03 run78 云平台证书 5/5 全计满实证） --------
+
+def test_cert_backing_per_cert_copy_page_true() -> None:
+    """用友式：复印件页可读（证书名+发证/编号特征）→ True 计入。"""
+    from app.engine.objective import classify_cert_backing, normalize_cert
+
+    pages = [
+        ("text", "证书清单表：阿里云产品认证证书 云平台运维培训证书 列表行。" * 3),
+        ("ocr", "阿里云产品认证证书 证书编号 ALY-2019-001 发证 2019年 有效期至2027年"),
+    ]
+    fb = classify_cert_backing(_facts_with_certs("阿里云产品认证证书"), pages, None)
+    assert fb[normalize_cert("阿里云产品认证证书")] is True
+
+
+def test_cert_backing_per_cert_claim_only_with_scans_none() -> None:
+    """用友式（防误杀）：只有声称行、文档有扫描页 → None 计入+疑问，不得清零。"""
+    from app.engine.objective import classify_cert_backing, normalize_cert
+
+    pages = [
+        ("text", "证书清单表：华为云认证证书 培训证书 列表行。" * 3),
+        ("ocr_img", "扫描图片页，OCR 输出很少"),  # <30 字低证据 → has_scan
+    ]
+    fb = classify_cert_backing(_facts_with_certs("华为云认证证书"), pages, None)
+    assert fb[normalize_cert("华为云认证证书")] is None
+
+
+def test_cert_backing_per_cert_claim_only_readable_false() -> None:
+    """德勤式（不许满额）：全文可读、证书只有声称行无复印件 → False 不计。
+    run78 云平台「提供两项得1分」用证书清单声称凑数的反例。"""
+    from app.engine.objective import classify_cert_backing, normalize_cert
+
+    pages = [
+        ("text", "证书清单表：云平台运维培训证书（声称） 另一本证书（声称） 列表行。" * 3),
+        ("text", "公司简介页，全部内容文本层可读，无任何复印件或证书编号内容。" * 3),
+    ]
+    fb = classify_cert_backing(_facts_with_certs("云平台运维培训证书"), pages, None)
+    assert fb[normalize_cert("云平台运维培训证书")] is False
+
+
+def test_cert_backing_per_cert_low_hit_none() -> None:
+    """命中候选页但低证据（扫描图看不清）→ None（德勤式：不可读不许满额，
+    同时不误杀——计入+疑问）。"""
+    from app.engine.objective import classify_cert_backing, normalize_cert
+
+    pages = [
+        ("text", "证书清单表：ITSS信息技术服务标准符合性证书 列表行。" * 3),
+        ("ocr", "ITSS 证书"),
+    ]
+    fb = classify_cert_backing(_facts_with_certs("ITSS信息技术服务标准符合性证书"), pages, None)
+    assert fb[normalize_cert("ITSS信息技术服务标准符合性证书")] is None

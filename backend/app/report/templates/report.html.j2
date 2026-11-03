@@ -199,6 +199,26 @@
 </table>
 {% endif %}
 
+{% if fallback_scores %}
+<h2>三（附）、兜底分清单（非评审结论）</h2>
+<div class="notice" style="background:#fff7e6;border-color:#ffd591">
+  以下格的分数是全自动模式的<b>最低档兜底 0 分</b>或「机器没抽到事实」的 0 分——
+  已按零未定分政策计入总分，但<b>非评审结论</b>。请人工核看原件后改分，或重跑该格。
+</div>
+<table>
+  <tr><th>投标人</th><th>评分项</th><th>当前分</th><th>兜底类型</th><th>机器说明</th></tr>
+  {% for f in fallback_scores %}
+  <tr>
+    <td>{{ f.bidder }}</td>
+    <td>{{ f.code }} {{ f.criterion }}</td>
+    <td>{{ f.final_score }}</td>
+    <td>{{ f.kind }}</td>
+    <td class="muted">{{ f.machine_message }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+
 <h2>四、复核与操作留痕（可答复质疑）</h2>
 <table>
   <tr><th style="width:170px">时间</th><th style="width:120px">操作人</th><th style="width:110px">对象</th><th style="width:100px">动作</th><th>理由</th></tr>

@@ -344,13 +344,25 @@ def _pointer_candidates(t: str, kw: str, line_window: int) -> list[tuple]:
     return out
 
 
+def _is_title_page(text: str) -> bool:
+    """标题页判据：正文过短，内容以章节标题为主（run78 ITSS p39 实证：41 字符
+    只有「2.7.1 ITSS 信息技术服务标准符合性证书」标题，证书扫描件在其后页）。
+    300 与 _BOUNDARY_HEADING_ZONE 同量纲（标题区窗口），非项目拟合。
+    """
+    return len((text or "").strip()) < 300
+
+
 def resolve_index_pages(
-    pages: list[PageRec], keyword: str, *, line_window: int = 0
+    pages: list[PageRec], keyword: str, *, line_window: int = 0,
+    extend: bool = False, extend_max_pages: int = 15,
 ) -> SectionGuess:
     """索引页码指针泛化：在索引表页找「<keyword> …（X-Y）页 / 第X页到第Y页」指针，
     借同页页脚印刷页码换算物理页区间。供任意评分项复用（业绩/服务承诺/证书…）。
 
     ``line_window=0``：指针与关键词必须同线（旧口径）；>0：容许表格拆行的邻近行关联。
+    ``extend=True``：单页指针落在**标题页**上时，窗口延伸到下一章节边界
+    （_extend_until_boundary 页首标题区判界，封顶 extend_max_pages 页）——
+    「见投标文件（39）页」常指章节起始页而非材料全貌（2026-11-03 run78 实证）。
     只解析指针，不含业绩表头核验（那是 locate_section 的后置细化）。
     """
     kw = (keyword or "").strip()
@@ -370,6 +382,10 @@ def resolve_index_pages(
         if start <= 0 or end < start:
             continue
         conf = 0.9 if kind == 0 or dist == 0 else 0.7
+        if extend and start == end:
+            target = next((x for x in pages if x.page_no == start), None)
+            if target is not None and _is_title_page(target.text or ""):
+                end = _extend_until_boundary(pages, start, max_pages=extend_max_pages)
         return SectionGuess(start, end, "index_offset", conf, offset)
     return SectionGuess(0, 0, "none", 0.0, None)
 

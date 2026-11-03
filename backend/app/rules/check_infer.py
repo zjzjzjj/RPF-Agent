@@ -277,3 +277,149 @@ def infer_engine_params(text: str) -> dict:
         return {"engine": "attribute_tier", "attr": "title", "tiers": tiers}
 
     return {}
+
+
+# --- R0：客观分路由（2026-11-03 run78 取证） -------------------------------
+# score_type=subjective 但细则是明示「X得N分」档表的格，评分时路由到客观引擎。
+# 服务承诺「4小时内到达得4分,5小时得3分…」被编译成 subjective 后丢确定性引擎
+# （证据簇均分只得 2/4），是 run78 中科「该给没给」的主因之一。
+
+# 通用「得N分」计分提及（闭合性检查用；"不得分"无数字不匹配）
+_RE_GET_SCORE = re.compile(r"得\s*(\d+(?:\.\d+)?)\s*分")
+# 响应时间档（宽松版：不强制「内/以内」——"5小时得3分"类省略式同样明示）
+_RE_HOURS_TIER_LOOSE = re.compile(
+    r"(\d+(?:\.\d+)?)\s*(?:个)?\s*小时(?:内|以内)?[^。；，,]{0,16}?得\s*(\d+(?:\.\d+)?)\s*分"
+)
+# 证书等级档："四级得1分，三级及以上得2分"（≥2 档才认）
+_RE_CERT_LEVEL_TIER = re.compile(
+    r"([一二三四五六七八九十\d]+级(?:及以上)?)\s*[^。；，,]{0,10}?得\s*(\d+(?:\.\d+)?)\s*分"
+)
+# 中文等级序（"及以上"=语言学语义，非项目拟合）
+_CERT_LEVEL_ORDER = {"一级": 1, "二级": 2, "三级": 3, "四级": 4, "五级": 5,
+                     "六级": 6, "七级": 7, "八级": 8, "九级": 9, "十级": 10}
+# 分档计数（带量词后名词捕获，判计数源用）："2个及以上…经验，得1分" / "提供两项得1分"
+_RE_COUNT_TIER_NOUN = re.compile(
+    r"(一|二|两|三|四|五|六|七|八|九|十|\d+)\s*(?:项|个|本|张|类)"
+    r"([^得。；]{0,14})得+\s*(\d+(?:\.\d+)?)\s*分"
+)
+_EXP_KW = re.compile(r"经验|业绩|案例")
+
+
+def _cert_level_expand(token: str) -> list[str]:
+    """「三级及以上」→ ["一级","二级","三级"]（优于/等于该级的显式列表）。"""
+    m = re.fullmatch(r"([一二三四五六七八九十\d]+级)(及以上)?", token.strip())
+    if not m:
+        return [token.strip()] if token.strip() else []
+    base = m.group(1)
+    if not m.group(2):
+        return [base]
+    rank = _CERT_LEVEL_ORDER.get(base)
+    if rank is None:
+        return [base]
+    return [k for k, v in sorted(_CERT_LEVEL_ORDER.items(), key=lambda kv: kv[1])
+            if v <= rank]
+
+
+def _tier_scores_closed(text: str, parsed_scores: set[str]) -> bool:
+    """闭合性：细则里所有「得N分」计分提及都被已解析档位覆盖。
+
+    文本另有解析不出的计分提及（散文式"酌情得N分"混写）→ 不闭合 → 不路由
+    （歧义不猜）。档表是打分规则的全部 → 闭合 → 客观形态。
+    """
+    mentions = {s for s in _RE_GET_SCORE.findall(text)}
+    return bool(mentions) and mentions <= parsed_scores
+
+
+def infer_objective_route(criterion: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
+    """主观格评分时的客观路由推断（R0）。返回 (engine_kind, params) 或 None。
+
+    engine_kind: "value_tier" | "attribute_tier" | "count_tier" | "count"。
+    守卫（防把主观散文客观化）：档表 ≥2 明示档，且
+    （`_subjectivity_hint=="objective"` 或文本含「客观分」 或 档表闭合）。
+    纯确定性零 LLM；只读 criteria 字典不回写，兼容冻结包。推断不出 → None
+    （回退 subjective，歧义不猜）。
+    """
+    text = _rule_text(criterion)
+    name = str(criterion.get("name") or "")
+    if not text.strip():
+        return None
+    gated_hint = (criterion.get("params") or {}).get("_subjectivity_hint") == "objective"
+    gated_mark = "客观分" in text
+
+    def _accept(parsed_scores: set[str]) -> bool:
+        return gated_hint or gated_mark or _tier_scores_closed(text, parsed_scores)
+
+    # ① 数值承诺档（响应时间）："4小时内到达得4分,5小时得3分…"
+    hours: list[tuple[str, str]] = _RE_HOURS_TIER_LOOSE.findall(text)
+    dedup: dict[str, str] = {}
+    for h, s in hours:
+        if h not in dedup or Decimal(s) > Decimal(dedup[h]):
+            dedup[h] = s
+    if len(dedup) >= 2 and _accept(set(dedup.values())):
+        tiers = [{"max_value": k, "score": v}
+                 for k, v in sorted(dedup.items(), key=lambda kv: Decimal(kv[0]))]
+        return "value_tier", {
+            "field": "response_hours", "direction": "lower_better", "tiers": tiers,
+        }
+
+    # ② 证书等级档："四级得1分，三级及以上得2分"
+    levels: list[tuple[str, str]] = _RE_CERT_LEVEL_TIER.findall(text)
+    lv_dedup: dict[tuple[str, ...], str] = {}
+    for token, s in levels:
+        key = tuple(_cert_level_expand(token))
+        if not key:
+            continue
+        if key not in lv_dedup or Decimal(s) > Decimal(lv_dedup[key]):
+            lv_dedup[key] = s
+    if len(lv_dedup) >= 2 and _accept(set(lv_dedup.values())):
+        tiers = [{"match_any": list(k), "score": v} for k, v in lv_dedup.items()]
+        return "attribute_tier", {"attr": "cert_level", "tiers": tiers}
+
+    # ③ 分档计数："2个及以上…经验，得1分；4个…得2分" / "提供两项得1分，四项得2分"
+    from app.engine.objective import _CN_NUM
+
+    cnt: dict[int, str] = {}
+    cnt_noun = ""
+    for raw_n, noun, s in _RE_COUNT_TIER_NOUN.findall(text):
+        n = _CN_NUM.get(raw_n)
+        if n is None:
+            try:
+                n = int(raw_n)
+            except ValueError:
+                continue
+        if n not in cnt or Decimal(s) > Decimal(cnt[n]):
+            cnt[n] = s
+        if _EXP_KW.search(noun or ""):
+            cnt_noun = noun
+    if len(cnt) >= 2 and _accept(set(cnt.values())):
+        tiers = [{"min_count": k, "score": v} for k, v in sorted(cnt.items())]
+        if _EXP_KW.search(cnt_noun):
+            # 计数源=人员/公司经验（verified_cases 逐案例核验路径）
+            out: dict[str, Any] = {"field": "performance", "tiers": tiers}
+            if _LEADER_KW.search(name):
+                out["person_scope"] = "leader"
+            elif _MEMBER_KW.search(name):
+                out["person_scope"] = "member"
+            return "count", out
+        return "count_tier", {"field": "certificates", "tiers": tiers}
+
+    # ④ per_item 线性："每1人得1分，最高不超过3分"
+    m = _RE_PER_ITEM.search(text)
+    if m:
+        out = {"per_item": m.group(1)}
+        cap = _RE_CAP.search(text)
+        if cap:
+            try:
+                per_d = Decimal(m.group(1))
+            except Exception:  # noqa: BLE001
+                per_d = Decimal(0)
+            if per_d > 0:
+                out["max_items"] = str(int(Decimal(cap.group(1)) / per_d))
+        if _accept({m.group(1)}):
+            if _LEADER_KW.search(name):
+                out["person_scope"] = "leader"
+            elif _MEMBER_KW.search(name):
+                out["person_scope"] = "member"
+            return "count", out
+
+    return None

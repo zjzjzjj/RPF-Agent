@@ -533,6 +533,7 @@ def select_chunks_for_criterion(
     chunk_cats: list[str | None] | None = None,
     chunk_cat_confs: list[float] | None = None,
     score_scale_extra: list[float] | None = None,
+    must_include: list[int] | None = None,
 ) -> tuple[list[Chunk], dict]:
     """统一入口：vector 模式优先（BID_EVAL_SELECTION=vector），失败回退关键词分档。
 
@@ -546,10 +547,34 @@ def select_chunks_for_criterion(
     score_scale_extra：调用方附加乘数（2026-11-02 P1-6：索引指针窗口页 ×1.3、
     偏离表通用条款块 ×0.25——run77 c54 实证：偏离表"8小时"抢掉承诺函"4小时"），
     与类别加成同位相乘。
+    must_include：强制入选块下标（R1-2 窗口页，2026-11-03）——软加权救不了
+    低原始相似度的材料页，窗口块必须保底进选段；超预算砍常规保强制。
     """
     meta_keys: dict = {}
     if score_scale_extra is not None and len(score_scale_extra) != len(chunks):
         score_scale_extra = None  # 长度不符不猜（同 chunk_cats 口径）
+    _must = sorted({i for i in (must_include or []) if 0 <= i < len(chunks)})
+
+    def _force(picked: list[Chunk], meta: dict) -> tuple[list[Chunk], dict]:
+        if not _must:
+            return picked, meta
+        sel = {c[0] for c in picked}
+        add = [chunks[i] for i in _must if chunks[i][0] not in sel]
+        if not add:
+            return picked, meta
+        keep: list[Chunk] = list(add)
+        chars = sum(len(c[1]) for c in add)
+        dropped = 0
+        for c in picked:
+            if chars + len(c[1]) > budget:
+                dropped += 1
+                continue
+            keep.append(c)
+            chars += len(c[1])
+        meta = {**meta, "must_include": len(add)}
+        if dropped:
+            meta["must_include_overflow"] = dropped
+        return keep, meta
 
     def _merge(scale: list[float] | None) -> list[float] | None:
         if score_scale_extra is None:
@@ -563,7 +588,7 @@ def select_chunks_for_criterion(
             chunks, criterion, budget, fallback_diffuse,
             score_scale=_merge(None), pool=None,
         )
-        return picked, meta
+        return _force(picked, meta)
 
     from app.material_index.catalog import material_category_for
 
@@ -588,7 +613,7 @@ def select_chunks_for_criterion(
                 score_scale=_merge(None), pool=in_class,
             )
             meta.update(meta_keys)
-            return picked, meta
+            return _force(picked, meta)
         meta_keys["price_fallback"] = True
         meta_keys["soft_fallback"] = True
         picked, meta = _select_once(
@@ -596,7 +621,7 @@ def select_chunks_for_criterion(
             score_scale=_merge(None), pool=None,
         )
         meta.update(meta_keys)
-        return picked, meta
+        return _force(picked, meta)
 
     if not in_class:
         meta_keys["soft_fallback"] = True
@@ -605,7 +630,7 @@ def select_chunks_for_criterion(
             score_scale=_merge(None), pool=None,
         )
         meta.update(meta_keys)
-        return picked, meta
+        return _force(picked, meta)
 
     # 阶段 1：类内选
     picked, meta = _select_once(
@@ -615,7 +640,7 @@ def select_chunks_for_criterion(
     # 充足性只看类内产出量（truncated=False 只说明池内全选完，池本身可能很小）
     if meta.get("chars", 0) >= budget * _SOFT_FILL_RATIO:
         meta.update(meta_keys)
-        return picked, meta
+        return _force(picked, meta)
 
     # 阶段 2：全库混选 + 类内加成
     meta_keys["soft_fallback"] = True
@@ -624,7 +649,7 @@ def select_chunks_for_criterion(
         score_scale=_merge(_scale()), pool=None,
     )
     meta.update(meta_keys)
-    return picked, meta
+    return _force(picked, meta)
 
 
 def build_evidence_map(
@@ -634,6 +659,7 @@ def build_evidence_map(
     min_gap: int = 2,
     chunk_cats: list[str | None] | None = None,
     score_scale_extra: list[float] | None = None,
+    must_include: list[int] | None = None,
 ) -> tuple[list[dict], str] | None:
     """证据地图：全量分块按相关性排序并聚类为不相交证据簇（零 LLM 成本）。
 
@@ -699,6 +725,33 @@ def build_evidence_map(
     floor_extend = raw_top * 0.75  # 行走扩展门槛（更严——防连续大片被吞成巨型簇）
     claimed: set[int] = set()
     clusters: list[dict] = []
+    # R1-2 窗口块强制进簇（2026-11-03 run78：×1.3 软加权救不了低原始相似度的
+    # 材料页，排不进 top-K 就静默落选）：窗口块先占簇位（前置进 clusters，
+    # clusters[:k] 必含），常规贪心随后（claimed/min_gap 防重叠）。
+    if must_include:
+        forced_ids = sorted({i for i in must_include if 0 <= i < len(chunks)})
+        group: list[int] = []
+        group_chars = 0
+
+        def _flush_forced() -> None:
+            if not group:
+                return
+            clusters.append({
+                "ids": sorted(group),
+                "chunk_nos": [chunks[i][0] for i in sorted(group)],
+                "chars": group_chars,
+                "score": round(max(scores[i] for i in group), 4),
+                "forced": True,
+            })
+
+        for i in forced_ids:
+            if group and group_chars + len(chunks[i][1]) > 18000:
+                _flush_forced()
+                group, group_chars = [], 0
+            group.append(i)
+            group_chars += len(chunks[i][1])
+            claimed.add(i)
+        _flush_forced()
     for seed_idx in order:
         # 种子资格用 raw（防"低原始分靠加成当种子"）
         if raw[seed_idx] < floor_seed or seed_idx in claimed:

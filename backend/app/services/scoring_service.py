@@ -415,6 +415,29 @@ def execute_run(
     subjective_items = [c for c in criteria if c["score_type"] == "subjective"]
     match_items = [c for c in criteria if c["score_type"] == "match"]
 
+    # R0 客观分路由（2026-11-03 run78 取证）：score_type=subjective 但细则是
+    # 明示「X得N分」档表的格，评分时改走客观引擎（服务承诺"4小时内到达得4分…"
+    # 被编译成 subjective 后丢确定性引擎，中科 12 分「该给没给」主因之一）。
+    # 浅拷贝 params（snapshot criteria 被全部 bidder 格共享，就地改会跨格泄漏）；
+    # score_type 保持原样（冻结包事实镜像，篡改会断审计链）。歧义不猜：路由不出
+    # 的格照走主观路径。
+    if config.objective_route_enabled():
+        from app.rules.check_infer import infer_objective_route
+
+        _kept_subj = []
+        for c in subjective_items:
+            route = infer_objective_route(c)
+            if route is None:
+                _kept_subj.append(c)
+                continue
+            engine_kind, rparams = route
+            c2 = {**c, "params": {**(c.get("params") or {}), **rparams}}
+            if engine_kind != "count":
+                c2["params"]["engine"] = engine_kind
+            c2["_objective_route"] = {"engine": engine_kind, "params": rparams}
+            count_items.append(c2)
+        subjective_items = _kept_subj
+
     # 进度按「评分项 × 投标人」粒度上报：客观审查是全链最耗时的一段（本地 8B
     # 每条 30-90s、串行），只按阶段上报会让 UI 停在 25% 长达数十分钟
     # （2026-10-20 实证：job 50 在「客观审查 85 项」停 20 分钟，用户以为没开始）。
@@ -795,7 +818,10 @@ def execute_run(
         kws = [name] if name else []
         kws += [k for k in re.split(r"[-—–、（）()：:（）\s]+", name) if len(k) >= 2]
         for kw in kws:
-            guess = resolve_index_pages(recs, kw, line_window=3)
+            guess = resolve_index_pages(
+                recs, kw, line_window=3,
+                extend=config.window_extend_enabled(),
+            )
             if guess.found:
                 return {p for p in range(guess.start, guess.end + 1)}
         return set()
@@ -839,6 +865,22 @@ def execute_run(
                     w *= 0.25
             out.append(w)
         return out
+
+    def _window_chunk_ids_for(bid_id: int, c) -> list[int]:  # noqa: ANN001
+        """评分项索引指针窗口页对应的块下标（R1-2 强制进选段/进簇，2026-11-03）。
+
+        ×1.3 软加权救不了低原始相似度的材料页（run78 ITSS：证书扫描件排不进
+        top-3 簇静默落选）——窗口块必须保底入选。长度口径与 score_scale_extra
+        同一假设（split_page_chunks 对齐），不符弃用不猜。
+        """
+        srcs = chunk_srcs_by_bidder.get(bid_id)
+        if not srcs:
+            return []
+        win = _window_pages_for(bid_id, c)
+        if not win:
+            return []
+        main_id = main_doc_by_bidder.get(bid_id)
+        return [i for i, (d, pno) in enumerate(srcs) if d == main_id and pno in win]
 
     def _count_cell(args):  # noqa: ANN001
         """count 格计算（无 DB 写）：参数装配 → 确定性/LLM 核验 → 计分 → 审计。"""
@@ -972,8 +1014,9 @@ def execute_run(
             _vw = _value_window_for(bid_id, c)
             if _vw:
                 c_scoring = {**c_scoring, "value_window_text": _vw}
-        if _engine in ("count_tier", "attribute_tier"):
-            # 证书背书三态（P0-5）：count_tier/attribute_tier 的软证据闸门
+        if _engine in ("count_tier", "attribute_tier") or _field == "certificates":
+            # 证书背书三态（P0-5，2026-11-03 R3-4 扩到普通 certificates 计数）：
+            # count_tier/attribute_tier/证书计数的软证据闸门（逐本定位复印件页）
             from app.engine.objective import classify_cert_backing
 
             _pages2 = [(src, t) for _p, t, src in (bid_pages.get(bid_id) or [])]
@@ -1027,6 +1070,10 @@ def execute_run(
         if _sv is not None:
             audit = dict(audit or {})
             audit["score_verified_only"] = str(_sv)
+        # R0 客观路由留痕（2026-11-03）：依据是包里写的还是执行时路由的，审计可见
+        if c.get("_objective_route"):
+            audit = dict(audit or {})
+            audit["objective_route"] = c["_objective_route"]
         return bid_id, c, result, unresolved, doubt, audit
 
     # Phase1：并行计算（业绩表快路径不走 LLM；LLM 逐案例核验 4 并发→8 并发）
@@ -1224,27 +1271,28 @@ def execute_run(
                 _cf = chunk_cat_confs_by_bidder.get(bid_id)
                 # P1-6 选段加成：索引指针窗口页优先 / 偏离表通用条款降权
                 _sce = _score_scale_extra_for(bid_id, c)
+                _wci = _window_chunk_ids_for(bid_id, c) or None
                 try:
                     if use_hierarchical:
                         suggestion, committee = suggest_score_hierarchical(
                             gateway, c, text_by_bidder[bid_id], data_class=data_class,
                             material_pages=hint, verify_quote=verifiers.get(bid_id),
                             chunk_cats=_cc, chunk_cat_confs=_cf,
-                            score_scale_extra=_sce,
+                            score_scale_extra=_sce, must_include=_wci,
                         )
                         if suggestion is None:
                             suggestion, committee = suggest_score_committee(
                                 gateway, c, text_by_bidder[bid_id], data_class=data_class,
                                 material_pages=hint, verify_quote=verifiers.get(bid_id),
                                 chunk_cats=_cc, chunk_cat_confs=_cf,
-                                score_scale_extra=_sce,
+                                score_scale_extra=_sce, must_include=_wci,
                             )
                     else:
                         suggestion, committee = suggest_score_committee(
                             gateway, c, text_by_bidder[bid_id], data_class=data_class,
                             material_pages=hint, verify_quote=verifiers.get(bid_id),
                             chunk_cats=_cc, chunk_cat_confs=_cf,
-                            score_scale_extra=_sce,
+                            score_scale_extra=_sce, must_include=_wci,
                         )
                 except Exception as exc:  # noqa: BLE001 —— 单格失败不让整场失败
                     if _is_fatal_llm_error(exc):
@@ -1811,7 +1859,8 @@ def _llm_verify_cases(
     # 模型"没找到材料"实为没看到 → 误判 0。
     if stats_out is not None and stats_out.get("pages_omitted", 0) > 0:
         _mat_keys = ("contract", "invoice", "acceptance",
-                     "work_proof", "experience_proof", "social_security")
+                     "work_proof", "experience_proof", "social_security",
+                     "cert_proof")
         for case in merged:
             if case.get("sanitized") != "ok":
                 continue  # 防作弊拒绝的 False 不是材料缺失
@@ -2150,7 +2199,7 @@ _AUDIT_CASE_KEYS = (
     "match_tier", "quote_source", "case_source", "page_hint",
     "amount_yuan", "sign_date", "table_page", "material_pages",
     "material_reasons", "contract", "invoice", "acceptance",
-    "work_proof", "experience_proof", "social_security",
+    "work_proof", "experience_proof", "social_security", "cert_proof",
     "person_name", "duplicate",
     "unverified", "unverified_reason", "truncated_review",
 )
@@ -2852,15 +2901,24 @@ def _persist_subjective(
                 fallback = min(mins) if mins else Decimal(0)
                 row.final_score = fallback
                 row.machine_status = "need_human"
+                # R3-5 兜底分清单（2026-11-03）：结构化键供报告单列（下游禁配
+                # 中文措辞），message 文案保留给人工阅读
+                _fb_key = {
+                    "kind": "min_level_floor",
+                    "value": str(fallback),
+                    "basis": "no_valid_output",
+                }
                 if parse_failed:
                     row.warnings_json = (row.warnings_json or []) + [
                         {"message": f"全自动模式：机器故障/无有效输出（模型调用失败或输出解析失败），"
-                                    f"按最低档兜底（{fallback} 分）——兜底分非评审结论，建议人工复核或重跑"}
+                                    f"按最低档兜底（{fallback} 分）——兜底分非评审结论，建议人工复核或重跑",
+                         "fallback_score": _fb_key}
                     ]
                 else:
                     row.warnings_json = (row.warnings_json or []) + [
                         {"message": f"全自动模式：机器故障/无有效输出（{suggestion.status}），"
-                                    f"按最低档兜底（{fallback} 分）——兜底分非评审结论，建议人工复核或重跑"}
+                                    f"按最低档兜底（{fallback} 分）——兜底分非评审结论，建议人工复核或重跑",
+                         "fallback_score": _fb_key}
                     ]
             row.review_status = (
                 "conflict_flagged"

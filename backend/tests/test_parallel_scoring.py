@@ -114,3 +114,17 @@ def test_forced_zero_zero_score_shape():
     )
     assert "不得分" in reason
     assert Decimal(0) == Decimal(0)  # 分值形态由 SubjectiveSuggestion(score=0) 承载
+
+
+def test_parallel_map_preserves_order_with_routed_dict_cells():
+    """R0 路由后 count_cells 带 _objective_route 的 dict 格——保序不变式不破。"""
+    cells = [(i, {"code": f"c{i}", "params": {"tiers": [{"min_count": 2, "score": "1"}]},
+                  "_objective_route": {"engine": "count", "params": {}}}) for i in range(10)]
+
+    def worker(args):
+        bid_id, c = args
+        return bid_id, c["code"], c.get("_objective_route") is not None
+
+    out = _parallel_map(worker, cells, ctx=_FakeCtx(), message_fmt="{done}/{total}")
+    assert [o[0] for o in out] == list(range(10))
+    assert all(o[2] for o in out)

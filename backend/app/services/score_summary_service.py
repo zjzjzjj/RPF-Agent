@@ -153,6 +153,15 @@ def _unresolved(score: ScoreRecord | None) -> str | None:
     return None
 
 
+def _fallback(score: ScoreRecord | None) -> dict | None:
+    """兜底分标记（R3-5，2026-11-03）：warnings 结构化 fallback_score 键。"""
+    for w in _warnings_list(score):
+        fb = w.get("fallback_score")
+        if isinstance(fb, dict):
+            return fb
+    return None
+
+
 def _ai_visible(score: ScoreRecord | None) -> bool:
     if score is None:
         return False
@@ -343,6 +352,7 @@ def _build_item(
             "human_actor": review.actor if review is not None else None,
             "human_at": _iso(review.created_at) if review is not None else None,
             "unresolved": _unresolved(score),
+            "fallback_score": _fallback(score),
         },
         "ai_locked": score is not None and not ai_visible,
         "committee": _committee(score) if ai_visible else [],

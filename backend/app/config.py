@@ -418,6 +418,46 @@ def leader_table_proof_enabled() -> bool:
     )
 
 
+def objective_route_enabled() -> bool:
+    """客观分路由开关（2026-11-03 run78 取证）。
+
+    开（默认）：score_type=subjective 但细则是明示「X得N分」档表（≥2 档且
+    客观标注/闭合档表）的格，评分时路由到客观引擎（value_tier/attribute_tier/
+    count_tier）——run78 实证这类格被编译成 subjective 后丢确定性引擎：
+    服务承诺「4小时内到达得4分…」走证据簇均分只得 2。歧义（档表不闭合/
+    无客观信号）仍回退 subjective，不猜。关=全部走主观路径（锚点对比用）。
+    """
+    return os.environ.get("BID_EVAL_OBJECTIVE_ROUTE", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def window_extend_enabled() -> bool:
+    """索引指针窗口延伸开关（2026-11-03 run78 取证）。
+
+    开（默认）：单页指针「见投标文件（39）页」落在标题页上时，窗口延伸到
+    下一章节边界（封顶 15 页）——p39 只有 41 字符标题、证书扫描件在 p40+，
+    死区间 (39,39) 让材料永远进不了送审窗口（ITSS 中科 0 分根因）。关=回退
+    单页死区间（locate_section 路径本就不受影响）。
+    """
+    return os.environ.get("BID_EVAL_WINDOW_EXTEND", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def cert_backing_per_cert_enabled() -> bool:
+    """证书背书逐本定位开关（2026-11-03 run78 取证）。
+
+    开（默认）：classify_cert_backing 按证书名/编号定位复印件页做**逐本**三态
+    （可读→True/低证据→None/可读确认无→False），section 级信号只作先验——
+    文档级一票让 5 本证书共享同一判定（云平台证书 5/5 全计满根因）。
+    关=回退 section 级一票（旧口径）。
+    """
+    return os.environ.get("BID_EVAL_CERT_BACKING_PER_CERT", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
 def material_ocr_max_pages() -> int:
     """单个投标文档材料页 OCR 救援的页数上限。
 
@@ -571,7 +611,7 @@ def llm_prompt_version() -> str:
     AUTO_JUDGE_BATCH_SYSTEM_PROMPT）——批量 prompt 是新常量，但版本号统一升
     以作废既有磁盘缓存键（新旧 prompt 不得共享缓存命中）。
     """
-    return os.environ.get("BID_EVAL_PROMPT_VERSION", "2026-10-30.1")
+    return os.environ.get("BID_EVAL_PROMPT_VERSION", "2026-11-03.1")
 
 
 def veto_batch_size() -> int:

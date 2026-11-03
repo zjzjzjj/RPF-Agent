@@ -252,6 +252,7 @@ def suggest_score(
     chunk_cats: list[str | None] | None = None,
     chunk_cat_confs: list[float] | None = None,
     score_scale_extra: list[float] | None = None,
+    must_include: list[int] | None = None,
 ) -> SubjectiveSuggestion:
     """对一家投标人的一个主观评分项给出建议分。
 
@@ -259,6 +260,7 @@ def suggest_score(
     页码索引文本，供证明材料链核对参考；无则传 None。
     chunk_cats/chunk_cat_confs：与 split_text_chunks(bid_text) 等长的材料类别/
     置信度（scoring_service 侧按同口径切块算好传入）——选段软过滤用，None=无标签。
+    must_include：强制入选块下标（R1-2 索引指针窗口页，2026-11-03）。
     """
     material_pages = material_pages or "（无材料页索引）"
     warnings: list[str] = []
@@ -278,7 +280,7 @@ def suggest_score(
         picked, meta = select_chunks_for_criterion(
             split_text_chunks(bid_text), criterion, MAX_BID_CHARS,
             chunk_cats=chunk_cats, chunk_cat_confs=chunk_cat_confs,
-            score_scale_extra=score_scale_extra,
+            score_scale_extra=score_scale_extra, must_include=must_include,
         )
         truncated = "\n".join(t for _i, t in picked)
         _sf = "；类内优先" if meta.get("in_class") else ""
@@ -469,6 +471,7 @@ def suggest_score_committee(
     chunk_cats: list[str | None] | None = None,
     chunk_cat_confs: list[float] | None = None,
     score_scale_extra: list[float] | None = None,
+    must_include: list[int] | None = None,
 ) -> tuple[SubjectiveSuggestion, list[dict]]:
     """size 个 AI 评委独立评分，去尾平均聚合。返回 (聚合建议, 评委明细)。
 
@@ -487,7 +490,8 @@ def suggest_score_committee(
         s = suggest_score(gateway, criterion, bid_text, data_class=data_class,
                           material_pages=material_pages, verify_quote=verify_quote,
                           chunk_cats=chunk_cats, chunk_cat_confs=chunk_cat_confs,
-                          score_scale_extra=score_scale_extra)
+                          score_scale_extra=score_scale_extra,
+                          must_include=must_include)
         committee = [{
             "judge_no": 1,
             "score": str(s.score) if s.score is not None else None,
@@ -508,7 +512,8 @@ def suggest_score_committee(
                                      verify_quote=verify_quote,
                                      chunk_cats=chunk_cats,
                                      chunk_cat_confs=chunk_cat_confs,
-                                     score_scale_extra=score_scale_extra),
+                                     score_scale_extra=score_scale_extra,
+                                     must_include=must_include),
             range(size),
         ))
 
@@ -674,6 +679,7 @@ def suggest_score_hierarchical(
     chunk_cats: list[str | None] | None = None,
     chunk_cat_confs: list[float] | None = None,
     score_scale_extra: list[float] | None = None,
+    must_include: list[int] | None = None,
 ) -> tuple[SubjectiveSuggestion, list[dict]] | None:
     """分层评审：证据地图定位 K 个不相交证据簇，逐簇深评后聚合。
 
@@ -681,6 +687,7 @@ def suggest_score_hierarchical(
     聚合规则：有原文子项时按"子项跨簇平均"；无子项时按簇相关性加权平均；
     跨簇分差 ≥2 时标"证据分散"疑问。
     chunk_cats：证据簇种子打分的类内加成（软过滤口径，不硬排除）。
+    must_include：强制进簇块下标（R1-2 窗口页，2026-11-03）。
     """
     from app.engine.selection import build_evidence_map, split_text_chunks
 
@@ -688,7 +695,8 @@ def suggest_score_hierarchical(
     max_score = Decimal(str(criterion.get("max_score") or 0))
     chunks = split_text_chunks(bid_text)
     emap = build_evidence_map(
-        chunks, criterion, chunk_cats=chunk_cats, score_scale_extra=score_scale_extra
+        chunks, criterion, chunk_cats=chunk_cats, score_scale_extra=score_scale_extra,
+        must_include=must_include,
     )
     if emap is None:
         return None
