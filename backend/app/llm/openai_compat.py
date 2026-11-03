@@ -72,7 +72,12 @@ class OpenAICompatProvider:
         # 可能是不同端点/不同模型服务，只用 host 会把两者混成同一缓存键。
         self.base_url = url
         self.host = (urlparse(url).hostname or "").lower()
-        self._client = OpenAI(api_key=key, base_url=url, timeout=timeout or config.llm_timeout_s())
+        self._client = OpenAI(
+            api_key=key,
+            base_url=url,
+            timeout=timeout or config.llm_timeout_s(),
+            max_retries=config.llm_sdk_max_retries(),
+        )
 
     @staticmethod
     def _extra_body() -> dict:

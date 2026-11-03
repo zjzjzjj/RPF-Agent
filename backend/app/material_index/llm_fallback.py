@@ -78,27 +78,60 @@ def fill_unknown(
     unknown = unknown[:max_pages]
     llm_errors: list[str] = []
 
-    for start in range(0, len(unknown), _BATCH_PAGES):
-        batch = unknown[start : start + _BATCH_PAGES]
+    def _classify_batch(args):  # noqa: ANN001
+        batch_no, batch = args
         user = _build_prompt(batch, text_by_page)
         try:
             out, _res = gateway.chat_json(
                 _SYSTEM, user, ClassifyBatchOut,
                 data_class="synthetic", prompt_version=PROMPT_VERSION,
             )
+            return batch_no, batch, out.items, None, None
         except LLMError as exc:
-            llm_errors.append(str(exc)[:200])
-            log.warning("分类 LLM 兜底失败（文档 %s）：%s", document_id, exc)
+            return batch_no, batch, None, "llm_failed", exc
+        except Exception as exc:  # noqa: BLE001 —— 配置类 AppError 等
+            return batch_no, batch, None, "llm_unavailable", exc
+
+    batches = [
+        (batch_no, unknown[start : start + _BATCH_PAGES])
+        for batch_no, start in enumerate(range(0, len(unknown), _BATCH_PAGES), start=1)
+    ]
+    # 两个 job worker 同时跑分类时，各自最多占一半网关并发；Gateway 的信号量
+    # 仍是进程级总闸门。worker 只返回结果，TagRow 统一按批序在主线程回写，保持
+    # 旧串行结果和持久化顺序不变。
+    workers = min(
+        len(batches),
+        max(1, config.llm_max_concurrency() // max(1, config.job_workers())),
+    )
+    if workers <= 1:
+        batch_results = [_classify_batch(item) for item in batches]
+    else:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            batch_results = list(pool.map(_classify_batch, batches))
+
+    for _batch_no, batch, items, error_kind, error in batch_results:
+        if error_kind == "llm_failed":
+            assert isinstance(error, LLMError)
+            llm_errors.append(str(error)[:200])
+            log.warning("分类 LLM 兜底失败（文档 %s）：%s", document_id, error)
             for r in batch:
                 r.basis = (r.basis or "") + " | llm_failed"
             continue
-        except Exception:  # noqa: BLE001 —— 配置类 AppError 等
-            log.warning("分类 LLM 兜底不可用（文档 %s）", document_id, exc_info=True)
+        if error_kind == "llm_unavailable":
+            log.warning(
+                "分类 LLM 兜底不可用（文档 %s）",
+                document_id,
+                exc_info=(type(error), error, error.__traceback__)
+                if isinstance(error, BaseException)
+                else False,
+            )
             for r in batch:
                 r.basis = (r.basis or "") + " | llm_unavailable"
             continue
 
-        by_no = {it.page_no: it for it in out.items}
+        by_no = {it.page_no: it for it in items or []}
         for r in batch:
             it = by_no.get(r.page_no)
             if it is None:

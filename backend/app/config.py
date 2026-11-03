@@ -283,6 +283,15 @@ def llm_transient_attempts() -> int:
     return max(1, int(os.environ.get("BID_EVAL_LLM_TRANSIENT_ATTEMPTS", 4)))
 
 
+def llm_sdk_max_retries() -> int:
+    """OpenAI SDK 内置重试次数，默认关闭。
+
+    provider 层已经统一处理 timeout/限流/5xx 重试；再叠加 SDK 默认的 2 次
+    隐藏重试会把一次调用放大成多层退避，且难以从日志判断真实请求数。
+    """
+    return max(0, int(os.environ.get("BID_EVAL_LLM_SDK_MAX_RETRIES", 0)))
+
+
 def review_clusters() -> int:
     """分层评审的证据簇数 K（默认 3）：每（投标人×评分项）取 K 个不相交证据簇
     分别深评后聚合。设 1 退化为单次评审。"""

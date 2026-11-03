@@ -109,7 +109,38 @@ def test_empty_content_with_stop_is_not_an_error(monkeypatch) -> None:  # noqa: 
     assert out.text == ""
 
 
-def test_transient_503_retried_configured_times(monkeypatch) -> None:  # noqa: ANN001
+def test_sdk_max_retries_is_explicitly_configurable(monkeypatch) -> None:  # noqa: ANN001
+    from app.llm.openai_compat import OpenAICompatProvider
+
+    monkeypatch.setenv("BID_EVAL_LLM_PROVIDER", "siliconflow")
+    monkeypatch.setenv("BID_EVAL_LLM_BASE_URL", "https://api.siliconflow.cn/v1")
+    monkeypatch.setenv("BID_EVAL_LLM_API_KEY", "test-key")
+    monkeypatch.delenv("BID_EVAL_LLM_SDK_MAX_RETRIES", raising=False)
+
+    import openai
+
+    captured: list[dict] = []
+
+    class _FakeOpenAI:
+        def __init__(self, **kwargs):  # noqa: ANN003
+            captured.append(kwargs)
+
+    monkeypatch.setattr(openai, "OpenAI", _FakeOpenAI)
+    OpenAICompatProvider()
+    assert captured[-1]["max_retries"] == 0
+
+    monkeypatch.setenv("BID_EVAL_LLM_SDK_MAX_RETRIES", "1")
+    OpenAICompatProvider()
+    assert captured[-1]["max_retries"] == 1
+
+
+def test_transient_retry_setting_still_controls_provider_attempts(monkeypatch) -> None:  # noqa: ANN001
+    from app import config
+
+    monkeypatch.delenv("BID_EVAL_LLM_SDK_MAX_RETRIES", raising=False)
+    assert config.llm_sdk_max_retries() == 0
+    monkeypatch.setenv("BID_EVAL_LLM_SDK_MAX_RETRIES", "2")
+    assert config.llm_sdk_max_retries() == 2
     """云端 Flash 模型高峰期 503 频发：按配置次数重试，而不是只重试一次。"""
     import time as _time
 

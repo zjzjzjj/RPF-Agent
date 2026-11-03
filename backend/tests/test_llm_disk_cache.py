@@ -42,6 +42,21 @@ class _FakeProvider:
         return LLMResult(text=self.text, provider=self.name, model=self.model)
 
 
+class _SequenceProvider(_FakeProvider):
+    def __init__(self, texts: list[str]) -> None:
+        super().__init__(texts[0] if texts else "")
+        self.texts = texts
+        self.users: list[str] = []
+
+    def complete(self, system, user, *, temperature=0.0, max_tokens=None):  # noqa: ANN001
+        self.users.append(user)
+        index = min(self.calls, len(self.texts) - 1)
+        self.text = self.texts[index]
+        return super().complete(
+            system, user, temperature=temperature, max_tokens=max_tokens
+        )
+
+
 @pytest.fixture()
 def disk_env(tmp_path, monkeypatch):  # noqa: ANN001
     """隔离环境：临时 data 目录 + 显式开启磁盘缓存 + 清缓存统计/预算计数。"""
@@ -78,6 +93,38 @@ def test_disk_cache_hit_across_gateway_instances(disk_env) -> None:  # noqa: ANN
     assert fake.calls == 1, "第二次（新实例）应命中磁盘，provider 零调用"
     assert res2.cached is True and out2.a == "hello"
     assert gw._CACHE_STATS["disk"] == 1 and gw._CACHE_STATS["mem"] == 0
+
+
+def test_contract_retry_changes_only_retry_user_and_repopulates_original_key(disk_env) -> None:  # noqa: ANN001
+    """契约失败后的请求可修复，但原始请求仍复用规范缓存键。"""
+    fake = _SequenceProvider(['{"wrong": "x"}', '{"a": "fixed"}'])
+    g = Gateway(provider=fake)
+
+    out, res = g.chat_json("sys", "user", _Out, prompt_version="v1")
+    assert out.a == "fixed" and res.cached is False
+    assert fake.calls == 2
+    assert fake.users[0] == "user"
+    assert fake.users[1] != "user"
+    assert "顶层必须包含这些字段：a" in fake.users[1]
+
+    out2, res2 = g.chat_json("sys", "user", _Out, prompt_version="v1")
+    assert out2.a == "fixed" and res2.cached is True
+    assert fake.calls == 2, "修复成功后原始请求键应直接命中缓存"
+
+    out3, res3 = Gateway(provider=fake).chat_json("sys", "user", _Out, prompt_version="v1")
+    assert out3.a == "fixed" and res3.cached is True
+    assert fake.calls == 2, "新 Gateway 也应命中原始磁盘键"
+
+
+def test_contract_retry_failed_attempt_keys_not_cached(disk_env) -> None:  # noqa: ANN001
+    """每次契约重试使用独立键，三次失败不留下坏缓存。"""
+    fake = _SequenceProvider(['{"wrong": "x"}'] * 3)
+    with pytest.raises(LLMError, match="不符合契约"):
+        Gateway(provider=fake).chat_json("sys", "user", _Out, prompt_version="v1")
+    assert fake.calls == 3
+    assert len(fake.users) == 3
+    assert len(set(fake.users)) == 3
+    assert not list((disk_env / "llm_cache").glob("*.json"))
 
 
 def test_memory_cache_hit_within_instance(disk_env) -> None:  # noqa: ANN001

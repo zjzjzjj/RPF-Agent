@@ -5,6 +5,10 @@ LLM 兜底契约（FakeGateway）与失败降级。
 """
 from __future__ import annotations
 
+import re
+import threading
+import time
+
 from app.material_index import llm_fallback, rules
 from app.material_index.catalog import material_category_for
 
@@ -156,7 +160,61 @@ def test_llm_fallback_fills_unknown(monkeypatch) -> None:  # noqa: ANN001
     assert config.material_index_enabled()  # 顺带确认开关默认开
 
 
-def test_llm_fallback_failure_degrades(monkeypatch) -> None:  # noqa: ANN001
+def test_llm_fallback_batches_parallel_but_apply_in_page_order(monkeypatch) -> None:  # noqa: ANN001
+    from app import config
+    from app.llm import gateway as gw
+
+    monkeypatch.setenv("BID_EVAL_LLM_PROVIDER", "openai")
+    monkeypatch.setenv("BID_EVAL_LLM_CONCURRENCY", "2")
+    monkeypatch.setenv("BID_EVAL_JOB_WORKERS", "1")
+
+    class _ParallelGateway:
+        def __init__(self) -> None:
+            self.calls = 0
+            self.active = 0
+            self.peak = 0
+            self._lock = threading.Lock()
+
+        def chat_json(self, _system, user, out_model, **_kw):  # noqa: ANN001
+            page_nos = [int(x) for x in re.findall(r"page_no=(\d+)", user)]
+            with self._lock:
+                self.calls += 1
+                self.active += 1
+                self.peak = max(self.peak, self.active)
+            try:
+                time.sleep(0.03)
+                items = [
+                    {
+                        "page_no": page_no,
+                        "category": "commercial" if page_no % 2 else "technical",
+                        "tags": [f"p{page_no}"],
+                        "confidence": 0.8,
+                        "reason": f"页{page_no}",
+                    }
+                    for page_no in page_nos
+                ]
+                return out_model.model_validate({"items": items}), _FakeResult()
+            finally:
+                with self._lock:
+                    self.active -= 1
+
+    fake = _ParallelGateway()
+    monkeypatch.setattr(gw, "get_gateway", lambda: fake)
+    pages = _pages(*[(i, "完全无关的页面内容。", "text") for i in range(1, 21)])
+    rows = rules.classify_pages(pages)
+    llm_fallback.fill_unknown(1, rows, {i: "完全无关的页面内容。" for i in range(1, 21)})
+
+    page_rows = [r for r in rows if r.seg_kind == "page"]
+    assert fake.calls == 2
+    assert fake.peak == 2
+    assert [r.page_no for r in page_rows] == list(range(1, 21))
+    assert all(r.method == "llm" for r in page_rows)
+    assert [r.category for r in page_rows] == [
+        "commercial" if i % 2 else "technical" for i in range(1, 21)
+    ]
+    assert config.llm_max_concurrency() == 2
+
+
     from app.llm import gateway as gw
     from app.llm.base import LLMError
 

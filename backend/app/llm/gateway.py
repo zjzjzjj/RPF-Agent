@@ -491,6 +491,12 @@ class Gateway:
             base_url=getattr(self.provider, "base_url", ""),
         )
 
+    def _store_memory(self, key: str, result: LLMResult) -> None:
+        with self._cache_lock:
+            if len(self._cache) >= _CACHE_LIMIT:
+                self._cache.pop(next(iter(self._cache)))
+            self._cache[key] = result
+
     def chat(
         self,
         system: str,
@@ -524,10 +530,7 @@ class Gateway:
                 latency_ms=disk.get("latency_ms"),
                 cached=True,
             )
-            with self._cache_lock:
-                if len(self._cache) >= _CACHE_LIMIT:
-                    self._cache.pop(next(iter(self._cache)))
-                self._cache[key] = result
+            self._store_memory(key, result)
             _CACHE_STATS["disk"] += 1
             return result
 
@@ -541,11 +544,24 @@ class Gateway:
             "llm call provider=%s model=%s tokens_in=%s tokens_out=%s latency_ms=%s",
             result.provider, result.model, result.tokens_in, result.tokens_out, result.latency_ms,
         )
-        with self._cache_lock:
-            if len(self._cache) >= _CACHE_LIMIT:
-                self._cache.pop(next(iter(self._cache)))
-            self._cache[key] = result
+        self._store_memory(key, result)
         return result
+
+    @staticmethod
+    def _repair_user(user: str, out_model: type[T], attempt: int) -> str:
+        """为契约失败的后续尝试追加结构化修复要求。
+
+        首次请求必须保持原样；只在模型已经返回不可用结构后改变重试请求，
+        让固定 temperature/seed 不会把同一份坏 JSON 原样重复三次。
+        """
+        fields = ", ".join(str(name) for name in out_model.model_fields)
+        return (
+            f"{user}\n\n"
+            f"[JSON契约修复：第 {attempt} 次重试]\n"
+            "上一轮输出未通过 JSON 契约校验。请只输出一个 JSON 对象，禁止输出解释、"
+            "Markdown 代码块或顶层数组；顶层必须包含这些字段："
+            f"{fields}。字段名必须完全一致，缺少字段请按约定输出空数组或空值。"
+        )
 
     def chat_json(
         self,
@@ -563,17 +579,22 @@ class Gateway:
         JSON 解析/契约失败重试 2 次（采样偶发缺逗号/截断，换一次生成大概率就好；
         余额/配额类错误不重试——上层按 fail-fast 处理）。
         model_validate 成功才落磁盘缓存（阶段 1，2026-10-30）：坏文本绝不上盘；
-        失败重试前驱逐该 key 的内存/磁盘缓存——chat() 刚把这份坏文本缓存了进去，
+        失败重试前驱逐当前 attempt 的 key——chat() 刚把这份坏文本缓存了进去，
         不驱逐的话下一轮重试会直接命中它、永远不再调 provider（自缓存毒化）。
         """
         prompt_version = prompt_version or config.llm_prompt_version()
         key = self._key_for(system, user, prompt_version, temperature, max_tokens)
         last_exc: LLMError | None = None
         result = None
+        repair = False
         for attempt in range(3):
+            attempt_user = self._repair_user(user, out_model, attempt) if repair else user
+            attempt_key = self._key_for(
+                system, attempt_user, prompt_version, temperature, max_tokens
+            )
             result = self.chat(
                 system,
-                user,
+                attempt_user,
                 data_class=data_class,
                 prompt_version=prompt_version,
                 temperature=temperature,
@@ -591,14 +612,21 @@ class Gateway:
                 ]
                 last_exc = LLMError(f"模型输出不符合契约：{brief}")
                 last_exc.__cause__ = exc
-                self._evict_failed(key)
+                repair = True
+                self._evict_failed(attempt_key)
             except LLMError as exc:
                 msg = str(exc)
                 if any(k in msg for k in ("402", "insufficient", "quota", "30001", "arrears")):
                     raise  # 余额/配额：fail-fast，不重试
                 last_exc = exc
-                self._evict_failed(key)
+                # provider 的瞬态错误只重发原请求；解析/契约错误才切换到修复提示。
+                repair = repair or not exc.transient
+                self._evict_failed(attempt_key)
             else:
+                if attempt_key != key:
+                    # 修复请求成功后，把已校验结果回填到原始请求键；后续原始请求
+                    # 仍可命中规范缓存，而不会依赖带修复后缀的临时键。
+                    self._store_memory(key, result)
                 _disk_put(key, result)  # 校验通过才上盘（阶段 1，2026-10-30）
                 return validated, result
             if attempt < 2:
