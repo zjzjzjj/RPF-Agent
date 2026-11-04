@@ -177,8 +177,9 @@ def infer_check(c: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
 _RE_DEV_PER_MISSING = re.compile(r"每缺失一条扣\s*(\d+(?:\.\d+)?)\s*分")
 _RE_DEV_PER_NEG = re.compile(r"每负偏离一条扣\s*(\d+(?:\.\d+)?)\s*分")
 # 响应时间档："2 小时内…得 3 分"（≥2 档才认）
+# 断行容错（2026-11-04）：OCR 断行常见"小时\n内"，\s* 覆盖不放宽档数守卫
 _RE_HOURS_TIER = re.compile(
-    r"(\d+(?:\.\d+)?)\s*(?:个)?\s*小时(?:内|以内)[^。；]{0,20}?得\s*(\d+(?:\.\d+)?)\s*分"
+    r"(\d+(?:\.\d+)?)\s*(?:个)?\s*小时\s*(?:内|以内)[^。；]{0,20}?得\s*(\d+(?:\.\d+)?)\s*分"
 )
 # 线性步进："每额外增加 12 个月质保期加 1 分" / "每增加 12 个月…得 1 分"
 _RE_LINEAR_STEP = re.compile(
@@ -190,9 +191,9 @@ _RE_LINEAR_BASE = re.compile(
     r"|质保期?(?:要求)?(?:不少于|不低于|达到)\s*(\d+(?:\.\d+)?)\s*(?:年|个月|月)"
 )
 _RE_CAP_SCORE = re.compile(r"最高(?:不超过|得)?\s*(\d+(?:\.\d+)?)\s*分")
-# 属性分档（年限）："具有 5 年及以上工作经验得 3 分"（≥2 档才认）
+# 属性分档（年限）："具有 5 年及以上工作经验得 3 分"（≥2 档才认；断行容错同上）
 _RE_YEARS_TIER = re.compile(
-    r"(\d+)\s*年(?:及)?以上[^。；]{0,20}?得\s*(\d+(?:\.\d+)?)\s*分"
+    r"(\d+)\s*年\s*(?:及\s*)?以上[^。；]{0,20}?得\s*(\d+(?:\.\d+)?)\s*分"
 )
 # 属性分档（职称）："高级工程师得 1 分" / "中级工程师得 0.5 分"（≥2 档才认）
 _RE_TITLE_TIER = re.compile(
@@ -288,28 +289,33 @@ def infer_engine_params(text: str) -> dict:
 _RE_GET_SCORE = re.compile(r"得\s*(\d+(?:\.\d+)?)\s*分")
 # 响应时间档（宽松版：不强制「内/以内」——"5小时得3分"类省略式同样明示）
 _RE_HOURS_TIER_LOOSE = re.compile(
-    r"(\d+(?:\.\d+)?)\s*(?:个)?\s*小时(?:内|以内)?[^。；，,]{0,16}?得\s*(\d+(?:\.\d+)?)\s*分"
+    r"(\d+(?:\.\d+)?)\s*(?:个)?\s*小时\s*(?:内|以内)?[^。；，,]{0,16}?得\s*(\d+(?:\.\d+)?)\s*分"
 )
-# 证书等级档："四级得1分，三级及以上得2分"（≥2 档才认）
+# 证书等级档："四级得1分，三级及以上得2分"（≥2 档才认；"三级及\n以上"断行容错）
 _RE_CERT_LEVEL_TIER = re.compile(
-    r"([一二三四五六七八九十\d]+级(?:及以上)?)\s*[^。；，,]{0,10}?得\s*(\d+(?:\.\d+)?)\s*分"
+    r"([一二三四五六七八九十\d]+级(?:及\s*以上)?)\s*[^。；，,]{0,10}?得\s*(\d+(?:\.\d+)?)\s*分"
 )
 # 中文等级序（"及以上"=语言学语义，非项目拟合）
 _CERT_LEVEL_ORDER = {"一级": 1, "二级": 2, "三级": 3, "四级": 4, "五级": 5,
                      "六级": 6, "七级": 7, "八级": 8, "九级": 9, "十级": 10}
 # 分档计数（带量词后名词捕获，判计数源用）："2个及以上…经验，得1分" / "提供两项得1分"
+# 得(得)* 容忍双得断行（与 objective._RE_COUNT_TIER 同口径）
 _RE_COUNT_TIER_NOUN = re.compile(
     r"(一|二|两|三|四|五|六|七|八|九|十|\d+)\s*(?:项|个|本|张|类)"
-    r"([^得。；]{0,14})得+\s*(\d+(?:\.\d+)?)\s*分"
+    r"([^得。；]{0,14})得(?:\s*得)*\s*(\d+(?:\.\d+)?)\s*分"
 )
 _EXP_KW = re.compile(r"经验|业绩|案例")
 
 
 def _cert_level_expand(token: str) -> list[str]:
-    """「三级及以上」→ ["一级","二级","三级"]（优于/等于该级的显式列表）。"""
-    m = re.fullmatch(r"([一二三四五六七八九十\d]+级)(及以上)?", token.strip())
+    """「三级及以上」→ ["一级","二级","三级"]（优于/等于该级的显式列表）。
+
+    断行容错（2026-11-04）：OCR"三级\\n及以上"先去空白再匹配，防止降级成单档。
+    """
+    t = re.sub(r"\s+", "", token or "")
+    m = re.fullmatch(r"([一二三四五六七八九十\d]+级)(及以上)?", t)
     if not m:
-        return [token.strip()] if token.strip() else []
+        return [t] if t else []
     base = m.group(1)
     if not m.group(2):
         return [base]
@@ -389,8 +395,10 @@ def infer_objective_route(criterion: dict[str, Any]) -> tuple[str, dict[str, Any
                 continue
         if n not in cnt or Decimal(s) > Decimal(cnt[n]):
             cnt[n] = s
-        if _EXP_KW.search(noun or ""):
-            cnt_noun = noun
+        # 捕获名词断行归一（"经\n验"→"经验"），防 _EXP_KW 漏判计数源
+        noun_norm = re.sub(r"\s+", "", noun or "")
+        if _EXP_KW.search(noun_norm):
+            cnt_noun = noun_norm
     if len(cnt) >= 2 and _accept(set(cnt.values())):
         tiers = [{"min_count": k, "score": v} for k, v in sorted(cnt.items())]
         if _EXP_KW.search(cnt_noun):

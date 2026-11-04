@@ -281,3 +281,68 @@ def test_infer_objective_route_guard_prose_none():
         "source_quote": "主观分 0-10 分",
     }
     assert infer_objective_route(c) is None
+
+
+# --- A3 档表断行容错（2026-11-04）：OCR 断行不丢档，不放宽守卫 ----------------
+
+def test_route_linebreak_variants_equal():
+    """断行变体与无断行解析结果逐字段相等（小时档/证书等级档/计数档）。"""
+    from app.rules.check_infer import infer_objective_route
+
+    pairs = [
+        # 响应时间档："小时\n内"断行
+        ({"name": "服务承诺",
+          "description": "承诺4 小时内到达现场得4 分,承诺5 小时内到达现场得3 分,"
+                         "承诺6 小时内到达现场得2 分,承诺7 小时内到达现场得1 分。",
+          "source_quote": "客观分 0-4 分"},
+         {"name": "服务承诺",
+          "description": "承诺4 小时\n内到达现场得4 分,承诺5 小时\n内到达现场得3 分,"
+                         "承诺6 小时\n内到达现场得2 分,承诺7 小时\n内到达现场得1 分。",
+          "source_quote": "客观分 0-4 分"}),
+        # 证书等级档："三级\n及以上"断行（旧代码降级成单档 → ≥2 档守卫不通过）
+        ({"name": "ITSS证书",
+          "description": "具有ITSS 证书，四级得1 分，三级及以上得2 分。",
+          "source_quote": "客观分 0-2 分"},
+         {"name": "ITSS证书",
+          "description": "具有ITSS 证书，四级得1 分，三级及\n以上得2 分。",
+          "source_quote": "客观分 0-2 分"}),
+        # 计数档："两项\n得1分"断行 + "得\n得"双得断行
+        ({"name": "云平台证书",
+          "description": "提供两项得1 分，提供四项得2 分，未提供不得分。",
+          "source_quote": "客观分 0-2 分"},
+         {"name": "云平台证书",
+          "description": "提供两项\n得1 分，提供四项得\n得2 分，未提供不得分。",
+          "source_quote": "客观分 0-2 分"}),
+    ]
+    for plain, broken in pairs:
+        r_plain = infer_objective_route(plain)
+        r_broken = infer_objective_route(broken)
+        assert r_plain is not None, plain["name"]
+        assert r_broken is not None, f"断行丢档：{broken['name']}"
+        assert r_plain[0] == r_broken[0]
+        assert r_plain[1] == r_broken[1], f"{plain['name']}：{r_plain[1]} != {r_broken[1]}"
+
+
+def test_route_linebreak_years_tier():
+    """年限档断行：「5 年\n及以上工作经验得 3 分」不丢档。"""
+    from app.rules.check_infer import infer_engine_params
+
+    text_plain = "具有5 年及以上工作经验得3 分，具有3 年及以上工作经验得1 分。"
+    text_broken = "具有5 年\n及以上工作经验得3 分，具有3 年\n及以上工作经验得1 分。"
+    p_plain = infer_engine_params(text_plain)
+    p_broken = infer_engine_params(text_broken)
+    assert p_plain.get("engine") == "attribute_tier", p_plain
+    assert p_plain == p_broken
+
+
+def test_route_linebreak_negative_still_none():
+    """断行容错不放宽守卫：单档断行仍不路由（≥2 档门槛不变）。"""
+    from app.rules.check_infer import infer_objective_route
+
+    c = {
+        "name": "服务承诺",
+        "description": "承诺4 小时\n内到达现场得4 分。",
+        "source_quote": "",
+    }
+    assert infer_objective_route(c) is None
+
