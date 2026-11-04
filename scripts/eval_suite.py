@@ -129,16 +129,99 @@ def _stage_timing(cur, run_id: int) -> list[tuple[str, str, str]]:
     return [(st, str(a), str(b)) for st, a, b, _n in rows]
 
 
+def _recompute_count_check(cur, run_id: int) -> tuple[int, int, list[str]]:
+    """count 可复算（A4）：从 ai_raw_json.verified_cases 重放 score_count 对照 final。
+
+    输入=评分实际用的冻结包 params（run 的 rule_packages.snapshot_json.criteria
+    同 code 条目）+ 审计落库的 verified_cases（已含 overlay 后三态键）。复用
+    score_count 引擎本身——重放差异即引擎/审计不同步，逐格 |Δ|>0.01 记 bad。
+    空案例/缺参数的格记 skip（不猜输入）。返回 (ok, bad, errs)。
+    """
+    from app.engine.facts import BidFacts
+    from app.engine.objective import score_count
+
+    pkg_row = cur.execute(
+        """SELECT p.snapshot_json FROM rule_packages p
+           JOIN evaluation_runs r ON r.package_id=p.id WHERE r.id=?""",
+        (run_id,),
+    ).fetchone()
+    snap = {}
+    if pkg_row:
+        try:
+            snap_data = json.loads(pkg_row[0]) if isinstance(pkg_row[0], str) else (pkg_row[0] or {})
+            snap = {c.get("code"): c for c in snap_data.get("criteria", [])}
+        except Exception:  # noqa: BLE001
+            snap = {}
+    ok = bad = 0
+    errs: list[str] = []
+    rows = cur.execute(
+        """SELECT s.id, s.bidder_id, c.code, c.name, s.final_score, s.ai_raw_json
+           FROM score_records s JOIN criteria c ON c.id=s.criterion_id
+           WHERE s.run_id=? AND c.score_type='count' AND s.ai_raw_json IS NOT NULL""",
+        (run_id,),
+    ).fetchall()
+    for sid, _bid, code, name, final, raw in rows:
+        try:
+            data = json.loads(raw) if isinstance(raw, str) else (raw or {})
+        except Exception:  # noqa: BLE001
+            continue
+        cases = data.get("verified_cases")
+        if not cases or final is None:
+            continue  # 无案例明细/未定分：不猜输入，skip
+        crit = snap.get(code)
+        if not crit or not crit.get("params"):
+            continue  # 冻结包无该条目参数：skip
+        try:
+            params = dict(crit.get("params") or {})
+            meta = data.get("meta") or {}
+            # required_artifacts 装配与 scoring_service._count_cell_impl 同款：
+            # 材料闸门（_required_flags）读它，口径不齐会重放漂移。
+            from app.engine.objective import parse_required_artifacts
+
+            requirement_text = (crit.get("required_evidence") or "").strip() or (
+                crit.get("source_quote") or ""
+            )
+            if not requirement_text.strip():
+                continue  # 无材料要求原文：不猜输入，skip
+            artifacts_list = parse_required_artifacts(requirement_text) or parse_required_artifacts(
+                crit.get("source_quote") or ""
+            )
+            artifacts = "、".join(artifacts_list) if artifacts_list else requirement_text
+            replay_crit = {
+                **crit,
+                "required_artifacts": artifacts,
+                "required_artifacts_raw": requirement_text,
+                "verified_cases": cases,
+                # 批失败注入同 score_count 语义（surviving 照计+疑问）
+                "case_batches_failed": meta.get("batches_failed") or 0,
+                "case_batches_total": meta.get("batches_total") or 0,
+            }
+            res = score_count(replay_crit, params, BidFacts(text=""))
+            recomputed = res.score
+            if abs(recomputed - Decimal(str(final))) <= Decimal("0.01"):
+                ok += 1
+            else:
+                bad += 1
+                errs.append(f"score#{sid} {name} final={final} 重放={recomputed}")
+        except Exception as exc:  # noqa: BLE001
+            bad += 1
+            errs.append(f"score#{sid} {name} 重放异常: {exc}")
+    return ok, bad, errs
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ground-truth", required=True, help="ground_truth 目录下的名字（test1/test2）")
+    ap.add_argument("--ground-truth", default="", help="ground_truth 目录下的名字（test1/test2/run77）")
     ap.add_argument("--run", type=int, required=True)
-    ap.add_argument("--project", required=True)
+    ap.add_argument("--project", default="")
     ap.add_argument("--db", default="")
     ap.add_argument("--validate", action="store_true", help="按门槛断言（非 0 退出）")
+    ap.add_argument("--recompute-count", action="store_true",
+                    help="count 可复算：从审计案例重放 score_count 对照 final（可独立运行）")
     args = ap.parse_args()
+    if not args.recompute_count and not (args.ground_truth and args.project):
+        ap.error("--ground-truth 与 --project 必填（除非仅运行 --recompute-count）")
 
-    gt = json.loads((GT_DIR / f"{args.ground_truth}.json").read_text(encoding="utf-8"))
     import sqlite3
 
     db = Path(args.db) if args.db else Path(__file__).resolve().parents[1] / "data" / "bid_eval.db"
@@ -147,6 +230,17 @@ def main() -> int:
     os.environ["BID_EVAL_DB_PATH"] = db.as_posix()
     con = sqlite3.connect(f"file:{db.as_posix()}?mode=ro", uri=True)
     cur = con.cursor()
+
+    # count 可复算（A4）：独立运行模式——不依赖金标准，直接出 diff 表
+    if args.recompute_count and not args.ground_truth:
+        ok, bad, errs = _recompute_count_check(cur, args.run)
+        print(f"count 可复算: {ok} 通过 / {bad} 不通过")
+        for e in errs:
+            print("  ", e)
+        con.close()
+        return 1 if bad else 0
+
+    gt = json.loads((GT_DIR / f"{args.ground_truth}.json").read_text(encoding="utf-8"))
 
     from app.services.ranking_service import compute_ranking
 
@@ -247,9 +341,15 @@ def main() -> int:
 
     # 可复算 + 阶段耗时
     ok, bad, errs = _recomputability_check(cur, args.run)
-    print(f"\n可复算校验（I1）: {ok} 通过 / {bad} 不通过")
+    print(f"\n可复算校验（I1 主观聚合）: {ok} 通过 / {bad} 不通过")
     for e in errs[:5]:
         print("  ", e)
+    cok, cbad, cerrs = _recompute_count_check(cur, args.run)
+    print(f"可复算校验（count 重放）: {cok} 通过 / {cbad} 不通过")
+    for e in cerrs[:5]:
+        print("  ", e)
+    bad += cbad
+    errs += cerrs
     print("\n阶段落库时段（created_at 首/末）:")
     for st, a, b in _stage_timing(cur, args.run):
         print(f"  {st:<10} {a} → {b}")
