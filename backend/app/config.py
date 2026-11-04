@@ -663,6 +663,20 @@ def math_skip_llm_enabled() -> bool:
     )
 
 
+def veto_llm_enabled() -> bool:
+    """veto 桶 LLM 深评开关（2026-11-04 资格审查弱化）。默认**关**（0=弱化）。
+
+    关：human_only 逐格/组批深评与 unknown/fail+need_human 的 LLM refine 全不跑，
+    按 Phase0 确定性预检结果 verdict_for 直出（unknown/human_only → need_human
+    转人工）；确定性硬 fail 仍出 recommend_reject（benchmark_ineligible 基准价
+    剔除通道完整保留）。只作用于 score_type=veto 桶：match（_match_cell）、
+    count/subjective、价格分不受影响。置 1（BID_EVAL_VETO_LLM=1）回旧行为。
+    """
+    return os.environ.get("BID_EVAL_VETO_LLM", "0").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
 def local_endpoint_hosts() -> list[str]:
     """数据分级：confidential 数据允许出网的端点主机白名单（默认仅本地）。"""
     raw = os.environ.get("BID_EVAL_LOCAL_LLM_HOSTS", "localhost,127.0.0.1,::1")

@@ -2489,7 +2489,16 @@ def _resolve_veto_results(
                 ctx.advance(n=n, message=fmt.format(done=done[0], total=total))
 
     results: dict[int, dict] = {}
-    llm_ok = config.auto_mode() and gateway is not None
+    # A.2 资格审查弱化（2026-11-04）：BID_EVAL_VETO_LLM 默认关——human_only/single
+    # 两路 LLM 深评全跳过，按 Phase0 确定性结果直出。确定性硬 fail 照出
+    # recommend_reject（基准价剔除通道保留）；match 桶（_match_cell）不经此闸。
+    llm_ok = config.veto_llm_enabled() and config.auto_mode() and gateway is not None
+    _weakened = (
+        not config.veto_llm_enabled()
+        and config.auto_mode()
+        and gateway is not None
+    )
+    _weaken_note = "（资格审查 LLM 深评已按配置停用（BID_EVAL_VETO_LLM=0），转人工复核）"
 
     # ---- Phase0：全格确定性预检（无 LLM） ----
     none_idxs: list[int] = []
@@ -2511,10 +2520,15 @@ def _resolve_veto_results(
             none_idxs.append(i)
             continue
         if not llm_ok or kind == "none":
-            # 终态（pass/硬 fail，或 math 冲突跳 LLM）/人工模式无网关：直接判定映射
+            # 终态（pass/硬 fail，或 math 冲突跳 LLM）/人工模式无网关/弱化态：直接判定映射。
+            # 弱化溯源：只给"本来会走 LLM 深评"的格（kind != none）附停用说明；
+            # 人工模式/无网关路径消息逐字不变。
+            msg = result.message
+            if _weakened and kind != "none":
+                msg = f"{msg or ''}{_weaken_note}"
             results[i] = {
                 "verdict": verdict_for(c["code"], c["name"], result),
-                "message": result.message,
+                "message": msg,
                 "evidence": result.evidence_quote,
             }
             none_idxs.append(i)

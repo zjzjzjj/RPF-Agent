@@ -183,6 +183,7 @@ def test_veto_batch_three_human_only_cells(monkeypatch):
     """3 条 human_only 组批：FakeGateway 一次返回 3 条 judgements → 逐格
     verdict/message 与逐格预期一致；一次调用覆盖 3 格（组批杠杆）。"""
     monkeypatch.setenv("BID_EVAL_AUTO_MODE", "1")
+    monkeypatch.setenv("BID_EVAL_VETO_LLM", "1")  # 本组验旧 LLM 路径语义
     monkeypatch.setenv("BID_EVAL_VETO_HUMAN_ONLY_BATCH", "1")
     from app.engine.facts import extract_bid_facts
     from app.services import scoring_service as ss
@@ -212,6 +213,7 @@ def test_veto_batch_three_human_only_cells(monkeypatch):
 def test_veto_batch_missing_code_degrades_that_cell(monkeypatch):
     """批量输出缺某个 code → 该条按契约降 fail（need_human 疑问），其余照常。"""
     monkeypatch.setenv("BID_EVAL_AUTO_MODE", "1")
+    monkeypatch.setenv("BID_EVAL_VETO_LLM", "1")  # 本组验旧 LLM 路径语义
     monkeypatch.setenv("BID_EVAL_VETO_HUMAN_ONLY_BATCH", "1")
     from app.engine.auto_judge import AutoJudgements, BatchJudgementItem
     from app.engine.facts import extract_bid_facts
@@ -265,6 +267,7 @@ def test_refine_with_llm_batch_illegal_verdict_degrades_that_cell():
 def test_veto_batch_quota_error_raises_through(monkeypatch):
     """402 类 LLMError → fail-fast 穿透批量路径（不降级成假否决/假疑问）。"""
     monkeypatch.setenv("BID_EVAL_AUTO_MODE", "1")
+    monkeypatch.setenv("BID_EVAL_VETO_LLM", "1")  # 本组验旧 LLM 路径语义
     import pytest
 
     from app.engine.facts import extract_bid_facts
@@ -294,6 +297,7 @@ def test_veto_batch_order_stable_across_blocks(monkeypatch):
     2 投标人 × 3 条、批大小 2 → 4 块；先发块人为延迟，强制后发块先完成。
     """
     monkeypatch.setenv("BID_EVAL_AUTO_MODE", "1")
+    monkeypatch.setenv("BID_EVAL_VETO_LLM", "1")  # 本组验旧 LLM 路径语义
     monkeypatch.setenv("BID_EVAL_VETO_BATCH_SIZE", "2")
     monkeypatch.setenv("BID_EVAL_VETO_HUMAN_ONLY_BATCH", "1")
     from app.engine.facts import extract_bid_facts
@@ -325,6 +329,7 @@ def test_veto_batch_order_stable_across_blocks(monkeypatch):
 def test_veto_batch_disabled_matches_single_path(monkeypatch):
     """组批开关关闭 → 与旧单格路径逐字节一致（同一网关逐格 _eval_veto 对照）。"""
     monkeypatch.setenv("BID_EVAL_AUTO_MODE", "1")
+    monkeypatch.setenv("BID_EVAL_VETO_LLM", "1")  # 本组验旧 LLM 路径语义
     monkeypatch.setenv("BID_EVAL_VETO_HUMAN_ONLY_BATCH", "0")
     from decimal import Decimal
 
@@ -453,3 +458,93 @@ def test_registered_capital_variants():
     assert extract_bid_facts(
         "注册资本：人民币2,000万元\n其他注册资本：人民币3,000万元"
     ).registered_capital == Decimal("20000000")
+
+
+# ===========================================================================
+# A.1/A.2 资格审查弱化（2026-11-04）：BID_EVAL_VETO_LLM 默认关
+# ===========================================================================
+def test_veto_llm_disabled_skips_deep_eval(monkeypatch):
+    """弱化态（默认）：human_only/unknown 全跳过 LLM，按 Phase0 确定性结果直出；
+    确定性硬 fail 仍 recommend_reject（基准价剔除通道钉死）；弱化消息带溯源。"""
+    monkeypatch.setenv("BID_EVAL_AUTO_MODE", "1")
+    monkeypatch.delenv("BID_EVAL_VETO_LLM", raising=False)
+    from decimal import Decimal
+
+    from app.engine.facts import extract_bid_facts
+    from app.services import scoring_service as ss
+
+    class RecordingGateway:
+        def __init__(self):
+            self.calls = 0
+
+        def chat_json(self, *a, **k):  # noqa: ANN001
+            self.calls += 1
+            raise AssertionError("弱化态不得调用 LLM")
+
+    facts = extract_bid_facts("投标文件正文。本单位承诺按招标文件执行。注册资本为人民币100万元。")
+    facts.bid_price = Decimal("100")
+    # ① human_only → need_human；② contains_phrase 命中 → pass；
+    # ③ value_in_range 硬 fail（注册资本低于要求）→ recommend_reject（基准价通道）；
+    # ④ math 冲突 → conflict_flagged
+    facts.bid_price_upper = "贰佰元整"
+    facts.bid_price_upper_value = Decimal("200")
+    cells = [
+        (10, _ho("c1", "密封盖章")),
+        (10, {"code": "c2", "name": "承诺书", "check_type": "contains_phrase",
+              "params": {"phrase": "承诺"}, "is_veto": True}),
+        (10, {"code": "c3", "name": "注册资本", "check_type": "value_in_range",
+              "params": {"field": "registered_capital", "min": "50000000"}, "is_veto": True}),
+        (10, {"code": "c4", "name": "报价算术关系", "check_type": "math_relation",
+              "params": {}}),
+    ]
+    gw = RecordingGateway()
+    out = ss._resolve_veto_results(
+        cells,
+        facts_by_bidder={10: facts},
+        text_by_bidder={10: facts.text},
+        scan_hints={10: False},
+        gateway=gw,
+        data_class="synthetic",
+    )
+    assert gw.calls == 0
+    assert out[0]["verdict"] == "need_human"
+    assert "转人工复核" in out[0]["message"], "弱化溯源句"
+    assert out[1]["verdict"] == "pass"
+    assert out[2]["verdict"] == "recommend_reject", "确定性硬 fail 仍出否决建议（基准价通道）"
+    assert out[3]["verdict"] == "conflict_flagged"
+
+
+def test_veto_llm_enabled_keeps_llm_path(monkeypatch):
+    """开关=1 旧路径回归：human_only 格走 LLM，消息前缀逐字不变。"""
+    monkeypatch.setenv("BID_EVAL_AUTO_MODE", "1")
+    monkeypatch.setenv("BID_EVAL_VETO_LLM", "1")
+    monkeypatch.setenv("BID_EVAL_VETO_HUMAN_ONLY_BATCH", "0")
+    from app.engine.auto_judge import AutoJudgement
+    from app.engine.facts import extract_bid_facts
+    from app.services import scoring_service as ss
+
+    class SingleGateway:
+        def __init__(self):
+            self.calls = 0
+
+        def chat_json(self, system, user, model, data_class="synthetic"):  # noqa: ANN001
+            self.calls += 1
+            return AutoJudgement(verdict="fail", reasoning="裁决 c1",
+                                 evidence=[{"quote": "原文摘录 c1"}]), {}
+
+    gw = SingleGateway()
+    facts = extract_bid_facts("投标文件正文。")
+    cells = [(10, _ho("c1", "签字"))]
+    out = ss._resolve_veto_results(
+        cells,
+        facts_by_bidder={10: facts},
+        text_by_bidder={10: facts.text},
+        scan_hints={10: False},
+        gateway=gw,
+        data_class="synthetic",
+    )
+    assert gw.calls == 1
+    assert out[0]["verdict"] == "need_human"
+    assert out[0]["message"].startswith("AI 存疑（不自动否决，转评标委员会认定）")
+    assert "转人工复核" not in out[0]["message"], "旧路径不得带弱化溯源句"
+
