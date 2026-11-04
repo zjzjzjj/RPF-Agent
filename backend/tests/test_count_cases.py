@@ -1619,3 +1619,103 @@ def test_material_count_prompt_cert_proof_contract() -> None:
     assert '"cert_proof":布尔|null' in P
     assert "逐人核验四链" in P
     assert "证书名+人名同现" in P
+
+
+# --- A1 tier 形状守卫 + A2 零分诚实化（2026-11-04 run79 业绩回归） ------------
+
+def test_score_count_amount_tiers_fall_back_to_per_item() -> None:
+    """run79 回归钉死：金额档 tiers（min_amount_yuan 形状）不是计数档——
+    查表无命中强制 0 分曾让 4 家「投标人业绩」4→0；必须回退 per_item 线性。"""
+    from app.engine.objective import score_count
+
+    crit = _perf_crit(
+        per_item="1",
+        max_items="4",
+        params={"field": "performance", "per_item": "1", "max_items": "4",
+                "tiers": [{"min_amount_yuan": "500000", "max_amount_yuan": "1000000",
+                           "per_item": "0.5"},
+                          {"min_amount_yuan": "1000000", "per_item": "1"}],
+                "min_amount_yuan": "1000000"},
+    )
+    # 4 个全链 True 案例（对照 run79 云锦形态：3 全链 + 1 unlinked）
+    cases = [
+        {"name": f"A{i}", "contract": True, "invoice": True, "acceptance": True,
+         "case_source": "table", "sanitized": "ok"} for i in range(3)
+    ] + [{"name": "B", "contract": None, "invoice": None, "acceptance": None,
+          "case_source": "table", "sanitized": "ok"}]
+    res = score_count({**crit, "verified_cases": cases}, crit["params"], BidFacts(text=""))
+    assert res.score == Decimal("4"), f"金额档不得查计数档表：{res.score} {res.detail}"
+    assert res.zero_reason is None
+    assert res.unverified_counted == 1  # unlinked 案例计入并标疑问
+    assert res.score_verified_only == Decimal("3")
+
+
+def test_score_count_count_tiers_below_lowest_stays_zero() -> None:
+    """反向守门：计数档（min_count 形状）低于最低档仍 0 分，不回退 per_item。"""
+    from app.engine.objective import score_count
+
+    crit = _count_crit(
+        name="项目负责人",
+        params={"person_scope": "leader", "field": "performance",
+                "tiers": [{"min_count": 2, "score": "1"}, {"min_count": 4, "score": "2"}]},
+        required_artifacts="社保证明、业绩证明材料",
+    )
+    cases = [{"name": "P0", "role": "leader", "work_proof": True,
+              "experience_proof": True, "social_security": True,
+              "quote": "项目0 运维负责人：某人", "sanitized": "ok"}]
+    res = score_count({**crit, "verified_cases": cases}, crit["params"], BidFacts(text=""))
+    assert res.score == Decimal("0"), "1 个不满足任何计数档（≥2）→ 0 分"
+    assert res.zero_reason == "confirmed_absent"  # 计数有依据的 0
+
+
+def test_score_count_batch_failure_marks_cases_unverified() -> None:
+    """A2：LLM 案例核验批失败（机器故障）→ cases_unverified，禁止伪装
+    no_facts/confirmed_absent；surviving 案例照计+疑问。"""
+    from app.engine.objective import score_count
+
+    crit = _perf_crit(verified_cases=[
+        {"name": "A", "contract": True, "invoice": True, "acceptance": True,
+         "case_source": "llm", "sanitized": "ok"},
+    ])
+    crit["case_batches_failed"] = 2
+    crit["case_batches_total"] = 7
+    res = score_count(crit, crit["params"], BidFacts(text=""))
+    assert res.score == Decimal("2"), "surviving 案例照计"
+    assert res.conflict is True
+    assert res.unresolved == "cases_unverified"
+    assert "批失败" in res.detail
+    # score>0 不带 zero_reason（既有约定）
+    assert res.zero_reason is None
+
+
+def test_score_count_batch_failure_zero_not_confirmed_absent() -> None:
+    """全批失败（无 surviving 案例）：0 分落 cases_unverified，不是确认未提供。"""
+    from app.engine.objective import score_count
+
+    crit = _perf_crit(verified_cases=[])
+    crit["case_batches_failed"] = 3
+    crit["case_batches_total"] = 3
+    # verified_cases 空 + 无 facts → 走 no_facts 路径；批失败存在时必须改判
+    # cases_unverified（诚实细分）。
+    res = score_count(crit, crit["params"], BidFacts(text=""))
+    assert res.zero_reason == "cases_unverified", res.zero_reason
+    assert res.zero_reason != "no_facts"
+    assert res.zero_reason != "confirmed_absent"
+
+
+def test_score_count_counted_but_zero_not_confirmed_absent() -> None:
+    """A2：案例已计入却算出 0（per_item=0 的机器口径问题）——诚实标
+    cases_unverified 转人工，绝不伪装"确认未提供"。"""
+    from app.engine.objective import score_count
+
+    crit = _perf_crit(verified_cases=[
+        {"name": "A", "contract": True, "invoice": True, "acceptance": True,
+         "case_source": "table", "sanitized": "ok"},
+    ])
+    # per_item=0：案例在、计入、但算不出分值
+    params = {"field": "performance", "per_item": "0", "max_items": "3"}
+    res = score_count({**crit, "verified_cases": crit["verified_cases"]}, params, BidFacts(text=""))
+    assert res.score == Decimal("0")
+    assert res.zero_reason == "cases_unverified"
+    assert res.conflict is True
+    assert "非确认未提供" in res.detail

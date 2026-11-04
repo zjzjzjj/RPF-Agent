@@ -84,6 +84,12 @@ QUESTION_KINDS: dict[str, dict[str, str]] = {
         "action": "投标文件中未提取到业绩/证书清单，已按 0 分计入总分并标疑问。"
                   "请人工翻阅原件核对；如确有条目，可补录后重跑。",
     },
+    "count_cases_unverified": {
+        "severity": "medium",
+        "label": "案例核验未完成",
+        "action": "LLM 案例核验批失败/未产出（机器故障，非确认缺失）。"
+                  "已按现有证据计入并标疑问；建议重跑该格，或人工翻阅原件核对业绩清单后改分。",
+    },
     "needs_judgment": {
         "severity": "medium",
         "label": "机器不可判定",
@@ -161,6 +167,8 @@ def _count_problem(score) -> str | None:
             return "count_field_unresolved"
         if code == "no_facts":
             return "count_no_facts"
+        if code in ("cases_unverified", "llm_failed"):
+            return "count_cases_unverified"
     return None
 
 
@@ -240,7 +248,7 @@ def _fallback_row(score, crit, bidder) -> dict | None:
     zero_reason = None
     for w in score.warnings_json or []:
         if isinstance(w, dict) and w.get("zero_reason") in (
-            "no_facts", "field_missing", "unreadable",
+            "no_facts", "field_missing", "unreadable", "cases_unverified",
         ):
             zero_reason = w["zero_reason"]
             break

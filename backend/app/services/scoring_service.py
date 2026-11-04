@@ -895,11 +895,13 @@ def execute_run(
 
             fallback = SimpleNamespace(
                 score=Decimal(0), detail=f"计数执行失败：{exc}",
-                unresolved="llm_failed", conflict=True, zero_reason="no_facts",
+                # llm_failed 是机器故障，不是"没抽到事实"——诚实标 cases_unverified
+                # （2026-11-04），不得伪装 no_facts/confirmed_absent。
+                unresolved="llm_failed", conflict=True, zero_reason="cases_unverified",
             )
             # audit 带 zero_reason：异常兜底的 0 分同样要过"score=0 必有理由"
             # 的审计约定（2026-10-29 审计 P2：曾因 audit=None 丢理由且 machine_status=pass）
-            return bid_id, c, fallback, "llm_failed", True, {"zero_reason": "no_facts"}
+            return bid_id, c, fallback, "llm_failed", True, {"zero_reason": "cases_unverified"}
 
     def _count_cell_impl(bid_id, c):  # noqa: ANN001
         facts = facts_by_bidder[bid_id]
@@ -982,6 +984,12 @@ def execute_run(
             )
             if cases:
                 c_scoring = {**c_scoring, "verified_cases": cases}
+            # 批失败语义（2026-11-04 诚实化）：LLM 核验批失败 = 机器故障，
+            # 案例清单可能不完整——注入 score_count 标 cases_unverified，
+            # 不得伪装"确认未提供"（no_facts/confirmed_absent）。
+            if case_stats.get("batches_failed"):
+                c_scoring["case_batches_failed"] = case_stats["batches_failed"]
+                c_scoring["case_batches_total"] = case_stats.get("batches_total", 0)
         # 人员级社保判定确定性覆盖（2026-10-23 run 49 实证：LLM 方差让
         # 先数 c60 0→6、龙即 6→4.5 来回摆）。名单/单位参保证明是可机械
         # 判定的：person_name 在社保材料页 → True；单位专用参保证明覆盖
@@ -1041,16 +1049,23 @@ def execute_run(
         if result.score == 0 and zero_reason is None:
             # P1E 引擎（count_tier/value_tier 等）与异常兜底未逐一设置 zero_reason →
             # 从 unresolved 统一映射：有任何 unresolved（含 llm_failed）都是机器侧
-            # 原因 → no_facts；无 unresolved 的 0 是计数有依据 → confirmed_absent。
+            # 原因 → no_facts/cases_unverified（诚实细分，2026-11-04：核验未做完
+            # 不得并进"没抽到事实"）；无 unresolved 的 0 是计数有依据 → confirmed_absent。
             # 保证"score=0 必有理由"约定全覆盖。
-            zero_reason = "no_facts" if result.unresolved else "confirmed_absent"
-        unreadable_zero = zero_reason == "unreadable" and result.score == 0
+            if result.unresolved == "cases_unverified":
+                zero_reason = "cases_unverified"
+            elif result.unresolved:
+                zero_reason = "no_facts"
+            else:
+                zero_reason = "confirmed_absent"
+        unreadable_zero = zero_reason in ("unreadable", "cases_unverified") and result.score == 0
         doubt = result.conflict or unresolved or unreadable_zero
         # 审计留痕：把逐案例核验结果 + 候选页统计落 ai_raw_json，否则判"照抄/
         # 未在标书定位"后无法复盘是抽取错还是闸门误杀（2026-10-21 实证为空）。
+        # 总批失败的格（无 cases 但有 case_stats）也要落 meta——复盘必须有据。
         audit = None
         _vc = c_scoring.get("verified_cases")
-        if _vc:
+        if _vc or case_stats:
             audit = {
                 "verified_cases": [
                     {
@@ -1086,10 +1101,14 @@ def execute_run(
         _upsert_score(
             run_id, bid_id, c,
             machine_score=result.score,
-            # unreadable 零分：机器不可见 ≠ 确认缺失 → 强制转人工（不因
-            # 全自动模式被收敛成 auto_confirmed——doubt=True 已保住复核态）。
-            # 含未核验案例（>0）同理转人工：分数进了总分但口径未定（双分值）。
-            machine_status="need_human" if (_unreadable_zero or _unverified_n) else "pass",
+            # unreadable/cases_unverified 零分：机器不可见/核验未做完 ≠ 确认缺失
+            # → 强制转人工（不因全自动模式被收敛成 auto_confirmed——doubt=True
+            # 已保住复核态）。含未核验案例（>0）同理转人工：分数进了总分但口径
+            # 未定（双分值）。批失败（unresolved=cases_unverified）无论分数
+            # 大小都转人工：案例清单可能不完整。
+            machine_status="need_human"
+            if (_unreadable_zero or _unverified_n or result.unresolved == "cases_unverified")
+            else "pass",
             review_status="conflict_flagged" if doubt else "pending",
             # 全自动化评分（用户要求零未定分）：计分项**一律写分**。
             # unresolved 只作疑问标记（落 warnings 供报告判读），不再决定弃评；
@@ -1698,6 +1717,7 @@ def _case_candidate_pages(
         stats_out["pages_sent"] = covered
         stats_out["pages_dropped_echo"] = dropped_nos
         stats_out["batches_sent"] = len(batches)
+        stats_out["batches_total"] = len(batches)
         # 截断透明化：未送审页数必须可审计（静默截断会让核验结论看起来完整）
         stats_out["pages_omitted"] = max(0, len(ordered) - covered)
     if len(batches) >= _max_batches and covered < len(ordered):
@@ -1832,6 +1852,8 @@ def _llm_verify_cases(
     for batch_no, batch, cases, exc in batch_results:
         if exc is not None:
             log.warning("案例核验第 %d/%d 批失败：%s", batch_no, len(batches), exc)
+            if stats_out is not None:
+                stats_out["batches_failed"] = stats_out.get("batches_failed", 0) + 1
             continue
         for x in cases:
             if not isinstance(x, dict):
@@ -2638,10 +2660,14 @@ def _count_zero_warn_entry(result, audit: dict | None) -> tuple[dict, bool]:
         zero_reason = getattr(result, "zero_reason", None)
     # type_gate（类型门槛剔空）与 unreadable 同级：0 分是类型判断结论而非
     # "未提供材料"，必须转人工核看（7.10 实证：集成/维保类案例被剔后
-    # 曾伪装 confirmed_absent/pass）
-    unreadable_zero = zero_reason in ("unreadable", "type_gate") and score == 0
+    # 曾伪装 confirmed_absent/pass）。cases_unverified（核验未做完/批失败）
+    # 同级（2026-11-04 诚实化）：机器故障 ≠ 确认缺失。
+    unreadable_zero = zero_reason in ("unreadable", "type_gate", "cases_unverified") and score == 0
     if zero_reason == "type_gate" and score == 0:
         msg = f"{result.detail}；零分理由：类型门槛剔除（type_gate），非材料缺失，建议人工核看"
+    elif score == 0 and zero_reason == "cases_unverified":
+        msg = (f"{result.detail}；零分理由：LLM 案例核验失败（cases_unverified），"
+               "机器故障非确认缺失，建议重跑或人工核看")
     elif unreadable_zero:
         msg = f"{result.detail}；零分理由：机器不可见（unreadable），非确认缺失，建议人工核看"
     elif score == 0 and zero_reason == "confirmed_absent":

@@ -357,7 +357,9 @@ class CountResult:
     # - "confirmed_absent"  确认未提供（材料三态 False/计数有依据的 0）
     # - "unreadable"        机器不可见（点名材料页不可读 None / OCR 超限）——
     #                       非确认缺失，强制 need_human + conflict_flagged
-    # - "no_facts"          机器没抽到事实（no_facts/cases_unverified/口径缺失）
+    # - "no_facts"          机器没抽到事实（no_facts/口径缺失）
+    # - "cases_unverified"  案例核验未完成（LLM 批失败/案例清单不完整/计入却
+    #                       算出 0）——机器故障非确认缺失（2026-11-04 诚实化）
     # - "gate_named_missing" 点名材料闸门未核验/未通过（材料要求存在但核验未执行）
     zero_reason: str | None = None
     # 双分值（2026-11-02）：剔除未核验案例后的可复算分（人工复核一眼算账）。
@@ -704,6 +706,28 @@ def _tier_score(tiers, n: Decimal) -> Decimal | None:
         except Exception:  # noqa: BLE001
             continue
     return best
+
+
+def _tier_shape(tiers) -> str:
+    """档表形状判定（2026-11-04 run79 业绩回归实锤）：count_tier | amount_tier | mixed | none。
+
+    「每提供一个得2分」类规则的 params 里可能带**金额档** tiers
+    （min_amount_yuan/max_amount_yuan/per_item 形状）——它是按金额分段的
+    每案例分值，不是"计几个得几分"的计数档。计数档查表（_tier_score 只认
+    min_count）对金额档无命中 → 旧代码强制 0 分，可计 3-10 个案例照样 0
+    （run79 四家「投标人业绩」4→0 回归）。
+    """
+    shapes: set[str] = set()
+    for t in tiers or []:
+        if not isinstance(t, dict):
+            continue
+        if "min_count" in t:
+            shapes.add("count_tier")
+        if "min_amount_yuan" in t or "max_amount_yuan" in t:
+            shapes.add("amount_tier")
+    if not shapes:
+        return "none"
+    return shapes.pop() if len(shapes) == 1 else "mixed"
 
 
 def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
@@ -1139,8 +1163,13 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
             # "有多少未核验案例的分数进了总分"，双分值/机器状态都以它为准。
             unverified_counted = sum(1 for c in kept if c.get("unverified"))
             effective = Decimal(len(kept))
-            # R0 客观路由档表（"2个经验得1分；4个得2分"）：命中最高档，非 per_item 线性
-            if params.get("tiers"):
+            # R0 客观路由档表（"2个经验得1分；4个得2分"）：命中最高档，非 per_item 线性。
+            # 形状守卫（2026-11-04）：只对**计数档**（min_count 形状）查表；金额档
+            # （min_amount_yuan 形状，"按金额分段的每案例分值"）不是计数档，回退
+            # per_item 线性——查表无命中强制 0 分曾让可计案例全归零（run79 回归）。
+            _tshape = _tier_shape(params.get("tiers"))
+            _use_tiers = _tshape == "count_tier"
+            if _use_tiers:
                 _ts = _tier_score(params.get("tiers"), effective)
                 score = _ts if _ts is not None else Decimal(0)
             else:
@@ -1149,7 +1178,7 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                 score = max_score
             # 可复算双分值：剔除全部未核验案例后的分数（warnings 附给人工一眼复算）
             _kept_verified = min(_verified_n, max_items) if max_items else _verified_n
-            if params.get("tiers"):
+            if _use_tiers:
                 _tsv = _tier_score(params.get("tiers"), Decimal(_kept_verified))
                 score_verified_only = _tsv if _tsv is not None else Decimal(0)
             else:
@@ -1167,9 +1196,15 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                 + _type_gate_note
             )
             # 零分理由：unverified 案例已计入 → score>0，故下面只在回退模式/全 False/
-            # 类型剔空时可达。
+            # 类型剔空时可达。诚实化（2026-11-04）：线性路径下案例**已计入**却算不出
+            # 分值（per_item=0 的机器口径问题）绝不伪装"确认未提供"；计数档不命中
+            # （低于最低档）是规则结论，走既有 confirmed_absent 映射。
             if score == 0:
-                if null_dropped:
+                if kept and zero_reason is None and not _use_tiers and per_item <= 0:
+                    zero_reason = "cases_unverified"
+                    conflict = True
+                    detail += "；案例已计入但未算出分值（机器口径问题，非确认未提供，转人工核看）"
+                elif null_dropped:
                     zero_reason = "unreadable"
                 elif dropped_false:
                     zero_reason = "confirmed_absent"
@@ -1178,6 +1213,21 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                     # 结论而非"未提供材料"——转人工核看（7.10 实证：集成/维保类
                     # 案例被剔后伪装 confirmed_absent/pass）
                     zero_reason = "type_gate"
+            # LLM 案例核验批失败（scoring_service 注入）：案例清单可能不完整，
+            # 是机器故障不是"确认没提供"——标 cases_unverified 转人工（surviving
+            # 案例照计=计入+疑问，三态哲学）。
+            _bf = int(criterion.get("case_batches_failed") or 0)
+            _bt = int(criterion.get("case_batches_total") or 0)
+            if _bf:
+                conflict = True
+                if unresolved is None:
+                    unresolved = "cases_unverified"
+                detail += (
+                    f"；LLM 案例核验 {_bf}/{_bt or '?'} 批失败，案例清单可能不完整"
+                    f"（按已核验 {len(kept)} 个计 {score} 分，建议人工核对或重跑）"
+                )
+                if score == 0 and zero_reason in (None, "confirmed_absent"):
+                    zero_reason = "cases_unverified"
     elif artifacts:
         conflict = True
         detail += "；该评分项含证明材料要求，材料齐全性需人工核对原件（AI 逐案例核验未执行）"
@@ -1187,13 +1237,24 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
     # 约定：score=0 必须给零分理由；score>0 不携带（避免下游误读）。
     if score != 0:
         zero_reason = None
-    elif zero_reason is None:
-        # 兜底：计数有依据的 0（如金额门槛过滤后 0 个、分档不命中）→ 确认未提供；
-        # unresolved 机器侧故障（口径缺失/没抽到事实）→ no_facts。
-        zero_reason = (
-            "no_facts" if unresolved in ("no_facts", "field_missing", "cases_unverified")
-            else "confirmed_absent"
-        )
+    else:
+        # LLM 案例核验批失败优先（2026-11-04 诚实化）：无论前面落到哪个分支
+        # （含空 cases 的 no_facts 路径），机器故障都不得伪装"确认未提供/没抽到事实"。
+        if int(criterion.get("case_batches_failed") or 0):
+            zero_reason = "cases_unverified"
+            if unresolved is None:
+                unresolved = "cases_unverified"
+        elif zero_reason is None:
+            # 兜底：计数有依据的 0（如金额门槛过滤后 0 个、分档不命中）→ 确认未提供；
+            # unresolved 机器侧故障（口径缺失/没抽到事实）→ no_facts/cases_unverified
+            # 诚实细分（2026-11-04）：cases_unverified 是"核验没做完"，不得并进
+            # no_facts 也不得伪装 confirmed_absent。
+            if unresolved == "cases_unverified":
+                zero_reason = "cases_unverified"
+            elif unresolved in ("no_facts", "field_missing"):
+                zero_reason = "no_facts"
+            else:
+                zero_reason = "confirmed_absent"
 
     return CountResult(
         score=score, detail=f"{detail}，得 {score} 分{inferred}", conflict=conflict,
