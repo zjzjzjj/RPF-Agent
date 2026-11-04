@@ -194,8 +194,9 @@ def _classify_question(score, crit) -> str | None:
         if score.review_status == "conflict_flagged":
             return "conflict"
         if score.machine_status == "need_human":
-            # 密封/签字/盖章/实质性响应这类否决条款机器判不了，**但绝不能当作已处置**：
-            # 漏掉它们会让报告在"疑问清零"后宣称定稿，而这些否决事由从未被裁决。
+            # 密封/签字/盖章/实质性响应这类否决条款机器判不了，仍列疑问清单
+            # （提示级）；按 2026-11-04「veto 疑问不阻塞定稿」决策不再阻塞 final
+            # 判定（定稿看 blocks_final）——但绝不得从清单消失（人工必须能看到）。
             return "veto_needs_judgment"
         # 机器判定通过的资格/符合性项：按设计**仍走复核流**（防错，但默认可批量浏览）。
         # 归入低危而非"已处置"——否则报告宣称"全部 N 项均已人工处置"时，
@@ -282,8 +283,14 @@ def _fallback_items(rows: list) -> list[dict]:
     return out
 
 
-def _build_open_questions(rows: list, run_id: int) -> tuple[list[dict], dict]:
-    """把待复核记录整理成按严重度排序的疑问清单，并给出处置进度。"""
+def _build_open_questions(rows: list, run_id: int) -> tuple[list[dict], dict, list[dict]]:
+    """把待复核记录整理成按严重度排序的疑问清单，并给出处置进度。
+
+    blocks_final（2026-11-04 资格审查弱化）：**按行判定**——veto/match 行与
+    veto_flag 格的疑问只作提示（不阻塞定稿）；评分侧（count/subjective/formula/
+    fallback/evidence 等）所有疑问仍阻塞。不能按 kind 判：auto 模式下 veto
+    need_human 实际落 kind="conflict"（_classify_question 先命中 conflict 分支）。
+    """
     questions: list[dict] = []
     settled = 0
     for score, crit, bidder in rows:
@@ -292,6 +299,9 @@ def _build_open_questions(rows: list, run_id: int) -> tuple[list[dict], dict]:
             settled += 1
             continue
         meta = QUESTION_KINDS[kind]
+        blocks_final = not (
+            crit.score_type in ("veto", "match") or score.veto_flag
+        )
         questions.append(
             {
                 "kind": kind,
@@ -312,6 +322,7 @@ def _build_open_questions(rows: list, run_id: int) -> tuple[list[dict], dict]:
                 "evidence_status": score.evidence_status,
                 "source_page": crit.source_page,
                 "source_quote": crit.source_quote,
+                "blocks_final": blocks_final,
             }
         )
     questions.sort(key=lambda q: (_SEVERITY_ORDER.get(q["severity"], 9), q["bidder"], q["code"]))
@@ -335,6 +346,7 @@ def _build_open_questions(rows: list, run_id: int) -> tuple[list[dict], dict]:
                 "severity": q["severity"],
                 "label": q["label"],
                 "action": q["action"],
+                "blocks_final": q["blocks_final"],
                 "bidders": [],
             },
         )
@@ -352,6 +364,8 @@ def _build_open_questions(rows: list, run_id: int) -> tuple[list[dict], dict]:
         "settled": settled,
         "open": len(questions),
         "blocking": sum(1 for q in questions if q["severity"] == "high"),
+        # 阻塞性疑问（评分侧）——定稿判定用；veto/match 提示不计入
+        "blocking_open": sum(1 for q in questions if q["blocks_final"]),
         "by_kind": by_kind,
         "criteria_open": len(by_criterion),
     }
@@ -467,12 +481,13 @@ def build_report(project_id: str, run_id: int | None = None) -> dict:
         ).scalars().all()
 
         open_questions, progress, by_criterion = _build_open_questions(rows, run_id)
-        # 报告状态：还有待裁决项就是草稿。草稿**可以生成**（先出报告、把疑问标出），
-        # 但必须自带醒目声明，避免被当成最终结论使用。
+        # 报告状态：**评分侧**疑问（count/subjective/formula/fallback/evidence 等）
+        # 清零才定稿；veto/match 类疑问按 2026-11-04「资格审查弱化」决策降为提示
+        # 不阻塞（仍列疑问清单，人工必须能看到）。草稿可生成但必须自带醒目声明。
         # 另有一条硬约束：评分运行未成功时绝不能出定稿——否则"0 条记录"会让
-        # progress.open 归零，报告宣称"全部 0 项均已人工处置"，把失败读成完成。
+        # progress 归零，报告宣称"全部 0 项均已人工处置"，把失败读成完成。
         run_ok = run.status == "succeeded" and bool(rows)
-        report_status = "final" if (progress["open"] == 0 and run_ok) else "draft"
+        report_status = "final" if (progress["blocking_open"] == 0 and run_ok) else "draft"
         if not run_ok:
             progress["incomplete_reason"] = (
                 f"评分运行 #{run.id} 状态为 {run.status}，报告内容不完整"

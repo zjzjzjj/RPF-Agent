@@ -164,26 +164,29 @@ def main() -> int:
         print(f"[5/6] 评分运行 #{run_id}：objective {summary['objective']}｜"
               f"price {summary['price']}｜subjective {summary['subjective']}｜"
               f"match {summary['match']}｜残留待人工 {summary['need_human']}")
-        check("零人工残留（无 need_human/conflict_flagged/pending/ai_suggested）",
-              summary["need_human"] == 0, str(summary))
-
+        # 2026-11-04 资格审查弱化：veto/match 行允许 need_human/conflict_flagged
+        # （human_only 转人工是设计语义），评分侧仍要求零残留。
         matrix = client.get(f"/api/runs/{run_id}/matrix").json()
         cells = [c for cols in matrix["cells"].values() for c in cols.values()]
-        bad = [c for c in cells if c["review_status"] not in ("auto_confirmed", "not_applicable")]
-        check("全部评分记录收敛 auto_confirmed 终态", not bad,
-              f"异常 {len(bad)} 条：{[ (c['criterion_name'], c['review_status']) for c in bad[:3] ]}")
-        # 模糊项的裁决 reasoning/逐字引用在报告"自动裁决记录"章节可审计；auto 模式下
-        # 机器状态不会残留 need_human/conflict_flagged（上一条 check 已覆盖），无需重复检查
+        scoring_bad = [
+            c for c in cells
+            if c.get("score_type") not in ("veto", "match")
+            and c["review_status"] not in ("auto_confirmed", "not_applicable")
+        ]
+        check("无评分侧残留（count/subjective/formula 全收敛）", not scoring_bad,
+              f"异常 {len(scoring_bad)} 条：{[ (c['criterion_name'], c['review_status']) for c in scoring_bad[:3] ]}")
 
         ranking = client.get(f"/api/projects/{pid}/ranking").json()
         check("排名无 missing_final 警告", all(not r["missing_final"] for r in ranking["rows"]),
               str([r["missing_final"] for r in ranking["rows"] if r["missing_final"]][:2]))
 
         report = client.get(f"/api/projects/{pid}/report").json()
-        print(f"[6/6] 报告状态：{report['status']}｜疑问 {len(report['open_questions'])} 条")
+        blocking = report["progress"].get("blocking_open", 0)
+        print(f"[6/6] 报告状态：{report['status']}｜疑问 {len(report['open_questions'])} 条"
+              f"（阻塞 {blocking}）")
         check("报告直接定稿（final）", report["status"] == "final", report["status"])
-        check("无待复核疑问", not report["open_questions"],
-              str([q["kind"] for q in report["open_questions"]][:5]))
+        check("无阻塞性疑问（评分侧清零）", blocking == 0,
+              str([q["kind"] for q in report["open_questions"] if q.get("blocks_final")][:5]))
 
     print()
     if failures:

@@ -5,9 +5,11 @@
 结构保证——
 - 法规包 confirm/freeze 的阻断项自动采纳；
 - 报价自动确认（无报价的投标人自动剔除留痕）；
-- 评分运行零 need_human/conflict_flagged 残留，全部收敛 auto_confirmed；
+- 评分侧零 need_human/conflict_flagged 残留，收敛 auto_confirmed；
 - 报告直接 final。
 
+2026-11-04 资格审查弱化后的新口径：veto/match 行的 need_human（human_only
+转人工）不阻塞报告定稿（progress.blocking_open 只计评分侧），但仍列疑问清单。
 说明：human_only 法条（87 条真实法规包中占 72 条）与冲突信号的 LLM 带证据
 裁决收敛属真实模型行为，不再由任何内置假 LLM 覆盖——由
 ``scripts/run_auto_pipeline.py --assert-final``（接真实模型）验收。
@@ -165,3 +167,55 @@ def test_auto_mode_confirms_prices_without_manual_step(auto_client, frozen_auto_
     matrix = c.get(f"/api/runs/{job['result_json']['run_id']}/matrix").json()
     cells = [cell for cols in matrix["cells"].values() for cell in cols.values()]
     assert cells and all(x["review_status"] == "auto_confirmed" for x in cells)
+
+
+def test_veto_need_human_does_not_block_final(auto_client, law_kb, samples_dir) -> None:  # noqa: ANN001
+    """2026-11-04 资格审查弱化端到端：human_only veto 格转 need_human（离线无
+    gateway）→ 格落 conflict_flagged、列疑问清单（veto 侧 kind），但报告仍 final、
+    blocking_open==0（决策 2 钉死）。"""
+    c = auto_client
+    pack = _mini_law_pack()
+    pack["criteria"].append(
+        {"code": "REJ-T2", "category": "compliance", "name": "投标文件签章与密封",
+         "score_type": "veto", "is_veto": True, "veto_consequence": "disqualify",
+         "description": "投标文件须按要求签章密封，否则否决投标。",
+         "max_score": None, "weight": None, "levels": [],
+         "check_type": "human_only", "params": {},
+         "source_quote": LAW51, "source_node_id": NODE_51},
+    )
+    pid = c.post("/api/projects", json={"name": "veto弱化链路"}).json()["id"]
+    r = c.post(f"/api/projects/{pid}/rules/import-law", json=pack)
+    assert r.status_code == 200, r.text
+    package_id = r.json()["package_id"]
+    assert c.post(f"/api/rules/packages/{package_id}/confirm").status_code == 200
+    fr = c.post(f"/api/rules/packages/{package_id}/freeze")
+    assert fr.status_code == 200, fr.text
+
+    pdf = sorted((samples_dir / "bids").glob("*_投标文件.pdf"))[0]
+    b = c.post(f"/api/projects/{pid}/bidders", json={"name": pdf.stem.split("_")[1]}).json()
+    up = upload_pdf(c, pid, pdf, "bid", bidder_id=b["id"])
+    job = wait_job(c, up["job_id"])
+    assert job["status"] == "succeeded", job.get("error")
+    c.get(f"/api/bidders/{b['id']}/price")  # 触发报价抽取（评分入口自动确认）
+
+    resp = c.post(f"/api/projects/{pid}/runs", json={
+        "package_id": package_id, "bidder_ids": [b["id"]], "stages": ["objective"],
+    })
+    assert resp.status_code == 200, resp.text
+    job = wait_job(c, resp.json()["job_id"], timeout=180)
+    assert job["status"] == "succeeded", job.get("error")
+
+    matrix = c.get(f"/api/runs/{job['result_json']['run_id']}/matrix").json()
+    cells = [cell for cols in matrix["cells"].values() for cell in cols.values()]
+    ho = [x for x in cells if x["criterion_name"] == "投标文件签章与密封"]
+    assert ho and ho[0]["machine_status"] == "need_human", ho
+    assert ho[0]["review_status"] == "conflict_flagged", ho
+
+    report = c.get(f"/api/projects/{pid}/report").json()
+    assert report["status"] == "final", report["status"]
+    assert report["progress"]["blocking_open"] == 0
+    assert report["progress"]["open"] >= 1, "veto 疑问仍列清单（人工必须能看到）"
+    kinds = {q["kind"] for q in report["open_questions"]}
+    assert "veto_needs_judgment" in kinds or "conflict" in kinds, kinds
+    assert all(not q["blocks_final"] for q in report["open_questions"])
+

@@ -124,8 +124,9 @@ def test_veto_need_human_must_stay_a_question():
     assert QUESTION_KINDS[kind]["severity"] == "high"
 
 
-def test_report_never_claims_final_while_veto_unadjudicated():
-    """只要还有未裁决的否决项，progress.open 就不能归零。"""
+def test_veto_questions_do_not_block_final():
+    """2026-11-04 资格审查弱化：veto 疑问仍列清单（open 计数）但不阻塞定稿
+    （blocking_open 只计评分侧）。"""
     crit = _Crit(score_type="veto", name="投标文件签章")
     rows = [
         (_Score(review_status="human_confirmed"), _Crit(score_type="count"), _Bidder()),
@@ -134,6 +135,47 @@ def test_report_never_claims_final_while_veto_unadjudicated():
     questions, progress, _by_crit = _build_open_questions(rows, 1)
     assert progress["open"] == 1
     assert progress["settled"] == 1
+    assert progress["blocking_open"] == 0, "veto 疑问不阻塞定稿"
+    assert questions[0]["blocks_final"] is False
+
+
+def test_scoring_side_questions_still_block():
+    """评分侧疑问（count unresolved 等）仍阻塞定稿。"""
+    crit = _Crit(score_type="count", name="投标人业绩")
+    s = _Score(final_score=Decimal("0"),
+               warnings=[{"message": "…", "unresolved": "no_facts"}])
+    rows = [(s, crit, _Bidder())]
+    questions, progress, _by_crit = _build_open_questions(rows, 1)
+    assert progress["blocking_open"] == 1
+    assert questions[0]["blocks_final"] is True
+
+
+def test_auto_veto_conflict_row_not_blocking():
+    """auto 形态：veto 行 machine=need_human + review=conflict_flagged 落 kind
+    ="conflict"（按 kind 判会误判评分侧）——必须按行放行。"""
+    crit = _Crit(score_type="veto", name="投标文件签章")
+    s = _Score(machine_status="need_human", final_score=None,
+               review_status="conflict_flagged",
+               warnings=[{"message": "该项需人工判定（如密封、签字、盖章）"}])
+    rows = [(s, crit, _Bidder())]
+    questions, progress, _by_crit = _build_open_questions(rows, 1)
+    assert questions[0]["kind"] == "conflict"  # kind 是 conflict 但行是 veto
+    assert questions[0]["blocks_final"] is False
+    assert progress["blocking_open"] == 0
+
+
+def test_count_cases_unverified_classified():
+    """cases_unverified（批失败/核验未做完）→ count_cases_unverified，阻塞定稿。"""
+    crit = _Crit(score_type="count", name="投标人业绩")
+    s = _Score(final_score=Decimal("0"),
+               warnings=[{"message": "…", "unresolved": "cases_unverified",
+                          "zero_reason": "cases_unverified"}])
+    kind = _classify_question(s, crit)
+    assert kind == "count_cases_unverified"
+    assert QUESTION_KINDS[kind]["severity"] == "medium"
+    rows = [(s, crit, _Bidder())]
+    questions, progress, _by_crit = _build_open_questions(rows, 1)
+    assert questions[0]["blocks_final"] is True
 
 
 def test_machine_computed_score_does_not_require_citation():

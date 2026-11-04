@@ -52,7 +52,8 @@
 </div>
 {% else %}
 <div class="notice" style="background:#f6ffed;border-color:#b7eb8f">
-  <b>本报告为定稿：</b>全部 {{ progress.total }} 项评分均已人工处置（疑问清单已清空），可提交评标委员会确认。
+  <b>本报告为定稿：</b>评分侧疑问已清零，可提交评标委员会确认；
+  资格/符合性提示 {{ progress.open }} 项见下方疑问清单（不阻塞定稿，建议人工核看）。
 </div>
 {% endif %}
 
