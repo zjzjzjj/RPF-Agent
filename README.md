@@ -6,7 +6,7 @@
 
 ```
 招标文件 ──PyMuPDF/OCR解析──▶ 条款树 ──┬─ LLM抽取评分细则（编译）
-                                        └─ 通用法规规则包（87条法条规则，仓库内固化）
+                                        └─ 通用法规规则包（84条法条规则，仓库内固化）
                                              │
                               规则包（可自动采纳/批量采纳）──▶ 冻结（内容哈希，可解冻出新版本）
                                              │
@@ -79,8 +79,8 @@ LLM 的每个结论都强制附**逐字引用**，引用经 `evidence/verifier.p
 | | 全自动模式（默认） | 人工回退模式 |
 |---|---|---|
 | 开关 | `BID_EVAL_AUTO_MODE=1`（缺省） | `BID_EVAL_AUTO_MODE=0` |
-| 机器判不了的条款（密封/盖章等 72 条 human_only） | LLM 带原文证据裁决（附逐字引用） | `need_human` 进复核队列 |
-| 冲突信号（大小写金额、分项合计、串通） | LLM 裁决收敛 + 留痕 | `conflict_flagged` 待人工裁决 |
+| 机器判不了的条款（密封/盖章等 70 条 human_only） | LLM 带原文证据裁决（附逐字引用） | `need_human` 进复核队列 |
+| 冲突信号（大小写金额、分项合计） | LLM 裁决收敛 + 留痕 | `conflict_flagged` 待人工裁决 |
 | 主观分 | LLM 直接写 `final_score`（给不出按最低档兜底） | 只写 `ai_suggested`，人工 confirm/override |
 | 报价 | 评分入口自动确认（无报价者自动剔除留痕） | 人工确认（卡点） |
 | 规则确认/冻结 | 阻断项自动采纳（逐条留痕） | 逐条 accept / 全部采纳按钮 |
@@ -99,7 +99,7 @@ LLM 的每个结论都强制附**逐字引用**，引用经 `evidence/verifier.p
 | 规则冻结 | draft → confirmed → frozen（内容哈希 + 快照），冻结后写入 409；**「解冻并创建新版本」**派生可编辑草稿（origin 溯源随版本链延续），历史评分不受影响 |
 | 全程留痕 | 自动裁决/人工确认/改分/否决全部记录 actor、时间、理由；报告附完整留痕链 |
 | 数据不出域 | 数据分级：`confidential`（真实投标文件）只允许发往本地模型端点 |
-| 规则即数据 | 法规规则包 = 仓库内声明式 JSON（一条一文件 + pack.json 元信息 + policies.json 法条原文登记），生成脚本唯一通道（`--check` 防手改漂移），借鉴 coll_det 围串标规则包框架 |
+| 规则即数据 | 法规规则包 = 仓库内声明式 JSON（一条一文件 + pack.json 元信息 + policies.json 法条原文登记），生成脚本唯一通道（`--check` 防手改漂移），借鉴 coll_det 规则包框架 |
 
 对应法规锚点：《招标投标法实施条例》49 条（只能用招标文件载明的标准）、87 号令 55 条（独立评价）、财库〔2012〕69 号（客观分必须一致）。
 
@@ -115,7 +115,7 @@ python -m pytest -q                    # 248 项测试，全离线（不依赖�
 cd ..
 python scripts/generate_sample_tender.py && python scripts/generate_sample_bids.py
 python scripts/run_e2e.py                              # 人工回退模式口径（真实模型冒烟，约 3-10 分钟）
-python scripts/run_auto_pipeline.py --assert-final     # 全自动模式口径（默认语义；87 条法规包
+python scripts/run_auto_pipeline.py --assert-final     # 全自动模式口径（默认语义；84 条法规包
                                                        # × 5 家约 400 次裁决，约 30-120 分钟，
                                                        # 可用 BID_EVAL_LLM_CONCURRENCY 提并发）
 
@@ -186,7 +186,7 @@ export BID_EVAL_LLM_TRANSIENT_ATTEMPTS=4         # 云端高峰期 503 重试次
      规则包已确认/冻结时不自动改动，提示先「解冻并创建新版本」。也可手动「重新匹配」。
    - **无招标文件 → 使用默认规则**：规则页「使用默认规则」选四套内置模板（综合货物/服务/工程、最低价），
      一键完成 **实例化 → 全部签批 → 确认 → 冻结**，随后直接进入投标人与评分。
-   - **导入法规包**：规则页「导入法规包」按钮（`POST /projects/{id}/rules/import-law-pack`，按 `pack_id` 取仓库内固化包；也可用 `POST /rules/import-law` 投递制品 JSON 或 `scripts/import_law_rules.py`）——87 条法规通则，法条逐条核验 fail-closed
+   - **导入法规包**：规则页「导入法规包」按钮（`POST /projects/{id}/rules/import-law-pack`，按 `pack_id` 取仓库内固化包；也可用 `POST /rules/import-law` 投递制品 JSON 或 `scripts/import_law_rules.py`）——84 条法规通则，法条逐条核验 fail-closed
    - **逐条启用/停用**：规则列表右侧开关（仅草稿包；停用项退出计分与冻结快照，恢复按停用前状态回滚）
    - **人工新增评分项**：规则页「新增评分项」（仅草稿包，理由必填，编号 x1/x2…，来源标「人工」）
 3. **批量处置**：「全部采纳」/「全部签批」按钮（公共理由留痕）→ 确认 → **冻结**（内容哈希，此后只读）
@@ -208,7 +208,7 @@ backend/app/
 ├─ rules/        规则契约、LLM 编译器、12 条确定性校验器、冻结（canonical JSON + 哈希）、
 │                规则包库（templates/ 内置模板 + law_packs/ 固化法规包，loader fail-fast）
 ├─ engine/       纯代码评分：价格公式、排名并列、资格三态原语、事实抽取（五级报价兜底）、
-│                主观分校验层、跨投标人串通信号、LLM 裁决（auto_judge）、章节约束选段
+│                主观分校验层、LLM 裁决（auto_judge）、章节约束选段
 ├─ llm/          provider 抽象（OpenAI 兼容：DeepSeek/Qwen/GLM/Kimi/硅基流动；未配置 fail-fast）、
 │                网关（缓存/限速/预算/数据分级）
 ├─ services/     业务编排（评分运行、规则状态机、法规导入、模板库、合并、报告、项目删除）
@@ -225,7 +225,7 @@ scripts/         样例数据生成、双模式端到端验收（run_e2e / run_a
 
 ## 法规规则包（law_packs/general-law）
 
-87 条法规通用评审规则（FORM 形式 37 / QUAL 资格 23 / RES 响应性 12 / REJ 否决 15），依据《招标投标法》《实施条例》《评标委员会和评标方法暂行规定》30 号令、87 号令等编制，每条 `source_node_id: 法条://法规名/条号`，原文登记于包内 `policies.json`（21 个被引法条节点）。**包是仓库内生成物，禁止手改**：
+84 条法规通用评审规则（FORM 形式 37 / QUAL 资格 23 / RES 响应性 12 / REJ 否决 12），依据《招标投标法》《实施条例》《评标委员会和评标方法暂行规定》30 号令、87 号令等编制，每条 `source_node_id: 法条://法规名/条号`，原文登记于包内 `policies.json`（18 个被引法条节点）。围串标三条（REJ-008/009/010，条例 39/40/41）经 `build_law_pack.EXCLUDED_CODES` 产品级裁剪不随包发布——围串标由独立的围串标智能体负责。**包是仓库内生成物，禁止手改**：
 
 ```bash
 python scripts/build_law_pack.py            # 从 E:\ZJUBJ\法规库\00_索引\ 制品生成/同步（幂等）
@@ -240,7 +240,7 @@ python scripts/build_law_pack.py --check    # 只比对，漂移 exit 2（测试
 |---|---|---|
 | 客观分复算一致性 | 0 差异 | ✅ pytest + 冒烟：价格分与独立真值 0 差异 |
 | 报价抽取（确定性五级启发） | 与生成侧真值一致 | ✅ 5 家全对（run_e2e 精确断言） |
-| 法规包导入 | 87 条全过法条核验 | ✅ error 0，快照带 law 溯源 |
+| 法规包导入 | 84 条全过法条核验 | ✅ error 0，快照带 law 溯源 |
 | 冻结不可变性 | 冻结后写入 409 | ✅ |
 | 全自动收敛 | 零 need_human 残留、报告直接 final | ✅ run_auto_pipeline `--assert-final`（auto 模式结构保证） |
 | 人工回退语义 | 三态 + 复核队列 + 绝不自动否决 | ✅ pytest（conftest auto=0 守护） |
