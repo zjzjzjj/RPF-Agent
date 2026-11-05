@@ -162,6 +162,21 @@ def _fallback(score: ScoreRecord | None) -> dict | None:
     return None
 
 
+def _verdict_source(score: ScoreRecord | None, score_type: str | None) -> str | None:
+    """判定来源（2026-11-05）：warnings 结构化 verdict_source 键（llm|machine）。
+
+    仅判定类（veto/match）条目有值——展示层据此区分「AI 裁决」与「确定性
+    判定项（过程即证据）」；LLM 裁决但没取到逐字引文的格子不能标成确定性判定。
+    旧数据缺键按 "machine" 兜底（确定性判定展示口径）。
+    """
+    if score_type not in ("veto", "match"):
+        return None
+    for w in _warnings_list(score):
+        if w.get("verdict_source"):
+            return str(w["verdict_source"])
+    return "machine"
+
+
 def _ai_visible(score: ScoreRecord | None) -> bool:
     if score is None:
         return False
@@ -341,6 +356,7 @@ def _build_item(
         "review_status": score.review_status if score is not None else "not_run",
         "evidence_status": score.evidence_status if score is not None else "none",
         "verdict": verdict,
+        "verdict_source": _verdict_source(score, score_type),
         "deduction": deduction,
         "reason": {
             "ai_reasoning": ai_reason,

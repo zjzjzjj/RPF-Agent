@@ -11,7 +11,7 @@ import logging
 import re
 from decimal import Decimal
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
 from app import config
 from app.db.models import (
@@ -539,11 +539,17 @@ def execute_run(
     # Phase2：串行落库（SQLite 单写者；顺序 = 提交序 = 旧串行循环序，行内容同构）
     for (bid_id, c), result in zip(veto_cells, veto_results):
         review_status = _review_status_for_verdict(result)
-        _upsert_score(
+        _row = _upsert_score(
             run_id, bid_id, c,
             machine_status=result["verdict"],
             review_status=review_status,
-            warnings_json=[{"message": result.get("message")}] if result.get("message") else None,
+            warnings_json=[_verdict_warning_entry(result)],
+        )
+        # LLM 裁决逐字引文落库（确定性判定不产引文——过程即证据）
+        _persist_verdict_citations(
+            _row, result,
+            main_doc_id=main_doc_by_bidder.get(bid_id),
+            role="veto", stats=stats,
         )
         # 剔除出基准价只认**人工已确认**的否决。未确认的否决建议（含 auto 模式
         # LLM 裁决）照常展示 veto_flag，但不改变有效投标人集合——证照/签章类
@@ -1124,11 +1130,17 @@ def execute_run(
     match_cells = [(bid_id, c) for bid_id in bidder_ids for c in match_items]
     match_results = _parallel_map(_match_cell, match_cells, ctx=ctx, message_fmt="判断项 {done}/{total}")
     for (bid_id, c), result in zip(match_cells, match_results):
-        _upsert_score(
+        _row = _upsert_score(
             run_id, bid_id, c,
             machine_status=result["verdict"],
             review_status=_review_status_for_verdict(result),
-            warnings_json=[{"message": result.get("message")}] if result.get("message") else None,
+            warnings_json=[_verdict_warning_entry(result)],
+        )
+        # LLM 裁决逐字引文落库（role=match，与 veto 区分展示口径）
+        _persist_verdict_citations(
+            _row, result,
+            main_doc_id=main_doc_by_bidder.get(bid_id),
+            role="match", stats=stats,
         )
         stats["match"] += 1
 
@@ -2333,6 +2345,30 @@ def _veto_precheck(  # noqa: ANN001
     return result, "single"
 
 
+def _evidence_items_of(result) -> list[dict]:  # noqa: ANN001 —— PrimitiveResult
+    """PrimitiveResult → 逐字引文条目 [{quote, page_hint?}]。
+
+    优先 evidence_items（LLM 裁决多条）；兼容只带 evidence_quote 的旧形态。
+    确定性判定（run_check）恒空列表——过程即证据，设计上无引文。
+    """
+    items = list(getattr(result, "evidence_items", None) or [])
+    if items:
+        return items
+    quote = getattr(result, "evidence_quote", None)
+    return [{"quote": quote}] if quote else []
+
+
+def _verdict_warning_entry(result: dict) -> dict:
+    """veto/match 落库的 warnings 条目：message + 结构化 verdict_source 键。
+
+    verdict_source（"llm"|"machine"）供 score-summary 的 _verdict_source 读取，
+    展示层据此区分「AI 裁决」与「确定性判定项」；缺省按 machine（确定性判定）。
+    """
+    entry = {"message": result.get("message")} if result.get("message") else {}
+    entry["verdict_source"] = result.get("verdict_source") or "machine"
+    return entry
+
+
 def _eval_veto(  # noqa: ANN001
     c: dict,
     facts,
@@ -2394,15 +2430,27 @@ def _eval_veto(  # noqa: ANN001
             gateway, c, facts, text or "", result, data_class=data_class,
             chunk_cats=chunk_cats, chunk_cat_confs=chunk_cat_confs,
         )
+        _items = _evidence_items_of(result)
         if result.status == "pass":
-            return {"verdict": "pass", "message": result.message, "evidence": result.evidence_quote}
+            return {
+                "verdict": "pass",
+                "message": result.message,
+                "evidence_items": _items,
+                "verdict_source": "llm",
+            }
         return {
             "verdict": "need_human",
             "message": f"AI 存疑（不自动否决，转评标委员会认定）：{result.message}",
-            "evidence": result.evidence_quote,
+            "evidence_items": _items,
+            "verdict_source": "llm",
         }
     verdict = verdict_for(c["code"], c["name"], result, on_fail=on_fail)
-    return {"verdict": verdict, "message": result.message, "evidence": result.evidence_quote}
+    return {
+        "verdict": verdict,
+        "message": result.message,
+        "evidence_items": _evidence_items_of(result),
+        "verdict_source": "machine",
+    }
 
 
 def _batch_cell_from_judgement(j) -> dict:  # noqa: ANN001 —— auto_judge.AutoJudgement
@@ -2413,21 +2461,19 @@ def _batch_cell_from_judgement(j) -> dict:  # noqa: ANN001 —— auto_judge.Aut
     单条 _eval_veto 里 f"AI 存疑…：{refine_with_llm 的 message}" 的同款拼接。
     """
     prefix = "通过" if j.verdict == "pass" else "不通过"
-    quote = next(
-        (str(e.get("quote") or "").strip()
-         for e in j.evidence if str(e.get("quote") or "").strip()),
-        None,
-    )
+    items = [e for e in (j.evidence or [])[:5] if str(e.get("quote") or "").strip()]
     if j.verdict == "pass":
         return {
             "verdict": "pass",
             "message": f"自动裁决（{prefix}）：{j.reasoning}",
-            "evidence": quote,
+            "evidence_items": items,
+            "verdict_source": "llm",
         }
     return {
         "verdict": "need_human",
         "message": f"AI 存疑（不自动否决，转评标委员会认定）：自动裁决（{prefix}）：{j.reasoning}",
-        "evidence": quote,
+        "evidence_items": items,
+        "verdict_source": "llm",
     }
 
 
@@ -2509,7 +2555,8 @@ def _resolve_veto_results(
             results[i] = {
                 "verdict": verdict_for(c["code"], c["name"], result),
                 "message": msg,
-                "evidence": result.evidence_quote,
+                "evidence_items": _evidence_items_of(result),
+                "verdict_source": "machine",
             }
             none_idxs.append(i)
         elif kind == "human_batch" and config.veto_human_only_batch_enabled():
@@ -2742,6 +2789,69 @@ def _upsert_score(
         s.flush()
         s.expunge(row)
         return row
+
+
+def _persist_verdict_citations(
+    score_row,  # ScoreRecord（_upsert_score 返回的 expunged 行）
+    result: dict,
+    *,
+    main_doc_id: int | None,
+    role: str,
+    stats: dict,
+) -> None:
+    """veto/match 的 LLM 裁决逐字引文落库（2026-11-05，补上被丢弃的 evidence 死字段）。
+
+    口径镜像 _persist_subjective 证据段：quote <8 字符跳过、每格最多 5 条、
+    create_citation 立即核验（verified 仍只由 verifier.py 写）、evidence_status
+    三态回写。与主观分路径的差异：重跑**先删后建**（限本 role + created_by='llm'，
+    保留人工补录与其它角色引文），引文与裁决结论同步替换；人工已处置
+    （human_confirmed/overridden）的行不动。纯机器判定（run_check）不产引文，
+    evidence_items 为空 → 只把 evidence_status 归 none。
+    """
+    if score_row.review_status in ("human_confirmed", "human_overridden"):
+        return
+    items = result.get("evidence_items") or []
+    from app.evidence.verifier import create_citation
+
+    with session_scope() as s:
+        s.execute(
+            delete(EvidenceCitation).where(
+                EvidenceCitation.score_record_id == score_row.id,
+                EvidenceCitation.citation_role == role,
+                EvidenceCitation.created_by == "llm",
+            )
+        )
+    evidence_status = "none"
+    verified_any = False
+    found_any = False
+    for ev in items[:5]:
+        quote = str(ev.get("quote") or "")
+        if len(quote.strip()) < 8:
+            continue
+        cit_id = create_citation(
+            main_doc_id,
+            quote,
+            page_hint=ev.get("page_hint"),
+            role=role,
+            score_record_id=score_row.id,
+            created_by="llm",
+        )
+        stats["citations_total"] += 1
+        with session_scope() as s:
+            cit = s.get(EvidenceCitation, cit_id)
+            if cit.verified:
+                verified_any = True
+            if cit.verify_method is not None:
+                found_any = True
+    if verified_any:
+        evidence_status = "verified"
+    elif found_any:
+        evidence_status = "unverified"
+    stats["citations_verified"] += int(verified_any)
+    with session_scope() as s:
+        row = s.get(ScoreRecord, score_row.id)
+        row.evidence_status = evidence_status
+        s.add(row)
 
 
 def _criterion_pk(s, criterion: dict) -> int:  # noqa: ANN001

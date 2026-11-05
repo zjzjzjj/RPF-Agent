@@ -75,10 +75,11 @@ export default function MatrixPanel({ pid, matrix, isLoading }: Props) {
                     {cell?.evidence_status === "verified" && (
                       <div style={{ fontSize: 10, color: "#389e0d" }}>✓ 有据</div>
                     )}
-                    {cell && cell.evidence_status !== "verified" && cell.score_type !== "veto" && (
-                      <div style={{ fontSize: 10, color: "#d46b08" }}>
-                        {cell.evidence_status === "unverified" ? "证据待核" : ""}
-                      </div>
+                    {cell?.evidence_status === "unverified" && (
+                      <div style={{ fontSize: 10, color: "#d46b08" }}>证据待核</div>
+                    )}
+                    {cell?.evidence_status === "none" && cell.score_type === "subjective" && (
+                      <div style={{ fontSize: 10, color: "#cf1322" }}>无证据</div>
                     )}
                   </div>
                 </Tooltip>
@@ -118,6 +119,12 @@ export default function MatrixPanel({ pid, matrix, isLoading }: Props) {
           </span>
           <span>
             <Tag color="red">已否决/不通过</Tag> 裁决终态（自动或人工确认）
+          </span>
+          <span>
+            <Tag color="green">✓ 有据</Tag>
+            <Tag color="orange">证据待核</Tag>
+            <Tag color="red">无证据</Tag>
+            格内证据角注：红＝主观项缺引文需人工处置；确定性项（判定/计算）无引文属设计
           </span>
         </Space>
       </div>

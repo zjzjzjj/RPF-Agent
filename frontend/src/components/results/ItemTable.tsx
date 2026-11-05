@@ -1,5 +1,6 @@
 import { Button, Space, Table, Tag, Tooltip, Typography } from "antd";
 import type { SummaryBucket, SummaryItem } from "../../types";
+import { evidenceCellLabel } from "../../utils/evidenceText";
 
 interface Props {
   bucket: SummaryBucket;
@@ -153,7 +154,7 @@ export default function ItemTable({ bucket, onOpenReason, onOpenEvidence }: Prop
             if (item.evidence.total_count === 0) {
               return (
                 <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                  {item.score_type === "subjective" ? "无引用" : "确定性项"}
+                  {evidenceCellLabel(item.side, item.verdict_source)}
                 </Typography.Text>
               );
             }

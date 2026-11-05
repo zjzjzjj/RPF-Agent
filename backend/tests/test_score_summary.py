@@ -488,3 +488,64 @@ def test_fallback_score_structured_key():
     fb = _fallback(score)
     assert fb == {"kind": "min_level_floor", "value": "0", "basis": "no_valid_output"}
     assert _fallback(SimpleNamespace(warnings_json=[{"message": "正常"}])) is None
+
+
+def test_verdict_source_structured_key():
+    """verdict_source 投影：warnings 结构化键优先，缺键按 machine 兜底；
+    非判定类（veto/match 之外）恒 None。"""
+    from types import SimpleNamespace
+
+    from app.services.score_summary_service import _verdict_source
+
+    llm = SimpleNamespace(warnings_json=[{"message": "自动裁决", "verdict_source": "llm"}])
+    machine = SimpleNamespace(warnings_json=[{"message": "已找到"}])
+    assert _verdict_source(llm, "veto") == "llm"
+    assert _verdict_source(machine, "veto") == "machine"
+    assert _verdict_source(machine, "match") == "machine"
+    assert _verdict_source(llm, "subjective") is None
+    assert _verdict_source(None, "veto") == "machine"
+
+
+def test_verdict_source_in_score_summary(client, summary_chain):  # noqa: ANN001
+    """端到端投影：非 auto 模式全机器判定 → veto/match 项 verdict_source="machine"、
+    主观/计分项 None；改写 warnings 为 llm + 种引文后投影随动，_machine_reason 不受影响。"""
+    d = _get(client, summary_chain).json()
+    items = [i for b in d["bidders"] for i in _all_items(b)]
+    veto_items = [i for i in items if i["state"] in ("veto", "match")]
+    assert veto_items, "模板应含判定类条目"
+    for i in veto_items:
+        assert i["verdict_source"] == "machine"
+    for i in items:
+        if i["state"] not in ("veto", "match"):
+            assert i["verdict_source"] is None
+
+    # 改写一条判定行：warnings 带 verdict_source=llm + 一条 LLM 裁决引文
+    from app.db.models import Criterion, EvidenceCitation, ScoreRecord
+    from app.db.session import session_scope
+
+    with session_scope() as s:
+        row = s.execute(
+            select(ScoreRecord).join(Criterion, ScoreRecord.criterion_id == Criterion.id).where(
+                ScoreRecord.run_id == summary_chain["run_id"],
+                ScoreRecord.bidder_id == summary_chain["bidder_ids"][0],
+                Criterion.score_type.in_(("veto", "match")),
+            )
+        ).scalars().first()
+        assert row is not None
+        row.warnings_json = [{"message": "自动裁决（通过）：已提供对应材料", "verdict_source": "llm"}]
+        s.add(row)
+        s.flush()
+        row_id = row.id
+        s.add(EvidenceCitation(
+            score_record_id=row_id, quote="逐字引文内容示例足够长",
+            citation_role="veto", created_by="llm",
+        ))
+        s.flush()
+
+    d2 = _get(client, summary_chain).json()
+    item = next(
+        i for b in d2["bidders"] for i in _all_items(b) if i["score_record_id"] == row_id
+    )
+    assert item["verdict_source"] == "llm"
+    assert item["evidence"]["total_count"] == 1
+    assert "自动裁决（通过）" in item["reason"]["machine_reason"]

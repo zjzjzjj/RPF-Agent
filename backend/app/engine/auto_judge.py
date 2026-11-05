@@ -277,9 +277,11 @@ def refine_with_llm(
             need_human=False,
         )
 
+    # 逐字引文：保留全部有效条（≤5，与 _persist_subjective 落库口径一致）——
+    # 旧实现只取首条且落库侧丢弃，"首条过短、次条有效"会整体丢失证据
+    items = [e for e in out.evidence[:5] if str(e.get("quote") or "").strip()]
     quote = next(
-        (str(e.get("quote") or "").strip()
-         for e in out.evidence if str(e.get("quote") or "").strip()),
+        (str(e.get("quote") or "").strip() for e in items),
         None,
     )
     prefix = "通过" if out.verdict == "pass" else "不通过"
@@ -288,6 +290,7 @@ def refine_with_llm(
         f"自动裁决（{prefix}）：{out.reasoning}",
         evidence_quote=quote,
         need_human=False,
+        evidence_items=items or None,
     )
 
 

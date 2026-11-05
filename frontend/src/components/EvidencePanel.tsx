@@ -45,7 +45,7 @@ interface Props {
  */
 export default function EvidencePanel({
   citations,
-  emptyText = "没有证据引用——无证据不评分，该项应由人工补录证据或降级",
+  emptyText = "没有证据引用",
   viewerHeight = 520,
   showViewer = true,
 }: Props) {

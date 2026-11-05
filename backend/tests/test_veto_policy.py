@@ -202,7 +202,8 @@ def test_veto_batch_three_human_only_cells(monkeypatch):
     assert gw.calls == 1  # 3 格同一投标人同批 → 1 次 LLM 调用
     assert out[0]["verdict"] == "pass"
     assert out[0]["message"] == "自动裁决（通过）：裁决 c1"
-    assert out[0]["evidence"] == "原文摘录 c1"
+    assert out[0]["evidence_items"] == [{"quote": "原文摘录 c1"}]
+    assert out[0]["verdict_source"] == "llm"
     assert out[1]["verdict"] == "need_human"
     assert out[1]["message"].startswith("AI 存疑（不自动否决，转评标委员会认定）")
     assert "自动裁决（不通过）：裁决 c2" in out[1]["message"]

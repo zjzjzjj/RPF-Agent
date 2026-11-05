@@ -49,6 +49,9 @@ class PrimitiveResult:
     message: str
     evidence_quote: str | None = None
     need_human: bool = False
+    # LLM 裁决抽取的逐字引文（[{quote, page_hint?}]，与 AutoJudgement.evidence 同构）。
+    # run_check 确定性判定恒不带（过程即证据，设计上无引文）；落库侧按 ≤5 条消费。
+    evidence_items: list[dict] | None = None
 
 
 @dataclass

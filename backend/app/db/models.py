@@ -497,6 +497,7 @@ class EvidenceCitation(Base):
     """证据四件套落点：文件 + 页码 + 坐标 + 逐字原文（+ 条款号）。
 
     verified 只由 evidence/verifier.py 写入：L1 精确命中且引文 ≥ MIN_QUOTE_CHARS。
+    veto/match 的 LLM 裁决引文 role=veto|match（2026-11-05 起落库，created_by=llm）。
     """
 
     __tablename__ = "evidence_citations"
@@ -507,7 +508,7 @@ class EvidenceCitation(Base):
     )
     criterion_id: Mapped[int | None] = mapped_column(ForeignKey("criteria.id"), index=True)
     citation_role: Mapped[str] = mapped_column(String(24), default="score")
-    # score|criterion_source|veto|price|level
+    # score|criterion_source|veto|match|price|level
     document_id: Mapped[int | None] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), index=True)
     page_no: Mapped[int | None] = mapped_column(Integer)
     node_id: Mapped[str | None] = mapped_column(String(512))

@@ -2,6 +2,7 @@ import { Alert, Button, Descriptions, Drawer, Empty, Space, Table, Tag, Typograp
 import { useNavigate } from "react-router-dom";
 import EvidencePanel, { type EvidenceLike } from "../EvidencePanel";
 import type { SummaryItem } from "../../types";
+import { evidenceCellLabel, evidenceEmptyText } from "../../utils/evidenceText";
 
 interface Props {
   pid: string;
@@ -86,7 +87,7 @@ export default function ItemReasonDrawer({ pid, item, open, onClose }: Props) {
             <Descriptions.Item label="复核状态">{item.review_status}</Descriptions.Item>
             <Descriptions.Item label="证据">
               {item.evidence.total_count === 0
-                ? "无引用"
+                ? evidenceCellLabel(item.side, item.verdict_source)
                 : `${item.evidence.verified_count}/${item.evidence.total_count} 已核验`}
             </Descriptions.Item>
             <Descriptions.Item label="失分算式">
@@ -231,7 +232,11 @@ export default function ItemReasonDrawer({ pid, item, open, onClose }: Props) {
           </Section>
 
           <Section title="证据引文">
-            <EvidencePanel citations={citations} viewerHeight={420} />
+            <EvidencePanel
+              citations={citations}
+              viewerHeight={420}
+              emptyText={evidenceEmptyText(item.side, item.verdict_source, item.state)}
+            />
           </Section>
         </>
       )}

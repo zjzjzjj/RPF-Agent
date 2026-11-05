@@ -332,7 +332,7 @@ export interface ScoreOut {
   ai_revealed_at: string | null;
   evaluator_actor: string | null;
   confirm_time: string | null;
-  warnings_json: { message?: string; formula_explanation?: string }[] | null;
+  warnings_json: { message?: string; formula_explanation?: string; verdict_source?: string }[] | null;
   /** 工作台展示用（只读关联信息） */
   criterion_code: string | null;
   criterion_name: string | null;
@@ -476,6 +476,9 @@ export interface SummaryItem {
   review_status: string;
   evidence_status: "verified" | "unverified" | "none";
   verdict: string | null;
+  /** 判定来源（仅 veto/match 有值）：llm＝AI 裁决（可能带引文），machine＝确定性判定（过程即证据，设计上无引文）。
+   *  旧后端缺该字段时按 "machine" 处理（见 utils/evidenceText.ts）。 */
+  verdict_source?: "llm" | "machine" | null;
   deduction: SummaryDeduction;
   reason: SummaryReason;
   ai_locked: boolean;

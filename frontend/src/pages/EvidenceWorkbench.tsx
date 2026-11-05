@@ -23,6 +23,7 @@ import { api } from "../api/client";
 import { useScore, useScoreEvidence } from "../api/hooks";
 import EvidencePanel from "../components/EvidencePanel";
 import { REVIEW_STATUS_LABELS } from "../types";
+import { evidenceEmptyText, sideFromScoreType, verdictSourceFromWarnings } from "../utils/evidenceText";
 
 export default function EvidenceWorkbench() {
   const { pid = "", sid = "" } = useParams();
@@ -73,7 +74,9 @@ export default function EvidenceWorkbench() {
   if (isLoading || !score) return <Spin />;
 
   const isVeto = score.score_type === "veto";
+  const isMatch = score.score_type === "match";
   const isSubjective = score.score_type === "subjective";
+  const verdictSource = verdictSourceFromWarnings(score.warnings_json);
 
   return (
     <div>
@@ -82,13 +85,14 @@ export default function EvidenceWorkbench() {
         <Typography.Title level={5} style={{ margin: 0 }}>
           {score.bidder_name} · {score.criterion_code} {score.criterion_name}
         </Typography.Title>
-        <Tag color={isVeto ? "red" : isSubjective ? "purple" : "blue"}>
-          {isVeto ? "否决项" : isSubjective ? "主观分（AI 仅建议）" : "确定性计算"}
+        <Tag color={isVeto ? "red" : isMatch ? "geekblue" : isSubjective ? "purple" : "blue"}>
+          {isVeto ? "否决项" : isMatch ? "判断项" : isSubjective ? "主观分（AI 仅建议）" : "确定性计算"}
         </Tag>
         <Tag>{REVIEW_STATUS_LABELS[score.review_status] ?? score.review_status}</Tag>
         {score.evidence_status === "verified" && <Tag color="green">证据已核验</Tag>}
         {score.evidence_status === "unverified" && <Tag color="orange">证据待人工核对</Tag>}
-        {score.evidence_status === "none" && !isVeto && <Tag color="red">无证据</Tag>}
+        {/* 「无证据」警示只给主观项——判定/计算项设计上不产引文，标红是误报 */}
+        {score.evidence_status === "none" && isSubjective && <Tag color="red">无证据</Tag>}
       </Space>
 
       <Row gutter={[16, 16]}>
@@ -304,7 +308,10 @@ export default function EvidenceWorkbench() {
               刷新证据
             </Button>
           </div>
-          <EvidencePanel citations={citations ?? []} />
+          <EvidencePanel
+            citations={citations ?? []}
+            emptyText={evidenceEmptyText(sideFromScoreType(score.score_type), verdictSource)}
+          />
         </Col>
       </Row>
 
