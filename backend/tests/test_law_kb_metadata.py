@@ -3,7 +3,7 @@
 
 审计后：草案（招标投标法修订草案）与已被取代的旧版（2002 政府采购法、2011
 实施条例、2007 标准施工试行规定）已从 data/law_kb.json 删除；每条带
-status/category 等效力元数据；87 条法规规则引用的 7 部法律必须仍在且现行有效。
+status/category 等效力元数据；84 条法规规则引用的 7 部法律必须仍在且现行有效。
 """
 from __future__ import annotations
 

@@ -491,28 +491,6 @@ def execute_run(
                 ).scalar_one()
                 scan_hints[bid_id] = bool(ocr_pages)
 
-    # ---- 串通信号预计算（跨投标人视角；事实/判定分离：run_check 只读信号）----
-    # 设计见 engine/collusion.py：报价完全相同/等差规律/同文档作者 → 信号而非结论。
-    from app.db.models import Document
-    from app.engine.collusion import compute_cross_bidder_signals
-
-    with session_scope() as s:
-        prices = {
-            b.id: (Decimal(str(b.bid_price)) if b.bid_price is not None else None)
-            for b in s.execute(select(Bidder).where(Bidder.id.in_(bidder_ids))).scalars()
-        }
-        authors: dict[int, list[str]] = {}
-        for _doc_id, doc_bidder_id, author in s.execute(
-            select(Document.id, Document.bidder_id, Document.author).where(
-                Document.bidder_id.in_(bidder_ids), Document.author.isnot(None)
-            )
-        ).all():
-            if (author or "").strip():
-                authors.setdefault(doc_bidder_id, []).append(author.strip())
-    for bid_id, sig in compute_cross_bidder_signals(prices, authors).items():
-        if bid_id in facts_by_bidder:
-            facts_by_bidder[bid_id].cross_bidder = sig
-
     # ---- 材料类别映射（选段软过滤/案例页优先用）----
     # 材料标签已在 parse 后自动分类落库；这里读映射（文本已变的失效标签自动跳过）。
     # rescue 改写页文本后在材料段重建一次。
@@ -772,7 +750,9 @@ def execute_run(
     # 招标文件原文页（归一化）：恢复评分项的【证明材料】要求段
     tender_pages: list[tuple[int, str]] = []
     with session_scope() as s:
-        from app.db.models import DocumentPage
+        # Document/DocumentPage 须在此显式绑定：上游循环内 import 在空
+        # bidder_ids 路径不会执行，本块的 select(Document.id) 不能依赖它。
+        from app.db.models import Document, DocumentPage
 
         tender_doc = s.execute(
             select(Document.id).where(
@@ -2306,7 +2286,7 @@ def _veto_precheck(  # noqa: ANN001
     （原 _eval_veto :1985-2007 逻辑原样搬出），并给出该格的 LLM 去向 llm_kind：
 
     - "human_batch"：human_only（或无 check_type）且需 LLM → 进组批裁决；
-    - "single"：其余 unknown/fail+need_human（冲突/信号命中）→ 逐格单条 LLM；
+    - "single"：其余 unknown/fail+need_human（冲突）→ 逐格单条 LLM；
     - "none"：终态（pass / 硬 fail），或 math_relation 冲突且跳 LLM 开关开
       （结构化比对已定论，LLM 不改变结论 → 直接 verdict_for 出 conflict_flagged）。
 
@@ -2404,7 +2384,7 @@ def _eval_veto(  # noqa: ANN001
         and gateway is not None
         and (result.status == "unknown" or (result.status == "fail" and result.need_human))
     ):
-        # 全自动模式：human_only / 冲突 / 信号命中 → LLM 带原文证据裁决。
+        # 全自动模式：human_only / 冲突 → LLM 带原文证据裁决。
         # AI 不否决（2026-10-14 用户指令，恢复"绝不自动否决"原则）：LLM 的 fail
         # 一律降级为"疑问"——machine_status=need_human，由评标委员会认定；
         # 投标人照常参与评分与排名。pass 才是唯一通过终态。

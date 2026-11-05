@@ -209,7 +209,6 @@ def parse_document(ctx: JobContext, payload: dict) -> dict:
             doc.page_count = len(extracted.pages)
             doc.parse_engine = extracted.engine
             doc.parse_status = "degraded" if extracted.degraded else "parsed"
-            doc.author = extracted.author  # 串通检测信号源（无元数据则 None）
             # 规则包错配护栏（2026-10-27）：投标文件与项目招标文件的项目关键词
             # 重合率过低 → 落警告（GYUU 类事故：二维码招标+多媒体投标静默出分）
             warn = _tender_mismatch_warning(project_id, document_id, extracted)

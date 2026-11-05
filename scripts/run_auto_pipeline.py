@@ -12,7 +12,7 @@
   未配置 provider/密钥缺失等配置错误不降级，整个运行显式失败（fail-fast，
   见 decisions/0005）。
 
-需要 .env 或 --provider 配置真实模型。注意：87 条法规包 × 5 家投标人约 400 次
+需要 .env 或 --provider 配置真实模型。注意：84 条法规包 × 5 家投标人约 400 次
 裁决调用，推理型模型下全程约 30-120 分钟——可用 BID_EVAL_LLM_CONCURRENCY
 （默认 4）提高并发；只要快速验证管线结构，直接跑 pytest 的 test_auto_pipeline
 （离线、秒级，验证同一套自动收敛保证）。
@@ -156,7 +156,7 @@ def main() -> int:
             "stages": ["objective", "price", "subjective"],
         })
         assert resp.status_code == 200, resp.text
-        # 全量裁决（87 条法规包 × 5 家 ≈ 400 次 LLM 调用）在推理型模型下需 30-120 分钟
+        # 全量裁决（84 条法规包 × 5 家 ≈ 400 次 LLM 调用）在推理型模型下需 30-120 分钟
         job = _wait(client, resp.json()["job_id"], timeout=7200)
         assert job["status"] == "succeeded", job.get("error")
         run_id = resp.json()["run_id"]

@@ -6,7 +6,7 @@
 3. 同一法规的重复副本/附件碎片去重（每个规范名称只保留一条完整文本）。
 4. 合并 `data/law_metadata.json` 的效力元数据（status/category/文号/施行日期…）。
 
-安全约束：87 条法规规则引用的 7 个 `法条://法规名` **必须保留**，否则拒绝写入。
+安全约束：84 条法规规则引用的 7 个 `法条://法规名` **必须保留**，否则拒绝写入。
 KB 的 `lawName` / `articles` 内容不改（只删多余条目、加元数据字段）。
 
 用法（在仓库根目录）：
@@ -26,7 +26,7 @@ ROOT = Path(__file__).resolve().parents[1]
 KB_PATH = ROOT / "data" / "law_kb.json"
 META_PATH = ROOT / "data" / "law_metadata.json"
 
-# 87 条法规规则实际引用的法规名——清理后必须全部存在
+# 84 条法规规则实际引用的法规名——清理后必须全部存在
 CITED_REQUIRED = {
     "中华人民共和国招标投标法实施条例（2019年修订）",
     "评标委员会和评标方法暂行规定",
@@ -137,7 +137,7 @@ def main() -> int:
     for m in sorted(missing):
         print("  MISSING:", m)
     if missing:
-        print("拒绝写入：被引用法规名不能缺失（会让 87 条规则校验失败）", file=sys.stderr)
+        print("拒绝写入：被引用法规名不能缺失（会让 84 条规则校验失败）", file=sys.stderr)
         return 2
 
     by_status: dict[str, int] = defaultdict(int)

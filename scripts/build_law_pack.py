@@ -14,11 +14,16 @@
 幂等：同一制品重跑输出逐字节一致（pack.json 记 artifact_sha256_16，不含时间戳）；
 无变化时零写入。收尾自检：law_pack_loader 全量校验 + law_import_service.validate_only
 （error 必须为 0），失败 exit 2。
+
+产品级裁剪：EXCLUDED_CODES 中的规则不随本包发布（围串标/串通投标规则由独立的
+围串标智能体负责，本系统不重复）。build 与 --check 同口径过滤，制品本身不动
+（artifact_sha256_16 仍对未过滤全文取哈希，溯源不变）。
 """
 from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -30,6 +35,10 @@ DEFAULT_LAW_KB = Path(r"E:\ZJUBJ\法规库\00_索引\生成_法条知识库.json
 REPO_KB = REPO / "data" / "law_kb.json"
 PACK_DIR = REPO / "backend" / "app" / "rules" / "library" / "law_packs" / "general-law"
 LAW_PREFIX = "法条://"
+
+# 产品级裁剪：围串标/串通投标规则（条例 39/40/41）由独立的围串标智能体负责，
+# 不随本包发布。制品不动，本过滤是 build/--check 唯一裁剪口径。
+EXCLUDED_CODES = {"REJ-008", "REJ-009", "REJ-010"}
 
 # pack.json 字段序（固定清单，保证重跑输出稳定）
 _META_ORDER = (
@@ -56,6 +65,49 @@ def _bump_patch(version: str) -> str:
         parts.append("0")
     parts[-1] = str(int(parts[-1]) + 1)
     return ".".join(parts)
+
+
+def _fmt_ranges(codes: list[str]) -> dict[str, str]:
+    """存活 code 按前缀做连续段压缩：REJ-001~007、REJ-011~015。"""
+    by_prefix: dict[str, list[int]] = {}
+    for code in codes:
+        m = re.match(r"^([A-Z]+)-(\d+)$", code)
+        if m:
+            by_prefix.setdefault(m.group(1), []).append(int(m.group(2)))
+    out: dict[str, str] = {}
+    for prefix, nums in by_prefix.items():
+        seqs = sorted(set(nums))
+        parts: list[str] = []
+        start = prev = seqs[0]
+        for n in seqs[1:] + [None]:
+            if n is not None and n == prev + 1:
+                prev = n
+                continue
+            parts.append(f"{prefix}-{start:03d}~{prev:03d}" if start != prev
+                         else f"{prefix}-{start:03d}")
+            if n is not None:
+                start = prev = n
+        out[prefix] = "、".join(parts)
+    return out
+
+
+def _rewrite_pack_text(name: str, description: str | None,
+                       codes: list[str]) -> tuple[str, str | None]:
+    """按存活规则重算 pack.json 展示文案（制品 package 文本含全量条数/区间）。"""
+    name = re.sub(r"（\d+条通用规则）", f"（{len(codes)}条通用规则）", name)
+    ranges = _fmt_ranges(codes)
+    if not description:
+        return name, description
+
+    def _repl(m: re.Match) -> str:
+        prefix = m.group(1)
+        if prefix not in ranges:
+            print(f"[warn] description 区间 {m.group(0)} 无对应存活规则，请人工核对",
+                  file=sys.stderr)
+            return m.group(0)
+        return ranges[prefix]
+
+    return name, re.sub(r"([A-Z]+)-(\d+)~(\d+)", _repl, description)
 
 
 def _split_node(node_id: str) -> tuple[str, str]:
@@ -129,6 +181,15 @@ def main() -> int:
     if not criteria:
         print("制品 criteria 为空", file=sys.stderr)
         return 2
+
+    # 产品级裁剪（EXCLUDED_CODES）：过滤在 _sorted_criteria 之前，
+    # policies/law_nodes/rule_count/targets 全部按裁剪后口径自动一致。
+    excluded_hit = [str(c.get("code") or "") for c in criteria
+                    if str(c.get("code") or "") in EXCLUDED_CODES]
+    if excluded_hit:
+        criteria = [c for c in criteria
+                    if str(c.get("code") or "") not in EXCLUDED_CODES]
+        print(f"[skip] 产品级裁剪 {len(excluded_hit)} 条（{', '.join(sorted(excluded_hit))}）")
 
     artifact_sha = content_hash(artifact_doc)
 
@@ -221,12 +282,18 @@ def main() -> int:
         "non_law_criteria": len(non_law),
     }
     gen_ordered = {k: generated_from[k] for k in _GEN_ORDER}
+    alive_codes = [str(c.get("code") or "") for c in criteria_sorted]
+    pack_name, pack_desc = _rewrite_pack_text(
+        str(meta_src.get("name") or "法律通用规则包"),
+        meta_src.get("description"),
+        alive_codes,
+    )
     meta_ordered = {
         "id": "general-law",
         "version": existing_meta.get("version") or args.set_version or "1.0.0",
         "extends": None,
-        "name": str(meta_src.get("name") or "法律通用规则包"),
-        "description": meta_src.get("description"),
+        "name": pack_name,
+        "description": pack_desc,
         "scope": "law",
         "source": meta_src.get("source") or "LAW",
         "total_max": meta_src.get("total_max"),
@@ -278,7 +345,7 @@ def main() -> int:
         return 0
 
     if not changed and not meta_changed:
-        print(f"[build] 无变化：87 条规则与制品同步（artifact_sha256_16={artifact_sha}）。")
+        print(f"[build] 无变化：{len(criteria_sorted)} 条规则与制品同步（artifact_sha256_16={artifact_sha}）。")
         return 0
 
     if not existing_meta:

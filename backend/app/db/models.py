@@ -75,7 +75,7 @@ class Document(Base):
     parse_status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
     # pending|parsed|degraded|failed|ocr_required
     parse_engine: Mapped[str | None] = mapped_column(String(64))
-    author: Mapped[str | None] = mapped_column(String(255))  # 文档作者元数据（串通检测信号源）
+    author: Mapped[str | None] = mapped_column(String(255))  # 文档作者元数据（历史字段，无写入方）
     warnings_json: Mapped[list | None] = mapped_column(JSON)
     data_class: Mapped[str] = mapped_column(String(24), default="synthetic")
     # synthetic|redacted_sample|confidential

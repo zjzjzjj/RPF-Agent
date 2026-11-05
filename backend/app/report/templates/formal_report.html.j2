@@ -123,11 +123,5 @@
 {% for c in it.citations %}<p class="note">引文（p{{ c.page_no }}{% if c.verified %}✓已核验{% else %}未核验{% endif %}）：{{ c.quote }}</p>{% endfor %}
 {% endfor %}
 {% endfor %}
-
-<h2>附表 A6 围串标核查</h2>
-<table><tr><th class="left">投标人</th><th>命中信号</th><th class="left">说明</th></tr>
-{% for r in collusion_rows %}<tr><td class="left">{{ r.bidder }}</td><td>{{ r.signals | join("、") if r.signals else "未命中" }}</td><td class="left">{{ r.detail or "-" }}</td></tr>{% endfor %}
-</table>
-<p class="note">{{ collusion_note }}</p>
 </body>
 </html>

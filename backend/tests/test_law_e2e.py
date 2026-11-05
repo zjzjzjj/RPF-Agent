@@ -1,13 +1,12 @@
-"""法律规则包端到端：导入 → 确认 → 冻结 → 评分执行（match 第五桶 + 串通检测）。
+"""法律规则包端到端：导入 → 确认 → 冻结 → 评分执行（match 第五桶）。
 
-主链用合成包（6 条：4 veto + 2 match）保证快速与 hermetic；
-固化包 87 条用例（law_packs/general-law）只验导入到冻结，不跑评分，避免 87×N 记录拖慢。
+主链用合成包（5 条：3 veto + 2 match）保证快速与 hermetic；
+固化包 84 条用例（law_packs/general-law）只验导入到冻结，不跑评分，避免 84×N 记录拖慢。
 
 核心回归护栏（对应计划 §八·2）：
 - ranking warnings == []（改动前 match 会按"未定分"逐家报警）；
 - 报告 open_questions 无 no_score 类（match 绝不落入"尚未定分"）；
-- match 记录 final/machine_score 为 NULL、三态合法、可 confirm 不可 override；
-- 串通检测命中也只到 conflict_flagged（绝不自动否决）。
+- match 记录 final/machine_score 为 NULL、三态合法、可 confirm 不可 override。
 """
 from __future__ import annotations
 
@@ -18,7 +17,7 @@ from pathlib import Path
 import pytest
 
 from .conftest import upload_pdf, wait_job
-from .test_law_import import _doc  # 合成 6 条法律包（与导入测试同源）
+from .test_law_import import _doc  # 合成 5 条法律包（与导入测试同源）
 from app.rules import law_kb as lk
 from app.rules.library.law_pack_loader import load_law_pack, reset_law_pack_cache
 
@@ -36,8 +35,6 @@ def law_kb(tmp_path):
          "articles": [
              {"articleNo": "第五十一条",
               "text": "有下列情形之一的，评标委员会应当否决其投标：（一）投标文件未经投标单位盖章和单位负责人签字。"},
-             {"articleNo": "第四十条",
-              "text": "有下列情形之一的，视为投标人相互串通投标：（一）不同投标人的投标文件由同一单位或者个人编制。"},
          ]},
         {"lawName": "中华人民共和国招标投标法（2017年修正本）",
          "articles": [{"articleNo": "第二十六条", "text": "投标人应当具备承担招标项目的能力。"}]},
@@ -94,8 +91,8 @@ def test_full_chain_import_confirm_freeze_score(client, law_chain) -> None:  # n
     pid, package_id, bidder_ids = law_chain
     summary = _run(client, pid, package_id, bidder_ids)
 
-    # ---- 桶统计：4 veto × 5 + 2 match × 5，无价格/主观 ----
-    assert summary["objective"] == 4 * 5
+    # ---- 桶统计：3 veto × 5 + 2 match × 5，无价格/主观 ----
+    assert summary["objective"] == 3 * 5
     assert summary["match"] == 2 * 5
     assert summary["price"] == 0
     assert summary["subjective"] == 0
@@ -103,20 +100,13 @@ def test_full_chain_import_confirm_freeze_score(client, law_chain) -> None:  # n
     # ---- 矩阵：match 单元格存在、final/machine 为 NULL、三态合法 ----
     matrix = client.get(f"/api/runs/{summary['run_id']}/matrix").json()
     cells = [c for cols in matrix["cells"].values() for c in cols.values()]
-    assert len(cells) == 6 * 5
+    assert len(cells) == 5 * 5
     match_cells = [c for c in cells if c["score_type"] == "match"]
     assert len(match_cells) == 2 * 5
     for c in match_cells:
         assert c["final_score"] is None
         assert c["machine_status"] in ("need_human", "pass", "conflict_flagged")
         assert c["review_status"] in ("pending", "conflict_flagged")
-
-    # 串通检测（REJ-009）：只到 conflict_flagged/need_human，**绝不自动否决**
-    collusion = [c for c in cells if "串通" in c["criterion_name"]]
-    assert len(collusion) == 5
-    for c in collusion:
-        assert c["machine_status"] in ("need_human", "conflict_flagged"), c
-        assert c["machine_status"] != "recommend_reject"
 
     # ---- 排名护栏：match 不产生"未定分"警告、不计总分 ----
     ranking = client.get(f"/api/projects/{pid}/ranking").json()
@@ -149,17 +139,17 @@ def test_full_chain_import_confirm_freeze_score(client, law_chain) -> None:  # n
 
 
 def test_import_packed_general_law(client, monkeypatch) -> None:
-    """固化包 87 条：导入 → 校验 0 error → 确认 → 冻结（不跑评分，防拖慢）。"""
+    """固化包 84 条：导入 → 校验 0 error → 确认 → 冻结（不跑评分，防拖慢）。"""
     monkeypatch.setenv("BID_EVAL_LAW_KB_PATH", str(REPO_KB))
     lk.reset_cache()
     reset_law_pack_cache()
     try:
-        pid = client.post("/api/projects", json={"name": "固定规则包 87 条"}).json()["id"]
+        pid = client.post("/api/projects", json={"name": "固定规则包 84 条"}).json()["id"]
         doc = load_law_pack()
         r = client.post(f"/api/projects/{pid}/rules/import-law", json=doc)
         assert r.status_code == 200, r.text
         out = r.json()
-        assert out["imported"] == 87
+        assert out["imported"] == 84
         assert len(out["dropped_nodes"]) == 5
         assert all(v["severity"] != "error" for v in out["validations"]), out["validations"]
 
@@ -169,7 +159,7 @@ def test_import_packed_general_law(client, monkeypatch) -> None:
         assert r.json()["content_hash"]
 
         cov = client.get(f"/api/rules/packages/{out['package_id']}/coverage").json()
-        assert cov["law"] == 87
+        assert cov["law"] == 84
         assert cov["template_fallback_pending"] == 0
     finally:
         lk.reset_cache()
@@ -182,12 +172,12 @@ def test_list_builtin_law_packs(client) -> None:
     assert r.status_code == 200, r.text
     packs = {p["id"]: p for p in r.json()}
     assert "general-law" in packs
-    assert packs["general-law"]["rule_count"] == 87
+    assert packs["general-law"]["rule_count"] == 84
     assert packs["general-law"]["version"]
 
 
 def test_import_packed_general_law_by_id(client, monkeypatch) -> None:
-    """POST /rules/import-law-pack：按 pack_id 导入固化包（前端无需持有 87 条 JSON）。"""
+    """POST /rules/import-law-pack：按 pack_id 导入固化包（前端无需持有 84 条 JSON）。"""
     monkeypatch.setenv("BID_EVAL_LAW_KB_PATH", str(REPO_KB))
     lk.reset_cache()
     reset_law_pack_cache()
@@ -197,13 +187,13 @@ def test_import_packed_general_law_by_id(client, monkeypatch) -> None:
                         json={"pack_id": "general-law"})
         assert r.status_code == 200, r.text
         out = r.json()
-        assert out["imported"] == 87
+        assert out["imported"] == 84
         assert out["created"] is True
         assert all(v["severity"] != "error" for v in out["validations"]), out["validations"]
 
         detail = client.get(f"/api/projects/{pid}/rules").json()
         assert detail["origin"] == "law"
-        assert len(detail["criteria"]) == 87
+        assert len(detail["criteria"]) == 84
     finally:
         lk.reset_cache()
         reset_law_pack_cache()
@@ -215,3 +205,31 @@ def test_import_law_pack_rejects_bad_id(client) -> None:
     for bad in ("../etc", "no-such-pack", "General-Law"):
         r = client.post(f"/api/projects/{pid}/rules/import-law-pack", json={"pack_id": bad})
         assert r.status_code == 422, f"{bad} → {r.status_code}"
+
+
+def test_formal_report_renders_without_collusion_section(client, law_chain) -> None:  # noqa: ANN001
+    """报告渲染契约（围串标功能下线护栏）：附表 A1-A5 在、A6 段与 report dict 键
+    同批消失——正式报告链此前零测试覆盖，删键留模板块会 Jinja 渲染 500。"""
+    from io import BytesIO
+
+    from docx import Document as DocxDocument
+
+    from app.services.report_service import (
+        build_formal_report,
+        render_docx,
+        render_formal_html,
+    )
+
+    pid, package_id, bidder_ids = law_chain
+    summary = _run(client, pid, package_id, bidder_ids)
+    report = build_formal_report(pid, summary["run_id"])
+    assert "collusion_rows" not in report
+    assert "collusion_note" not in report
+
+    html = render_formal_html(report)
+    assert "附表 A5" in html
+    assert "围串标" not in html and "A6" not in html
+
+    text = "\n".join(p.text for p in DocxDocument(BytesIO(render_docx(report))).paragraphs)
+    assert "附表 A5" in text
+    assert "围串标" not in text

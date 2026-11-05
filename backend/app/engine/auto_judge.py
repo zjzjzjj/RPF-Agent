@@ -1,7 +1,7 @@
 """全自动模式的 LLM 裁决：机器判不了的模糊项，带原文证据收敛为终态。
 
 触发条件（scoring_service._eval_veto 内）：run_check 返回 unknown（human_only、
-事实缺失）或 fail+need_human（算术冲突、串通信号命中）——这些在人工模式下进复核
+事实缺失）或 fail+need_human（算术冲突）——这些在人工模式下进复核
 队列，全自动模式下交本模块裁决。
 
 契约（AutoJudgement）：
@@ -174,8 +174,6 @@ def _facts_summary(facts: BidFacts) -> dict:
         "credit_statement": facts.credit_statement,
         "has_qualification_cert": facts.has_qualification_cert,
         "placeholders": facts.placeholders[:5],
-        "cross_bidder_signals": facts.cross_bidder.get("signals") or [],
-        "cross_bidder_detail": facts.cross_bidder.get("detail") or "",
     }
 
 

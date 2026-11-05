@@ -258,7 +258,7 @@ def test_merge_requires_template_package(client) -> None:  # noqa: ANN001
 def test_law_criteria_excluded_from_match_proposal(client) -> None:  # noqa: ANN001
     """法规条目（origin=law）不参与合并匹配，也不会被提议弃用。
 
-    2026-10-20 实证回归：导入法规包后再上传招标文件，合并把 87 条法规当成
+    2026-10-20 实证回归：导入法规包后再上传招标文件，合并把 84 条法规当成
     「未匹配的模板条目」提议 drop_template，_drop_template 拒绝后整个自动合并
     回滚（auto_resolve_error=只有模板条目可以弃用）。
     """

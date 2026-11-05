@@ -360,3 +360,17 @@ def test_attribute_tier_cert_level_no_certs_zero_no_facts() -> None:
     r = score_attribute_tier(crit, params, facts)
     assert r.score == D("0")
     assert r.unresolved == "no_facts"
+
+
+def test_run_check_unknown_type_falls_through() -> None:
+    """存量降级路径锁死：围串标功能下线后，冻结包里残留的 check_type
+    （如 collusion_check）不得崩、不得误判——run_check fallthrough 一律
+    unknown + need_human（转人工/LLM 裁决）。"""
+    from app.engine.objective import run_check
+
+    facts = BidFacts(text="")
+    for stale_type in ("collusion_check", "some_future_check"):
+        r = run_check(stale_type, {}, facts)
+        assert r.status == "unknown", r
+        assert r.need_human is True
+        assert "未知检查类型" in r.message

@@ -4,7 +4,7 @@
 变更内容（对应 docs/通用评分规则库设计方案.md §4.4）：
 - rule_packages  origin CHECK 扩充 'law'（法律通用规则包导入）
 - criteria       origin CHECK 扩充 'law'
-- documents      新增 author 列（文档作者元数据，串通检测信号源）
+- documents      新增 author 列（文档作者元数据，历史字段）
 
 SQLite 不支持 ALTER CHECK。本脚本采用「读原 DDL → 文本替换 CHECK → 建新表 →
 SELECT * 复制 → 删旧表 → 改名 → 重建索引」的重建流程：SELECT * 天然保留

@@ -619,8 +619,10 @@ def llm_prompt_version() -> str:
     2026-10-30 阶段 2：新增 human_only 批量裁决 prompt（auto_judge
     AUTO_JUDGE_BATCH_SYSTEM_PROMPT）——批量 prompt 是新常量，但版本号统一升
     以作废既有磁盘缓存键（新旧 prompt 不得共享缓存命中）。
+    2026-11-05：围串标功能下线，<facts> 摘要删除 cross_bidder 两键（提示词内容
+    变更），升版作废旧缓存。
     """
-    return os.environ.get("BID_EVAL_PROMPT_VERSION", "2026-11-03.1")
+    return os.environ.get("BID_EVAL_PROMPT_VERSION", "2026-11-05.1")
 
 
 def veto_batch_size() -> int:

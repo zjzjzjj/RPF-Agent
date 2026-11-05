@@ -1,9 +1,10 @@
 """法规通用规则包（law_packs/general-law）固化测试。
 
-覆盖：包加载与规模（87 条 = FORM37/QUAL23/RES12/REJ15）、文件名==code、
-法条引用 ∈ policies.json（21 项）、非法条引用 ∈ external_refs（5 条）、
+覆盖：包加载与规模（84 条 = FORM37/QUAL23/RES12/REJ12）、文件名==code、
+法条引用 ∈ policies.json（18 项）、非法条引用 ∈ external_refs（5 条）、
 法条节点对仓库 data/law_kb.json 全解析、内容哈希稳定、
 导入 → 确认 → 冻结全链、坏包 fail-fast、build 脚本 --check 护栏。
+（围串标三条 REJ-008/009/010 已按产品级裁剪 EXCLUDED_CODES 不随包发布。）
 """
 from __future__ import annotations
 
@@ -30,7 +31,7 @@ PACK_DIR = default_pack_dir()
 REPO_KB = REPO / "data" / "law_kb.json"
 ARTIFACT = Path(r"E:\ZJUBJ\法规库\00_索引\生成_规则包_通用规则库全量.json")
 
-EXPECTED_DIST = {"FORM": 37, "QUAL": 23, "RES": 12, "REJ": 15}
+EXPECTED_DIST = {"FORM": 37, "QUAL": 23, "RES": 12, "REJ": 12}
 EXPECTED_EXTERNAL = {"招标文件://投标人须知前附表"}
 
 
@@ -44,7 +45,7 @@ def pack_doc() -> dict:
 # ---------------------------------------------------------------------------
 def test_pack_loads_and_counts(pack_doc: dict) -> None:
     criteria = pack_doc["criteria"]
-    assert len(criteria) == 87
+    assert len(criteria) == 84
     dist: dict[str, int] = {}
     for c in criteria:
         prefix = str(c["code"]).split("-")[0]
@@ -67,7 +68,7 @@ def test_pack_loads_and_counts(pack_doc: dict) -> None:
 
 def test_rule_filename_matches_code() -> None:
     rule_files = sorted((PACK_DIR / "rules").glob("*.json"))
-    assert len(rule_files) == 87
+    assert len(rule_files) == 84
     for path in rule_files:
         raw = json.loads(path.read_text(encoding="utf-8"))
         assert raw["code"] == path.stem, f"{path.name} 的 code 与文件名不一致"
@@ -78,11 +79,11 @@ def test_rule_filename_matches_code() -> None:
 # ---------------------------------------------------------------------------
 def test_law_nodes_covered_by_policies(pack_doc: dict) -> None:
     policies = json.loads((PACK_DIR / "policies.json").read_text(encoding="utf-8"))
-    assert len(policies) == 21
+    assert len(policies) == 18
 
     law_nodes = {c["source_node_id"] for c in pack_doc["criteria"]
                  if (c.get("source_node_id") or "").startswith("法条://")}
-    assert law_nodes, "87 条里必须有法条引用"
+    assert law_nodes, "84 条里必须有法条引用"
     for node in law_nodes:
         entry = policies.get(node)
         assert entry is not None, f"{node} 未在 policies.json 登记"
@@ -108,7 +109,7 @@ def test_nodes_resolve_against_repo_kb(pack_doc: dict, monkeypatch) -> None:  # 
     try:
         nodes = {c["source_node_id"] for c in pack_doc["criteria"]
                  if (c.get("source_node_id") or "").startswith("法条://")}
-        assert len(nodes) == 21
+        assert len(nodes) == 18
         unresolved = [n for n in nodes if not lk.node_exists(n)]
         assert unresolved == [], f"以下法条在仓库知识库中无法解析：{unresolved}"
     finally:
@@ -123,6 +124,18 @@ def test_content_hash_stable() -> None:
     assert canonical_json(load_law_pack()) == canonical_json(doc1)
 
 
+def test_pack_display_text_matches_pruned_codes() -> None:
+    """pack.json 展示文案护栏（build_law_pack._rewrite_pack_text 产物）：
+    name 条数 == rule_count；description 的 REJ 区间 == 存活 codes；
+    围串标三条（REJ-008~010，EXCLUDED_CODES）不得出现在包内。"""
+    meta = json.loads((PACK_DIR / "pack.json").read_text(encoding="utf-8"))
+    assert f"（{meta['rule_count']}条通用规则）" in meta["name"]
+    assert "87" not in meta["name"]
+    assert "REJ-001~007、REJ-011~015" in meta["description"]
+    for code in ("REJ-008", "REJ-009", "REJ-010"):
+        assert not (PACK_DIR / "rules" / f"{code}.json").exists()
+
+
 # ---------------------------------------------------------------------------
 # 导入 → 确认 → 冻结（仓库包 + 仓库知识库，全程离线）
 # ---------------------------------------------------------------------------
@@ -135,7 +148,7 @@ def test_import_confirm_freeze_from_pack(client, monkeypatch) -> None:  # noqa: 
         r = client.post(f"/api/projects/{pid}/rules/import-law", json=doc)
         assert r.status_code == 200, r.text
         out = r.json()
-        assert out["imported"] == 87
+        assert out["imported"] == 84
         assert len(out["dropped_nodes"]) == 5  # 招标文件:// 前附表组
         assert all(v["severity"] != "error" for v in out["validations"]), out["validations"]
 
@@ -145,7 +158,7 @@ def test_import_confirm_freeze_from_pack(client, monkeypatch) -> None:  # noqa: 
         assert r.json()["content_hash"]
 
         cov = client.get(f"/api/rules/packages/{out['package_id']}/coverage").json()
-        assert cov["law"] == 87
+        assert cov["law"] == 84
         assert cov["template_fallback_pending"] == 0
     finally:
         lk.reset_cache()
@@ -184,7 +197,7 @@ def test_bad_pack_fails_fast(tmp_path: Path) -> None:  # noqa: ANN001
         load_law_pack(_make_pack(
             tmp_path, "c", lambda r: r.update({"source_node_id": "规范://某规范/第一条"})))
 
-    # 4) rule_count 与实际文件数不一致（真实包声明 87，坏包只有 1 条）
+    # 4) rule_count 与实际文件数不一致（真实包声明 84，坏包只有 1 条）
     with pytest.raises(LawPackError, match="rule_count"):
         load_law_pack(_make_pack(tmp_path, "d", lambda r: r))
 

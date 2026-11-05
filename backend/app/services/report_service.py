@@ -15,7 +15,6 @@ from app.db.models import (
     AuditLog,
     Bidder,
     Criterion,
-    Document,
     EvidenceCitation,
     EvaluationRun,
     Project,
@@ -217,9 +216,11 @@ def _classify_question(score, crit) -> str | None:
         if score.machine_status in (None, "need_human"):
             return "needs_judgment"     # 中危：机器不可判，逐项裁决
         return "batch_confirmable"      # 低危：机器 pass，待浏览确认
-    # 证据核验只对**主观分**有意义：formula/count/match 的证据是确定性计算过程本身
+    # 证据核验只对**主观分**有意义：formula/count 的证据是确定性计算过程本身
     # （价格分可复算、计数分有原语与参数），不产生引文，故 evidence_status 恒为 none。
     # 若不区分，所有机器计算分都会被误报为"证据未核验"。
+    # veto/match 的 LLM 裁决引文自 2026-11-05 起落 role=veto|match（确定性判定仍
+    # 不产引文），但 _doubt_kind 的证据检查保持只对主观分——判定类不适用红线。
     if crit.score_type == "subjective":
         # 先判证据：AI 给了建议但证据未核验时，final_score 仍为 None，
         # 若先判 final_score 会被归成中危"尚未定分"，掩盖了"无证据不评分"这条红线。
@@ -592,11 +593,9 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
 
     形态对齐真实评审资料（如浙江中烟项目）：正文（项目简介/过程/程序/结论）
     → 评审结果汇总表（投标人 × 评委 + 最终得分 + 名次）→ 评审情况说明（逐家
-    零分/扣分依据）→ 附表（资格审查/符合性/分项得分/价格/AI 评审明细/围串标）。
+    零分/扣分依据）→ 附表（资格审查/符合性/分项得分/价格/AI 评审明细）。
     合规：全程标注 AI 辅助评审，结论须评标委员会确认。
     """
-    from app.engine.collusion import compute_cross_bidder_signals
-
     with session_scope() as s:
         project = s.get(Project, project_id)
         if project is None:
@@ -631,9 +630,6 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
             select(EvidenceCitation).where(
                 EvidenceCitation.score_record_id.in_([r[0].id for r in score_rows] or [-1])
             )
-        ).scalars().all()
-        docs = s.execute(
-            select(Document).where(Document.project_id == project_id, Document.kind == "bid")
         ).scalars().all()
 
     ranking_rows = compute_ranking(project_id, run_id).get("rows", [])
@@ -880,27 +876,6 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
         if items:
             ai_detail.append({"bidder": bidder.name, "items": items})
 
-    # ---- 围串标核查附录（系统可得信号 + 平台数据注记） ----
-    prices = {b.id: b.bid_price for b in bidders}
-    authors = {}
-    for d in docs:
-        if d.bidder_id is not None and d.author:
-            authors.setdefault(d.bidder_id, []).append(d.author)
-    signals_map = compute_cross_bidder_signals(prices, authors)
-    collusion_rows = []
-    for bidder in bidders:
-        sig = signals_map.get(bidder.id, {})
-        collusion_rows.append({
-            "bidder": bidder.name,
-            "signals": sig.get("signals") or [],
-            "detail": sig.get("detail") or "",
-        })
-    collusion_note = (
-        "本附录为系统可自动核验的信号（报价一致性/等差规律/文档作者相同）。"
-        "真实评审资料中的硬件特征码、投标文件上传 IP、购标/投标联系人信息"
-        "属电子招投标平台数据，本系统不可得，需评标委员会向平台调取核对。"
-    )
-
     total_citations = len(citations)
     verified_citations = sum(1 for c in citations if c.verified)
 
@@ -929,8 +904,6 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
         "price_rows": price_rows,
         "tax_rate": str(TAX_RATE),
         "ai_detail": ai_detail,
-        "collusion_rows": collusion_rows,
-        "collusion_note": collusion_note,
         "declaration": {
             "ai_assisted": True,
             "text": (
@@ -1094,13 +1067,6 @@ def render_docx(report: dict) -> bytes:
                 para(f"评审依据：{it['reasoning']}")
             for c in it["citations"]:
                 para(f"　引文（p{c['page_no']}{'✓' if c['verified'] else '未核验'}）：{c['quote']}")
-    # A6 围串标
-    heading("附表 A6 围串标核查", 1)
-    table(
-        ["投标人", "命中信号", "说明"],
-        [[r["bidder"], "、".join(r["signals"]) or "未命中", r["detail"] or "-"] for r in report["collusion_rows"]],
-    )
-    para(report["collusion_note"])
 
     buf = BytesIO()
     doc.save(buf)

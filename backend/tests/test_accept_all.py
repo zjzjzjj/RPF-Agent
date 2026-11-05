@@ -93,12 +93,12 @@ def test_accept_all_on_law_package(client, monkeypatch, app_env) -> None:  # noq
         r = client.post(f"/api/projects/{pid}/rules/import-law-pack",
                         json={"pack_id": "general-law"})
         assert r.status_code == 200, r.text
-        assert r.json()["imported"] == 87
+        assert r.json()["imported"] == 84
         package_id = r.json()["package_id"]
 
         detail = client.get(f"/api/projects/{pid}/rules").json()
-        assert len(detail["criteria"]) == 87
-        # 法规条目：免签批（signoff_json 为空）、全部 verified → 前端 verifiedCount = 87
+        assert len(detail["criteria"]) == 84
+        # 法规条目：免签批（signoff_json 为空）、全部 verified → 前端 verifiedCount = 84
         assert all(c["status"] == "verified" for c in detail["criteria"])
         assert all(c["origin"] == "law" for c in detail["criteria"])
         assert all(c["signoff_json"] is None for c in detail["criteria"])
@@ -107,7 +107,7 @@ def test_accept_all_on_law_package(client, monkeypatch, app_env) -> None:  # noq
         r = client.post(f"/api/rules/packages/{package_id}/accept-all",
                         json={"reason": "批量采纳：法条逐条核验通过"})
         assert r.status_code == 200, r.text
-        assert r.json()["accepted"] == 87
+        assert r.json()["accepted"] == 84
 
         # 采纳后仍可确认 → 冻结（免签批语义不受影响）
         assert client.post(f"/api/rules/packages/{package_id}/confirm").status_code == 200

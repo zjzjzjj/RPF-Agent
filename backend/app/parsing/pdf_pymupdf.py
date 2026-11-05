@@ -472,8 +472,6 @@ def extract_pdf(path: str) -> ExtractedDocument:
         if doc.page_count == 0:
             raise DocumentRejectedError(config.REJECT_EMPTY_FILE, "PDF 没有任何页面")
 
-        author = str((doc.metadata or {}).get("author") or "").strip() or None
-
         ocr_budget = config.ocr_max_pages() if config.ocr_enabled() else 0
         ocr_available = False
         ocr_engine = config.ocr_engine()
@@ -615,5 +613,4 @@ def extract_pdf(path: str) -> ExtractedDocument:
         warnings=warnings,
         table_boxes=table_boxes,
         degraded=degraded,
-        author=author,
     )

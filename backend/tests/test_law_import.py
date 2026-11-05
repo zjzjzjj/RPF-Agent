@@ -18,20 +18,15 @@ LAW51 = (
     "有下列情形之一的，评标委员会应当否决其投标：（一）投标文件未经投标单位盖章和单位负责人签字；"
     "（二）投标联合体没有提交共同投标协议；（三）投标人不符合国家或者招标文件规定的资格条件。"
 )
-LAW40 = (
-    "有下列情形之一的，视为投标人相互串通投标：（一）不同投标人的投标文件由同一单位或者个人编制；"
-    "（二）不同投标人委托同一单位或者个人办理投标事宜。"
-)
 LAW26 = "投标人应当具备承担招标项目的能力；国家有关规定对投标人资格条件有规定的，投标人应当具备规定的资格条件。"
 
 NODE_51 = "法条://中华人民共和国招标投标法实施条例（2019年修订）/第五十一条"
-NODE_40 = "法条://中华人民共和国招标投标法实施条例（2019年修订）/第四十条"
 NODE_26 = "法条://中华人民共和国招标投标法（2017年修正本）/第二十六条"
 NODE_BID_DOC = "招标文件://投标人须知前附表"  # 非法条前缀 → 导入时置空并留痕
 
 
 def _doc() -> dict:
-    """6 条合成包：4 veto（human_only/document_present/collusion_check/count_at_least）
+    """5 条合成包：3 veto（human_only/document_present/count_at_least）
     + 2 match（其一带招标文件:// 节点用于 dropped_nodes 断言）。"""
     return {
         "package": {"name": "法律规则测试包", "version": "0.9.0", "source": "LAW",
@@ -48,11 +43,6 @@ def _doc() -> dict:
              "max_score": None, "weight": None, "levels": [],
              "check_type": "document_present", "params": {"document": "联合体共同投标协议"},
              "source_quote": LAW51, "source_node_id": NODE_51},
-            {"code": "REJ-009", "category": "compliance", "name": "视为投标人相互串通投标",
-             "score_type": "veto", "is_veto": True, "veto_consequence": "disqualify",
-             "description": "条例第四十条六种客观情形命中任一即视为串通投标。",
-             "max_score": None, "weight": None, "levels": [], "check_type": "collusion_check", "params": {},
-             "source_quote": LAW40, "source_node_id": NODE_40},
             {"code": "QUAL-009", "category": "qualification", "name": "类似业绩证明材料完整性",
              "score_type": "veto", "is_veto": True, "veto_consequence": "disqualify",
              "description": "业绩须提供合同关键页及中标通知书或验收证明。",
@@ -80,8 +70,7 @@ def law_kb(tmp_path):
 
     kb = [
         {"lawName": "中华人民共和国招标投标法实施条例（2019年修订）",
-         "articles": [{"articleNo": "第五十一条", "text": LAW51},
-                      {"articleNo": "第四十条", "text": LAW40}]},
+         "articles": [{"articleNo": "第五十一条", "text": LAW51}]},
         {"lawName": "中华人民共和国招标投标法（2017年修正本）",
          "articles": [{"articleNo": "第二十六条", "text": LAW26}]},
     ]
@@ -103,7 +92,7 @@ def test_import_creates_law_package(client, law_kb) -> None:  # noqa: ANN001
     assert r.status_code == 200, r.text
     out = r.json()
     assert out["created"] is True
-    assert out["imported"] == 6
+    assert out["imported"] == 5
     assert out["skipped_codes"] == []
     # 非法条节点被置空并留痕
     assert out["dropped_nodes"] == [{"code": "MATCH-001", "node_id": NODE_BID_DOC}]
@@ -113,7 +102,7 @@ def test_import_creates_law_package(client, law_kb) -> None:  # noqa: ANN001
     assert pkg["origin"] == "law"
     assert pkg["status"] == "draft"
     assert pkg["library_version"] == "0.9.0"
-    assert len(pkg["criteria"]) == 6
+    assert len(pkg["criteria"]) == 5
     for c in pkg["criteria"]:
         assert c["origin"] == "law"
         assert c["p_source"] == "P0"
@@ -126,7 +115,6 @@ def test_import_creates_law_package(client, law_kb) -> None:  # noqa: ANN001
     checks = {c["code"]: c["checks"][0] for c in pkg["criteria"]}
     assert checks["REJ-002"]["check_type"] == "document_present"
     assert checks["REJ-002"]["on_fail"] == "recommend_reject"
-    assert checks["REJ-009"]["check_type"] == "collusion_check"
     assert checks["MATCH-001"]["on_fail"] == "need_human"
 
 
@@ -150,9 +138,9 @@ def test_append_into_existing_draft(client, law_kb) -> None:  # noqa: ANN001
     assert inst.status_code == 200, inst.text
     out = _import(client, pid).json()
     assert out["created"] is False
-    assert out["imported"] == 6  # 幂等追加，不覆盖模板条目
+    assert out["imported"] == 5  # 幂等追加，不覆盖模板条目
     pkg = client.get(f"/api/rules/packages/{out['package_id']}").json()
-    assert len(pkg["criteria"]) == 14 + 6
+    assert len(pkg["criteria"]) == 14 + 5
     origins = {c["origin"] for c in pkg["criteria"]}
     assert origins == {"template", "law"}
     # 模板条目未签批的 error 照常返回（导入只报告，不阻断）
@@ -163,7 +151,7 @@ def test_confirmed_package_conflict_409(client, law_kb) -> None:  # noqa: ANN001
     pid = client.post("/api/projects", json={"name": "确认后禁止导入"}).json()["id"]
     pkg_id = _import(client, pid).json()["package_id"]
     r = client.post(f"/api/rules/packages/{pkg_id}/confirm")
-    assert r.status_code == 200, r.text  # 6 条全 verified，免签批直接过闸门
+    assert r.status_code == 200, r.text  # 5 条全 verified，免签批直接过闸门
     r = _import(client, pid)
     assert r.status_code == 409, r.text
     assert "versions" in r.json()["message"]
@@ -209,7 +197,7 @@ def test_confirm_freeze_without_signoff(client, law_kb) -> None:  # noqa: ANN001
     with session_scope() as s:
         snap = s.get(RulePackage, pkg_id).snapshot_json
     assert snap["package"]["origin"] == "law"
-    assert len(snap["criteria"]) == 6
+    assert len(snap["criteria"]) == 5
     for c in snap["criteria"]:
         assert c["origin"] == "law"
         assert c["p_source"] == "P0"
@@ -230,12 +218,12 @@ def test_coverage_law_bucket(client, law_kb) -> None:  # noqa: ANN001
     pid = client.post("/api/projects", json={"name": "覆盖率"}).json()["id"]
     pkg_id = _import(client, pid).json()["package_id"]
     cov = client.get(f"/api/rules/packages/{pkg_id}/coverage").json()
-    assert cov["law"] == 6
+    assert cov["law"] == 5
     assert cov["template_fallback_pending"] == 0
     assert cov["document_backed"] == 0
-    assert cov["total"] == 6
+    assert cov["total"] == 5
     assert cov["veto_covered_ratio"] == 1.0
-    assert cov["by_category"]["compliance"]["law"] == 5
+    assert cov["by_category"]["compliance"]["law"] == 4
     assert cov["by_category"]["qualification"]["law"] == 1
 
 

@@ -71,17 +71,9 @@ def extract_pdf(path: str) -> ExtractedDocument:
             raise DocumentRejectedError(config.REJECT_ENCRYPTED, "PDF 已加密，无法解析") from exc
         raise DocumentRejectedError(config.REJECT_EXTRACTION_FAILED, f"PDF 打开失败：{exc}") from exc
 
-    author: str | None = None
     with pdf:
         if not pdf.pages:
             raise DocumentRejectedError(config.REJECT_EMPTY_FILE, "PDF 没有任何页面")
-
-        # 作者元数据（打开时顺带读取；合成/扫描 PDF 常无此项 → None）
-        try:
-            meta = getattr(pdf, "metadata", None) or {}
-            author = str(meta.get("Author") or meta.get("author") or "").strip() or None
-        except Exception:  # noqa: BLE001
-            author = None
 
         # 文字层判定（抽样）
         probe = pdf.pages[: config.TEXT_PROBE_PAGES]
@@ -128,5 +120,5 @@ def extract_pdf(path: str) -> ExtractedDocument:
 
     return ExtractedDocument(
         pages=pages, engine="pdfplumber", warnings=warnings, table_boxes=table_boxes,
-        degraded=degraded, author=author,
+        degraded=degraded,
     )

@@ -10,7 +10,7 @@
 
 2026-11-04 资格审查弱化后的新口径：veto/match 行的 need_human（human_only
 转人工）不阻塞报告定稿（progress.blocking_open 只计评分侧），但仍列疑问清单。
-说明：human_only 法条（87 条真实法规包中占 72 条）与冲突信号的 LLM 带证据
+说明：human_only 法条（84 条真实法规包中占 70 条）与冲突信号的 LLM 带证据
 裁决收敛属真实模型行为，不再由任何内置假 LLM 覆盖——由
 ``scripts/run_auto_pipeline.py --assert-final``（接真实模型）验收。
 """

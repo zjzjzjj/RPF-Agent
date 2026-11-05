@@ -389,7 +389,7 @@ export default function TenderRules() {
     onError: (e: Error) => message.error(e.message),
   });
 
-  // 导入仓库内固化的法规规则包（87 条通则，法条逐条核验 fail-closed）
+  // 导入仓库内固化的法规规则包（84 条通则，法条逐条核验 fail-closed）
   const importLaw = useMutation({
     mutationFn: (packId: string) =>
       api.post<{ package_id: number; imported: number; created: boolean; skipped_codes: string[] }>(
@@ -486,7 +486,7 @@ export default function TenderRules() {
             <Tooltip
               title={
                 canImportLaw
-                  ? "导入仓库内固化的 87 条法规通用评审规则（免签批，法条逐条核验）"
+                  ? "导入仓库内固化的 84 条法规通用评审规则（免签批，法条逐条核验）"
                   : draftHint
               }
             >
@@ -592,7 +592,7 @@ export default function TenderRules() {
                   <Progress
                     size="small"
                     style={{ width: 180 }}
-                    // 分子必须含 law 桶：否则导入 87 条法规后进度条纹丝不动（纯法规包永远是 0/87）
+                    // 分子必须含 law 桶：否则导入 84 条法规后进度条纹丝不动（纯法规包永远是 0/84）
                     percent={Math.round(
                       ((coverage.document_backed +
                         coverage.template_fallback_signed +
@@ -880,7 +880,7 @@ export default function TenderRules() {
         onClose={() => setProposalOpen(false)}
       />
 
-      {/* 导入法规包（仓库内固化包，87 条通则） */}
+      {/* 导入法规包（仓库内固化包，84 条通则） */}
       <Modal
         open={lawOpen}
         title="导入法规规则包"
