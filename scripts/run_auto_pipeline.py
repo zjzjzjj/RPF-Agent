@@ -4,18 +4,17 @@
 与 run_e2e.py（人工回退模式冒烟）成对；本脚本断言的是 BID_EVAL_AUTO_MODE=1
 （默认）的全自动语义：
 - 法规包 confirm/freeze 的阻断项自动采纳（含模板签批的自动形态）；
-- 报价自动确认（无报价的投标人自动剔除并留痕）；
-- 评分运行结束无 need_human/conflict_flagged 残留，全部 auto_confirmed 或 rejected；
-- human_only/冲突项由真实模型带原文证据裁决（reasoning 落留痕）；
-- 报告直接 final（无待复核疑问）——零 need_human 是 auto 模式的**结构保证**
-  （模型故障也降级为 fail 终态，绝不悬挂），对任何**已配置**的模型成立；
-  未配置 provider/密钥缺失等配置错误不降级，整个运行显式失败（fail-fast，
-  见 decisions/0005）。
+- 报价缺失或冲突自动补抽，投标人不会因补抽失败而被删除；
+- 核对所选投标人 × 全部应评条款，缺记录也算未完成；
+- human_only/冲突项由模型依据有效引文或原页视觉核验自动裁决，补评过程留痕；
+- 不符合与外部事实无法证实均为已评审结论，投标人仍参与评分和排名；
+- 成功运行零待人工、零未完成、零技术兜底分，计分项都有合法终分后报告才 final；
+- 模型/OCR/引文故障经重试补评仍失败时整场 failed，成功项保留，可续评未完成项。
 
 需要 .env 或 --provider 配置真实模型。注意：84 条法规包 × 5 家投标人约 400 次
-裁决调用，推理型模型下全程约 30-120 分钟——可用 BID_EVAL_LLM_CONCURRENCY
-（默认 4）提高并发；只要快速验证管线结构，直接跑 pytest 的 test_auto_pipeline
-（离线、秒级，验证同一套自动收敛保证）。
+裁决调用，补评和视觉核验可能增加调用——可用 BID_EVAL_LLM_CONCURRENCY
+提高并发。离线结构与故障恢复验证请跑 test_automatic_scoring、
+test_automation_lifecycle 和 test_automatic_review_contract；本脚本会实际调用模型。
 
 用法：
     python scripts/run_auto_pipeline.py                    # 用 .env 配置的模型跑全链
@@ -28,6 +27,7 @@ import os
 import sys
 import tempfile
 import time
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -137,6 +137,8 @@ def main() -> int:
             "全自动模式下阻断项应已被自动采纳"
         frozen = client.post(f"/api/rules/packages/{doc_pkg}/freeze").json()
         check("规则确认→冻结（阻断项自动采纳）", bool(frozen.get("content_hash")))
+        frozen_pkg = client.get(f"/api/rules/packages/{doc_pkg}").json()
+        criterion_ids = {int(c["id"]) for c in frozen_pkg["criteria"] if c.get("status") != "retired"}
 
         bidder_ids: list[int] = []
         pdfs = sorted((samples / "bids").glob("*_投标文件.pdf"))
@@ -148,7 +150,7 @@ def main() -> int:
             assert jb["status"] == "succeeded", jb.get("error")
             client.get(f"/api/bidders/{b['id']}/price")  # GET 触发报价抽取
             bidder_ids.append(b["id"])
-        print(f"[4/6] {len(bidder_ids)} 家投标人解析完成（报价确认留给评分入口自动处理）")
+        print(f"[4/6] {len(bidder_ids)} 家投标人解析完成（报价核验与补抽由评分运行处理）")
 
         resp = client.post(f"/api/projects/{pid}/runs", json={
             "package_id": doc_pkg,
@@ -156,36 +158,63 @@ def main() -> int:
             "stages": ["objective", "price", "subjective"],
         })
         assert resp.status_code == 200, resp.text
+        run_id = resp.json()["run_id"]
         # 全量裁决（84 条法规包 × 5 家 ≈ 400 次 LLM 调用）在推理型模型下需 30-120 分钟
         job = _wait(client, resp.json()["job_id"], timeout=7200)
-        assert job["status"] == "succeeded", job.get("error")
-        run_id = resp.json()["run_id"]
+        if job["status"] != "succeeded":
+            progress = client.get(f"/api/runs/{run_id}").json().get("automation")
+            print(f"自动运行 #{run_id} 未完成：{job.get('error')}｜进度 {progress}")
+            print(f"数据保留于 {tmp}；修复技术故障后可 POST /api/runs/{run_id}/resume。")
+            return 1
         summary = job["result_json"]
         print(f"[5/6] 评分运行 #{run_id}：objective {summary['objective']}｜"
               f"price {summary['price']}｜subjective {summary['subjective']}｜"
-              f"match {summary['match']}｜残留待人工 {summary['need_human']}")
-        # 2026-11-04 资格审查弱化：veto/match 行允许 need_human/conflict_flagged
-        # （human_only 转人工是设计语义），评分侧仍要求零残留。
+              f"match {summary['match']}｜未完成 {summary.get('automation', {}).get('remaining', '未知')}")
+        expected_keys = {(bid, crit) for bid in bidder_ids for crit in criterion_ids}
+        run = client.get(f"/api/runs/{run_id}").json()
+        automation = run.get("automation") or {}
+        check("完整预期矩阵全部自动完成", bool(expected_keys) and automation.get("expected") == len(expected_keys)
+              and automation.get("completed") == len(expected_keys) and automation.get("remaining") == 0
+              and automation.get("failed") == 0 and automation.get("is_final") is True,
+              str(automation))
         matrix = client.get(f"/api/runs/{run_id}/matrix").json()
         cells = [c for cols in matrix["cells"].values() for c in cols.values()]
-        scoring_bad = [
+        actual_keys = {(int(bid), int(crit)) for bid, cols in matrix["cells"].items() for crit in cols}
+        check("逐项记录覆盖完整矩阵，无缺失或额外条目", actual_keys == expected_keys,
+              f"缺失 {len(expected_keys - actual_keys)}，额外 {len(actual_keys - expected_keys)}")
+        unresolved = [
             c for c in cells
-            if c.get("score_type") not in ("veto", "match")
-            and c["review_status"] not in ("auto_confirmed", "not_applicable")
+            if c["review_status"] not in ("auto_confirmed", "not_applicable")
+            or c.get("machine_status") in ("need_human", "conflict_flagged", "execution_failed", "failed")
         ]
-        check("无评分侧残留（count/subjective/formula 全收敛）", not scoring_bad,
-              f"异常 {len(scoring_bad)} 条：{[ (c['criterion_name'], c['review_status']) for c in scoring_bad[:3] ]}")
+        check("全部资格与计分项零待人工、零技术故障", not unresolved,
+              f"异常 {len(unresolved)} 条：{[(c['criterion_name'], c['review_status']) for c in unresolved[:3]]}")
+        illegal_scores = []
+        for cell in cells:
+            if cell.get("score_type") in ("veto", "match"):
+                continue
+            try:
+                final, maximum = Decimal(str(cell.get("final_score"))), Decimal(str(cell.get("max_score")))
+                legal = final.is_finite() and maximum.is_finite() and 0 <= final <= maximum
+            except (InvalidOperation, ValueError, TypeError):
+                legal = False
+            if not legal:
+                illegal_scores.append(cell["criterion_name"])
+        check("全部计分项具有合法终分", not illegal_scores, str(illegal_scores[:3]))
 
-        ranking = client.get(f"/api/projects/{pid}/ranking").json()
+        ranking = client.get(f"/api/projects/{pid}/ranking?run_id={run_id}").json()
+        check("所有参评投标人均保留在最终排名", ranking.get("is_final") is True
+              and {r["bidder_id"] for r in ranking["rows"]} == set(bidder_ids)
+              and all(r["rank"] is not None for r in ranking["rows"]))
         check("排名无 missing_final 警告", all(not r["missing_final"] for r in ranking["rows"]),
               str([r["missing_final"] for r in ranking["rows"] if r["missing_final"]][:2]))
 
-        report = client.get(f"/api/projects/{pid}/report").json()
+        report = client.get(f"/api/projects/{pid}/report?run_id={run_id}").json()
         blocking = report["progress"].get("blocking_open", 0)
         print(f"[6/6] 报告状态：{report['status']}｜疑问 {len(report['open_questions'])} 条"
               f"（阻塞 {blocking}）")
-        check("报告直接定稿（final）", report["status"] == "final", report["status"])
-        check("无阻塞性疑问（评分侧清零）", blocking == 0,
+        check("完整评审通过后报告定稿（final）", report["status"] == "final", report["status"])
+        check("所有应评项无阻塞性未决事项", blocking == 0,
               str([q["kind"] for q in report["open_questions"] if q.get("blocks_final")][:5]))
 
     print()

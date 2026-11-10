@@ -29,6 +29,10 @@ data/samples/
 data/diag/
 # LLM 结果磁盘缓存（模型对投标内容的输出衍生文本，含敏感语料）
 data/llm_cache/
+# 操作系统级运行互斥锁（稳定保留的运行文件）
+data/run_locks/
+# 跨进程 HTTP 并发槽位（稳定 inode，运行时保留）
+data/llm_request_slots/
 
 # ---- 前端 ----
 frontend/node_modules/
