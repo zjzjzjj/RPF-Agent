@@ -124,8 +124,9 @@ def test_veto_need_human_must_stay_a_question():
     assert QUESTION_KINDS[kind]["severity"] == "high"
 
 
-def test_report_never_claims_final_while_veto_unadjudicated():
-    """只要还有未裁决的否决项，progress.open 就不能归零。"""
+def test_veto_questions_do_not_block_final():
+    """2026-11-04 资格审查弱化：veto 疑问仍列清单（open 计数）但不阻塞定稿
+    （blocking_open 只计评分侧）。"""
     crit = _Crit(score_type="veto", name="投标文件签章")
     rows = [
         (_Score(review_status="human_confirmed"), _Crit(score_type="count"), _Bidder()),
@@ -134,6 +135,47 @@ def test_report_never_claims_final_while_veto_unadjudicated():
     questions, progress, _by_crit = _build_open_questions(rows, 1)
     assert progress["open"] == 1
     assert progress["settled"] == 1
+    assert progress["blocking_open"] == 0, "veto 疑问不阻塞定稿"
+    assert questions[0]["blocks_final"] is False
+
+
+def test_scoring_side_questions_still_block():
+    """评分侧疑问（count unresolved 等）仍阻塞定稿。"""
+    crit = _Crit(score_type="count", name="投标人业绩")
+    s = _Score(final_score=Decimal("0"),
+               warnings=[{"message": "…", "unresolved": "no_facts"}])
+    rows = [(s, crit, _Bidder())]
+    questions, progress, _by_crit = _build_open_questions(rows, 1)
+    assert progress["blocking_open"] == 1
+    assert questions[0]["blocks_final"] is True
+
+
+def test_auto_veto_conflict_row_not_blocking():
+    """auto 形态：veto 行 machine=need_human + review=conflict_flagged 落 kind
+    ="conflict"（按 kind 判会误判评分侧）——必须按行放行。"""
+    crit = _Crit(score_type="veto", name="投标文件签章")
+    s = _Score(machine_status="need_human", final_score=None,
+               review_status="conflict_flagged",
+               warnings=[{"message": "该项需人工判定（如密封、签字、盖章）"}])
+    rows = [(s, crit, _Bidder())]
+    questions, progress, _by_crit = _build_open_questions(rows, 1)
+    assert questions[0]["kind"] == "conflict"  # kind 是 conflict 但行是 veto
+    assert questions[0]["blocks_final"] is False
+    assert progress["blocking_open"] == 0
+
+
+def test_count_cases_unverified_classified():
+    """cases_unverified（批失败/核验未做完）→ count_cases_unverified，阻塞定稿。"""
+    crit = _Crit(score_type="count", name="投标人业绩")
+    s = _Score(final_score=Decimal("0"),
+               warnings=[{"message": "…", "unresolved": "cases_unverified",
+                          "zero_reason": "cases_unverified"}])
+    kind = _classify_question(s, crit)
+    assert kind == "count_cases_unverified"
+    assert QUESTION_KINDS[kind]["severity"] == "medium"
+    rows = [(s, crit, _Bidder())]
+    questions, progress, _by_crit = _build_open_questions(rows, 1)
+    assert questions[0]["blocks_final"] is True
 
 
 def test_machine_computed_score_does_not_require_citation():
@@ -229,3 +271,46 @@ def test_infer_count_field_company_level_only():
     assert _infer_count_field({"name": "项目驻场运维工程师经验", "description": ""}) is None
     assert _infer_count_field({"name": "增值服务", "description": "每项1分"}) is None
 
+
+
+# ---- R3-5 兜底分清单（2026-11-03） -------------------------------------------
+
+def test_fallback_marker_classified_machine_fallback():
+    """兜底格定性 machine_fallback（压过 conflict/needs_judgment），高危。"""
+    from app.services.report_service import _classify_question
+
+    score = _Score(
+        review_status="conflict_flagged", machine_status="need_human",
+        final_score=Decimal("0"),
+        warnings=[{"message": "全自动模式：……按最低档兜底（0 分）……",
+                   "fallback_score": {"kind": "min_level_floor", "value": "0",
+                                      "basis": "no_valid_output"}}],
+    )
+    assert _classify_question(score, _Crit(score_type="subjective")) == "machine_fallback"
+    assert QUESTION_KINDS["machine_fallback"]["severity"] == "high"
+
+
+def test_fallback_items_collects_marker_and_zero_no_facts():
+    """兜底清单收 ①fallback_score 标记 ②zero_reason=no_facts 的 0 分；
+    正常分不入清单。旧数据（仅文案无键）兼容识别。"""
+    from app.services.report_service import _fallback_items
+
+    fb_score = _Score(
+        review_status="conflict_flagged", machine_status="need_human",
+        final_score=Decimal("0"),
+        warnings=[{"message": "全自动模式：……按最低档兜底（0 分）……"}],  # 旧数据形态
+    )
+    zero_score = _Score(
+        review_status="conflict_flagged", machine_status="need_human",
+        final_score=Decimal("0"),
+        warnings=[{"message": "未提取到业绩清单", "unresolved": "no_facts",
+                   "zero_reason": "no_facts"}],
+    )
+    normal = _Score(final_score=Decimal("2"), warnings=[{"message": "计数 2 项"}])
+    items = _fallback_items(_rows(fb_score, _Crit()) + _rows(zero_score, _Crit(code="c2"))
+                            + _rows(normal, _Crit(code="c3")))
+    codes = {i["code"] for i in items}
+    assert codes == {"c1", "c2"}
+    kinds = {i["code"]: i["kind"] for i in items}
+    assert kinds["c1"] == "min_level_floor"
+    assert kinds["c2"] == "zero_no_facts"

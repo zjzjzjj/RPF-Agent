@@ -36,7 +36,13 @@ def _install_sqlite_pragmas(engine: Engine) -> None:
         cursor = dbapi_conn.cursor()
         cursor.execute("PRAGMA journal_mode=WAL")
         cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.execute("PRAGMA busy_timeout=5000")
+        # Long batch/collection commits plus 8 concurrent workers can hold the
+        # single SQLite writer for seconds; 5s was short enough to surface
+        # "database is locked" inside job progress and heartbeats (run 85).
+        cursor.execute("PRAGMA busy_timeout=30000")
+        # WAL + NORMAL is durable across process crashes; only an OS/power loss
+        # can drop the last transactions, and it removes one fsync per commit.
+        cursor.execute("PRAGMA synchronous=NORMAL")
         cursor.close()
 
 
@@ -83,3 +89,24 @@ def init_db() -> None:
     import app.db.models  # noqa: F401  确保模型已注册到 metadata
 
     Base.metadata.create_all(bind=get_engine())
+    from app.db.execution_schema import upgrade_execution_schema
+
+    upgrade_execution_schema(get_engine())
+
+
+def initialize_application_database() -> None:
+    """Production verifies an explicitly migrated database; development may bootstrap."""
+    import os
+
+    raw = os.environ.get("BID_EVAL_DB_AUTO_INIT", "").strip().lower()
+    production = (os.environ.get("BID_EVAL_ENV", "").strip().lower() == "production"
+                  or bool(os.environ.get("BID_EVAL_STATIC_DIR")))
+    auto_init = not production and (raw in ("1", "true", "yes") if raw else True)
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        auto_init = True
+    if auto_init:
+        init_db()
+    else:
+        from app.db.execution_schema import validate_execution_schema
+
+        validate_execution_schema(get_engine())

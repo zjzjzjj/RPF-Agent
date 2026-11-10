@@ -1,15 +1,14 @@
 import { lazy, Suspense } from "react";
 import { Button, Card, Result, Skeleton } from "antd";
-import { Link, Route, Routes, useParams } from "react-router-dom";
+import { Link, Navigate, Route, Routes, useParams } from "react-router-dom";
 import AppShell from "./components/AppShell";
 import ProjectList from "./pages/ProjectList";
 
 const ProjectWorkbench = lazy(() => import("./pages/ProjectWorkbench"));
 const TenderRules = lazy(() => import("./pages/TenderRules"));
 const Bidders = lazy(() => import("./pages/Bidders"));
-const ScoreMatrix = lazy(() => import("./pages/ScoreMatrix"));
+const ScoreResults = lazy(() => import("./pages/ScoreResults"));
 const EvidenceWorkbench = lazy(() => import("./pages/EvidenceWorkbench"));
-const RankingReport = lazy(() => import("./pages/RankingReport"));
 
 function NotFound() {
   return (
@@ -24,6 +23,12 @@ function NotFound() {
       }
     />
   );
+}
+
+/** 旧路由（评分矩阵 / 排名与报告）已并入「评分结果」，保留重定向以免书签失效。 */
+function LegacyRedirect({ tab }: { tab: "matrix" | "report" }) {
+  const { pid = "" } = useParams();
+  return <Navigate to={`/p/${pid}/results?tab=${tab}`} replace />;
 }
 
 function ProjectShell() {
@@ -41,9 +46,10 @@ function ProjectShell() {
           <Route path="/" element={<ProjectWorkbench />} />
           <Route path="rules" element={<TenderRules />} />
           <Route path="bidders" element={<Bidders />} />
-          <Route path="matrix" element={<ScoreMatrix />} />
+          <Route path="results" element={<ScoreResults />} />
           <Route path="evidence/:sid" element={<EvidenceWorkbench />} />
-          <Route path="report" element={<RankingReport />} />
+          <Route path="matrix" element={<LegacyRedirect tab="matrix" />} />
+          <Route path="report" element={<LegacyRedirect tab="report" />} />
           <Route path="*" element={<NotFound />} />
         </Routes>
       </Suspense>

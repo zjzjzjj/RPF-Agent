@@ -34,32 +34,52 @@
   <tr><td>招标编号</td><td>{{ project.code or "—" }}</td><td>招标人</td><td>{{ project.purchaser or "—" }}</td></tr>
   <tr><td>最高限价</td><td>{{ project.max_price or "—" }} 元</td><td>生成时间</td><td>{{ generated_at }}</td></tr>
   <tr><td>报告状态</td><td><b>{{ status_label }}</b></td>
-      <td>复核进度</td><td>{{ progress.settled }} / {{ progress.total }} 已处置{% if progress.open %}（{{ progress.open }} 项待处理）{% endif %}</td></tr>
+      <td>{{ "自动评审进度" if run.automation else "复核进度" }}</td><td>{{ progress.settled }} / {{ progress.total }} 已完成{% if progress.open %}（{{ progress.open }} 项未完成）{% endif %}</td></tr>
   <tr><td>规则版本</td><td>v{{ rule_package.version }}（哈希 {{ rule_package.content_hash or "—" }}）</td>
       <td>评分运行</td><td>#{{ run.id }}（{{ run.status }}）</td></tr>
   <tr><td>模型</td><td>{{ run.llm_provider or "—" }} / {{ run.llm_model or "—" }}</td>
       <td>运行时间</td><td>{{ run.started_at or "—" }} ~ {{ run.finished_at or "—" }}</td></tr>
 </table>
 
-{% if status == "draft" %}
+{% if status == "partial" %}
+<div class="draft">
+  <h2>评审结果汇总（含故障跳过项）</h2>
+  <p>本次评审已结束：有效完成 {{ run.automation.completed }} 项，故障跳过 {{ run.automation.skipped }} 项。</p>
+  <p>合计仅包含有效完成的评分项；故障项得分留空，原因逐项列于报告。各家的评分覆盖率可能不同，合计为已评分小计。</p>
+</div>
+{% elif status == "draft" %}
 <div class="draft">
   <h2>⚠ 本报告为草稿，不得作为最终评审结论</h2>
+  {% if run.automation %}
+  <p>自动评审已完成 {{ progress.settled }}/{{ progress.total }} 项，尚有 {{ progress.open }} 项未完成。技术故障恢复后继续自动评审。</p>
+  <p>下表仅展示已完成结果，不发布最终排名。全部应评项完成后才能生成正式报告。</p>
+  {% else %}
   <p>尚有 <b>{{ progress.open }}</b> 项评分未经人工处置，其中 <b>{{ progress.blocking }}</b> 项为需优先裁决事项
      （建议否决、判定冲突、证据未核验）。</p>
   <p>草稿中的排名与总分为<b>暂定值</b>：未定分项不计入总分，建议否决者仍参与排名仅供交叉验证。
      人工复核完成后，从同一入口重新生成即为<b>定稿报告</b>，草稿与定稿共用同一规则版本哈希，可逐项对照。</p>
   <p class="muted">疑问逐条列于「三、疑问清单」。</p>
+  {% endif %}
 </div>
 {% else %}
 <div class="notice" style="background:#f6ffed;border-color:#b7eb8f">
-  <b>本报告为定稿：</b>全部 {{ progress.total }} 项评分均已人工处置（疑问清单已清空），可提交评标委员会确认。
+  {% if run.automation %}
+  <b>本报告为定稿：</b>全部应评条款已完成自动评审，计分项均已形成最终分数。外部事实的证据边界单列于评审结论。
+  {% else %}
+  <b>本报告为定稿：</b>评分侧疑问已清零，可提交评标委员会确认；
+  资格/符合性提示 {{ progress.open }} 项见下方疑问清单（不阻塞定稿，建议人工核看）。
+  {% endif %}
 </div>
 {% endif %}
 
 <div class="notice">
+  {% if run.automation %}
+  <b>自动评审说明：</b>{{ automatic_method }}
+  {% else %}
   <b>合规声明：</b>本报告由 AI 辅助评标系统生成。客观分（资格性/符合性审查、价格分、计数类评分）由确定性程序计算，
   可复算、可审计；主观分由 AI 提供建议并附原文依据，最终分值由评审人员逐项确认。
   所有否决类结论均需人工确认方可生效。本报告不替代评标委员会的法定评审职责，最终评审结论以评标委员会确认为准。
+  {% endif %}
 </div>
 
 <h2>一、评标结果排名</h2>
@@ -67,10 +87,10 @@
   {% for w in ranking.warnings %}<div class="warn tag">提示：{{ w }}</div>{% endfor %}
 {% endif %}
 <table>
-  <tr><th>名次</th><th>投标人</th><th>投标报价（元）</th><th>总分</th><th>价格分</th><th>技术分</th><th>商务分</th><th>备注</th></tr>
+  <tr><th>名次</th><th>投标人</th><th>投标报价（元）</th><th>总分</th><th>价格分（客观）</th><th>技术分（主观+客观）</th><th>商务分（客观）</th><th>备注</th></tr>
   {% for row in ranking.rows %}
   <tr>
-    <td>{{ row.rank }}</td>
+    <td>{{ row.rank if row.rank is not none else "未发布" }}</td>
     <td>{{ row.bidder_name }}</td>
     <td>{{ row.bid_price or "—" }}</td>
     <td><b>{{ row.total }}</b>{% if row.missing_final %}<span class="warn tag">部分未定分</span>{% endif %}</td>
@@ -78,7 +98,7 @@
     <td>{{ row.tech_total }}</td>
     <td>{{ row.commercial_total }}</td>
     <td>
-      {% if row.veto_flag %}<span class="bad tag">建议否决/已否决</span>{% endif %}
+      {% if row.veto_flag %}<span class="bad tag">{{ "存在不符合结论" if run.automation else "建议否决/已否决" }}</span>{% endif %}
       {% for t in row.tie_explanations %}<div class="muted">{{ t }}</div>{% endfor %}
     </td>
   </tr>
@@ -86,7 +106,7 @@
 </table>
 <div class="muted">
   并列名次处理顺序：① 投标报价低者在前 ② 技术得分高者在前 ③ 商务得分高者在前 ④ 名称字典序。
-  建议否决的投标人仍参与排名以便交叉验证，其名次不构成定标依据。
+  {% if run.automation %}资格与符合性结论单独列示，全部参评投标人均参与评分排序。{% else %}建议否决的投标人仍参与排名以便交叉验证，其名次不构成定标依据。{% endif %}
 </div>
 
 <h2>二、分投标人评分明细与原文依据</h2>
@@ -94,21 +114,21 @@
 <h3>{{ bidder.name }}{% if bidder.bid_price %}（投标报价 {{ bidder.bid_price }} 元）{% endif %}</h3>
 <table>
   <tr><th style="width:70px">编号</th><th style="width:150px">评分项</th><th style="width:70px">类别</th>
-      <th style="width:80px">得分</th><th style="width:110px">复核状态</th><th>招标文件依据与投标文件证据</th></tr>
+      <th style="width:80px">得分 / 结论</th><th style="width:110px">{{ "执行状态" if run.automation else "复核状态" }}</th><th>招标文件依据与投标文件证据</th></tr>
   {% for item in bidder['items'] %}
   <tr>
     <td>{{ item.code }}</td>
-    <td>{{ item.name }}{% if item.is_veto %}<span class="bad tag">否决项</span>{% endif %}</td>
+    <td>{{ item.name }}{% if item.is_veto %}<span class="bad tag">{{ "符合性判定" if run.automation else "否决项" }}</span>{% endif %}</td>
     <td>{{ item.category }}</td>
     <td>
-      {% if item.is_veto %}
-        {{ item.machine_status or "—" }}
+      {% if item.is_veto or (run.automation and item.is_verdict) %}
+        {{ (item.verdict if item.auto_completed else "自动评审未完成") if run.automation else item.machine_status or "—" }}
       {% else %}
         {{ item.final_score if item.final_score is not none else "未定分" }}
         {% if item.max_score %} / {{ item.max_score }}{% endif %}
         {% if item.ai_suggested_score %}<div class="muted">AI 建议 {{ item.ai_suggested_score }}</div>
         {% elif item.ai_revealed %}<div class="muted">AI 未给出建议分</div>
-        {% else %}<div class="muted">AI 建议未解锁（防锚定：先给独立分再解锁）</div>{% endif %}
+        {% elif not run.automation %}<div class="muted">AI 建议未解锁（防锚定：先给独立分再解锁）</div>{% endif %}
       {% endif %}
     </td>
     <td>
@@ -130,7 +150,16 @@
           ：{{ c.quote }}
         </div>
       {% endfor %}
-      {% if not item.is_veto and not item.citations %}
+      {% if run.automation %}
+        {% if item.reasoning %}<div>评审理由：{{ item.reasoning }}</div>{% endif %}
+        {% if item.auto_review %}
+          {% if item.auto_completed and item.auto_review.basis == "absence" %}<div class="muted">已完成关联材料检索，确认所需材料缺失，按细则形成结论。</div>{% endif %}
+          {% if item.auto_completed and item.auto_review.basis == "external" %}<div class="muted">外部事实证据边界：现有材料无法证实该事实，已作为最终结论记录。</div>{% endif %}
+          {% if item.auto_completed and item.auto_review.basis == "deterministic" %}<div class="muted">依据已留存事实与冻结规则完成程序计算。</div>{% endif %}
+          {% for v in item.auto_review.visual_evidence or [] %}<div class="quote">页图证据：文件 #{{ v.document_id }} 第 {{ v.page_no }} 页：{{ v.observation }}</div>{% endfor %}
+          {% if item.auto_review.error %}<div class="bad tag">技术故障：{{ item.auto_review.error }}</div>{% endif %}
+        {% endif %}
+      {% elif not item.is_veto and not item.citations %}
         <div class="muted">无证据引用——该项分值须人工补录证据或降级处理。</div>
       {% endif %}
     </td>
@@ -139,16 +168,16 @@
 </table>
 {% endfor %}
 
-<h2>三、疑问清单（待人工处置）</h2>
+<h2>三、{{ "自动评审未完成项" if run.automation else "疑问清单（待人工处置）" }}</h2>
 {% if not open_questions %}
-<div class="notice" style="background:#f6ffed;border-color:#b7eb8f">无疑问项——全部评分已人工处置。</div>
+<div class="notice" style="background:#f6ffed;border-color:#b7eb8f">{% if run.automation %}{% if progress.open == 0 %}全部应评条款已形成有效终态。{% if status == "draft" %}运行尚未成功结束，正式报告暂不可发布。{% endif %}{% else %}尚有 {{ progress.open }} 项自动评审未完成，正式报告暂不可发布。{% endif %}{% else %}无疑问项——全部评分已人工处置。{% endif %}</div>
 {% else %}
 <div class="muted">
   共 {{ progress.open }} 项，涉及 {{ progress.criteria_open }} 个评分项，按严重度排序。
-  高severity项在处置前<b>不得作为定标依据</b>。处置入口：复核队列 / 评分矩阵 → 点进证据核验工作台。
+  {% if run.automation %}故障恢复后从本次运行继续自动评审。{% else %}高severity项在处置前<b>不得作为定标依据</b>。处置入口：复核队列 / 评分矩阵 → 点进证据核验工作台。{% endif %}
 </div>
 
-<h3>按评分项汇总（处置入口一致，可批量裁决）</h3>
+<h3>{{ "按评分项汇总（恢复后继续自动评审）" if run.automation else "按评分项汇总（处置入口一致，可批量裁决）" }}</h3>
 <table>
   <tr><th>严重度</th><th>类型</th><th>评分项</th><th>类别</th><th>涉及投标人</th><th>所需处置</th></tr>
   {% for g in open_by_criterion %}
@@ -199,7 +228,31 @@
 </table>
 {% endif %}
 
-<h2>四、复核与操作留痕（可答复质疑）</h2>
+{% if fallback_scores %}
+<h2>三（附）、兜底分清单（非评审结论）</h2>
+<div class="notice" style="background:#fff7e6;border-color:#ffd591">
+  {% if run.automation %}
+  以下记录含故障兜底标记，不构成有效最终分。运行不能成功或发布最终排名，恢复后继续自动评审。
+  {% else %}
+  以下格的分数是全自动模式的<b>最低档兜底 0 分</b>或「机器没抽到事实」的 0 分——
+  已按零未定分政策计入总分，但<b>非评审结论</b>。请人工核看原件后改分，或重跑该格。
+  {% endif %}
+</div>
+<table>
+  <tr><th>投标人</th><th>评分项</th><th>当前分</th><th>兜底类型</th><th>机器说明</th></tr>
+  {% for f in fallback_scores %}
+  <tr>
+    <td>{{ f.bidder }}</td>
+    <td>{{ f.code }} {{ f.criterion }}</td>
+    <td>{{ f.final_score }}</td>
+    <td>{{ f.kind }}</td>
+    <td class="muted">{{ f.machine_message }}</td>
+  </tr>
+  {% endfor %}
+</table>
+{% endif %}
+
+<h2>四、{{ "自动评审与操作留痕" if run.automation else "复核与操作留痕" }}（可答复质疑）</h2>
 <table>
   <tr><th style="width:170px">时间</th><th style="width:120px">操作人</th><th style="width:110px">对象</th><th style="width:100px">动作</th><th>理由</th></tr>
   {% for r in reviews %}

@@ -1,6 +1,6 @@
 """法规通用规则包（S-Law 固化版）契约：pack.json / rules/*.json 的强校验模型。
 
-借鉴 coll_det 围串标规则包框架（一条规则一个文件 + 包元信息 + 法条登记），
+借鉴 coll_det 规则包框架（一条规则一个文件 + 包元信息 + 法条登记），
 把法规库制品固化为仓库内一等公民规则包。extra=forbid：包文件不得携带
 契约之外的字段——制品升级带来新字段时，build 脚本的自检会当场失败，
 逼着契约先行升级，而不是静默吞掉新字段。
@@ -18,19 +18,18 @@ from pydantic import BaseModel, ConfigDict, Field
 Category = Literal["qualification", "compliance", "price", "technical", "commercial"]
 ScoreType = Literal["veto", "formula", "count", "match", "subjective"]
 VetoConsequence = Literal["disqualify", "may_request", "discretionary"]
-# 比 library/schema.py 的 CheckType 多一个 collusion_check：法规包 REJ 组的
-# 串通核查项由 engine/collusion.py 预计算信号供给（engine/objective.run_check 已支持）。
+# 与 library/schema.py 的 CheckType 同口径（历史上曾多一个 collusion_check，
+# 围串标/串通投标功能已移除，由独立围串标智能体负责）。
 CheckType = Literal[
     "document_present", "contains_phrase", "value_in_range", "date_valid",
     "math_relation", "cross_document_match", "count_at_least", "human_only",
-    "collusion_check",
 ]
 FormulaType = Literal["lowest_ratio", "benchmark_ratio", "deviation_deduct", "above_deduct"]
 BenchmarkMethod = Literal["lowest", "average", "average_trimmed", "second_lowest", "average_below"]
 
 
 class LawPackLevel(BaseModel):
-    """主观档位（当前 87 条全为空，保留契约以防制品升级）。"""
+    """主观档位（当前 84 条全为空，保留契约以防制品升级）。"""
 
     model_config = ConfigDict(extra="forbid")
 

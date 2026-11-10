@@ -11,11 +11,12 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy import select
 
-from app.db.models import EvidenceCitation, ScoreRecord, utcnow
+from app.db.models import EvaluationRun, EvidenceCitation, ScoreRecord, utcnow
 from app.db.session import session_scope
 from app.deps import get_actor
-from app.errors import NotFound, ValidationFailed
+from app.errors import Conflict, NotFound, ValidationFailed
 from app.services import audit_service
 
 router = APIRouter(tags=["scores"])
@@ -57,6 +58,7 @@ class ScoreOut(BaseModel):
     source_page: int | None = None
     levels: list[dict] = []
     bidder_name: str | None = None
+    auto_review: dict | None = None
 
 
 class CitationOut(BaseModel):
@@ -104,6 +106,18 @@ def _load_score(score_id: int) -> ScoreRecord:
         return row
 
 
+def _managed_score(session, row: ScoreRecord) -> bool:
+    from app.services.automation_service import is_managed
+
+    run = session.get(EvaluationRun, row.run_id)
+    return run is not None and is_managed(run)
+
+
+def _require_manual_write(session, row: ScoreRecord) -> None:
+    if _managed_score(session, row):
+        raise Conflict("自动评审运行的结论和证据只读；技术故障请恢复运行，输入或规则变化请新建自动评审运行")
+
+
 @router.get("/scores/{score_id}", response_model=ScoreOut)
 def get_score(score_id: int) -> ScoreOut:
     """防锚定：AI 建议分只有在人工解锁（ai_revealed_at 已写）之后才返回。
@@ -125,6 +139,9 @@ def _attach_context(out: ScoreOut, row: ScoreRecord) -> None:
     from app.db.models import Bidder, Criterion, CriterionLevel
 
     with session_scope() as s:
+        if _managed_score(s, row):
+            from app.services.automation_service import public_auto_review
+            out.auto_review = public_auto_review(row)
         crit = s.get(Criterion, row.criterion_id)
         bidder = s.get(Bidder, row.bidder_id)
         if crit is not None:
@@ -152,6 +169,13 @@ def reveal_score(score_id: int, body: RevealBody, actor: str = Depends(get_actor
     row = _load_score(score_id)
     with session_scope() as s:
         row = s.get(ScoreRecord, score_id)
+        if _managed_score(s, row):
+            # Automatic results have no blind human-scoring phase. Reading an
+            # AI explanation must not append a human review or change a cell.
+            out = ScoreOut.model_validate(row)
+            from app.services.automation_service import public_auto_review
+            out.auto_review = public_auto_review(row)
+            return out
         if row.ai_revealed_at is not None:
             s.expunge(row)
             return ScoreOut.model_validate(row)
@@ -184,6 +208,7 @@ def review_score(score_id: int, body: ReviewBody, actor: str = Depends(get_actor
         row = s.get(ScoreRecord, score_id)
         if row is None:
             raise NotFound("评分记录不存在")
+        _require_manual_write(s, row)
         old = {"final": str(row.final_score) if row.final_score is not None else None,
                "review_status": row.review_status}
 
@@ -306,6 +331,12 @@ def add_evidence(body: EvidenceBody, actor: str = Depends(get_actor)) -> Citatio
     """人工补录证据：立即定位核验（verified 仍只由 verifier 写）。"""
     from app.evidence.verifier import create_citation
 
+    if body.score_record_id is not None:
+        with session_scope() as s:
+            row = s.get(ScoreRecord, body.score_record_id)
+            if row is None:
+                raise NotFound("评分记录不存在")
+            _require_manual_write(s, row)
     cit_id = create_citation(
         body.document_id, body.quote, page_hint=body.page_hint,
         score_record_id=body.score_record_id, role="score", created_by="human",
@@ -320,6 +351,14 @@ def add_evidence(body: EvidenceBody, actor: str = Depends(get_actor)) -> Citatio
 def relocate_evidence(citation_id: int) -> CitationOut:
     from app.evidence.verifier import verify_citation
 
+    with session_scope() as s:
+        citation = s.get(EvidenceCitation, citation_id)
+        if citation is None:
+            raise NotFound("证据不存在")
+        if citation.score_record_id is not None:
+            row = s.get(ScoreRecord, citation.score_record_id)
+            if row is not None:
+                _require_manual_write(s, row)
     cit = verify_citation(citation_id)
     if cit is None:
         raise NotFound("证据不存在")
@@ -342,6 +381,13 @@ def review_queue(project_id: str, run_id: int | None = None) -> dict:
             if run is None:
                 return {"items": []}
             run_id = run.id
+        run = s.get(EvaluationRun, run_id)
+        if run is None or run.project_id != project_id:
+            raise NotFound("评分运行不存在或不属于该项目")
+        from app.services.automation_service import progress
+        automation = progress(run_id, session=s)
+        if automation is not None:
+            return {"run_id": run_id, "items": [], "automation": automation}
         rows = s.execute(
             select(ScoreRecord, Criterion, Bidder)
             .join(Criterion, Criterion.id == ScoreRecord.criterion_id)

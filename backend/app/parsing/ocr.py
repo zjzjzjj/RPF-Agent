@@ -46,3 +46,25 @@ def recognize(img) -> list[tuple[str, tuple[float, float, float, float]]]:  # no
         ys = [p[1] for p in row[0]]
         out.append((text, (float(min(xs)), float(min(ys)), float(max(xs)), float(max(ys)))))
     return out
+
+
+def ocr_backend_available() -> tuple[bool, str]:
+    """解析层可用的 OCR 后端 → (可用?, 引擎名)。
+
+    2026-10-21 故障修复：旧实现只看本地 rapidocr（`get_ocr() is not None`），
+    完全忽略 `BID_EVAL_OCR_ENGINE=remote_paddle`——镜像未装 rapidocr 时
+    4 份标书整体零 OCR，扫描件（证书/查询截图/合同发票验收）全部丢失，
+    却只在 warnings 里写一句"OCR 组件未安装"。这里改为按配置解析：
+    远程引擎探针通过即视为可用，探针不过再退回本地 rapidocr。
+    """
+    from app import config
+
+    engine = config.ocr_engine()
+    if engine == "remote_paddle":
+        from app.parsing import paddle_client
+
+        if paddle_client.probe():
+            return True, "remote_paddle"
+    if get_ocr() is not None:
+        return True, "rapidocr"
+    return False, engine

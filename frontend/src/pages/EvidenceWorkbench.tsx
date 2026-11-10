@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import {
   Alert,
@@ -20,17 +20,11 @@ import {
 import { EyeInvisibleOutlined, EyeOutlined, ReloadOutlined } from "@ant-design/icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
-import { useScore, useScoreEvidence } from "../api/hooks";
-import PdfPageViewer, { type Highlight } from "../components/PdfPageViewer";
-import type { Citation } from "../types";
+import { useRuns, useScore, useScoreEvidence } from "../api/hooks";
+import EvidencePanel from "../components/EvidencePanel";
+import AutoReviewDetails from "../components/AutoReviewDetails";
 import { REVIEW_STATUS_LABELS } from "../types";
-
-const METHOD_LABEL: Record<string, string> = {
-  exact: "逐字精确命中",
-  ws_insensitive: "逐字命中（忽略排版换行）",
-  prefix_fallback: "前缀回退（部分命中，待人工核对）",
-  sentence_fallback: "句读片段命中（待人工核对）",
-};
+import { automaticEvidenceEmptyText, evidenceEmptyText, sideFromScoreType, verdictSourceFromWarnings } from "../utils/evidenceText";
 
 export default function EvidenceWorkbench() {
   const { pid = "", sid = "" } = useParams();
@@ -39,18 +33,24 @@ export default function EvidenceWorkbench() {
   const navigate = useNavigate();
   const { data: score, isLoading } = useScore(scoreId);
   const { data: citations } = useScoreEvidence(scoreId);
-  const [selected, setSelected] = useState<number | null>(null);
+  const { data: runs, isLoading: runsLoading } = useRuns(pid);
+  const currentRun = runs?.find((r) => r.id === score?.run_id);
+  const managed = currentRun?.automation != null;
   const [humanScore, setHumanScore] = useState<number | null>(null);
   const [reason, setReason] = useState("");
   const [blindDialog, setBlindDialog] = useState(false);
   const [blindReason, setBlindReason] = useState("");
 
-  const revealed = !!score?.ai_revealed_at;
+  const revealed = managed || !!score?.ai_revealed_at;
 
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ["score", scoreId] });
     qc.invalidateQueries({ queryKey: ["matrix"] });
     qc.invalidateQueries({ queryKey: ["reviewQueue", pid] });
+    // 评分结果页的三份数据都要跟着复核动作更新
+    qc.invalidateQueries({ queryKey: ["scoreSummary"] });
+    qc.invalidateQueries({ queryKey: ["ranking", pid] });
+    qc.invalidateQueries({ queryKey: ["report", pid] });
   };
 
   const reveal = useMutation({
@@ -75,51 +75,31 @@ export default function EvidenceWorkbench() {
     onError: (e: Error) => message.error(e.message),
   });
 
-  const highlights: Highlight[] = useMemo(() => {
-    const out: Highlight[] = [];
-    for (const cit of citations ?? []) {
-      if (!cit.bbox_json || !cit.page_no) continue;
-      out.push({
-        id: cit.id,
-        page: cit.page_no,
-        boxes: cit.bbox_json,
-        pageSize: cit.page_size_json,
-        color:
-          selected === cit.id
-            ? "rgba(250, 204, 21, 0.55)"
-            : cit.verified
-              ? "rgba(134, 239, 172, 0.35)"
-              : "rgba(252, 165, 165, 0.35)",
-        label: cit.quote.slice(0, 40),
-      });
-    }
-    return out;
-  }, [citations, selected]);
-
-  const focusPage =
-    citations?.find((c) => c.id === selected)?.page_no ??
-    citations?.find((c) => c.page_no)?.page_no ??
-    1;
-
-  if (isLoading || !score) return <Spin />;
+  if (isLoading || runsLoading || !score) return <Spin />;
+  if (!currentRun) {
+    return <Alert type="warning" showIcon message="暂时无法确认本项所属运行" description="运行信息加载完成后才能查看评审操作，请刷新后重试。" />;
+  }
 
   const isVeto = score.score_type === "veto";
+  const isMatch = score.score_type === "match";
   const isSubjective = score.score_type === "subjective";
+  const verdictSource = verdictSourceFromWarnings(score.warnings_json);
 
   return (
     <div>
       <Space style={{ marginBottom: 8 }}>
-        <Button onClick={() => navigate(`/p/${pid}/matrix`)}>← 返回评分矩阵</Button>
+        <Button onClick={() => navigate(`/p/${pid}/results`)}>← 返回评分结果</Button>
         <Typography.Title level={5} style={{ margin: 0 }}>
           {score.bidder_name} · {score.criterion_code} {score.criterion_name}
         </Typography.Title>
-        <Tag color={isVeto ? "red" : isSubjective ? "purple" : "blue"}>
-          {isVeto ? "否决项" : isSubjective ? "主观分（AI 仅建议）" : "确定性计算"}
+        <Tag color={isVeto ? "red" : isMatch ? "geekblue" : isSubjective ? "purple" : "blue"}>
+          {isVeto ? managed ? "符合性结论" : "否决项" : isMatch ? "判断项" : isSubjective ? managed ? "AI 自动评分" : "主观分（AI 仅建议）" : "确定性计算"}
         </Tag>
-        <Tag>{REVIEW_STATUS_LABELS[score.review_status] ?? score.review_status}</Tag>
+        <Tag>{managed && score.machine_status === "execution_failed" ? "执行失败，可恢复" : managed && !["auto_confirmed", "not_applicable"].includes(score.review_status) ? "待自动完成" : REVIEW_STATUS_LABELS[score.review_status] ?? score.review_status}</Tag>
         {score.evidence_status === "verified" && <Tag color="green">证据已核验</Tag>}
-        {score.evidence_status === "unverified" && <Tag color="orange">证据待人工核对</Tag>}
-        {score.evidence_status === "none" && !isVeto && <Tag color="red">无证据</Tag>}
+        {score.evidence_status === "unverified" && <Tag color="orange">{managed ? "证据自动核验中" : "证据待人工核对"}</Tag>}
+        {/* 「无证据」警示只给主观项——判定/计算项设计上不产引文，标红是误报 */}
+        {score.evidence_status === "none" && isSubjective && !managed && <Tag color="red">无证据</Tag>}
       </Space>
 
       <Row gutter={[16, 16]}>
@@ -158,7 +138,7 @@ export default function EvidenceWorkbench() {
           </Card>
 
           <Card size="small" title="判定与评分" style={{ marginTop: 12 }}>
-            {!isVeto && (
+            {!managed && !isVeto && (
               <Alert
                 type="info"
                 showIcon
@@ -171,7 +151,22 @@ export default function EvidenceWorkbench() {
               />
             )}
 
-            {isVeto ? (
+            {managed ? (
+              <Space direction="vertical" style={{ width: "100%" }}>
+                <Alert
+                  type={score.machine_status === "execution_failed" ? "error" : "info"}
+                  showIcon
+                  message={score.machine_status === "execution_failed" ? "自动评审遇到技术故障，已保留进度" : isVeto || isMatch ? score.machine_status === "unverifiable" ? "现有材料无法证实（已评审的外部事实风险结论）" : score.machine_status === "fail" ? "不符合，投标人继续参与计分和排名" : score.review_status === "auto_confirmed" ? "符合" : "待自动完成" : `最终得分：${score.final_score ?? "尚未完成"}${score.final_score == null ? "" : ` / ${score.max_score ?? "—"}`}`}
+                  description={score.ai_reasoning}
+                />
+                {score.warnings_json?.map((w, i) => (w.message || w.formula_explanation) ? (
+                  <Typography.Paragraph key={i} style={{ whiteSpace: "pre-wrap" }}>
+                    {w.message ?? w.formula_explanation}
+                  </Typography.Paragraph>
+                ) : null)}
+                <Typography.Text type="secondary">本页展示系统评审结果与证据。全部应评项完成后，系统才发布正式报告和最终排名。</Typography.Text>
+              </Space>
+            ) : isVeto ? (
               <div>
                 <Typography.Paragraph>
                   机器判定：
@@ -261,6 +256,7 @@ export default function EvidenceWorkbench() {
               </Space>
             )}
 
+            {!managed && <>
             <Divider style={{ margin: "12px 0" }} />
             <Input.TextArea
               rows={2}
@@ -322,71 +318,29 @@ export default function EvidenceWorkbench() {
               每次确认都单独留痕并记入审计（操作人 {score.evaluator_actor ?? "—"}
               {score.confirm_time ? `，${score.confirm_time}` : ""}）；规则包支持"全部采纳/全部签批"批量操作（同样逐条留痕）。
             </div>
+            </>}
           </Card>
         </Col>
 
         <Col xs={24} lg={13}>
-          <Card
-            size="small"
-            title={`证据（${citations?.length ?? 0} 条）`}
-            extra={
-              <Button
-                size="small"
-                icon={<ReloadOutlined />}
-                onClick={() => qc.invalidateQueries({ queryKey: ["evidence", scoreId] })}
-              >
-                刷新
-              </Button>
-            }
-          >
-            <List
+          {managed && <AutoReviewDetails metadata={score.auto_review} />}
+          <div style={{ marginBottom: 8, textAlign: "right" }}>
+            <Button
               size="small"
-              dataSource={citations ?? []}
-              locale={{ emptyText: "没有证据引用——无证据不评分，该项应由人工补录证据或降级" }}
-              renderItem={(cit: Citation) => (
-                <List.Item
-                  onClick={() => setSelected(cit.id)}
-                  style={{
-                    cursor: "pointer",
-                    background: selected === cit.id ? "#e6f4ff" : undefined,
-                    borderRadius: 4,
-                  }}
-                >
-                  <Space direction="vertical" size={2} style={{ width: "100%" }}>
-                    <Space wrap>
-                      {cit.verified ? <Tag color="green">已核验</Tag> : <Tag color="red">未核验</Tag>}
-                      <Tag>{METHOD_LABEL[cit.verify_method ?? ""] ?? cit.verify_method ?? "未定位"}</Tag>
-                      <Tag>第 {cit.page_no ?? "?"} 页</Tag>
-                      {cit.node_id && <Tag color="blue">{cit.node_id}</Tag>}
-                      <Tag>{cit.created_by === "human" ? "人工补录" : cit.created_by === "engine" ? "引擎生成" : "AI 引用"}</Tag>
-                    </Space>
-                    <Typography.Text style={{ background: "#fffbe6", padding: 4, borderRadius: 4, display: "block" }}>
-                      {cit.quote}
-                    </Typography.Text>
-                    {cit.candidates_json && cit.candidates_json.length > 0 && (
-                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                        候选位置：{cit.candidates_json.map((c) => `第${c.page_no}页`).join("、")}（点击后请在右侧核对）
-                      </Typography.Text>
-                    )}
-                  </Space>
-                </List.Item>
-              )}
-            />
-          </Card>
-
-          {citations?.some((c) => c.document_id) ? (
-            <Card size="small" title="原件定位（高亮为证据所在位置）" style={{ marginTop: 12 }}>
-              <PdfPageViewer
-                documentId={citations.find((c) => c.document_id && c.page_no)!.document_id!}
-                focusPage={focusPage}
-                highlights={highlights}
-              />
-            </Card>
-          ) : null}
+              icon={<ReloadOutlined />}
+              onClick={() => qc.invalidateQueries({ queryKey: ["evidence", scoreId] })}
+            >
+              刷新证据
+            </Button>
+          </div>
+          <EvidencePanel
+            citations={citations ?? []}
+            emptyText={managed ? automaticEvidenceEmptyText(score.auto_review) : evidenceEmptyText(sideFromScoreType(score.score_type), verdictSource)}
+          />
         </Col>
       </Row>
 
-      <Modal
+      {!managed && <Modal
         open={blindDialog}
         title="跳过盲评，直接查看 AI 建议"
         onCancel={() => setBlindDialog(false)}
@@ -405,7 +359,7 @@ export default function EvidenceWorkbench() {
           value={blindReason}
           onChange={(e) => setBlindReason(e.target.value)}
         />
-      </Modal>
+      </Modal>}
     </div>
   );
 }

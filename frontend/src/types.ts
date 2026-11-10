@@ -19,6 +19,8 @@ export interface StageState {
   state: "done" | "active" | "blocked" | "pending";
   detail: string;
   todo_count: number;
+  /** 可选阶段（如已有模板规则时的招标文件）：pending 不阻塞“下一步” */
+  optional?: boolean;
 }
 
 export interface Workbench {
@@ -53,6 +55,8 @@ export interface JobOut {
   result_json: Record<string, unknown> | null;
   error: string | null;
   attempts: number;
+  /** 前面还有几个未完成任务（0 = 正在运行或已终态） */
+  queue_position?: number;
 }
 
 export interface LevelOut {
@@ -134,6 +138,36 @@ export interface TemplateSummary {
   library_version: string;
   criteria_count: number;
   categories_summary: Record<string, number>;
+  applicable?: Record<string, string>;
+  notes?: string | null;
+}
+
+/** 一键启用默认规则（POST /projects/{pid}/rules/use-default-template） */
+export interface UseDefaultTemplateResult {
+  package_id: number;
+  ok: boolean;
+  frozen: boolean;
+  already_frozen: boolean;
+  created: boolean;
+  signed_off: number;
+  blockers: { code?: string; message?: string; [k: string]: unknown }[];
+  validations: { code: string; severity: string; message: string; hint?: string | null }[];
+  message?: string | null;
+}
+
+/** 自动匹配留下的逐条变更（覆盖 / 弃用 / 追加） */
+export interface MergeRecord {
+  id: number;
+  action: "override" | "keep_template" | "drop_template" | "append_document" | string;
+  match_method: string | null;
+  similarity: string | null;
+  template: { code: string | null; name: string | null };
+  document: { code: string | null; name: string | null };
+  document_page: number | null;
+  quote: string | null;
+  confirmed_by: string | null;
+  reason: string | null;
+  created_at: string | null;
 }
 
 export interface TemplateLevel {
@@ -152,6 +186,7 @@ export interface TemplateCriterion {
   veto_consequence: string | null;
   max_score: string | null;
   description: string | null;
+  required_evidence: string | null;
   essential: boolean;
   hint: string | null;
   levels: TemplateLevel[];
@@ -172,6 +207,16 @@ export interface TemplateDetail extends TemplateSummary {
   criteria: TemplateCriterion[];
 }
 
+/** 仓库内固化的法规规则包（GET /rules/law-packs） */
+export interface LawPackSummary {
+  id: string;
+  name: string;
+  version: string;
+  rule_count: number;
+  scope: string | null;
+  total_max: number | null;
+}
+
 /** 覆盖率报告（S0） */
 export interface Coverage {
   total: number;
@@ -180,6 +225,8 @@ export interface Coverage {
   template_fallback_pending: number;
   retired: number;
   manual: number;
+  /** 法规来源条目数（P0，免签批）——覆盖率分子必须计入，否则导入法规包后进度条纹丝不动 */
+  law: number;
   by_category: Record<string, Record<string, number>>;
   essential_uncovered: string[];
   price_covered: boolean;
@@ -245,6 +292,7 @@ export interface MatrixCell {
   evidence_status: string;
   veto_flag: boolean;
   machine_status: string | null;
+  auto_review_basis?: string | null;
 }
 
 export interface Matrix {
@@ -285,7 +333,8 @@ export interface ScoreOut {
   ai_revealed_at: string | null;
   evaluator_actor: string | null;
   confirm_time: string | null;
-  warnings_json: { message?: string; formula_explanation?: string }[] | null;
+  warnings_json: { message?: string; formula_explanation?: string; verdict_source?: string }[] | null;
+  auto_review?: AutoReviewMetadata | null;
   /** 工作台展示用（只读关联信息） */
   criterion_code: string | null;
   criterion_name: string | null;
@@ -295,6 +344,26 @@ export interface ScoreOut {
   source_page: number | null;
   levels: { label: string; min: string; max: string; criteria: string }[];
   bidder_name: string | null;
+}
+
+export interface AutoReviewMetadata {
+  state?: string;
+  basis?: string;
+  attempts?: number;
+  reasoning?: string;
+  error?: string;
+  error_code?: string;
+  calculation?: string | Record<string, unknown> | null;
+  confirmed_absent?: boolean;
+  coverage_complete?: boolean;
+  attempt_history?: { round: number; state: string; error?: string }[];
+  visual_evidence?: {
+    document_id: number;
+    page_no: number;
+    observation: string;
+    sha256?: string | null;
+    image_sha256?: string | null;
+  }[];
 }
 
 export interface Citation {
@@ -313,7 +382,7 @@ export interface Citation {
 }
 
 export interface RankingRow {
-  rank: number;
+  rank: number | null;
   bidder_id: number;
   bidder_name: string;
   bid_price: string | null;
@@ -340,6 +409,251 @@ export interface Ranking {
   run_id: number | null;
   rows: RankingRow[];
   warnings: string[];
+  is_final?: boolean;
+  provisional?: boolean;
+}
+
+export interface AutomationProgress {
+  expected: number;
+  completed: number;
+  failed: number;
+  remaining: number;
+  resumable: boolean;
+  last_error: string | null;
+  failure_policy?: "stop" | "continue";
+  skipped?: number;
+  processed?: number;
+  pending?: number;
+  execution_finished?: boolean;
+  result_available?: boolean;
+  execution_progress?: ExecutionProgress | null;
+}
+
+export interface ExecutionProgress {
+  executor_version: number;
+  phase: string;
+  qualification_mode?: "light" | "full";
+  count_deterministic_mode?: "off" | "shadow" | "on";
+  collections_total: number;
+  collections_ready: number;
+  batches_total: number;
+  batches_completed: number;
+  batches_running: number;
+  batches_pending?: number;
+  batches_failed: number;
+  requests_queued?: number;
+  requests_inflight?: number;
+  request_scope?: "run" | "collection";
+  read_units_total: number;
+  read_units_completed: number;
+  read_pages_total?: number;
+  read_pages_completed?: number;
+  failures?: {
+    collection_id: number;
+    batch_key: string;
+    batch_index: number | null;
+    criterion_id: number;
+    bidder_id: number | null;
+    documents: { document_id: number; filename: string | null; page_numbers: number[] }[];
+    code: string;
+    message: string;
+  }[];
+  last_progress_at: string | null;
+  metrics: Record<string, number>;
+}
+
+export interface EvaluationRun {
+  id: number;
+  status: string;
+  package_version: number;
+  automation?: AutomationProgress | null;
+  executor_version?: number;
+  execution_progress?: ExecutionProgress | null;
+}
+
+// ---------------------------------------------------------------------------
+// 评分结果聚合（GET /runs/{run_id}/score-summary）
+// ---------------------------------------------------------------------------
+export type SummaryItemState = "scored" | "missing_final" | "veto" | "match" | "not_run";
+
+export interface SummaryDeduction {
+  kind: "points" | "undetermined" | "n_a";
+  points: string | null;
+  formula: string | null;
+}
+
+export interface SummaryReason {
+  ai_reasoning: string | null;
+  ai_reasoning_chars: number;
+  truncated: boolean;
+  machine_reason: string | null;
+  human_reason: string | null;
+  human_action: string | null;
+  human_actor: string | null;
+  human_at: string | null;
+  unresolved: string | null;
+}
+
+export interface SummaryCitation {
+  id: number;
+  document_id: number | null;
+  page_no: number | null;
+  node_id: string | null;
+  quote: string | null;
+  verified: boolean;
+  verify_method: string | null;
+  bbox_json: number[][] | null;
+  page_size_json: number[] | null;
+  citation_role: string;
+  created_by: string;
+}
+
+export interface CommitteeMember {
+  judge_no: number | null;
+  score: string | null;
+  level_label: string | null;
+  status: string | null;
+  insufficient: boolean;
+  dropped: boolean;
+  warnings: string[];
+  cluster_chars: number | null;
+}
+
+export interface SummarySubScore {
+  name: string;
+  score: number | string | null;
+  max: number | string | null;
+}
+
+export interface SummaryArtifact {
+  artifact: string;
+  found: boolean;
+  quote: string | null;
+}
+
+export interface SummaryItem {
+  criterion_id: number;
+  score_record_id: number | null;
+  code: string;
+  name: string;
+  category: string;
+  score_type: string;
+  /** 主观/客观口径：主观＝AI 评委评审，客观＝公式/计数确定性计算，verdict＝只出结论不计分 */
+  side: "subjective" | "objective" | "verdict";
+  /** 评分方式中文标签（与规则页类型措辞一致） */
+  scoring_method: string;
+  is_veto: boolean;
+  bucket: string;
+  state: SummaryItemState;
+  max_score: string | null;
+  max_score_source: "snapshot" | "criterion" | null;
+  final: string | null;
+  machine_score: string | null;
+  machine_status: string | null;
+  ai_suggested: string | null;
+  ai_level_label: string | null;
+  ai_confidence: number | null;
+  human_score: string | null;
+  human_level_label: string | null;
+  review_status: string;
+  auto_review?: AutoReviewMetadata | null;
+  evidence_status: "verified" | "unverified" | "none";
+  verdict: string | null;
+  /** 判定来源（仅 veto/match 有值）：llm＝AI 裁决（可能带引文），machine＝确定性判定（过程即证据，设计上无引文）。
+   *  旧后端缺该字段时按 "machine" 处理（见 utils/evidenceText.ts）。 */
+  verdict_source?: "llm" | "machine" | null;
+  deduction: SummaryDeduction;
+  reason: SummaryReason;
+  ai_locked: boolean;
+  committee: CommitteeMember[];
+  sub_scores: SummarySubScore[];
+  artifacts_check: SummaryArtifact[];
+  evidence: {
+    status: string;
+    verified_count: number;
+    total_count: number;
+    citations: SummaryCitation[];
+  };
+  source: {
+    source_quote: string | null;
+    source_page: number | null;
+    source_node_id: string | null;
+    levels: { label: string; min: string; max: string; criteria: string }[];
+  };
+}
+
+export interface SummaryBucket {
+  key: string;
+  label: string;
+  kind: "score" | "verdict";
+  max: string | null;
+  score: string | null;
+  all_items_score: string | null;
+  item_count: number;
+  scored_count: number;
+  missing_count: number;
+  subjective_count: number;
+  objective_count: number;
+  verdicts: Record<string, number> | null;
+  items: SummaryItem[];
+}
+
+export interface BidderSummary {
+  bidder_id: number;
+  name: string;
+  state: "scored" | "excluded";
+  excluded_reason: string | null;
+  bid_price: string | null;
+  bid_price_is_run_snapshot: boolean;
+  bidder_status: string;
+  bidder_status_is_run_snapshot: boolean;
+  rank: number | null;
+  veto_flag: boolean;
+  tie_break_level: number | null;
+  tie_explanations: string[];
+  summary: {
+    total: string;
+    price_score: string | null;
+    tech_score: string;
+    commercial_score: string;
+    other_score: string;
+    bucket_sum: string;
+    consistent: boolean;
+    total_items: number;
+    scored_items: number;
+    missing_count: number;
+    missing_criteria: string[];
+  } | null;
+  buckets: SummaryBucket[];
+}
+
+export interface SummaryRun {
+  id: number;
+  status: string;
+  ready: boolean;
+  incomplete_reason: string | null;
+  package_id: number;
+  package_version: number;
+  package_content_hash: string | null;
+  package_origin: string | null;
+  llm_provider: string | null;
+  llm_model: string | null;
+  stages: string[];
+  bidder_ids: number[];
+  auto_dropped_bidders: string[];
+  started_at: string | null;
+  finished_at: string | null;
+  automation?: AutomationProgress | null;
+}
+
+export interface ScoreSummary {
+  project_id: string;
+  run: SummaryRun;
+  generated_at: string;
+  criteria_count: number;
+  ai_gating: { rule: string; settled_statuses: string[] };
+  warnings: string[];
+  bidders: BidderSummary[];
 }
 
 /** 报告疑问条目：草稿报告把待处置项逐条标出，复核后刷新即为定稿。 */
@@ -393,14 +707,16 @@ export interface OpenByCriterion {
 }
 
 export interface ReportOut {
-  status: "draft" | "final";
+  status: "draft" | "final" | "partial";
   status_label: string;
   progress: ReportProgress;
   open_questions: OpenQuestion[];
   open_by_criterion: OpenByCriterion[];
   project: { id: string; name: string };
-  run: { id: number; status: string };
+  run: { id: number; status: string; automation?: AutomationProgress | null };
   rule_package: { version: number | null; content_hash: string | null };
+  out_of_scope?: { code?: string; name?: string; reason?: string }[];
+  qualification_mode?: "light" | "full" | null;
   generated_at: string;
   ranking: Ranking;
 }
@@ -440,6 +756,15 @@ export const CATEGORY_LABELS: Record<string, string> = {
   commercial: "商务分",
 };
 
+/** 矩阵与明细的固定类别顺序（评分矩阵表头按此分组）。 */
+export const CATEGORY_ORDER = [
+  "qualification",
+  "compliance",
+  "price",
+  "technical",
+  "commercial",
+] as const;
+
 export const REVIEW_STATUS_LABELS: Record<string, string> = {
   pending: "待复核",
   ai_suggested: "AI 已建议",
@@ -456,4 +781,6 @@ export const MACHINE_STATUS_LABELS: Record<string, string> = {
   recommend_reject: "建议否决",
   need_human: "待人工",
   conflict_flagged: "冲突",
+  unverifiable: "现有材料无法证实",
+  execution_failed: "执行失败",
 };

@@ -8,15 +8,18 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import threading
-import time
+from pathlib import Path
 from typing import TypeVar
 
 from pydantic import BaseModel, ValidationError
 
 from app import config
-from app.errors import DataClassDenied, LLMBudgetExceeded
+from app.errors import DataClassDenied
 from app.llm.base import LLMError, LLMProvider, LLMResult
+from app.llm.request_control import _BUDGET_STATE, emit_cache_hit, http_attempt  # _BUDGET_STATE: legacy diagnostics
+from app.services.execution_version import current_execution_manifest, execution_config_value, execution_prompt_version
 
 log = logging.getLogger("bid_eval.llm")
 
@@ -24,16 +27,206 @@ T = TypeVar("T", bound=BaseModel)
 
 _CACHE_LIMIT = 512
 
-# 进程级预算计数（跨 Gateway 实例共享、按天滚动）
-_BUDGET_LOCK = threading.Lock()
-_BUDGET_STATE: dict[str, object] = {"day": "", "calls": 0}
+# 缓存命中统计：mem=内存命中 / disk=磁盘命中 / miss=逻辑请求未命中。
+# 阶段 5 验收直接读它。+= 非原子，但只是观测计数，不参与判定。
+_CACHE_STATS: dict[str, int] = {"mem": 0, "disk": 0, "miss": 0}
+
+# 涉密数据发往外部端点的一次性告警去重（provider/host）；跨实例共享
+_REMOTE_CONFIDENTIAL_WARNED_LOCK = threading.Lock()
+_REMOTE_CONFIDENTIAL_WARNED: set[str] = set()
+
+
+_VALID_ESCAPES = frozenset('"\\/bfnrt')
+_HEX = frozenset("0123456789abcdefABCDEF")
+
+
+def _repair_invalid_escapes(text: str) -> tuple[str, int]:
+    """把字符串内的**非法反斜杠转义**改成字面反斜杠（`\\X`）。返回 (新文本, 修复数)。
+
+    8B 模型输出的 JSON 字符串里常出现 `"C:\\Users"`、`"\\（中文"`、`"\\u-2026"`
+    这类非法转义，`json.loads` 会整段拒绝（Invalid \\escape），导致整块规则抽取
+    失败（2026-10-21 线上实证）。合法转义（`\\n` `\\\\` `\\"` `\\u4e2d`）原样保留，
+    引号外的字符一律不动——只把"本来想表达字面反斜杠"的地方补齐，不删任何字符。
+    """
+    out: list[str] = []
+    in_str = False
+    fixed = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if not in_str:
+            if ch == '"':
+                in_str = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_str = False
+            out.append(ch)
+            i += 1
+            continue
+        if ch != "\\":
+            out.append(ch)
+            i += 1
+            continue
+        nxt = text[i + 1] if i + 1 < n else ""
+        if nxt and nxt in _VALID_ESCAPES:
+            out.append(ch)
+            out.append(nxt)
+            i += 2
+            continue
+        if nxt == "u" and i + 5 < n and all(c in _HEX for c in text[i + 2 : i + 6]):
+            out.append(text[i : i + 6])
+            i += 6
+            continue
+        # 非法转义：保留反斜杠字面量（"\\" + 该字符），继续处理该字符本身
+        out.append("\\\\")
+        fixed += 1
+        i += 1
+    return "".join(out), fixed
+
+
+def _strip_trailing_commas(text: str) -> tuple[str, int]:
+    """去掉字符串外、紧跟 `}` / `]` 的尾逗号（`{"a":[1,2,],}` 这类）。"""
+    out: list[str] = []
+    in_str = False
+    fixed = 0
+    i = 0
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if in_str:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+            i += 1
+            continue
+        if ch == '"':
+            in_str = True
+            out.append(ch)
+            i += 1
+            continue
+        if ch == ",":
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j < n and text[j] in "}]":
+                fixed += 1
+                i += 1
+                continue
+        out.append(ch)
+        i += 1
+    return "".join(out), fixed
+
+
+def _repair_missing_commas(text: str) -> tuple[str, int]:
+    """字符串感知地补缺失逗号（`}`/`]`/数字/字面量后直接跟新 token 的形态）。
+
+    实证（2026-10-23 run 44 客观审查 173 项中断）：DeepSeek 输出在数组元素/键值
+    对之间漏一个逗号 → `Expecting ',' delimiter` → 整场评分失败。不能安全修复
+    字符串内未转义引号，但"值后缺逗号"是确定性结构错误，可机械修复。
+    """
+    out: list[str] = []
+    in_str = False
+    escape = False
+    fixed = 0
+    last_sig = ""  # 字符串外最近一个"值结束"信号：} ] " #(数字) A(字面量)
+    i = 0
+    n = len(text)
+    _DIGITS = "0123456789"
+    _NUM_EXTRA = "+-.eE"
+    while i < n:
+        ch = text[i]
+        if in_str:
+            out.append(ch)
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_str = False
+                last_sig = '"'
+            i += 1
+            continue
+        if ch == '"':
+            if last_sig in ('}', ']', '"', '#', 'A'):
+                out.append(",")
+                fixed += 1
+            in_str = True
+            out.append(ch)
+            last_sig = ""
+            i += 1
+            continue
+        if ch in "{[":
+            if last_sig in ('}', ']', '"', '#', 'A'):
+                out.append(",")
+                fixed += 1
+            out.append(ch)
+            last_sig = ""
+            i += 1
+            continue
+        if ch in ":,":
+            out.append(ch)
+            last_sig = ch
+            i += 1
+            continue
+        if ch in "}]":
+            out.append(ch)
+            last_sig = ch
+            i += 1
+            continue
+        if ch in _DIGITS or (ch == "-" and i + 1 < n and text[i + 1] in _DIGITS):
+            # 数字 token：整段消费后再判下一个 token
+            if last_sig in ('}', ']', '"', '#', 'A'):
+                out.append(",")
+                fixed += 1
+            j = i
+            while j < n and (text[j] in _DIGITS or text[j] in _NUM_EXTRA):
+                j += 1
+            out.append(text[i:j])
+            last_sig = "#"
+            i = j
+            continue
+        if ch.isalpha():
+            # true/false/null 字面量（或未知裸词）整词消费
+            if last_sig in ('}', ']', '"', '#', 'A'):
+                out.append(",")
+                fixed += 1
+            j = i
+            while j < n and text[j].isalnum():
+                j += 1
+            out.append(text[i:j])
+            last_sig = "A"
+            i = j
+            continue
+        # 空白与其它符号原样输出（不改变 last_sig：逗号后的空白后跟值仍能判对）
+        out.append(ch)
+        i += 1
+    return "".join(out), fixed
+
+
+def _loads_lenient(candidate: str) -> dict | None:
+    """strict=True / strict=False 各试一次（后者放行字符串内的裸换行等控制字符）。"""
+    for strict in (True, False):
+        try:
+            return json.loads(candidate, strict=strict)
+        except json.JSONDecodeError:
+            continue
+    return None
 
 
 def extract_json(text: str) -> dict:
-    """从模型输出中提取 JSON 对象：剥围栏 + 配平花括号扫描。
+    """从模型输出中提取 JSON 对象：剥围栏 + 配平花括号扫描 + 分级容错解析。
 
-    模型输出常见三种坏形态：```json 围栏、前后缀说明文字、截断。
-    截断无法修复，直接抛 LLMError（由上层降级为 need_human，绝不猜）。
+    模型输出常见坏形态：```json 围栏、前后缀说明文字、截断、**字符串内非法转义**
+    （`\\（`、Windows 路径、`\\u` 后非 4 位十六进制）、字符串内裸换行、尾逗号。
+    前三种可容错修复；截断与"字符串内未转义的双引号"无法安全修复，仍抛 LLMError
+    （由上层降级，绝不猜）。
     """
     s = text.strip()
     if s.startswith("```"):
@@ -43,7 +236,9 @@ def extract_json(text: str) -> dict:
         s = s.strip()
     start = s.find("{")
     if start < 0:
-        raise LLMError(f"模型输出中找不到 JSON：{text[:200]}")
+        # 不回显模型原文：招标/投标内容属 confidential，异常会进日志、job.error
+        # 并经 API 返回前端（2026-10-21 合规复核）
+        raise LLMError(f"模型输出中找不到 JSON（共 {len(text)} 字符）")
     depth = 0
     in_str = False
     escape = False
@@ -65,23 +260,130 @@ def extract_json(text: str) -> dict:
             depth -= 1
             if depth == 0:
                 candidate = s[start : i + 1]
-                try:
-                    return json.loads(candidate)
-                except json.JSONDecodeError as exc:
-                    raise LLMError(f"模型输出 JSON 无法解析：{exc}") from exc
+                return _parse_candidate(candidate)
     raise LLMError("模型输出 JSON 不完整（可能被截断）")
+
+
+def _parse_candidate(candidate: str) -> dict:
+    """分级解析单个 JSON 对象文本；全部失败才抛 LLMError。"""
+    data = _loads_lenient(candidate)
+    if data is not None:
+        return data
+
+    repaired, escapes = _repair_invalid_escapes(candidate)
+    if escapes:
+        data = _loads_lenient(repaired)
+        if data is not None:
+            # 只记数量，不落原文（证据/招标原文属 confidential，日志不得出现）
+            log.warning("模型输出 JSON 含 %d 处非法转义，已按字面量自动修复", escapes)
+            return data
+
+    stripped, commas = _strip_trailing_commas(repaired)
+    if commas:
+        data = _loads_lenient(stripped)
+        if data is not None:
+            log.warning(
+                "模型输出 JSON 含 %d 处非法转义、%d 处尾逗号，已自动修复", escapes, commas
+            )
+            return data
+
+    # 第三级：缺失逗号（值后直接跟新 token）——2026-10-23 run 44 客观审查
+    # 173 项因一个漏逗号整场失败；结构错误可机械补。
+    nocommas, inserted = _repair_missing_commas(stripped)
+    if inserted:
+        data = _loads_lenient(nocommas)
+        if data is not None:
+            log.warning(
+                "模型输出 JSON 含 %d 处非法转义、%d 处尾逗号、%d 处缺失逗号，已自动修复",
+                escapes, commas, inserted,
+            )
+            return data
+
+    # 仍失败：用原始 candidate 的报错信息（对用户最直观）
+    try:
+        json.loads(candidate)
+    except json.JSONDecodeError as exc:
+        raise LLMError(f"模型输出 JSON 无法解析：{exc}") from exc
+    raise LLMError("模型输出 JSON 无法解析")
+
+
+# ---------------------------------------------------------------------------
+# LLM 磁盘缓存（阶段 1，2026-10-30）
+# ---------------------------------------------------------------------------
+def _disk_cache_path(key: str) -> Path:
+    """缓存文件路径：data/llm_cache/<key 前 16 位>.json（键是 sha256，16 位前缀已够唯一）。"""
+    return config.data_dir() / "llm_cache" / f"{key[:16]}.json"
+
+
+def _disk_get(key: str) -> dict | None:
+    """读磁盘缓存：文件缺失/坏 JSON/缺字段一律 None（静默当 miss，绝不抛）。
+
+    缓存是 best-effort 加速层：任何读失败都退回真实调用，不能让评分链路失败。
+    """
+    if not config.llm_disk_cache_enabled():
+        return None
+    try:
+        data = json.loads(_disk_cache_path(key).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 —— 文件不存在/坏 JSON/坏编码都当 miss
+        return None
+    if (
+        not isinstance(data, dict)
+        or not isinstance(data.get("text"), str)
+        or not isinstance(data.get("provider"), str)
+        or not isinstance(data.get("model"), str)
+    ):
+        return None
+    return data
+
+
+def _disk_put(key: str, result: LLMResult) -> None:
+    """写磁盘缓存（best-effort）：mkdir + 临时文件 + os.replace 原子替换。
+
+    只在 chat_json 校验通过后调用（2026-10-30 阶段 1）：坏文本绝不上盘，
+    避免重启/重试后反复命中坏缓存。任何 IO 失败都静默——缓存写不进
+    绝不能让评分失败。
+    """
+    if not config.llm_disk_cache_enabled():
+        return
+    payload = {
+        "provider": result.provider,
+        "model": result.model,
+        "text": result.text,
+        "tokens_in": result.tokens_in,
+        "tokens_out": result.tokens_out,
+        "latency_ms": result.latency_ms,
+    }
+    try:
+        path = _disk_cache_path(key)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # 临时文件带 pid+线程 id：并发写同一 key 互不踩踏，os.replace 保证原子可见
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+        tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception:  # noqa: BLE001 —— 落盘失败静默，绝不影响本次调用结果
+        pass
 
 
 class Gateway:
     """对上层只暴露 chat_json；provider 可替换（将来换 kuncore model_router）。"""
 
     def __init__(self, provider: LLMProvider | None = None):
-        from app.llm.registry import get_provider
-
-        self.provider: LLMProvider = provider or get_provider()
+        self._provider = provider
         self._cache: dict[str, LLMResult] = {}
         self._cache_lock = threading.Lock()
-        self._sem = threading.Semaphore(config.llm_max_concurrency())
+
+    @property
+    def provider(self) -> LLMProvider:
+        """惰性解析 provider：构造网关不触发配置校验，首次调用时才解析。
+
+        客观-only 评分链路不产生任何 LLM 调用，未配置 provider 也能全程离线；
+        解析错误（未配置/密钥缺失）在真正调用时抛出，报错信息可操作。
+        """
+        if self._provider is None:
+            from app.llm.registry import get_provider
+
+            self._provider = get_provider()
+        return self._provider
 
     # ------------------------------------------------------------------
     def _check_data_class(self, data_class: str) -> None:
@@ -89,26 +391,26 @@ class Gateway:
             host = (self.provider.host or "").lower()
             allowed = [h.lower() for h in config.local_endpoint_hosts()]
             if host not in allowed and not _is_private_host(host):
+                if config.allow_remote_confidential():
+                    # 部署方显式接受"招标/投标原文会离开本机"（文件只有本地端点
+                    # 可读时唯一的云端方案）。每个端点只告警一次，避免刷屏；
+                    # 日志不含任何文件内容。
+                    key = f"{self.provider.name}/{host}"
+                    with _REMOTE_CONFIDENTIAL_WARNED_LOCK:
+                        first = key not in _REMOTE_CONFIDENTIAL_WARNED
+                        _REMOTE_CONFIDENTIAL_WARNED.add(key)
+                    if first:
+                        log.warning(
+                            "涉密数据将发往非本地端点 %s（provider=%s）："
+                            "已通过 BID_EVAL_ALLOW_REMOTE_CONFIDENTIAL 显式放开",
+                            host, self.provider.name,
+                        )
+                    return
                 raise DataClassDenied(
                     f"涉密数据（confidential）不允许发往 {host or '未知端点'}；"
                     f"仅允许本地端点：{allowed}",
                     detail={"host": host, "provider": self.provider.name},
                 )
-
-    def _check_budget(self) -> None:
-        budget = config.llm_daily_call_budget()
-        if budget <= 0:
-            return
-        # 预算计数必须**跨实例**共享（请求带 provider 覆盖会新建 Gateway）
-        # 且按天滚动，否则换 provider 名或过午夜就绕过上限。
-        today = time.strftime("%Y-%m-%d")
-        with _BUDGET_LOCK:
-            if _BUDGET_STATE["day"] != today:
-                _BUDGET_STATE["day"] = today
-                _BUDGET_STATE["calls"] = 0
-            if _BUDGET_STATE["calls"] >= budget:
-                raise LLMBudgetExceeded(f"今日模型调用已达上限 {budget} 次")
-            _BUDGET_STATE["calls"] += 1
 
     @staticmethod
     def _cache_key(
@@ -119,12 +421,66 @@ class Gateway:
         prompt_version: str,
         temperature: float = 0.0,
         max_tokens: int | None = None,
+        thinking: str = "auto",
+        disable_thinking: bool = False,
+        seed: int | None = None,
+        base_url: str = "",
+        images: list[str] | None = None,
     ) -> str:
-        # 影响输出的所有维度都要进键：temperature/max_tokens 不同 → 结果不同
+        # 影响输出的所有维度都要进键：temperature/max_tokens/thinking/seed/base_url
+        # 任一不同 → 结果不同（2026-10-30 阶段 1：补 thinking/disable_thinking/seed/
+        # base_url；同 host 不同路径前缀的端点也可能是不同模型服务）。
         payload = "\x00".join(
-            [provider, model, prompt_version, system, user, f"t={temperature}", f"m={max_tokens}"]
+            [
+                provider,
+                model,
+                base_url,
+                prompt_version,
+                system,
+                user,
+                f"t={temperature}",
+                f"m={max_tokens}",
+                f"thinking={thinking}",
+                f"dt={disable_thinking}",
+                f"seed={seed}",
+                *["image=" + hashlib.sha256(image.encode("utf-8")).hexdigest() for image in (images or [])],
+            ]
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+    def _key_for(
+        self,
+        system: str,
+        user: str,
+        prompt_version: str,
+        temperature: float,
+        max_tokens: int | None,
+        images: list[str] | None = None,
+    ) -> str:
+        """chat / chat_json 共用的缓存键：现取 provider 与全部影响输出的配置维度。
+
+        base_url 用 getattr 容错：FakeProvider 等测试替身没有该属性（2026-10-30）。
+        """
+        return self._cache_key(
+            system,
+            user,
+            self.provider.name,
+            self.provider.model,
+            prompt_version,
+            temperature,
+            max_tokens if max_tokens is not None else execution_config_value("llm_default_max_tokens"),
+            thinking=execution_config_value("llm_thinking"),
+            disable_thinking=execution_config_value("llm_disable_thinking"),
+            seed=execution_config_value("llm_seed"),
+            base_url=getattr(self.provider, "base_url", ""),
+            images=images,
+        )
+
+    def _store_memory(self, key: str, result: LLMResult) -> None:
+        with self._cache_lock:
+            if len(self._cache) >= _CACHE_LIMIT:
+                self._cache.pop(next(iter(self._cache)))
+            self._cache[key] = result
 
     def chat(
         self,
@@ -135,33 +491,74 @@ class Gateway:
         prompt_version: str | None = None,
         temperature: float = 0.0,
         max_tokens: int | None = None,
+        images: list[str] | None = None,
     ) -> LLMResult:
-        prompt_version = prompt_version or config.llm_prompt_version()
+        prompt_version = prompt_version or execution_prompt_version()
         self._check_data_class(data_class)
-        key = self._cache_key(
-            system, user, self.provider.name, self.provider.model, prompt_version,
-            temperature, max_tokens,
-        )
+        key = self._key_for(system, user, prompt_version, temperature, max_tokens, images)
 
         with self._cache_lock:
             hit = self._cache.get(key)
         if hit is not None:
+            _CACHE_STATS["mem"] += 1
+            emit_cache_hit("memory")
             return hit.model_copy(update={"cached": True})
 
-        self._check_budget()
-        with self._sem:
-            result = self.provider.complete(
-                system, user, temperature=temperature, max_tokens=max_tokens
+        # 磁盘缓存（阶段 1，2026-10-30）：命中即回填内存并返回——不调 provider、
+        # 不耗预算（预算只统计真实调用）。
+        disk = _disk_get(key)
+        if disk is not None:
+            result = LLMResult(
+                text=disk["text"],
+                provider=disk["provider"],
+                model=disk["model"],
+                tokens_in=disk.get("tokens_in"),
+                tokens_out=disk.get("tokens_out"),
+                latency_ms=disk.get("latency_ms"),
+                cached=True,
             )
+            self._store_memory(key, result)
+            _CACHE_STATS["disk"] += 1
+            emit_cache_hit("disk")
+            return result
+
+        _CACHE_STATS["miss"] += 1
+        image_kwargs = {"images": images} if images else {}
+        if getattr(self.provider, "controls_http_attempts", False):
+            result = self.provider.complete(
+                system, user, temperature=temperature, max_tokens=max_tokens, **image_kwargs
+            )
+        else:
+            # Custom providers implement one complete call. The production
+            # compatibility provider guards each physical retry itself.
+            with http_attempt(provider=self.provider.name, model=self.provider.model,
+                              images=len(images or [])) as attempt:
+                result = self.provider.complete(
+                    system, user, temperature=temperature, max_tokens=max_tokens, **image_kwargs
+                )
+                attempt.tokens_in, attempt.tokens_out = result.tokens_in, result.tokens_out
         log.info(
             "llm call provider=%s model=%s tokens_in=%s tokens_out=%s latency_ms=%s",
             result.provider, result.model, result.tokens_in, result.tokens_out, result.latency_ms,
         )
-        with self._cache_lock:
-            if len(self._cache) >= _CACHE_LIMIT:
-                self._cache.pop(next(iter(self._cache)))
-            self._cache[key] = result
+        self._store_memory(key, result)
         return result
+
+    @staticmethod
+    def _repair_user(user: str, out_model: type[T], attempt: int) -> str:
+        """为契约失败的后续尝试追加结构化修复要求。
+
+        首次请求必须保持原样；只在模型已经返回不可用结构后改变重试请求，
+        让固定 temperature/seed 不会把同一份坏 JSON 原样重复三次。
+        """
+        fields = ", ".join(str(name) for name in out_model.model_fields)
+        return (
+            f"{user}\n\n"
+            f"[JSON契约修复：第 {attempt} 次重试]\n"
+            "上一轮输出未通过 JSON 契约校验。请只输出一个 JSON 对象，禁止输出解释、"
+            "Markdown 代码块或顶层数组；顶层必须包含这些字段："
+            f"{fields}。字段名必须完全一致，缺少字段请按约定输出空数组或空值。"
+        )
 
     def chat_json(
         self,
@@ -173,21 +570,102 @@ class Gateway:
         prompt_version: str | None = None,
         temperature: float = 0.0,
         max_tokens: int | None = None,
+        images: list[str] | None = None,
     ) -> tuple[T, LLMResult]:
-        """调用并解析为 Pydantic 模型。解析失败抛 LLMError（上层降级为待人工，不猜）。"""
-        result = self.chat(
-            system,
-            user,
-            data_class=data_class,
-            prompt_version=prompt_version,
-            temperature=temperature,
-            max_tokens=max_tokens,
-        )
-        payload = extract_json(result.text)
+        """调用并解析为 Pydantic 模型。解析失败抛 LLMError，由执行器自动补评或失败。
+
+        JSON 解析/契约失败重试 2 次（采样偶发缺逗号/截断，换一次生成大概率就好；
+        余额/配额类错误不重试——上层按 fail-fast 处理）。
+        model_validate 成功才落磁盘缓存（阶段 1，2026-10-30）：坏文本绝不上盘；
+        失败重试前驱逐当前 attempt 的 key——chat() 刚把这份坏文本缓存了进去，
+        不驱逐的话下一轮重试会直接命中它、永远不再调 provider（自缓存毒化）。
+        """
+        prompt_version = prompt_version or execution_prompt_version()
+        key = self._key_for(system, user, prompt_version, temperature, max_tokens, images)
+        last_exc: LLMError | None = None
+        result = None
+        repair = False
+        from app.services.execution_version import continue_after_errors
+
+        max_attempts = 1 if continue_after_errors() else 3
+        for attempt in range(max_attempts):
+            attempt_user = self._repair_user(user, out_model, attempt) if repair else user
+            if current_execution_manifest() is not None:
+                from app.llm.request_sizing import ReviewContextExceeded, assert_request_fits
+
+                usage = assert_request_fits(system, attempt_user, images)
+                # A repair suffix and an explicit larger output allowance must
+                # fit as sent; never repair context errors by shrinking output.
+                requested_output = max(usage["output_tokens"], max_tokens or 0)
+                if usage["context_tokens"] and (usage["text_token_upper_bound"] +
+                        usage["image_token_reserve"] + requested_output + 1024 > usage["context_tokens"]):
+                    raise ReviewContextExceeded("实际评审请求超过冻结模型上下文，须拆分完整输入，禁止降低输出预算")
+            attempt_key = self._key_for(
+                system, attempt_user, prompt_version, temperature, max_tokens, images
+            )
+            result = self.chat(
+                system,
+                attempt_user,
+                data_class=data_class,
+                prompt_version=prompt_version,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                **({"images": images} if images else {}),
+            )
+            try:
+                payload = extract_json(result.text)
+                validated = out_model.model_validate(payload)
+            except ValidationError as exc:
+                # 只保留 type/loc/msg：pydantic v2 的 errors() 默认带 input（字段原值），
+                # 而这段文本会被拼进 AppError → job.error → 前端/日志——招标原文
+                # 属 confidential，不得外泄（2026-10-21 合规复核）。
+                brief = [
+                    {k: e.get(k) for k in ("type", "loc", "msg")} for e in exc.errors()[:3]
+                ]
+                last_exc = LLMError(f"模型输出不符合契约：{brief}")
+                last_exc.__cause__ = exc
+                repair = True
+                self._evict_failed(attempt_key)
+            except LLMError as exc:
+                msg = str(exc)
+                if any(k in msg for k in ("402", "insufficient", "quota", "30001", "arrears")):
+                    raise  # 余额/配额：fail-fast，不重试
+                last_exc = exc
+                # provider 的瞬态错误只重发原请求；解析/契约错误才切换到修复提示。
+                repair = repair or not exc.transient
+                self._evict_failed(attempt_key)
+            else:
+                if attempt_key != key:
+                    # 修复请求成功后，把已校验结果回填到原始请求键；后续原始请求
+                    # 仍可命中规范缓存，而不会依赖带修复后缀的临时键。
+                    # Only the canonical key may survive: semantic evidence
+                    # validation can reject it immediately after this return.
+                    # A temporary alias would otherwise resurrect that result.
+                    self._evict_failed(attempt_key)
+                    self._store_memory(key, result)
+                _disk_put(key, result)  # 校验通过才上盘（阶段 1，2026-10-30）
+                return validated, result
+            if attempt < max_attempts - 1:
+                log.warning(
+                    "chat_json 第 %d 次输出解析失败，重试：%s", attempt + 1, last_exc
+                )
+        assert last_exc is not None and result is not None
+        last_exc.review_attempts_exhausted = True
+        raise last_exc
+
+    def _evict_failed(self, key: str) -> None:
+        """驱逐坏文本缓存：弹内存 + 删盘上文件（best-effort）。
+
+        2026-10-30 阶段 1：解析/契约失败的文本无论来自 provider 还是缓存，都
+        不允许留在缓存里——否则重试（含新 Gateway 实例）会反复命中同一份坏
+        文本、永远不调 provider（自缓存毒化）。删不存在的文件是 no-op。
+        """
+        with self._cache_lock:
+            self._cache.pop(key, None)
         try:
-            return out_model.model_validate(payload), result
-        except ValidationError as exc:
-            raise LLMError(f"模型输出不符合契约：{exc.errors()[:3]}") from exc
+            _disk_cache_path(key).unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _is_private_host(host: str) -> bool:
@@ -205,7 +683,7 @@ def _is_private_host(host: str) -> bool:
 
 
 def get_gateway() -> Gateway:
-    """进程级单例（含缓存与预算计数）。"""
+    """进程级缓存单例；请求槽和持久预算由 request_control 共享。"""
     global _GATEWAY
     if _GATEWAY is None:
         _GATEWAY = Gateway()
@@ -216,6 +694,7 @@ _GATEWAY: Gateway | None = None
 
 
 def reset_gateway() -> None:
-    """测试用：重建网关（重读环境变量、清缓存与预算）。"""
+    """测试用：重建网关和缓存观测；不重置持久请求预算。"""
     global _GATEWAY
     _GATEWAY = None
+    _CACHE_STATS.update({"mem": 0, "disk": 0, "miss": 0})

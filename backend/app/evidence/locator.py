@@ -30,7 +30,22 @@ class PageInfo:
     text: str
     width: float
     height: float
-    line_boxes: list[tuple[float, float, float, float]] | None
+    line_boxes: list[tuple[float, float, float, float]] | None = None
+    # 归一化缓存（2026-10-27 提速）：normalize_with_map 对同页文本是纯函数，
+    # locate 的 L1/L1b/L2/L3 四趟反复重算同一页——一次构建全 run 复用，
+    # 输出与现算逐字节一致（不变式 I3）。
+    _norm_cache: tuple | None = None
+    _norm_nows_cache: tuple | None = None
+
+    def normed(self) -> tuple[str, list[int]]:
+        if self._norm_cache is None:
+            self._norm_cache = normalize_with_map(self.text)
+        return self._norm_cache
+
+    def normed_nows(self) -> tuple[str, list[int]]:
+        if self._norm_nows_cache is None:
+            self._norm_nows_cache = normalize_no_ws_with_map(self.text)
+        return self._norm_nows_cache
 
 
 class DocumentSource:
@@ -80,15 +95,30 @@ class DocumentSource:
             ).scalar_one_or_none()
             if row is None:
                 raise KeyError(f"第 {page_no} 页不存在")
+            # 行框懒加载（2026-10-27 提速）：pdfplumber extract_text_lines 是
+            # 每页每引文的重头（10.5s/引文的主因之一），只有命中页需要 bbox——
+            # 扫描阶段不再取行框，结果与 eager 加载逐字节一致（不变式 I3）。
             info = PageInfo(
                 page_no=page_no,
                 text=row.text or "",
                 width=row.width or 0.0,
                 height=row.height or 0.0,
-                line_boxes=self._load_line_boxes(page_no) if self.suffix == "pdf" else None,
+                line_boxes=None,
             )
         self._pages[page_no] = info
         return info
+
+    def line_boxes(self, page_no: int) -> list[tuple[float, float, float, float]] | None:
+        """命中页的行框（懒加载+缓存）；docx 或失败返回 None。"""
+        if self.suffix != "pdf":
+            return None
+        info = self._pages.get(page_no)
+        if info is not None and info.line_boxes is not None:
+            return info.line_boxes
+        boxes = self._load_line_boxes(page_no)
+        if info is not None:
+            info.line_boxes = boxes
+        return boxes
 
     # ------------------------------------------------------------------
     def _load_line_boxes(self, page_no: int) -> list[tuple[float, float, float, float]] | None:
@@ -146,7 +176,7 @@ def locate(
         page = _safe_page(src, page_no)
         if page is None:
             continue
-        p_norm, index_map = normalize_with_map(page.text)
+        p_norm, index_map = page.normed()
         pos = p_norm.find(q_norm)
         if pos >= 0:
             return _hit(src, page, index_map, pos, len(q_norm), "exact", verified=True)
@@ -158,7 +188,7 @@ def locate(
             page = _safe_page(src, page_no)
             if page is None:
                 continue
-            p_nows, index_map_nows = normalize_no_ws_with_map(page.text)
+            p_nows, index_map_nows = page.normed_nows()
             pos = p_nows.find(q_nows)
             if pos >= 0:
                 return _hit(
@@ -174,7 +204,7 @@ def locate(
             page = _safe_page(src, page_no)
             if page is None:
                 continue
-            p_norm, index_map = normalize_with_map(page.text)
+            p_norm, index_map = page.normed()
             pos = p_norm.find(prefix)
             if pos >= 0:
                 return _hit(src, page, index_map, pos, length, "prefix_fallback", verified=False)
@@ -186,7 +216,7 @@ def locate(
             page = _safe_page(src, page_no)
             if page is None:
                 continue
-            p_norm, index_map = normalize_with_map(page.text)
+            p_norm, index_map = page.normed()
             pos = p_norm.find(piece)
             if pos >= 0:
                 return _hit(src, page, index_map, pos, len(piece), "sentence_fallback", verified=False)
@@ -213,7 +243,7 @@ def _hit(
 ) -> LocateResult:
     start = index_map[pos]
     end = index_map[pos + length - 1] + 1
-    boxes = _bbox_for_range(page, start, end)
+    boxes = _bbox_for_range(src, page, start, end)
     return LocateResult(
         found=True,
         page_no=page.page_no,
@@ -224,16 +254,17 @@ def _hit(
     )
 
 
-def _bbox_for_range(page, start: int, end: int) -> list[list[float]] | None:  # noqa: ANN001
-    """把页内字符区间映射为行 bbox 并集（top-left 原点）。"""
-    if not page.line_boxes:
+def _bbox_for_range(src: DocumentSource, page, start: int, end: int) -> list[list[float]] | None:  # noqa: ANN001
+    """把页内字符区间映射为行 bbox 并集（top-left 原点）。行框懒加载。"""
+    line_boxes = src.line_boxes(page.page_no)
+    if not line_boxes:
         return None
     boxes: list[list[float]] = []
     offset = 0
     for i, line in enumerate(page.text.split("\n")):
         l_start, l_end = offset, offset + len(line)
-        if l_end > start and l_start < end and i < len(page.line_boxes):
-            x0, y0, x1, y1 = page.line_boxes[i]
+        if l_end > start and l_start < end and i < len(line_boxes):
+            x0, y0, x1, y1 = line_boxes[i]
             boxes.append([float(x0), float(y0), float(x1), float(y1)])
         offset = l_end + 1
     return boxes or None

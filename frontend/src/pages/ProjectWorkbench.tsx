@@ -17,7 +17,6 @@ import {
   ClockCircleOutlined,
   FileProtectOutlined,
   FileTextOutlined,
-  LockOutlined,
   SafetyCertificateOutlined,
   TableOutlined,
   TeamOutlined,
@@ -41,20 +40,14 @@ const STATE_COLOR = {
   pending: "default",
 };
 const STAGE_PATH: Record<string, string> = {
-  tender: "/rules",
   rules: "/rules",
   bidders: "/bidders",
-  evaluate: "/matrix",
-  review: "/report",
-  report: "/report",
+  results: "/results",
 };
 const STAGE_ICON: Record<string, ReactNode> = {
-  tender: <FileTextOutlined />,
-  rules: <LockOutlined />,
+  rules: <FileTextOutlined />,
   bidders: <TeamOutlined />,
-  evaluate: <TableOutlined />,
-  review: <AuditOutlined />,
-  report: <TrophyOutlined />,
+  results: <TrophyOutlined />,
 };
 
 export default function ProjectWorkbench() {
@@ -84,7 +77,9 @@ export default function ProjectWorkbench() {
   const firstAction = data.stages.findIndex(
     (s) => s.state === "active" || s.state === "blocked",
   );
-  const firstPending = data.stages.findIndex((s) => s.state === "pending");
+  const firstPending = data.stages.findIndex(
+    (s) => s.state === "pending" && !s.optional,
+  );
   const currentIndex =
     firstAction >= 0
       ? firstAction
@@ -146,9 +141,9 @@ export default function ProjectWorkbench() {
             </Link>
           )}
           {!nextStage && data.stages.length > 0 && (
-            <Link to={`/p/${pid}/report`}>
+            <Link to={`/p/${pid}/results?tab=report`}>
               <Button type="primary" icon={<ArrowRightOutlined />}>
-                查看排名与报告
+                查看评分结果
               </Button>
             </Link>
           )}
@@ -226,7 +221,7 @@ export default function ProjectWorkbench() {
         <div className="panel-heading">
           <div>
             <h2>评审流程</h2>
-            <p>按阶段推进，在关键节点完成确认与复核。</p>
+            <p>按阶段自动评审，疑难项自动补检与复评，进度和证据随时可查。</p>
           </div>
           <span className="section-note">{data.stages.length} 个阶段</span>
         </div>
@@ -260,6 +255,7 @@ export default function ProjectWorkbench() {
                 {STAGE_ICON[s.key] ?? <FileProtectOutlined />}
               </span>
               <Tag color={STATE_COLOR[s.state]}>{STATE_LABEL[s.state]}</Tag>
+              {s.optional && s.state === "pending" && <Tag>可选</Tag>}
             </div>
             <div className="stage-title">
               <span>{String(i + 1).padStart(2, "0")}</span>
@@ -294,22 +290,22 @@ export default function ProjectWorkbench() {
           <div>
             <TableOutlined />
             <h3>客观分可复算</h3>
-            <p>资格、价格与计数类评分由确定性计算产生。</p>
+            <p>AI 核验材料事实，程序执行计数与价格公式，计算依据可逐项核对。</p>
           </div>
           <div>
             <AuditOutlined />
             <h3>评分有据可依</h3>
-            <p>先依据原文证据裁决，AI 建议与推理过程全部可查。</p>
+            <p>先依据原文或页图证据裁决，自动补评过程与最终理由全部可查。</p>
           </div>
           <div>
             <SafetyCertificateOutlined />
             <h3>否决可追溯</h3>
-            <p>系统提供建议与依据，否决结论由裁决记录（人工或自动）给出并留痕。</p>
+            <p>系统自动给出符合性结论和分数；不符合项保留风险记录，投标人继续参与评分和排名。</p>
           </div>
           <div>
             <FileProtectOutlined />
             <h3>操作全程留痕</h3>
-            <p>确认、改分与否决记录操作者、时间和理由。</p>
+            <p>自动评审、补评和恢复记录时间、依据与处理结果。</p>
           </div>
         </div>
       </Card>

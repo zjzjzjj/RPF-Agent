@@ -167,9 +167,10 @@ def llm_match(
         template_text="\n".join(_line(c) for c in template),
         document_text="\n".join(_line(c) for c in document),
     )
-    gateway = get_gateway() if provider is None and model is None else Gateway(get_provider(provider, model))
     result: MatchProposal | None = None
     try:
+        # 网关构建也必须在 try 内：未配置 provider 时按"LLM 辅助失败"降级为仅确定性匹配
+        gateway = get_gateway() if provider is None and model is None else Gateway(get_provider(provider, model))
         result, _ = gateway.chat_json(
             MATCH_SYSTEM_PROMPT, user, MatchProposal, data_class=data_class
         )
@@ -205,7 +206,7 @@ def generate_match_proposal(
 ) -> dict[str, Any]:
     """生成匹配提案（只读，不写业务行）。
 
-    流程：确定性匹配 → 对未匹配集合跑 LLM 辅助（mock/已配置真实模型时）→ 合并去重。
+    流程：确定性匹配 → 对未匹配集合跑 LLM 辅助（已配置真实模型时）→ 合并去重。
     返回 {merge_package_id, target_package_id, pairs, unmatched_template, unmatched_document}。
     """
     from app.db.models import RulePackage
@@ -220,6 +221,28 @@ def generate_match_proposal(
         template = load_criteria_for_snapshot(s, target_id)
         document = load_criteria_for_snapshot(s, merge_package_id)
         source_doc_id = merge_pkg.source_document_id
+
+    # 法规条目（origin=law）不参与合并匹配：
+    #  - 它们是法定义务红线，不因「招标文件没写」而被弃用；
+    #  - 参与匹配还可能被同名的文档条目覆盖，破坏法条层的独立性。
+    # 此前未过滤的后果：导入法规包后再上传招标文件，合并会把 87 条法规
+    # 当作「未匹配的模板条目」提议弃用，_drop_template 拒绝后整个自动合并回滚
+    # （2026-10-20 实证：auto_resolve_error=只有模板条目可以弃用）。
+    template = [t for t in template if t.get("origin") != "law"]
+
+    # 防御性内存校正：文档条目类别错标（商务→技术，2026-10-21 实证）会让
+    # category 硬过滤直接落空，模板的 commercial 条目因此被整条弃用。
+    # DB 的权威修复在 compile/normalize（apply_category_from_nodes）；
+    # 这里只改内存副本，保证配对不被陈旧类别卡死。
+    if source_doc_id:
+        from app.rules.category_map import in_memory_category_fixes
+
+        fixes = in_memory_category_fixes(document, int(source_doc_id))  # 一次加载，勿逐条查库
+        for e in document:
+            new_cat = fixes.get(e["id"])
+            if new_cat:
+                log.info("合并前内存校正类别：doc %s %s→%s", e["id"], e.get("category"), new_cat)
+                e["category"] = new_cat
 
     result = deterministic_match(template, document)
     pairs: list[dict] = result["pairs"]

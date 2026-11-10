@@ -2,6 +2,8 @@
 
 用法：python scripts/seed_demo.py
 之后 uvicorn + 前端打开即可看到完整演示项目。
+
+注意：编译走 .env 配置的**真实模型**（会产生真实 API 调用与少量费用）。
 """
 from __future__ import annotations
 
@@ -76,15 +78,31 @@ def main() -> None:
         assert job["status"] == "succeeded", job.get("error")
 
         resp = client.post(f"/api/projects/{pid}/rules/compile",
-                           json={"document_id": out["document_id"], "provider": "mock"})
+                           json={"document_id": out["document_id"]})
         job = _wait(client, resp.json()["job_id"])
         assert job["status"] == "succeeded", job.get("error")
         package_id = job["result_json"]["package_id"]
 
         pkg = client.get(f"/api/rules/packages/{package_id}").json()
+        # 真实模型可能抽出不完整条目（needs_input）：先补全（PATCH 置 verified，留痕）
         for c in pkg["criteria"]:
-            r = client.post(f"/api/rules/criteria/{c['id']}/accept", json={"reason": "与招标文件原文核对一致"})
+            if c["status"] not in ("verified", "retired"):
+                r = client.patch(f"/api/rules/criteria/{c['id']}",
+                                 json={"description": c.get("description") or c["name"],
+                                       "reason": "演示铺底：人工复核确认，补全未决项"})
+                assert r.status_code == 200, r.text
+        # 价格公式缺结构化参数时 accept/confirm 都救不了——按样例真值补全（留痕）
+        if any(v["code"] == "PRICE_PARAMS_INCOMPLETE" for v in pkg.get("validations") or []):
+            r = client.patch(f"/api/rules/packages/{package_id}/price-formula", json={
+                "formula_type": "benchmark_ratio", "benchmark_method": "average",
+                "k": "0.95", "upper_bound": "40", "rounding": 2,
+                "reason": "演示铺底：按样例招标文件载明的公式补全缺失参数"})
             assert r.status_code == 200, r.text
+        pkg = client.get(f"/api/rules/packages/{package_id}").json()
+        for c in pkg["criteria"]:
+            if c["status"] == "verified":
+                client.post(f"/api/rules/criteria/{c['id']}/accept",
+                            json={"reason": "与招标文件原文核对一致"})
         client.post(f"/api/rules/packages/{package_id}/confirm")
         client.post(f"/api/rules/packages/{package_id}/freeze")
         print(f"规则包 v1 已冻结：{len(pkg['criteria'])} 个评分项")

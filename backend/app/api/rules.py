@@ -1,10 +1,12 @@
 """规则编译 / 审核 / 冻结 API。"""
 from __future__ import annotations
 
+import re
+
 from fastapi import APIRouter, Depends, Query
 
 from app.deps import get_actor
-from app.errors import NotFound
+from app.errors import NotFound, ValidationFailed
 from app.schemas.rules import (
     CompileRequest,
     CoverageOut,
@@ -15,6 +17,8 @@ from app.schemas.rules import (
     InstantiateBody,
     LawImportBody,
     LawImportOut,
+    LawPackImportBody,
+    LawPackSummaryOut,
     LevelsBody,
     LevelOut,
     MatchProposalOut,
@@ -28,6 +32,8 @@ from app.schemas.rules import (
     TemplateCriterionOut,
     TemplateDetailOut,
     TemplateSummaryOut,
+    UseDefaultTemplateBody,
+    UseDefaultTemplateOut,
     ValidationOut,
 )
 from app.services import (
@@ -145,6 +151,24 @@ def accept_criterion(criterion_id: int, body: ReasonBody, actor: str = Depends(g
     return CriterionOut.model_validate(crit)
 
 
+@router.post("/rules/criteria/{criterion_id}/retire", response_model=CriterionOut)
+def retire_criterion(criterion_id: int, body: ReasonBody, actor: str = Depends(get_actor)):
+    """停用评分项（仅草稿）：退出计分与冻结快照，保留行与留痕。"""
+    crit = rule_service.retire_criterion(criterion_id, actor, body.reason)
+    audit_service.log(None, actor, "rules.criterion.retire", "criterion", str(criterion_id),
+                      {"reason": body.reason})
+    return CriterionOut.model_validate(crit)
+
+
+@router.post("/rules/criteria/{criterion_id}/restore", response_model=CriterionOut)
+def restore_criterion(criterion_id: int, body: ReasonBody, actor: str = Depends(get_actor)):
+    """恢复被停用的评分项（仅草稿）：按停用前状态回滚。"""
+    crit = rule_service.restore_criterion(criterion_id, actor, body.reason)
+    audit_service.log(None, actor, "rules.criterion.restore", "criterion", str(criterion_id),
+                      {"reason": body.reason})
+    return CriterionOut.model_validate(crit)
+
+
 @router.post("/rules/packages/{package_id}/accept-all")
 def accept_all(package_id: int, body: ReasonBody, actor: str = Depends(get_actor)) -> dict:
     out = rule_service.accept_all_criteria(package_id, actor, body.reason)
@@ -242,6 +266,8 @@ def _template_summary(tpl) -> TemplateSummaryOut:  # noqa: ANN001
         library_version=detail.library_version,
         criteria_count=detail.criteria_count,
         categories_summary=detail.categories_summary,
+        applicable=detail.applicable,
+        notes=detail.notes,
     )
 
 
@@ -270,6 +296,28 @@ def instantiate_rules(project_id: str, body: InstantiateBody, actor: str = Depen
     return {"package_id": package_id}
 
 
+@router.post(
+    "/projects/{project_id}/rules/use-default-template",
+    response_model=UseDefaultTemplateOut,
+)
+def use_default_template(
+    project_id: str, body: UseDefaultTemplateBody, actor: str = Depends(get_actor)
+) -> UseDefaultTemplateOut:
+    """无招标文件的一键启用：实例化 → 全部签批 → 确认 → 冻结。
+
+    校验不过时返回 200 + ok=false + blockers（保留 package_id 供前端修正），
+    不直接 422——前端需要包 id 才能打开校验/价格公式编辑。
+    """
+    result = library_service.use_default_template(
+        project_id, body.template_id, actor, body.reason
+    )
+    audit_service.log(
+        project_id, actor, "rules.use_default_template", "package", str(result["package_id"]),
+        {"template_id": body.template_id, "ok": result["ok"], "frozen": result["frozen"]},
+    )
+    return UseDefaultTemplateOut(**result)
+
+
 @router.post("/projects/{project_id}/rules/import-law", response_model=LawImportOut)
 def import_law_rules(project_id: str, body: LawImportBody, actor: str = Depends(get_actor)) -> LawImportOut:
     """导入法律通用规则包（S-Law，P0 来源，免签批；同步、纯确定性复制）。
@@ -280,6 +328,66 @@ def import_law_rules(project_id: str, body: LawImportBody, actor: str = Depends(
     result = law_import_service.import_law_package(
         project_id, {"package": body.package, "criteria": body.criteria}, actor
     )
+    return LawImportOut(
+        package_id=result["package_id"],
+        version=result["version"],
+        created=result["created"],
+        imported=result["imported"],
+        skipped_codes=result["skipped_codes"],
+        dropped_nodes=result["dropped_nodes"],
+        validations=result["validations"],
+    )
+
+
+@router.get("/rules/law-packs", response_model=list[LawPackSummaryOut])
+def list_law_packs() -> list[LawPackSummaryOut]:
+    """仓库内固化的法规规则包目录（前端「导入法规包」选择用）。
+
+    包是 `scripts/build_law_pack.py` 的生成物，禁止手改；此处只做目录展示，
+    真正的 fail-fast 校验在导入时由 load_law_pack 执行。
+    """
+    from app.rules.library.law_pack_loader import LAW_PACKS_DIR, LawPackError, load_law_pack
+
+    out: list[LawPackSummaryOut] = []
+    if not LAW_PACKS_DIR.is_dir():
+        return out
+    for d in sorted(p for p in LAW_PACKS_DIR.iterdir() if (p / "pack.json").is_file()):
+        try:
+            doc = load_law_pack(d)
+        except LawPackError:
+            continue  # 损坏的包不阻塞目录展示（导入时会给出明确报错）
+        pkg = doc["package"]
+        out.append(
+            LawPackSummaryOut(
+                id=str(pkg.get("id") or d.name),
+                name=str(pkg.get("name") or d.name),
+                version=str(pkg.get("version") or ""),
+                rule_count=len(doc["criteria"]),
+                scope=pkg.get("scope"),
+                total_max=pkg.get("total_max"),
+            )
+        )
+    return out
+
+
+@router.post("/projects/{project_id}/rules/import-law-pack", response_model=LawImportOut)
+def import_law_pack(
+    project_id: str, body: LawPackImportBody, actor: str = Depends(get_actor)
+) -> LawImportOut:
+    """按 pack_id 导入仓库内固化的法规规则包（与 import-law 同一服务、同一留痕）。"""
+    from app.rules.library.law_pack_loader import (
+        LawPackError,
+        default_pack_dir,
+        load_law_pack,
+    )
+
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", body.pack_id):
+        raise ValidationFailed(f"非法的法规包标识：{body.pack_id}")
+    try:
+        doc = load_law_pack(default_pack_dir(body.pack_id))
+    except LawPackError as exc:
+        raise ValidationFailed(f"法规规则包加载失败：{exc}") from exc
+    result = law_import_service.import_law_package(project_id, doc, actor)
     return LawImportOut(
         package_id=result["package_id"],
         version=result["version"],
@@ -303,6 +411,59 @@ def signoff_criterion(criterion_id: int, body: SignoffBody, actor: str = Depends
 def coverage(package_id: int) -> CoverageOut:
     """覆盖率报告（设计稿 §6.3）。"""
     return CoverageOut.model_validate(rule_service.coverage_report(package_id))
+
+
+@router.get("/rules/packages/{package_id}/merge-records")
+def merge_records(package_id: int) -> list[dict]:
+    """自动/人工匹配留下的逐条变更（覆盖 / 弃用 / 追加），供页面展示变更清单。"""
+    from sqlalchemy import select
+
+    from app.db.models import Criterion, OverrideRecord
+    from app.db.session import session_scope
+
+    with session_scope() as s:
+        rows = list(
+            s.execute(
+                select(OverrideRecord)
+                .where(OverrideRecord.package_id == package_id)
+                .order_by(OverrideRecord.id)
+            ).scalars()
+        )
+        crit_ids = {
+            cid
+            for r in rows
+            for cid in (r.template_criterion_id, r.document_criterion_id)
+            if cid is not None
+        }
+        crits = {
+            c.id: c
+            for c in (
+                s.execute(select(Criterion).where(Criterion.id.in_(crit_ids))).scalars()
+                if crit_ids
+                else []
+            )
+        }
+
+    def _name(cid: int | None) -> dict:
+        c = crits.get(cid) if cid is not None else None
+        return {"code": c.code if c else None, "name": c.name if c else None}
+
+    return [
+        {
+            "id": r.id,
+            "action": r.action,
+            "match_method": r.match_method,
+            "similarity": str(r.similarity) if r.similarity is not None else None,
+            "template": _name(r.template_criterion_id),
+            "document": _name(r.document_criterion_id),
+            "document_page": r.document_page,
+            "quote": (r.quote or "")[:300] or None,
+            "confirmed_by": r.confirmed_by,
+            "reason": r.reason,
+            "created_at": r.created_at.isoformat() if r.created_at else None,
+        }
+        for r in rows
+    ]
 
 
 # ---------------------------------------------------------------------------

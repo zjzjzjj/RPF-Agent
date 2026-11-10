@@ -21,6 +21,7 @@ from app.rules.validators import run_validators
 LIBRARY_DIR = Path(__file__).resolve().parents[1] / "app" / "rules" / "library" / "templates"
 
 ALL_TEMPLATE_IDS = [
+    "comprehensive-default",
     "comprehensive-goods",
     "comprehensive-works",
     "comprehensive-services",
@@ -67,6 +68,16 @@ def _snapshot_for_template(tid: str) -> dict:
                     "upper_bound": c.formula.upper_bound,
                     "lower_bound": c.formula.lower_bound,
                     "rounding": c.formula.rounding,
+                    "trim_ratio": c.formula.trim_ratio,
+                    "deduct_rate": c.formula.deduct_rate,
+                    "params_json": {
+                        key: str(value)
+                        for key, value in (
+                            ("deduct_rate_down", c.formula.deduct_rate_down),
+                            ("deduct_rate_up", c.formula.deduct_rate_up),
+                        )
+                        if value is not None
+                    },
                 }
                 if c.formula
                 else None
@@ -193,3 +204,39 @@ def test_rule_template_file_pydantic() -> None:
     assert tpl.criteria[0].is_veto
     assert tpl.criteria[-1].formula is not None
     assert tpl.criteria[-1].formula.formula_type == "lowest_ratio"
+
+def test_default_template_split_50_40_10() -> None:
+    """默认模板的评分细则：价格 50 / 技术 40 / 商务 10（用户 2026-10-20 指定）。
+
+    同时钉死「无招标文件也能评分」所需的完整结构：价格有公式、技术有可执行档位、
+    商务有计分参数与证明材料。
+    """
+    tpl = load_templates()["comprehensive-default"]
+    assert tpl.method == "comprehensive"
+    assert tpl.applicable.get("procurement") == "general"
+
+    by_cat: dict[str, Decimal] = {}
+    for c in tpl.criteria:
+        by_cat[c.category] = by_cat.get(c.category, Decimal(0)) + (c.max_score or Decimal(0))
+    assert by_cat["price"] == Decimal("50")
+    assert by_cat["technical"] == Decimal("40")
+    assert by_cat["commercial"] == Decimal("10")
+    assert sum(c.max_score for c in tpl.criteria if not c.is_veto) == Decimal("100")
+
+    price = next(c for c in tpl.criteria if c.category == "price")
+    # 2026-10-20：默认模板改为偏离扣分（否则低于平均价的报价全部封顶满分）
+    assert price.formula is not None
+    assert price.formula.formula_type == "deviation_deduct"
+    assert price.formula.benchmark_method == "average"
+    assert price.formula.deduct_rate_down == Decimal("0.2")
+    assert price.formula.deduct_rate_up == Decimal("0.4")
+    assert price.max_score == Decimal("50")
+    assert tpl.library_version == "2.1.0"
+
+    subjective = [c for c in tpl.criteria if c.score_type == "subjective"]
+    assert subjective and all(len(c.levels) == 4 for c in subjective)
+    assert all(c.required_evidence for c in subjective)
+
+    counts = [c for c in tpl.criteria if c.score_type == "count"]
+    assert counts and all(c.required_evidence for c in counts)
+    assert any((c.checks[0].params or {}).get("min_amount_yuan") for c in counts)

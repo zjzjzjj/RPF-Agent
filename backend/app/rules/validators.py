@@ -89,16 +89,167 @@ def run_validators(
                                         "签批理由应在报告中单列",
                                         "criterion", code))
 
-        # ⑤ 价格公式变量完备
+        # ⑤ 价格公式变量完备（按公式类型判定：ratio 要 k，deviation 要扣分率）
         if c["score_type"] == "formula":
             f = c.get("formula") or {}
-            missing = [k for k in ("formula_type", "benchmark_method", "k") if not f.get(k)]
+            ext = f.get("params_json") or {}
+            formula_type = f.get("formula_type") or ""
+            missing: list[str] = []
+            if not formula_type:
+                # 2026-10-28：识别不出公式形态（解析器对价格句式无任何已知形态命中）
+                # ≠ 参数缺失——用独立 error 码，且 _auto_settle_blocking 不自动收敛，
+                # 直到人工补全公式。这是"静默算错"的兜底。
+                findings.append(Finding(
+                    "PRICE_FORMULA_UNRECOGNIZED", "error",
+                    f"评分项「{c['name']}」的价格公式无法识别（招标文件中未匹配到任何已知公式形态）",
+                    "formula", code, "请人工确认并补全该价格公式"))
+            if not f.get("benchmark_method"):
+                missing.append("benchmark_method")
             if c.get("max_score") is None:
                 missing.append("max_score")
+            if formula_type == "deviation_deduct":
+                if not (
+                    f.get("deduct_rate")
+                    or ext.get("deduct_rate")
+                    or ext.get("deduct_rate_down")
+                    or ext.get("deduct_rate_up")
+                ):
+                    missing.append("deduct_rate_down/up")
+            elif formula_type in ("benchmark_ratio", "lowest_ratio"):
+                if not f.get("k"):
+                    missing.append("k")
             if missing:
                 findings.append(Finding("PRICE_PARAMS_INCOMPLETE", "error",
-                                        f"价格分公式缺少参数：{('、'.join(missing))}",
+                                        f"评分项「{c['name']}」的价格公式缺少参数：{('、'.join(missing))}",
                                         "formula", code, "请人工补全公式参数后确认"))
+            upper = f.get("upper_bound")
+            if (
+                upper is not None
+                and c.get("max_score") is not None
+                and Decimal(str(upper)) > Decimal(str(c["max_score"]))
+            ):
+                findings.append(Finding("PRICE_UPPER_BOUND", "error",
+                                        f"评分项「{c['name']}」的价格分上限 {upper} 大于满分 {c['max_score']}",
+                                        "formula", code, "价格分不得超过该项满分"))
+            if formula_type == "benchmark_ratio" and f.get("benchmark_method") == "average":
+                findings.append(Finding("PRICE_FULL_MARK_RISK", "warn",
+                                        f"评分项「{c['name']}」使用 benchmark_ratio + average："
+                                        "所有低于平均基准价的报价都会被上限截成满分",
+                                        "formula", code,
+                                        "如招标文件是偏离扣分型，请改用 deviation_deduct 并填写扣分率"))
+            # 分档截尾/门槛/离群：引擎侧执行状态（P1-A/B/C 落地后按字段消警）
+            approx = []
+            if ext.get("trim_tiers"):
+                approx.append("按有效家数分档截尾")
+            if ext.get("benchmark_gate"):
+                approx.append("基准价资格门槛")
+            if ext.get("outlier_policy"):
+                approx.append("离群剔除重算")
+            if ext.get("special_rules") and not (
+                ext.get("benchmark_gate") or ext.get("outlier_policy")
+            ):
+                approx.append("基准价剔除/重算特殊规则")
+            if ext.get("lot_weights"):
+                approx.append("多产品加权（lot_weights，按单包总价近似）")
+            if approx:
+                findings.append(Finding("PRICE_ENGINE_APPROX", "warn",
+                                        f"评分项「{c['name']}」的{'、'.join(approx)}"
+                                        "由引擎按近似口径执行（原文已留档）",
+                                        "formula", code,
+                                        "请人工复核价格分口径是否与评标细则一致"))
+
+            # 分档截尾结构完整性（P0-D）：[[bound|None, cut], ...] 末档 None、cut 单调不减
+            tiers = ext.get("trim_tiers")
+            if tiers is not None:
+                tier_bad = not (
+                    isinstance(tiers, list)
+                    and tiers
+                    and all(
+                        isinstance(row, (list, tuple))
+                        and len(row) == 2
+                        and (row[0] is None or (isinstance(row[0], (int, float))))
+                        and isinstance(row[1], int)
+                        and row[1] >= 0
+                        for row in tiers
+                    )
+                    and tiers[-1][0] is None
+                    and all(tiers[i][1] <= tiers[i + 1][1] for i in range(len(tiers) - 1))
+                )
+                if tier_bad:
+                    findings.append(Finding("PRICE_TRIM_TIERS_MALFORMED", "error",
+                                            f"评分项「{c['name']}」的 trim_tiers 结构非法："
+                                            "须为 [[bound|None, cut]...]，末档 bound=None 且 cut 单调不减",
+                                            "formula", code, "请人工修正分档截尾参数"))
+
+            # 基准价资格门槛结构完整性（P0-D）
+            gate = ext.get("benchmark_gate")
+            if gate is not None:
+                gate_bad: list[str] = []
+                if not isinstance(gate, dict):
+                    gate_bad.append("须为对象")
+                else:
+                    kind = gate.get("ratio_kind")
+                    if kind not in ("percent", "absolute"):
+                        gate_bad.append("ratio_kind")
+                    try:
+                        ratio = Decimal(str(gate.get("min_ratio")))
+                        if ratio <= 0 or (kind == "percent" and ratio > 100):
+                            gate_bad.append("min_ratio")
+                    except Exception:  # noqa: BLE001
+                        gate_bad.append("min_ratio")
+                    if gate.get("on_fail") not in ("exclude", "half_max"):
+                        gate_bad.append("on_fail")
+                    if gate.get("on_fail") == "half_max" and not gate.get("half_max_ratio"):
+                        gate_bad.append("half_max_ratio")
+                    if gate.get("gate_on") not in (
+                        "tech", "tech_qualification", "biz_tech", "sample_or_composite",
+                    ):
+                        gate_bad.append("gate_on")
+                if gate_bad:
+                    findings.append(Finding("PRICE_GATE_INCOMPLETE", "error",
+                                            f"评分项「{c['name']}」的 benchmark_gate 参数不完备："
+                                            f"{'、'.join(gate_bad)}",
+                                            "formula", code, "请按评标细则原文补全门槛参数"))
+
+            # 离群保护结构完整性（P0-D）
+            outlier = ext.get("outlier_policy")
+            if outlier is not None:
+                out_bad: list[str] = []
+                if not isinstance(outlier, dict):
+                    out_bad.append("须为对象")
+                else:
+                    if outlier.get("on_hit") != "zero_and_recompute":
+                        out_bad.append("on_hit")
+                    if "max_mult" not in outlier and "min_mult" not in outlier:
+                        out_bad.append("max_mult/min_mult 至少其一")
+                if out_bad:
+                    findings.append(Finding("PRICE_OUTLIER_POLICY_INCOMPLETE", "warn",
+                                            f"评分项「{c['name']}」的 outlier_policy 参数不完备："
+                                            f"{'、'.join(out_bad)}（引擎将不执行离群保护）",
+                                            "formula", code, "请按评标细则原文补全离群参数"))
+
+            # 基准法标签归一留痕（G20）：确定性目录与模型自报不一致 → 以目录为准并提示
+            mismatch = ext.get("_label_mismatch")
+            if isinstance(mismatch, dict) and mismatch.get("deterministic"):
+                findings.append(Finding("PRICE_METHOD_LABEL_MISMATCH", "warn",
+                                        f"评分项「{c['name']}」的基准法标签不一致："
+                                        f"模型「{mismatch.get('model')}」→ 确定性目录"
+                                        f"「{mismatch.get('deterministic')}」（已按目录归一）",
+                                        "formula", code,
+                                        "请人工确认归一结果与评标细则一致"))
+
+        # P0-C：主/客观冲突告警——hint 来自评分表明文列或量化措辞，score_type 却是
+        # match（骨架缺席时 LLM 回退路径的历史错分形态：12 分客观被误分成 match）
+        if (
+            (c.get("params") or {}).get("_subjectivity_hint") == "objective"
+            and c.get("score_type") == "match"
+            and not c.get("is_veto")
+        ):
+            findings.append(Finding("AMBIGUOUS_SUBJECTIVITY", "warn",
+                                    f"评分项「{c['name']}」的细则含客观计分措辞/明文标注，"
+                                    "但评分类型是 match（满足即得分）——请人工确认是否应为 count/formula",
+                                    "criterion", code,
+                                    "核对评标细则原文的主/客观分列与计分方式"))
 
         # ⑦ 否决项必须有后果
         if c.get("is_veto") and not c.get("veto_consequence"):
@@ -135,8 +286,16 @@ def run_validators(
             findings.append(Finding("PRICE_WEIGHT_RANGE", "warn",
                                     f"价格分权重 {v} 分超出常规区间（{lo}–{hi}）", "package"))
 
-    # ⑨ 总分 = 各项满分之和（只统计非否决项）
-    scored = [c for c in criteria if not c.get("is_veto")]
+    # ⑨ 总分 = 各计分项满分之和（veto/match 不计分；计分项缺满分是错误，
+    # 不能像旧实现那样因为一个 None 就整段跳过校验）
+    scored = [
+        c for c in criteria
+        if c.get("score_type") in ("formula", "count", "subjective")
+    ]
+    missing_max = [c["code"] for c in scored if c.get("max_score") is None]
+    if missing_max:
+        findings.append(Finding("MAX_SCORE_MISSING", "error",
+                                f"计分项缺少满分：{'、'.join(missing_max)}", "package"))
     maxes = [c.get("max_score") for c in scored]
     if all(m is not None for m in maxes) and maxes:
         total = sum((Decimal(str(m)) for m in maxes), ZERO)
@@ -172,6 +331,15 @@ def has_blocking_errors(findings: list[Finding]) -> bool:
 def _check_level_closure(c: dict) -> list[Finding]:
     levels = c.get("levels") or []
     if not levels:
+        # 真实标书常把主观分拆在子项里（如"协同办公（0-2分）、行政管理（0-2分）…"），
+        # 原文没有档位表。引擎本就支持无档位评分（按判据在 0-满分内给分，
+        # 见 subjective.py 的 levels_text 兜底），故有满分时只 warn 不阻断；
+        # 连满分都没有则完全不可评，保持 error。
+        if c.get("max_score") is not None:
+            return [Finding("LEVELS_MISSING", "warn",
+                            f"主观评分项「{c['name']}」没有任何档位（原文未给分值档位，将按 0-满分综合评定）",
+                            "criterion", c["code"],
+                            "如原文有档位表请人工补录；无档位时主观分按 0-满分综合评定")]
         return [Finding("LEVELS_MISSING", "error",
                         f"主观评分项「{c['name']}」没有任何档位", "criterion", c["code"])]
     for lv in levels:
@@ -197,10 +365,17 @@ def _check_level_closure(c: dict) -> list[Finding]:
             problems.append(Finding("LEVEL_RANGE_INVALID", "error",
                                     f"「{c['name']}」档位「{label}」区间下界大于上界", "criterion", c["code"]))
     for (lo1, hi1, l1), (lo2, hi2, l2) in zip(intervals, intervals[1:]):
-        if hi1 >= lo2:
-            # 端点重合或区间相交 → 同一分值可落进两个档位，歧义
+        if hi1 > lo2:
+            # 区间内部相交 → 同一分值可落进两个档位，真歧义
             problems.append(Finding("LEVEL_OVERLAP", "error",
                                     f"「{c['name']}」档位「{l1}」与「{l2}」区间重叠", "criterion", c["code"]))
+        elif hi1 == lo2:
+            # 端点共享（原文常见写法："得0-2分/得2-3分"）——评分时按较低档确定性归属
+            #（level_for_score 取首个命中档），不阻断，提示留痕即可
+            problems.append(Finding("LEVEL_OVERLAP", "warn",
+                                    f"「{c['name']}」档位「{l1}」与「{l2}」共享边界值 {hi1}"
+                                    "（原文如此，评分时该分值归入较低档）",
+                                    "criterion", c["code"]))
         elif hi1 + 1 < lo2:
             # 整数分值档位之间允许正好相邻（如 16 与 17），中间留空则是空洞
             problems.append(Finding("LEVEL_GAP", "error",

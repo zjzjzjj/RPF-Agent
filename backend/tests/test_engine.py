@@ -296,6 +296,23 @@ def test_price_fallback_requires_context():
     assert facts2.bid_price == D("7000000.00")
 
 
+def test_money_fullwidth_digits_not_crash():
+    """全角数字金额（OCR 噪声）不得让整场评分崩溃（2026-10-23 run 46 实证）。
+
+    人员救援 OCR 后新文本含全角数字行，旧 _money 直接 Decimal() 抛
+    ConversionSyntax → extract_bid_facts 崩 → 整个 job failed 0/226。
+    """
+    from app.engine.facts import _money
+
+    assert _money("４４６２") == D("4462")
+    assert _money("２，５８７，２４８.００") == D("2587248.00")
+    assert _money("") is None
+    assert _money("abc") is None
+    # 全角金额出现在文本中：extract_bid_facts 不得抛异常
+    facts = extract_bid_facts("某运维项目 ４４６２ 2024年 签订合同")
+    assert isinstance(facts.performance_amounts, list)  # 至少不崩
+
+
 # ---- 真实标书格式（浙江中烟项目实测）------------------------------------------
 # 样例数据里的 "投标总价：金额" 同行写法在真实标书中很少见；金额通常落在
 # 表头**下一行**，且小写前常夹货币符号。以下四种形态均取自真实开标一览表。
@@ -470,11 +487,49 @@ def test_validator_level_gap():
 
 def test_validator_level_overlap_and_top():
     snap = _valid_snapshot()
-    snap["criteria"][1]["levels"][0]["max"] = "18"  # 优 17-18 与 良 12-16 不重叠但顶≠20
-    snap["criteria"][1]["levels"][0]["max"] = "20"
-    snap["criteria"][1]["levels"][1]["max"] = "17"  # 良 12-17 与 优 17-20 重叠
+    # 内部相交：良 12-18 与 优 17-20 在 17-18 上真重叠 → error
+    snap["criteria"][1]["levels"][1]["max"] = "18"
     findings = run_validators(snap)
-    assert any(f.code == "LEVEL_OVERLAP" for f in findings)
+    assert any(f.code == "LEVEL_OVERLAP" and f.severity == "error" for f in findings)
+
+
+def test_validator_level_shared_boundary_warn_only():
+    """真实标书写法「得0-2分/得2-3分」：端点共享只是 warn，不再阻断冻结。
+
+    取自浙江中烟招标文件第 97 页的实际档位形状（故障案例）。
+    """
+    snap = {
+        "package": {"project_id": "P", "version": 1, "status": "draft"},
+        "criteria": [
+            {"code": "1", "category": "technical", "name": "故障响应流程及应急预案",
+             "max_score": "4", "score_type": "subjective", "is_veto": False,
+             "source_quote": "故障响应流程及应急预案（4分）",
+             "levels": [
+                 {"label": "得3-4分", "min": "3", "max": "4", "criteria": "故障响应及时"},
+                 {"label": "得2-3分", "min": "2", "max": "3", "criteria": "故障响应较及时"},
+                 {"label": "得0-2分", "min": "0", "max": "2", "criteria": "故障响应不够及时"},
+             ]},
+        ],
+    }
+    findings = run_validators(snap, total_max=4)
+    shared = [f for f in findings if f.code == "LEVEL_OVERLAP"]
+    assert len(shared) == 2 and all(f.severity == "warn" for f in shared)
+    errors = [f for f in findings if f.severity == "error"]
+    assert errors == [], [e.message for e in errors]
+
+
+def test_validator_levels_missing_downgrade():
+    """主观项无档位：有满分 → warn（按 0-满分综合评定）；无满分 → error。"""
+    snap = _valid_snapshot()
+    snap["criteria"][2]["levels"] = []  # 有 max_score=15 → warn
+    findings = run_validators(snap)
+    missing = [f for f in findings if f.code == "LEVELS_MISSING"]
+    assert len(missing) == 1 and missing[0].severity == "warn"
+
+    snap["criteria"][2]["max_score"] = None  # 无满分 → error
+    findings = run_validators(snap)
+    missing = [f for f in findings if f.code == "LEVELS_MISSING"]
+    assert len(missing) == 1 and missing[0].severity == "error"
 
 
 def test_validator_veto_scored():
@@ -519,3 +574,187 @@ def test_validator_price_params_incomplete():
     snap["criteria"][0]["formula"]["k"] = None
     findings = run_validators(snap)
     assert any(f.code == "PRICE_PARAMS_INCOMPLETE" for f in findings)
+
+
+# ---------------------------------------------------------------------------
+# document_present 词组匹配（「机器看不见」≠「不符合」，2026-10-14）
+# ---------------------------------------------------------------------------
+def _facts(text: str):
+    from app.engine.facts import extract_bid_facts
+
+    return extract_bid_facts(text)
+
+
+def test_document_present_phrase_split_hit():
+    """名称按标点拆词组，任一命中即 pass（招标文件该句是「或」列举）。"""
+    from app.engine.objective import run_check
+
+    facts = _facts("我公司具有营业执照及相关资质，现附复印件。")
+    r = run_check(
+        "document_present",
+        {"document": "营业执照、法人证书或其他组织登记证明文件的复印件"},
+        facts,
+    )
+    assert r.status == "pass" and "营业执照" in r.message
+
+
+def test_document_present_normalized_hit():
+    """OCR 软换行/空格打断子串时，归一化后仍应命中。"""
+    from app.engine.objective import run_check
+
+    facts = _facts("详见附件：营 业 执 照 复 印 件。")
+    r = run_check("document_present", {"document": "营业执照复印件"}, facts)
+    assert r.status == "pass"
+
+
+def test_document_present_not_found_is_unknown_not_fail():
+    """全部词组未命中 → unknown + need_human（机器看不见 ≠ 不存在），不再直接 fail。"""
+    from app.engine.objective import run_check
+
+    facts = _facts("本投标文件不含任何证照信息。")
+    r = run_check("document_present", {"document": "投标保证金缴纳凭证"}, facts)
+    assert r.status == "unknown" and r.need_human
+
+
+def test_document_present_guarantee_regex_miss_phrase_fallback():
+    """has_guarantee 正则失效（词序不同）时，词组兜底（归一化）仍能 pass。"""
+    from app.engine.objective import run_check
+
+    facts = _facts("投标保证金 缴纳凭证复印件见附件。")
+    assert not facts.has_guarantee  # 正则要求「缴纳投标保证金」连续出现，此处词序不同
+    r = run_check("document_present", {"document": "投标保证金缴纳凭证"}, facts)
+    assert r.status == "pass"
+
+
+# ---------------------------------------------------------------------------
+# count_at_least 的数量门槛（params.min_count）
+# ---------------------------------------------------------------------------
+def _facts_with_performance(n: int):
+    from decimal import Decimal
+
+    from app.engine.facts import BidFacts
+
+    return BidFacts(text="业绩见附件。", performance_amounts=[Decimal("1000000")] * n)
+
+
+def test_count_at_least_missing_min_count_is_unknown():
+    """min_count 缺失时不得按 0 个当作"永远满足"，应转人工（机器看不见 ≠ 满足）。"""
+    from app.engine.objective import run_check
+
+    r = run_check("count_at_least", {"field": "performance"}, _facts_with_performance(5))
+    assert r.status == "unknown" and r.need_human
+    assert "min_count" in r.message
+
+
+def test_count_at_least_with_min_count_judges_normally():
+    """给出 min_count 后按数量正常判定（阈值上下各验一次）。"""
+    from app.engine.objective import run_check
+
+    params = {"field": "performance", "min_count": "3", "min_amount_yuan": "600000"}
+    assert run_check("count_at_least", params, _facts_with_performance(3)).status == "pass"
+    assert run_check("count_at_least", params, _facts_with_performance(2)).status == "fail"
+
+
+def test_recover_artifacts_from_tender_extracts_segment():
+    """从招标原文定位因素原文并截出【证明材料】段（首段逻辑，非死代码）。
+
+    契约：tender_pages 的文本必须**已归一化**（调用方 scoring_service 用
+    normalize_no_ws 预处理过）——函数用归一化后的 quote 前缀去页里找。
+    """
+    from app.engine.objective import recover_artifacts_from_tender
+    from app.parsing.normalize import normalize_no_ws
+
+    criterion = {"source_quote": "投标人业绩：每提供 1 个类似项目业绩得 2 分。"}
+    pages = [
+        (1, normalize_no_ws("第一章 招标公告")),
+        (2, normalize_no_ws(
+            "投标人业绩：每提供 1 个类似项目业绩得 2 分。"
+            "【证明材料】须提供合同复印件、发票复印件。不提供不得分。【其他】无"
+        )),
+    ]
+    seg = recover_artifacts_from_tender(criterion, pages)
+    assert isinstance(seg, str)
+    assert seg.startswith("【证明材料】")
+    assert "合同复印件" in seg
+    assert "【其他】" not in seg  # 到下一个【】段为止
+
+
+def test_recover_artifacts_from_tender_returns_empty_when_absent():
+    from app.engine.objective import recover_artifacts_from_tender
+
+    assert recover_artifacts_from_tender({"source_quote": "无材料要求"}, [(1, "无关正文")]) == ""
+    assert recover_artifacts_from_tender({"source_quote": ""}, [(1, "x")]) == ""
+    assert recover_artifacts_from_tender({"source_quote": "某段"}, []) == ""
+
+
+
+# ---------------------------------------------------------------------------
+# contains_phrase 承诺语义（检索失败 ≠ 不存在，2026-10-26 run 54 c13 误否决实证）
+# ---------------------------------------------------------------------------
+def test_contains_phrase_commitment_variants_hit():
+    """「不转包、不分包」要能命中措辞变体（不进行转包/不得转包或违法分包）。"""
+    from app.engine.objective import run_check
+
+    phrase = {"phrase": "不转包、不分包"}
+    for text in (
+        "我方承诺不进行转包，不进行违法分包。",
+        "本项目不得转包或违法分包，特此承诺。",
+        "不转包、不分包。",
+        "保证不 拖欠工资，不 转包。",
+    ):
+        r = run_check("contains_phrase", phrase, _facts(text))
+        assert r.status == "pass", f"应命中变体: {text}"
+
+
+def test_contains_phrase_positive_mention_not_a_declaration():
+    """肯定语境提及（存在转包行为）不算声明成立。"""
+    from app.engine.objective import run_check
+
+    r = run_check(
+        "contains_phrase",
+        {"phrase": "不转包、不分包"},
+        _facts("经查该项目存在转包行为的线索。"),
+    )
+    assert r.status != "pass"
+
+
+def test_contains_phrase_miss_is_unknown_never_reject():
+    """检索未命中必须转人工，绝不硬 fail（误否决=0 的机制保证）。"""
+    from app.engine.objective import run_check
+
+    r = run_check(
+        "contains_phrase",
+        {"phrase": "不转包、不分包"},
+        _facts("本文件只谈技术方案，未提及任何承包方式。"),
+    )
+    assert r.status == "unknown" and r.need_human
+    assert "否决" in r.message  # 明示不作为否决依据
+
+    # 空短语/空文本同样不得 fail
+    assert run_check("contains_phrase", {}, _facts("任意")).status == "unknown"
+    assert run_check("contains_phrase", {"phrase": "不转包"}, _facts("")).status == "unknown"
+
+
+def test_contains_phrase_fullwidth_normalized_hit():
+    """全角标点/空白打断的原短语仍走归一化快路径。"""
+    from app.engine.objective import run_check
+
+    r = run_check(
+        "contains_phrase",
+        {"phrase": "不转包、不分包"},
+        _facts("承诺不转包、 不分包，如有违反愿负法律责任。"),
+    )
+    assert r.status == "pass"
+
+
+def test_required_flags_unmapped_materials_fall_back_to_contract_gate():
+    """细则点名了材料但关键词映射不上 → 不得空闸门放行（假通过），退回合同闸门。"""
+    from app.engine.objective import _required_flags
+
+    # 完全没点名材料 → 不设闸（计数项自由计数）
+    assert _required_flags("", "") == ()
+    # 点名了但映射不上 → 兜底 contract
+    assert _required_flags("提供用户证书和查询截图", "") == ("contract",)
+    # 映射得上 → 按点名材料闸
+    assert _required_flags("中标通知书、用户证明", "") == ("contract", "acceptance")
+    assert _required_flags("合同复印件、发票复印件、业主证明", "") == ("contract", "invoice", "acceptance")

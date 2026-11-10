@@ -8,6 +8,7 @@ objective/primitives 做；事实与判定分离才能保证"客观分可复算�
 """
 from __future__ import annotations
 
+import decimal
 import re
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -16,23 +17,57 @@ _UPPER_DIGITS = {"零": 0, "壹": 1, "贰": 2, "叁": 3, "肆": 4, "伍": 5, "�
 _RUN_UPPER = re.compile(r"[零壹贰叁肆伍陆柒捌玖拾佰仟万亿圆元整角分]{4,}")
 # 行首：前导分隔符* + 可选编号 + 后随分隔符*。
 # 兼容 "1 某项目" / "1. 某项目" / "1、某项目" / "（1）某项目" / "| 1 | 某项目"。
-_SEP = r"(?:[|｜]|\s)"
-_ROW_PREFIX = r"[|｜、.．\s）)]*(?:[（(]?\d+[）)]?)?[|｜、.．\s）)]*"
 _RE_PRICE_TOTAL_ROW = re.compile(
     r"投标总价\s*[：:（(]*(?:大写|小写)?[）)]?\s*[|｜]?\s*([\d,，]+(?:\.\d+)?)"
 )
 _RE_PRICE_SYMBOL = re.compile(r"[¥￥]\s*([\d,，]+(?:\.\d+)?)")
 _RE_PRICE_TOTAL_CN = re.compile(r"投标总价人民币([零壹贰叁肆伍陆柒捌玖拾佰仟万亿圆元整]+)")
 _RE_ITEMS_TOTAL_ROW = re.compile(r"^\s*[|｜]?\s*合计\s*[|｜]?\s*([\d,，]+(?:\.\d+)?)", re.M)
-_RE_ITEM_ROW = re.compile(
-    r"^\s*" + _ROW_PREFIX + r"\s*(.{2,60}?)\s*" + _SEP + r"\s*([\d,，]+(?:\.\d+)?)\s*"
-    + _SEP + r"\s*(\d{4})\s*年",
-    re.M,
+# 业绩行（行级匹配）：占有量词消除灾难性回溯。
+# 旧版 `[|｜、.．\s）)]* … \s*`（前缀字符类与相邻空白量词重叠）+ 全文本 finditer，
+# 在 PaddleOCR-VL 输出的长表格行上产生指数级回溯（2026-10-15 实证：单次 scan
+# 满载 CPU 20+ 分钟不返回）。修复：①字符类合并且用 *+ 占有（不回溯）；
+# ②按行 re.match（行文本短，回溯空间受限）。
+_RE_ITEM_LINE = re.compile(
+    r"^[\s|｜、.．)）]*+(?:[（(]?\d{1,3}[）)]?)?[\s|｜、.．)）]*+"
+    r"(.{2,60}?)[\s|｜]++([\d,，]+(?:\.\d+)?)[\s|｜]++(\d{4})\s*年"
 )
-_RE_CAPITAL = re.compile(r"注册资本[：:]*人民币?([\d,，]+(?:\.\d+)?)\s*万元")
-_RE_CERT_ROW = re.compile(
-    r"^\s*" + _ROW_PREFIX + r"\s*((?:ISO\s?\d+|CMMI\s?\d?)[^\n|｜]{0,60})", re.M
+# 注册资本（阶段 2 补强，2026-10-30）：
+# - 标签与数字间允许连接字 为/计/系/共（真实营业执照/投标声明常见形态）；
+# - 单位支持「元」（值即元，不乘 10000）与「万 元」空格变体（OCR 拆字）；
+# - 允许数字后跟「整」（金额大写习惯）。
+# 宁缺勿错：不做中文大写数字（壹仟万…），不从「营业执照」标题邻近推断。
+# 首个 .search 命中语义不变（万元 ×10000；纯元不换算）。
+_RE_CAPITAL = re.compile(
+    r"注册资本[：:为计系共]*人民币?([\d,，]+(?:\.\d+)?)\s*(万\s*元|元)(整)?"
 )
+# 证书行（行级匹配）：与 _RE_ITEM_LINE 同理——占有量词消除回溯
+# （原 _ROW_PREFIX 版本在诚道 25 万字符文本上满载 CPU 不返回，2026-10-15）。
+# 2026-10-21 重做：OCR 后证书文本形态是"ISO/IEC 20000-1:2018""GB/T19001-2016/
+# ISO9001:2015""信息技术服务管理体系认 证证书"（空格插进词中间），旧正则要求
+# ISO/CMMI 出现在行首，全部匹配不上 → 有证书也计 0。改为"语境 + 词素"提取：
+# 行内出现 ISO/CMMI 词素或中文证书名，且行（或相邻行）带证书语境才计入；
+# 入库直接存归一键（ISO9001/ISO27001/ISO20000/CMMI），天然去重。
+_CERT_ZH_KEYS: tuple[tuple[str, str], ...] = (
+    ("质量管理体系认证证书", "ISO9001"),
+    ("信息安全管理体系认证证书", "ISO27001"),
+    ("信息技术服务管理体系认证证书", "ISO20000"),
+    ("质量管理体系认证", "ISO9001"),
+    ("信息安全管理体系认证", "ISO27001"),
+    ("信息技术服务管理体系认证", "ISO20000"),
+    ("质量管理体系符合", "ISO9001"),
+    ("信息安全管理体系符合", "ISO27001"),
+    ("信息技术服务管理体系符合", "ISO20000"),
+    # B3: OCR 变体（空格插进词中间、简称）
+    ("质量管理体系", "ISO9001"),
+    ("信息安全管理体系", "ISO27001"),
+    ("信息技术服务管理体系", "ISO20000"),
+    ("IT服务管理体系", "ISO20000"),
+    ("ITSS", "ISO20000"),
+)
+_RE_CERT_CONTEXT = re.compile(r"证书|认证|体系|有效期|编号|CMMI|ISO")
+_RE_ISO_TOKEN = re.compile(r"ISO(?:\s?/?\s?IEC)?\s?(\d{4,5})")
+_RE_CMMI_TOKEN = re.compile(r"CMMI\s?[1-5]?\s?级?")
 # 证书行里的证书编号/有效期（用于把名称与编号切开）
 _RE_CERT_TAIL = re.compile(r"\s+[A-Z][A-Za-z]{1,8}[-–]\d|\s+\d{4}\s*年")
 _RE_CERT_CLAIM = re.compile(r"已通过\s*((?:ISO\s?\d+|CMMI\s?\d?)[^，。；；()（）]{0,30})")
@@ -94,8 +129,23 @@ def parse_upper_amount(text: str) -> Decimal | None:
     return Decimal(value) + fraction
 
 
-def _money(s: str) -> Decimal:
-    return Decimal(s.replace(",", "").replace("，", ""))
+# 全角数字/标点 → ASCII（OCR 常把金额读成"４４６２""．"）
+_FW_NUM_TRANS = str.maketrans("０１２３４５６７８９．，－＋％", "0123456789.,-+%")
+
+
+def _money(s: str) -> Decimal | None:
+    """OCR 金额 → Decimal。全角归一；非法输入返回 None（调用方跳过/换策略）。
+
+    2026-10-23 实证：人员救援 OCR 后新文本含全角数字行，`Decimal("４４６２")`
+    抛 ConversionSyntax → 整场评分在 extract_bid_facts 崩掉。
+    """
+    t = (s or "").translate(_FW_NUM_TRANS).replace(",", "").replace("，", "")
+    if not t or not any(ch.isdigit() for ch in t):
+        return None
+    try:
+        return Decimal(t)
+    except (decimal.InvalidOperation, ValueError):
+        return None
 
 
 def _contextual_price(text: str) -> Decimal | None:
@@ -109,6 +159,8 @@ def _contextual_price(text: str) -> Decimal | None:
     first_non_deposit: Decimal | None = None
     for m in _RE_PRICE_SYMBOL.finditer(text):
         value = _money(m.group(1))
+        if value is None:
+            continue
         context = text[max(0, m.start() - 40) : m.start()]
         if any(k in context for k in ("投标总价", "投标报价", "总报价", "报价")):
             return value
@@ -243,10 +295,14 @@ def _price_near_total_label(text: str) -> Decimal | None:
     for m in _RE_TOTAL_LABEL.finditer(text):
         tail = text[m.end() : m.end() + _PRICE_LABEL_WINDOW]
         if lm := _RE_PRICE_LOWER_LABEL.search(tail):
-            return _money(lm.group(1))
+            v = _money(lm.group(1))
+            if v is not None:
+                return v
         for line in tail.split("\n")[:3]:
             if lm := _RE_PRICE_LOWER_LABEL.search(line):
-                return _money(lm.group(1))
+                v = _money(lm.group(1))
+                if v is not None:
+                    return v
             if um := _RUN_UPPER.search(line):
                 if value := parse_upper_amount(um.group(0)):
                     return value
@@ -269,9 +325,9 @@ class BidFacts:
     credit_statement: bool = False
     placeholders: list[str] = field(default_factory=list)
     documents: list[str] = field(default_factory=list)  # 章节标题
-    # 跨投标人串通信号（engine/collusion.py 预计算后注入；单家抽取无法产出）。
-    # 结构：{"signals": [...], "detail": str, "available": bool}；未注入 = 空 dict → need_human 兜底
-    cross_bidder: dict = field(default_factory=dict)
+    # P1-E 事实扩展（人员属性表：[{name, years, title, ...}]；由表解析/LLM 填充，
+    # 缺失时 attribute_tier 的 years/title 口径走 unresolved=no_facts 不猜测）
+    person_attributes: list[dict] = field(default_factory=list)
 
 
 def extract_bid_facts(text: str, documents: list[str] | None = None) -> BidFacts:
@@ -280,17 +336,19 @@ def extract_bid_facts(text: str, documents: list[str] | None = None) -> BidFacts
     # 报价：多级策略（宁缺勿错，都取不到就留 None，由人工在报价确认卡点录入）：
     # ① "投标总价：金额" 同行 → ② 标签后窗口内的小写/大写金额（真实标书的换行表格）
     # → ③ "投标价（含增值税…）" 合计行 → ④ 带语境的 ¥。
+    price: Decimal | None = None
     if m := _RE_PRICE_TOTAL_ROW.search(text):
-        facts.bid_price = _money(m.group(1))
-    elif (near := _price_near_total_label(text)) is not None:
-        facts.bid_price = near
-    elif m := _RE_PRICE_INCL_VAT.search(text):
-        facts.bid_price = _money(m.group(1))
-    elif (ob := _price_from_open_bid_section(text)) is not None:
+        price = _money(m.group(1))
+    if price is None and (near := _price_near_total_label(text)) is not None:
+        price = near
+    if price is None and (m := _RE_PRICE_INCL_VAT.search(text)):
+        price = _money(m.group(1))
+    if price is None and (ob := _price_from_open_bid_section(text)) is not None:
         # ⑤ 结构锚点兜底（强于④的全局弱启发）：开标一览表跨行断裂表单
-        facts.bid_price = ob
-    else:
-        facts.bid_price = _contextual_price(text)
+        price = ob
+    if price is None:
+        price = _contextual_price(text)
+    facts.bid_price = price
     # 大写金额
     if m := _RE_PRICE_TOTAL_CN.search(text):
         facts.bid_price_upper = m.group(1)
@@ -299,19 +357,28 @@ def extract_bid_facts(text: str, documents: list[str] | None = None) -> BidFacts
     if m := _RE_ITEMS_TOTAL_ROW.search(text):
         facts.price_items_total = _money(m.group(1))
 
-    # 注册资本
+    # 注册资本（阶段 2 补强，2026-10-30）：单位「元」→ 值即元不换算；
+    # 「万元/万 元」→ ×10000（首个 .search 命中语义与旧版一致）
     if m := _RE_CAPITAL.search(text):
-        facts.registered_capital = _money(m.group(1)) * Decimal(10_000)
+        cap = _money(m.group(1))
+        if cap is not None:
+            unit = (m.group(2) or "").replace(" ", "").replace("　", "")
+            facts.registered_capital = cap if unit == "元" else cap * Decimal(10_000)
 
     # 业绩（表格行：编号 名称 金额 年份；管道或空格分隔）
-    # 表头若声明"万元"单位，金额要做 ×10000 换算，否则出现 10000 倍低估
+    # 表头若声明"万元"单位，金额要做 ×10000 换算，否则出现 10000 倍低估。
+    # 行级匹配（_RE_ITEM_LINE，见定义处说明）；等价于原 re.M finditer 的行内语义。
     lines = text.split("\n")
-    for m in _RE_ITEM_ROW.finditer(text):
+    for line_no, line in enumerate(lines):
+        m = _RE_ITEM_LINE.match(line)
+        if m is None:
+            continue
         name, amount, year = m.group(1).strip(" |｜"), m.group(2), m.group(3)
         if "项目名称" in name or "合同金额" in name:
             continue
         value = _money(amount)
-        line_no = text.count("\n", 0, m.start())
+        if value is None:
+            continue  # 全角/非法金额（OCR 噪声）→ 跳过该行，不崩整场
         for back in range(line_no - 1, max(-1, line_no - 12), -1):
             header = lines[back] if 0 <= back < len(lines) else ""
             if "合同金额" in header or "金额" in header:
@@ -320,13 +387,32 @@ def extract_bid_facts(text: str, documents: list[str] | None = None) -> BidFacts
                 break
         facts.performance_amounts.append(value)
 
-    # 体系认证：表内（有证书）与正文声称（可能无证书）分开记
-    for m in _RE_CERT_ROW.finditer(text):
-        raw = m.group(1)
-        name = _RE_CERT_TAIL.split(raw)[0]
-        name = re.sub(r"\s+", "", name)
-        if name and name not in facts.certificates:
-            facts.certificates.append(name)
+    # 体系认证：表内（有证书）与正文声称（可能无证书）分开记。
+    # 行级 + 语境判定，词素提取后直接存归一键（见 _CERT_ZH_KEYS 处说明）。
+    for line_no, line in enumerate(lines):
+        if _RE_CERT_CLAIM.search(line):
+            continue  # 正文声称由 _RE_CERT_CLAIM 单独记，不冒充证书复印件
+        compact = line.replace(" ", "")
+        if not _RE_CERT_CONTEXT.search(line):
+            # OCR 常把"证书/认证"语境拆到相邻行：±1 行带语境即算
+            if not any(
+                0 <= j < len(lines) and _RE_CERT_CONTEXT.search(lines[j])
+                for j in (line_no - 1, line_no + 1)
+            ):
+                continue
+        key: str | None = None
+        for zh, mapped in _CERT_ZH_KEYS:
+            if zh in compact:
+                key = mapped
+                break
+        if key is None:
+            m_iso = _RE_ISO_TOKEN.search(line)
+            if m_iso:
+                key = f"ISO{m_iso.group(1)}"
+            elif _RE_CMMI_TOKEN.search(line):
+                key = "CMMI"
+        if key and key not in facts.certificates:
+            facts.certificates.append(key)
     for m in _RE_CERT_CLAIM.finditer(text):
         name = re.sub(r"\s+", "", m.group(1))
         if name and name not in facts.cert_claims:

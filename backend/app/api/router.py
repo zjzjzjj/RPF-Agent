@@ -3,11 +3,12 @@ from __future__ import annotations
 
 from fastapi import APIRouter
 
-from app.api import bidders, documents, jobs, projects, reports, rules, runs, scores
+from app.api import bidders, documents, jobs, material, projects, reports, rules, runs, scores
 
 api_router = APIRouter()
 api_router.include_router(projects.router)
 api_router.include_router(documents.router)
+api_router.include_router(material.router)
 api_router.include_router(rules.router)
 api_router.include_router(bidders.router)
 api_router.include_router(runs.router)

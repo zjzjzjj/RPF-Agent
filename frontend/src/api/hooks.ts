@@ -1,13 +1,19 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useSearchParams } from "react-router-dom";
 import { api } from "../api/client";
+import { pickDefaultRun } from "../utils/runs";
 import type {
   Bidder,
   Citation,
   Coverage,
   DocumentOut,
+  EvaluationRun,
+  ExecutionProgress,
   JobOut,
+  LawPackSummary,
   MatchProposal,
   Matrix,
+  MergeRecord,
   ModelsOut,
   PackageDetail,
   Project,
@@ -15,8 +21,10 @@ import type {
   ReportOut,
   ReviewQueueItem,
   ScoreOut,
+  ScoreSummary,
   TemplateDetail,
   TemplateSummary,
+  UseDefaultTemplateResult,
   Workbench,
 } from "../types";
 
@@ -89,17 +97,71 @@ export function useBidders(pid: string) {
 export function useRuns(pid: string) {
   return useQuery({
     queryKey: ["runs", pid],
-    queryFn: () => api.get<{ id: number; status: string; package_version: number }[]>(`/projects/${pid}/runs`),
+    queryFn: () => api.get<EvaluationRun[]>(`/projects/${pid}/runs`),
     enabled: !!pid,
     refetchInterval: 1500,
   });
 }
 
-export function useMatrix(runId: number | null) {
+export function useRunExecutionProgress(runId: number | null, active = false) {
+  return useQuery({
+    queryKey: ["executionProgress", runId],
+    queryFn: () => api.get<ExecutionProgress | null>(`/runs/${runId}/execution-progress`),
+    enabled: runId != null,
+    refetchInterval: active ? 1500 : false,
+  });
+}
+
+/**
+ * 统一的「当前运行」选择：`?run=` 持久化，自动运行缺省展示最新进度。
+ *
+ * 评分结果页的矩阵 / 聚合 / 排名 / 报告必须共用同一个 runId——否则会出现
+ * 「矩阵是上一次成功的运行、排名是最新那次失败的运行」这类串台。
+ */
+export function useSelectedRun(pid: string) {
+  const { data: runs } = useRuns(pid);
+  const [params, setParams] = useSearchParams();
+  const raw = params.get("run");
+  const parsed = raw != null && raw !== "" ? Number(raw) : null;
+  const fallback = pickDefaultRun(runs);
+  const runId = parsed != null && Number.isFinite(parsed) ? parsed : (fallback?.id ?? null);
+  const setRunId = (id: number | null) => {
+    const next = new URLSearchParams(params);
+    if (id == null) next.delete("run");
+    else next.set("run", String(id));
+    setParams(next, { replace: true });
+  };
+  return {
+    runs: runs ?? [],
+    runId,
+    setRunId,
+    run: (runs ?? []).find((r) => r.id === runId) ?? null,
+  };
+}
+
+/**
+ * 评分结果聚合（排名 + 四分桶 + 逐项加减分明细与理由）。
+ *
+ * `live=true` 时以 4s 间隔轮询——评分运行进行中结果页必须渐进刷新，
+ * 否则横幅冻结在 run 创建瞬间的 queued、评分格全「未执行」
+ * （2026-10-26 run 54 实证）。仅 ScoreResults 传 live，复核/证据页不受影响。
+ */
+export function useScoreSummary(runId: number | null, pid: string, opts?: { live?: boolean }) {
+  return useQuery({
+    queryKey: ["scoreSummary", runId],
+    queryFn: () =>
+      api.get<ScoreSummary>(`/runs/${runId}/score-summary?project_id=${encodeURIComponent(pid)}`),
+    enabled: runId != null && !!pid,
+    refetchInterval: opts?.live ? 4000 : false,
+  });
+}
+
+export function useMatrix(runId: number | null, opts?: { live?: boolean }) {
   return useQuery({
     queryKey: ["matrix", runId],
     queryFn: () => api.get<Matrix>(`/runs/${runId}/matrix`),
     enabled: runId != null,
+    refetchInterval: opts?.live ? 4000 : false,
   });
 }
 
@@ -127,20 +189,23 @@ export function useReviewQueue(pid: string) {
   });
 }
 
-export function useRanking(pid: string) {
+export function useRanking(pid: string, runId?: number | null) {
   return useQuery({
-    queryKey: ["ranking", pid],
-    queryFn: () => api.get<Ranking>(`/projects/${pid}/ranking`),
+    queryKey: ["ranking", pid, runId ?? null],
+    queryFn: () =>
+      api.get<Ranking>(`/projects/${pid}/ranking${runId != null ? `?run_id=${runId}` : ""}`),
     enabled: !!pid,
   });
 }
 
 /** 评标报告（草稿/定稿）。有评分运行即可取——草稿把疑问逐条标出。 */
-export function useReport(pid: string) {
+export function useReport(pid: string, runId?: number | null) {
   return useQuery({
-    queryKey: ["report", pid],
-    queryFn: () => api.get<ReportOut>(`/projects/${pid}/report`),
+    queryKey: ["report", pid, runId ?? null],
+    queryFn: () =>
+      api.get<ReportOut>(`/projects/${pid}/report${runId != null ? `?run_id=${runId}` : ""}`),
     enabled: !!pid,
+    retry: false, // 无运行时后端 404，不适合重试
   });
 }
 
@@ -162,6 +227,15 @@ export function useTemplate(templateId: string | null) {
   });
 }
 
+/** 仓库内固化的法规规则包目录（导入选择用） */
+export function useLawPacks() {
+  return useQuery({
+    queryKey: ["lawPacks"],
+    queryFn: () => api.get<LawPackSummary[]>("/rules/law-packs"),
+    staleTime: 3600_000,
+  });
+}
+
 /** 覆盖率报告（S0） */
 export function useCoverage(packageId: number | null) {
   return useQuery({
@@ -177,6 +251,57 @@ export function useMatchProposal(mergePackageId: number | null) {
     queryKey: ["matchProposal", mergePackageId],
     queryFn: () => api.get<MatchProposal>(`/rules/packages/${mergePackageId}/match-proposal`),
     enabled: mergePackageId != null && mergePackageId > 0,
+  });
+}
+
+/** 一键启用默认规则：实例化（或复用草稿模板包）→ 全部签批 → 确认 → 冻结。 */
+export function useUseDefaultTemplate(pid: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: { template_id: string; reason?: string | null }) =>
+      api.post<UseDefaultTemplateResult>(`/projects/${pid}/rules/use-default-template`, body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["rules", pid] });
+      qc.invalidateQueries({ queryKey: ["workbench", pid] });
+      qc.invalidateQueries({ queryKey: ["coverage"] });
+    },
+  });
+}
+
+/** 停用评分项（仅草稿）：退出计分与冻结快照。 */
+export function useRetireCriterion(pid: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, reason }: { id: number; reason: string }) =>
+      api.post(`/rules/criteria/${id}/retire`, { reason }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["rules", pid] });
+      qc.invalidateQueries({ queryKey: ["coverage"] });
+      qc.invalidateQueries({ queryKey: ["workbench", pid] });
+    },
+  });
+}
+
+/** 恢复被停用的评分项（仅草稿）。 */
+export function useRestoreCriterion(pid: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, reason }: { id: number; reason: string }) =>
+      api.post(`/rules/criteria/${id}/restore`, { reason }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["rules", pid] });
+      qc.invalidateQueries({ queryKey: ["coverage"] });
+      qc.invalidateQueries({ queryKey: ["workbench", pid] });
+    },
+  });
+}
+
+/** 自动匹配的逐条变更（覆盖 / 弃用 / 追加）。 */
+export function useMergeRecords(packageId: number | null) {
+  return useQuery({
+    queryKey: ["mergeRecords", packageId],
+    queryFn: () => api.get<MergeRecord[]>(`/rules/packages/${packageId}/merge-records`),
+    enabled: packageId != null && packageId > 0,
   });
 }
 

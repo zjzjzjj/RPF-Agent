@@ -114,6 +114,23 @@ class LawImportBody(BaseModel):
     criteria: list[dict] = Field(default_factory=list)
 
 
+class LawPackSummaryOut(BaseModel):
+    """仓库内固化的法规规则包（rules/library/law_packs/）目录项。"""
+
+    id: str
+    name: str
+    version: str
+    rule_count: int
+    scope: str | None = None
+    total_max: float | None = None
+
+
+class LawPackImportBody(BaseModel):
+    """按 pack_id 导入仓库内固化的法规规则包（无需前端持有 87 条 JSON）。"""
+
+    pack_id: str = Field(default="general-law", min_length=1)
+
+
 class DroppedNodeOut(BaseModel):
     code: str
     node_id: str
@@ -218,6 +235,8 @@ class TemplateFormulaOut(BaseModel):
     rounding: int = 2
     trim_ratio: Decimal | None = None
     deduct_rate: Decimal | None = None
+    deduct_rate_down: Decimal | None = None
+    deduct_rate_up: Decimal | None = None
 
 
 class TemplateCriterionOut(BaseModel):
@@ -229,6 +248,7 @@ class TemplateCriterionOut(BaseModel):
     veto_consequence: str | None = None
     max_score: Decimal | None = None
     description: str | None = None
+    required_evidence: str | None = None
     essential: bool = False
     hint: str | None = None
     levels: list[TemplateLevelOut] = []
@@ -243,16 +263,35 @@ class TemplateSummaryOut(BaseModel):
     library_version: str
     criteria_count: int
     categories_summary: dict[str, int]
+    applicable: dict = Field(default_factory=dict)
+    notes: str | None = None
 
 
 class TemplateDetailOut(TemplateSummaryOut):
-    applicable: dict
-    notes: str | None = None
     criteria: list[TemplateCriterionOut]
 
 
 class SignoffBody(BaseModel):
     reason: str = Field(min_length=1)
+
+
+class UseDefaultTemplateBody(BaseModel):
+    """一键启用默认规则：无包时按 template_id 实例化；已有草稿模板包则直接启用。"""
+
+    template_id: str = Field(default="comprehensive-services", min_length=1)
+    reason: str | None = None
+
+
+class UseDefaultTemplateOut(BaseModel):
+    package_id: int
+    ok: bool
+    frozen: bool
+    already_frozen: bool = False
+    created: bool = False
+    signed_off: int = 0
+    blockers: list[dict] = Field(default_factory=list)
+    validations: list[dict] = Field(default_factory=list)
+    message: str | None = None
 
 
 # ---------------------------------------------------------------------------

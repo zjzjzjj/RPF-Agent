@@ -3,8 +3,8 @@
   "name": "综合评分法（服务类）通用模板",
   "method": "comprehensive",
   "applicable": {"procurement": "services"},
-  "library_version": "1.0.0",
-  "notes": "价格权重 10（87 号令第 55 条服务项目价格权重≥10% 的下限），服务类主观项占比更高；全部条目均为候选，未经招标文件覆盖并签批不得执行；判据文字为通用判据，覆盖时必须替换为招标文件原文。",
+  "library_version": "2.0.0",
+  "notes": "价格 10 分（《政府采购货物和服务招标投标管理办法》87 号令第 55 条：服务项目价格权重不得低于 10%），技术 60 分，商务 30 分，非否决项合计 100 分。全部条目均为通用判据候选，未经招标文件覆盖并签批不得执行；分值、门槛与证明材料可在覆盖时按招标文件替换。库内不收录品牌、型号或指向唯一供应商的条目。",
   "criteria": [
     {
       "template_code": "T1.1",
@@ -14,6 +14,7 @@
       "is_veto": true,
       "veto_consequence": "disqualify",
       "description": "投标人须为在中华人民共和国境内注册、具有独立承担民事责任能力的法人或其他组织。",
+      "required_evidence": "有效的营业执照（或事业单位法人证书）复印件，加盖投标人公章。",
       "checks": [
         {"check_type": "document_present", "field": null, "params": {"document": "营业执照"}, "on_fail": "recommend_reject"}
       ],
@@ -31,7 +32,8 @@
       "score_type": "veto",
       "is_veto": true,
       "veto_consequence": "disqualify",
-      "description": "投标人须具备招标文件载明的相应服务资质或在有效期内的许可证明。",
+      "description": "投标人须具备招标文件载明的相应服务资质或有效期内的许可证明。",
+      "required_evidence": "招标文件要求的服务类资质/许可证书复印件（须在有效期内）。",
       "checks": [
         {"check_type": "document_present", "field": null, "params": {"document": "资质证书"}, "on_fail": "recommend_reject"}
       ],
@@ -50,6 +52,7 @@
       "is_veto": true,
       "veto_consequence": "disqualify",
       "description": "投标人未被列入失信被执行人名单及政府采购严重违法失信行为记录名单。",
+      "required_evidence": "信用中国（creditchina.gov.cn）与政府采购网（ccgp.gov.cn）查询结果截图，或加盖公章的信用承诺函。",
       "checks": [
         {"check_type": "document_present", "field": null, "params": {"document": "信用承诺函"}, "on_fail": "recommend_reject"}
       ],
@@ -68,6 +71,7 @@
       "is_veto": true,
       "veto_consequence": "disqualify",
       "description": "投标函须由法定代表人或其授权代表签署并加盖投标人公章。",
+      "required_evidence": "投标函原件（法定代表人或授权代表签字，并加盖投标人公章）。",
       "checks": [
         {"check_type": "human_only", "field": null, "params": {}, "on_fail": "recommend_reject"}
       ],
@@ -86,6 +90,7 @@
       "is_veto": true,
       "veto_consequence": "disqualify",
       "description": "投标人须按招标文件要求提交投标保证金。",
+      "required_evidence": "投标保证金缴纳凭证（银行回单/保函/电子凭证），金额与形式符合招标文件。",
       "checks": [
         {"check_type": "document_present", "field": null, "params": {"document": "投标保证金缴纳凭证"}, "on_fail": "recommend_reject"}
       ],
@@ -104,6 +109,7 @@
       "is_veto": true,
       "veto_consequence": "disqualify",
       "description": "投标人须对同一项目提交唯一报价，且报价不得高于最高投标限价。",
+      "required_evidence": "开标一览表/投标报价表（报价唯一且不高于最高投标限价）。",
       "checks": [
         {"check_type": "math_relation", "field": null, "params": {}, "on_fail": "recommend_reject"}
       ],
@@ -112,7 +118,7 @@
       "formula": null,
       "weight": null,
       "essential": true,
-      "hint": "覆盖时可在 params.max_yuan 填入本项目最高限价"
+      "hint": "覆盖时可在 params.max_yuan 填入本项目最高限价，使限价检查生效"
     },
     {
       "template_code": "T3.1",
@@ -121,7 +127,8 @@
       "score_type": "formula",
       "is_veto": false,
       "veto_consequence": null,
-      "description": "以全部有效投标报价的算术平均价为基准价（系数 k=1.0），评标价每高于基准价一定比例扣分。",
+      "description": "以通过初步评审的全部有效投标报价的算术平均价为评标基准价（系数 k=1.0）；投标报价等于基准价的得满分，偏离基准价的按比例扣分，扣完为止。",
+      "required_evidence": null,
       "checks": [],
       "formula": {
         "formula_type": "benchmark_ratio",
@@ -135,7 +142,7 @@
       "levels": [],
       "weight": null,
       "essential": true,
-      "hint": "覆盖时必须替换为招标文件载明的价格分计算公式"
+      "hint": "覆盖时必须替换为招标文件载明的价格分计算公式与基准价方法"
     },
     {
       "template_code": "T4.1",
@@ -144,15 +151,16 @@
       "score_type": "subjective",
       "is_veto": false,
       "veto_consequence": null,
-      "description": "对投标人服务方案的理解深度、工作流程的合理性进行综合评价。",
+      "description": "评价服务方案对本项目需求的响应完整度，以及工作流程的可执行性（环节、时限、责任人）。",
+      "required_evidence": "服务方案文本；工作流程应覆盖接单/受理/处理/反馈/归档环节并给出时限与责任人。",
       "checks": [],
       "formula": null,
       "max_score": 20,
       "levels": [
-        {"label": "优", "min": 17, "max": 20, "criteria": "理解深刻、流程科学、针对性强（通用判据，覆盖时替换）"},
-        {"label": "良", "min": 12, "max": 16, "criteria": "理解较深刻、流程较合理、针对性较强（通用判据，覆盖时替换）"},
-        {"label": "一般", "min": 6, "max": 11, "criteria": "理解一般、流程基本可行（通用判据，覆盖时替换）"},
-        {"label": "差", "min": 0, "max": 5, "criteria": "理解偏差或流程不可行（通用判据，覆盖时替换）"}
+        {"label": "优", "min": 17, "max": 20, "criteria": "完整响应全部服务需求；流程覆盖全部环节，每环节有明确时限与责任人；针对本项目难点有专门应对方案，可操作性强。"},
+        {"label": "良", "min": 12, "max": 16, "criteria": "响应全部服务需求；流程覆盖主要环节，时限与责任分工基本明确；有针对性措施。"},
+        {"label": "一般", "min": 6, "max": 11, "criteria": "响应主要服务需求；流程覆盖部分环节，缺少明确时限或责任分工。"},
+        {"label": "差", "min": 0, "max": 5, "criteria": "未实质响应服务需求，或工作流程缺失关键环节。"}
       ],
       "weight": null,
       "essential": true,
@@ -161,44 +169,46 @@
     {
       "template_code": "T4.2",
       "category": "technical",
-      "name": "项目团队配置与人员资质",
-      "score_type": "subjective",
-      "is_veto": false,
-      "veto_consequence": null,
-      "description": "对投标人项目团队结构、人员资质与经验进行综合评价。",
-      "checks": [],
-      "formula": null,
-      "max_score": 20,
-      "levels": [
-        {"label": "优", "min": 17, "max": 20, "criteria": "团队配置完整、人员资质高（通用判据，覆盖时替换）"},
-        {"label": "良", "min": 12, "max": 16, "criteria": "团队配置较完整、人员资质较好（通用判据，覆盖时替换）"},
-        {"label": "一般", "min": 6, "max": 11, "criteria": "团队配置一般、人员资质一般（通用判据，覆盖时替换）"},
-        {"label": "差", "min": 0, "max": 5, "criteria": "团队配置缺失或人员资质不满足（通用判据，覆盖时替换）"}
-      ],
-      "weight": null,
-      "essential": true,
-      "hint": "覆盖时必须替换为招标文件的具体评分要点"
-    },
-    {
-      "template_code": "T4.3",
-      "category": "technical",
       "name": "服务质量保障与应急响应措施",
       "score_type": "subjective",
       "is_veto": false,
       "veto_consequence": null,
-      "description": "对投标人服务质量保障体系与应急响应能力进行综合评价。",
+      "description": "评价质量目标与检查制度，以及应急响应的量化时限与预案完备度。",
+      "required_evidence": "质量保障制度文件、应急预案（含响应时限）、服务承诺函或演练记录。",
       "checks": [],
       "formula": null,
       "max_score": 20,
       "levels": [
-        {"label": "优", "min": 17, "max": 20, "criteria": "保障体系完善、应急响应迅速（通用判据，覆盖时替换）"},
-        {"label": "良", "min": 12, "max": 16, "criteria": "保障体系较完善、应急响应较及时（通用判据，覆盖时替换）"},
-        {"label": "一般", "min": 6, "max": 11, "criteria": "保障体系一般、应急响应时效一般（通用判据，覆盖时替换）"},
-        {"label": "差", "min": 0, "max": 5, "criteria": "无保障安排或明显不满足要求（通用判据，覆盖时替换）"}
+        {"label": "优", "min": 17, "max": 20, "criteria": "有明确质量目标与考核办法；设三级质检；应急响应≤2 小时到场（或≤30 分钟响应），附应急预案与演练记录。"},
+        {"label": "良", "min": 12, "max": 16, "criteria": "有质量目标与检查制度；应急响应≤4 小时，附应急预案。"},
+        {"label": "一般", "min": 6, "max": 11, "criteria": "质量保障与应急措施表述笼统，无量化响应时限。"},
+        {"label": "差", "min": 0, "max": 5, "criteria": "无质量保障安排或应急措施。"}
       ],
       "weight": null,
-      "essential": false,
-      "hint": "覆盖时必须替换为招标文件的具体评分要点"
+      "essential": true,
+      "hint": "覆盖时必须替换为招标文件的具体评分要点与响应时限"
+    },
+    {
+      "template_code": "T4.3",
+      "category": "technical",
+      "name": "服务团队配置与人员资质",
+      "score_type": "subjective",
+      "is_veto": false,
+      "veto_consequence": null,
+      "description": "评价团队岗位齐备度、核心人员持证情况与从业经验。",
+      "required_evidence": "团队人员名单与岗位分工、资格/职称证书、从业经验证明、近六个月社保缴纳证明。",
+      "checks": [],
+      "formula": null,
+      "max_score": 20,
+      "levels": [
+        {"label": "优", "min": 17, "max": 20, "criteria": "岗位齐备（项目经理/技术服务/质量管理）；核心人员持相关资格证书且经验≥5 年；社保与证书齐全。"},
+        {"label": "良", "min": 12, "max": 16, "criteria": "岗位基本齐备；核心人员持证，经验≥3 年。"},
+        {"label": "一般", "min": 6, "max": 11, "criteria": "人员配置基本满足，但证书或经验证明不全。"},
+        {"label": "差", "min": 0, "max": 5, "criteria": "人员配置不足或关键岗位缺失。"}
+      ],
+      "weight": null,
+      "essential": true,
+      "hint": "覆盖时必须替换为招标文件的具体评分要点与人员数量要求"
     },
     {
       "template_code": "T5.1",
@@ -207,9 +217,10 @@
       "score_type": "count",
       "is_veto": false,
       "veto_consequence": null,
-      "description": "按投标人提供的近年同类项目业绩数量计分，每项 3 分，最高 15 分。",
+      "description": "近三年（以合同签订时间为准）完成的同类服务项目，单个合同金额不低于 80 万元，每项计 3 分，最高 15 分（最多计 5 项）。",
+      "required_evidence": "合同复印件（含金额页与签署页）+ 发票复印件 + 业主验收或证明（三者缺一不得分；验收材料可替代业主证明）。",
       "checks": [
-        {"check_type": "count_at_least", "field": null, "params": {"field": "performance", "per_item": 3, "max_items": 5}, "on_fail": "need_human"}
+        {"check_type": "count_at_least", "field": null, "params": {"field": "performance", "per_item": 3, "max_items": 5, "min_amount_yuan": 800000}, "on_fail": "need_human"}
       ],
       "formula": null,
       "max_score": 15,
@@ -221,20 +232,40 @@
     {
       "template_code": "T5.2",
       "category": "commercial",
-      "name": "服务团队专业认证",
+      "name": "投标人认证及资质",
       "score_type": "count",
       "is_veto": false,
       "veto_consequence": null,
-      "description": "按投标人服务团队持有的专业认证与资格证书数量计分，每项 3 分，最高 15 分。",
+      "description": "投标人持有有效的质量管理体系、信息安全管理体系、信息技术服务管理体系认证（如 ISO9001、ISO27001、ISO20000，或同等体系），或软件能力成熟度模型认证（如 CMMI 2 级及以上，或同等），每项计 3 分，最高 9 分。",
+      "required_evidence": "有效期内的证书复印件 + 全国认证认可信息公共服务平台（cnca.cn）查询结果截图；无查询截图的不予计分。",
       "checks": [
-        {"check_type": "count_at_least", "field": null, "params": {"field": "certificates", "per_item": 3, "max_items": 5}, "on_fail": "need_human"}
+        {"check_type": "count_at_least", "field": null, "params": {"field": "certificates", "per_item": 3, "max_items": 3}, "on_fail": "need_human"}
       ],
       "formula": null,
-      "max_score": 15,
+      "max_score": 9,
       "levels": [],
       "weight": null,
       "essential": false,
-      "hint": "覆盖时替换为招标文件要求的证书类型"
+      "hint": "覆盖时替换为招标文件要求的认证类型；不得写入品牌或型号"
+    },
+    {
+      "template_code": "T5.3",
+      "category": "commercial",
+      "name": "项目负责人资格与经验",
+      "score_type": "count",
+      "is_veto": false,
+      "veto_consequence": null,
+      "description": "拟派项目负责人具有同类服务项目经验，每提供一个有效案例计 2 分，最高 6 分（最多计 3 个案例）。",
+      "required_evidence": "项目负责人资格/职称证书 + 同类项目案例（合同须体现负责人姓名，未体现的须补充业主证明）+ 近六个月社保缴纳证明。",
+      "checks": [
+        {"check_type": "count_at_least", "field": null, "params": {"field": "performance", "per_item": 2, "max_items": 3}, "on_fail": "need_human"}
+      ],
+      "formula": null,
+      "max_score": 6,
+      "levels": [],
+      "weight": null,
+      "essential": false,
+      "hint": "覆盖时替换为招标文件对负责人资格与经验年限的具体要求"
     }
   ]
 }

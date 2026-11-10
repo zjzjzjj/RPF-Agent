@@ -200,10 +200,10 @@ export default function ProjectList() {
       <div className="overview-banner">
         <div className="banner-copy">
           <span className="banner-kicker">
-            <span className="small-dot" /> AI 辅助评审，人工确认结果
+            <span className="small-dot" /> 全自动评审，逐项证据可查
           </span>
           <h2>每一分，都有据可循。</h2>
-          <p>以冻结规则为起点，用原文证据连接评分与复核。</p>
+          <p>按冻结规则自动评审，以原文和页图证据支撑每项结论。</p>
           <div className="banner-tags">
             <span>
               <CheckCircleOutlined /> 规则可追溯
@@ -229,7 +229,7 @@ export default function ProjectList() {
           <ArrowRightOutlined />
           <span className="flow-node">
             <AuditOutlined />
-            人工复核
+            自动复评
           </span>
         </div>
       </div>
@@ -436,7 +436,7 @@ export default function ProjectList() {
                       title="删除该项目？"
                       description="文档、规则、评分与报告数据将一并删除且不可恢复。"
                       okText="删除"
-                      okButtonProps={{ danger: true }}
+                      okButtonProps={{ danger: true, loading: remove.isPending && remove.variables === p.id }}
                       cancelText="取消"
                       onConfirm={(e) => {
                         e?.stopPropagation();
@@ -495,7 +495,7 @@ export default function ProjectList() {
                       title="删除该项目？"
                       description="文档、规则、评分与报告数据将一并删除且不可恢复。"
                       okText="删除"
-                      okButtonProps={{ danger: true }}
+                      okButtonProps={{ danger: true, loading: remove.isPending && remove.variables === p.id }}
                       cancelText="取消"
                       onConfirm={() => remove.mutate(p.id)}
                     >
@@ -572,7 +572,12 @@ export default function ProjectList() {
               maxLength={200}
             />
           </Form.Item>
-          <Form.Item name="base_template_id" label="评标办法基线模板（可选）">
+          <Form.Item
+            name="base_template_id"
+            label="评标办法基线模板（可选）"
+            initialValue="comprehensive-default"
+            extra="默认使用「综合评分法（通用·默认）」（价格 50 / 技术 40 / 商务 10）。上传招标文件后，系统会按文件条款自动覆盖重建；也可选择「暂不使用」只走招标文件编译。"
+          >
             <Select
               allowClear
               placeholder="暂不使用（仅上传招标文件编译）"

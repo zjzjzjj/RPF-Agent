@@ -59,6 +59,8 @@ class StageState(BaseModel):
     state: Literal["done", "active", "blocked", "pending"]
     detail: str = ""
     todo_count: int = 0
+    # 可选阶段（如已有模板规则时的招标文件）：pending 不阻塞"下一步"引导
+    optional: bool = False
 
 
 class WorkbenchOut(BaseModel):

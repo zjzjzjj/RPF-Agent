@@ -13,6 +13,10 @@ class PriceBid:
     name: str
     price: Decimal
     excluded: bool = False  # 建议否决/否决 → 不进基准价（exclude_invalid=true 时）
+    # P1-C 基准价资格门槛输入（由 scoring_service 注入；None=不可得 → 门槛不执行）
+    gate_value: Decimal | None = None   # 门槛所依据的实际得分（如技术分合计）
+    gate_basis: Decimal | None = None   # 门槛分母（如技术部分总分，percent 口径用）
+    sample_pass: bool | None = None     # 样品评审结论（sample_or_composite 口径用）
 
 
 @dataclass
@@ -45,6 +49,9 @@ class PrimitiveResult:
     message: str
     evidence_quote: str | None = None
     need_human: bool = False
+    # LLM 裁决抽取的逐字引文（[{quote, page_hint?}]，与 AutoJudgement.evidence 同构）。
+    # run_check 确定性判定恒不带（过程即证据，设计上无引文）；落库侧按 ≤5 条消费。
+    evidence_items: list[dict] | None = None
 
 
 @dataclass

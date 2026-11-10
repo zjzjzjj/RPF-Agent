@@ -48,7 +48,7 @@ def test_health(client):
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "ok"
-    assert body["llm_provider"] == "mock"
+    assert body["llm_provider"] is None  # 测试环境不配置任何 provider（全程离线）
 
 
 def test_project_crud(client):
@@ -73,11 +73,12 @@ def test_project_crud(client):
     resp = client.get("/api/projects")
     assert len(resp.json()) == 1
 
-    # 审计留痕已写入
+    # 审计留痕已写入；工作台为三阶段（规则库与招标文件 / 投标人 / 评分结果）
     resp = client.get(f"/api/projects/{pid}/workbench")
     assert resp.status_code == 200
+    assert [s["key"] for s in resp.json()["stages"]] == ["rules", "bidders", "results"]
     stages = {s["key"]: s for s in resp.json()["stages"]}
-    assert stages["tender"]["state"] == "pending"
+    assert stages["rules"]["state"] == "pending"
 
 
 def test_project_not_found(client):

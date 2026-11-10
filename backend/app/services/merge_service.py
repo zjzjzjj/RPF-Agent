@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import logging
 from decimal import Decimal
 from typing import Any
 
@@ -29,6 +30,8 @@ from app.db.models import (
 from app.db.session import session_scope
 from app.errors import NotFound, ValidationFailed
 from app.rules import compiler
+
+log = logging.getLogger("bid_eval.merge_service")
 
 
 def auto_resolve_merge(
@@ -57,7 +60,28 @@ def auto_resolve_merge(
             "reason": (f"自动合并（{p.get('match_method') or 'deterministic'}，"
                        f"相似度 {p.get('similarity')}）：招标文件条款覆盖模板条目"),
         })
+    from app.rules.merger import _norm_name
+
     for t in proposal["unmatched_template"]:
+        # 兜底：仅因类别不同而落空、但文档侧存在"同名同类型"条目时，不能弃用
+        # ——类别错标（商务→技术）曾让模板 commercial 项整条消失，商务桶恒 0。
+        # 这里选择"不处置"（模板条目原样保留在合并结果里）并记日志：正常情况下
+        # generate_match_proposal 的内存类别校正已让两者配上，走不到这里。
+        twin = next(
+            (
+                d for d in proposal["unmatched_document"]
+                if d["score_type"] == t["score_type"]
+                and d["category"] != t["category"]
+                and _norm_name(d["name"]) == _norm_name(t["name"])
+            ),
+            None,
+        )
+        if twin is not None:
+            log.warning(
+                "自动合并跳过弃用：模板条目 %s（%s）与文档条目 %s（%s）同名同类型但类别不同，保留待人工处置",
+                t["code"], t["category"], twin["code"], twin["category"],
+            )
+            continue
         decisions.append({
             "action": "drop_template",
             "template_criterion_id": t["id"],
@@ -69,21 +93,34 @@ def auto_resolve_merge(
             "document_criterion_id": d["id"],
             "reason": "自动合并：招标文件新增条款，模板无对应条目，追加为文件依据",
         })
-    return resolve_proposal(merge_package_id, decisions, actor)
+    # 把刚生成的提案直接传给 resolve，避免它在 POST 时重新调 LLM 生成、
+    # pair_id 漂移导致"无效的配对 pair_id"整体回滚
+    return resolve_proposal(merge_package_id, decisions, actor, proposal=proposal)
 
 
-def resolve_proposal(merge_package_id: int, decisions: list[dict], actor: str) -> int:
+def resolve_proposal(
+    merge_package_id: int,
+    decisions: list[dict],
+    actor: str,
+    *,
+    proposal: dict | None = None,
+) -> int:
     """执行合并处置，返回模板包 id。
 
     decisions 每项：
       {"action": "override", "pair_id": "T-D", "reason": "..."}
+      {"action": "override", "template_criterion_id": T, "document_criterion_id": D, "reason": "..."}
       {"action": "drop_template", "template_criterion_id": T, "reason": "..."}
       {"action": "append_document" | "reject", "document_criterion_id": D, "reason": "..."}
     """
     from app.rules.merger import generate_match_proposal
 
-    proposal = generate_match_proposal(merge_package_id)
+    if proposal is None:
+        proposal = generate_match_proposal(merge_package_id)
     pair_by_id = {p["pair_id"]: p for p in proposal["pairs"]}
+    pair_by_ids = {
+        (p["template"]["id"], p["document"]["id"]): p for p in proposal["pairs"]
+    }
 
     with session_scope() as s:
         merge_pkg = _require_draft_pkg(s, merge_package_id)
@@ -98,7 +135,13 @@ def resolve_proposal(merge_package_id: int, decisions: list[dict], actor: str) -
             if not reason:
                 raise ValidationFailed("每个处置决定都必须填写理由")
             if action == "override":
-                pair = pair_by_id.get(str(d.get("pair_id") or ""))
+                pair = None
+                t_id = d.get("template_criterion_id")
+                d_id = d.get("document_criterion_id")
+                if t_id is not None and d_id is not None:
+                    pair = pair_by_ids.get((int(t_id), int(d_id)))
+                if pair is None:
+                    pair = pair_by_id.get(str(d.get("pair_id") or ""))
                 if pair is None:
                     raise ValidationFailed(f"无效的配对 pair_id：{d.get('pair_id')}")
                 _apply_override(s, target_id, pair, actor, reason)
@@ -110,14 +153,18 @@ def resolve_proposal(merge_package_id: int, decisions: list[dict], actor: str) -
                 raise ValidationFailed(f"未知处置动作：{action}")
 
         # 收尾：合并辅助包标记 superseded；模板包来源升级为 merged，
-        # 并把来源文档指向招标文件（覆盖条目引用了该文档的条款节点）
+        # 并把来源文档**始终**指向本次招标文件（换文件后旧 id 会让新节点校验全部不可达）
         merge_pkg.status = "superseded"
         target_pkg.origin = "merged"
-        if target_pkg.source_document_id is None:
+        if merge_pkg.source_document_id is not None:
             target_pkg.source_document_id = merge_pkg.source_document_id
         s.add(merge_pkg)
         s.add(target_pkg)
 
+    # 确定性自愈（证明材料块/档位/公式/计数参数），再重跑校验
+    from app.services import rule_service
+
+    rule_service.normalize_package(target_id, actor)
     compiler.run_validations(target_id)
     return target_id
 
@@ -181,17 +228,20 @@ def _apply_override(s, target_package_id: int, pair: dict, actor: str, reason: s
         s.add(cit)
     s.add(t)
 
-    # 档位全删全建（复用 D 的档位）
-    s.execute(delete(CriterionLevel).where(CriterionLevel.criterion_id == t.id))
-    for lv in s.execute(
+    # 档位：只有源档位闭合覆盖 [0,max] 才替换；否则保留模板档位。
+    # 模型只抽到一条"优 6-7"就覆盖，会让评分项永远只能选最高档（真实项目实证）。
+    src_levels = s.execute(
         select(CriterionLevel).where(CriterionLevel.criterion_id == d.id)
-    ).scalars().all():
-        s.add(CriterionLevel(
-            criterion_id=t.id, level_label=lv.level_label,
-            score_min=lv.score_min, score_max=lv.score_max,
-            description=lv.description, source_quote=lv.source_quote,
-            source_node_id=lv.source_node_id,
-        ))
+    ).scalars().all()
+    if _levels_closed(src_levels, d.max_score):
+        s.execute(delete(CriterionLevel).where(CriterionLevel.criterion_id == t.id))
+        for lv in src_levels:
+            s.add(CriterionLevel(
+                criterion_id=t.id, level_label=lv.level_label,
+                score_min=lv.score_min, score_max=lv.score_max,
+                description=lv.description, source_quote=lv.source_quote,
+                source_node_id=lv.source_node_id,
+            ))
 
     # 检查原语全删全建
     s.execute(delete(CriterionCheck).where(CriterionCheck.criterion_id == t.id))
@@ -251,15 +301,17 @@ def _append_document(s, target_package_id: int, d_id: int, actor: str, reason: s
     s.add(new_c)
     s.flush()
 
-    for lv in s.execute(
+    src_levels = s.execute(
         select(CriterionLevel).where(CriterionLevel.criterion_id == d.id)
-    ).scalars().all():
-        s.add(CriterionLevel(
-            criterion_id=new_c.id, level_label=lv.level_label,
-            score_min=lv.score_min, score_max=lv.score_max,
-            description=lv.description, source_quote=lv.source_quote,
-            source_node_id=lv.source_node_id,
-        ))
+    ).scalars().all()
+    if _levels_closed(src_levels, d.max_score):
+        for lv in src_levels:
+            s.add(CriterionLevel(
+                criterion_id=new_c.id, level_label=lv.level_label,
+                score_min=lv.score_min, score_max=lv.score_max,
+                description=lv.description, source_quote=lv.source_quote,
+                source_node_id=lv.source_node_id,
+            ))
     for ck in s.execute(
         select(CriterionCheck).where(CriterionCheck.criterion_id == d.id)
     ).scalars().all():
@@ -275,20 +327,60 @@ def _append_document(s, target_package_id: int, d_id: int, actor: str, reason: s
 
 
 def _drop_template(s, target_package_id: int, t_id: int, actor: str, reason: str) -> None:  # noqa: ANN001
-    """弃用模板条目：status → retired（不进快照、不参与计分）。"""
+    """弃用模板条目：status → retired（不进快照、不参与计分）。
+
+    允许 template 与 document 两种来源：后者是上一次合并从旧招标文件追加进来的，
+    新文件不再规定时应当一并退出计分。法规条目（origin=law）不会出现在待弃用
+    列表里（merger 已过滤），如出现说明调用方绕过了提案生成，直接拒绝。
+    """
     t = s.get(Criterion, t_id)
     if t is None or t.package_id != target_package_id:
         raise NotFound("模板条目不存在")
-    if t.origin != "template":
-        raise ValidationFailed("只有模板条目（origin=template）可以弃用")
+    if t.origin not in ("template", "document"):
+        raise ValidationFailed(f"来源为 {t.origin} 的条目不能通过合并弃用")
     t.status = "retired"
     s.add(t)
     _record(s, target_package_id, "drop_template", t.id, None, "human", None,
             None, "P5", None, actor, reason, {"status": t.status})
 
 
+def _levels_closed(levels: list[CriterionLevel], max_score) -> bool:  # noqa: ANN001
+    """档位是否闭合覆盖 [0, max_score]（最低下界=0、最高上界=max、无空洞/真重叠）。"""
+    if not levels or max_score is None:
+        return False
+    intervals = sorted(
+        (Decimal(str(lv.score_min)), Decimal(str(lv.score_max))) for lv in levels
+    )
+    if intervals[0][0] != Decimal(0):
+        return False
+    if intervals[-1][1] != Decimal(str(max_score)):
+        return False
+    for (lo1, hi1), (lo2, hi2) in zip(intervals, intervals[1:]):
+        if hi1 > lo2 or hi1 + 1 < lo2:
+            return False
+        if lo1 > hi1 or lo2 > hi2:
+            return False
+    return True
+
+
+def _formula_complete(f: PriceFormula) -> bool:
+    """源公式是否足以覆盖目标：ratio 要有 k，deviation 要有扣分率。"""
+    if not f.formula_type or not f.benchmark_method:
+        return False
+    ext = f.params_json or {}
+    if f.formula_type == "deviation_deduct":
+        return bool(f.deduct_rate or ext.get("deduct_rate_down") or ext.get("deduct_rate_up"))
+    if f.formula_type in ("benchmark_ratio", "lowest_ratio"):
+        return f.k is not None
+    return True
+
+
 def _replace_formula(s, target_criterion_id: int, source_criterion_id: int, package_id: int) -> None:  # noqa: ANN001
-    """把 source 的价格公式参数复制到 target（无则创建）。"""
+    """把 source 的价格公式复制到 target；源缺参时保留目标已有的完整参数。
+
+    旧实现是整行覆盖：文档抽取出的 benchmark_ratio + k=NULL 会把模板的完整
+    公式清空，confirm/freeze 直接 PRICE_PARAMS_INCOMPLETE（真实项目实证）。
+    """
     src = s.execute(
         select(PriceFormula).where(PriceFormula.criterion_id == source_criterion_id).limit(1)
     ).scalar_one_or_none()
@@ -300,10 +392,22 @@ def _replace_formula(s, target_criterion_id: int, source_criterion_id: int, pack
     if dst is None:
         dst = PriceFormula(package_id=package_id, criterion_id=target_criterion_id)
         s.add(dst)
-    for field in ("formula_type", "benchmark_method", "trim_ratio", "k", "deduct_rate",
-                  "upper_bound", "lower_bound", "rounding", "exclude_invalid", "tax_basis",
-                  "params_json", "source_node_id", "source_quote"):
-        setattr(dst, field, getattr(src, field))
+    if _formula_complete(src):
+        for field in ("formula_type", "benchmark_method", "trim_ratio", "k", "deduct_rate",
+                      "upper_bound", "lower_bound", "rounding", "exclude_invalid", "tax_basis",
+                      "params_json", "source_node_id", "source_quote"):
+            setattr(dst, field, getattr(src, field))
+    else:
+        # 源公式不完整：类型/基准法保持目标的（招标文件明确写了偏离扣分时，
+        # 编译期的 enrich 已经把它补完整；这里只兜底"模型没抽到参数"的情况）
+        for field in ("trim_ratio", "k", "deduct_rate", "upper_bound", "lower_bound",
+                      "rounding", "exclude_invalid", "tax_basis"):
+            if getattr(dst, field) is None and getattr(src, field) is not None:
+                setattr(dst, field, getattr(src, field))
+        if not (dst.params_json or {}) and src.params_json:
+            dst.params_json = src.params_json
+        if src.source_quote:
+            dst.source_quote = src.source_quote
     s.add(dst)
 
 

@@ -15,6 +15,10 @@ class LLMError(Exception):
 
     def __init__(self, message: str, transient: bool = False):
         self.transient = transient
+        # A boundary that has already spent its bounded contract/semantic
+        # recovery must fail the cell. Re-reading its entire material as an
+        # outer supplementation round would silently multiply those attempts.
+        self.review_attempts_exhausted = False
         super().__init__(message)
 
 
@@ -42,4 +46,5 @@ class LLMProvider(Protocol):
         *,
         temperature: float = 0.0,
         max_tokens: int | None = None,
+        images: list[str] | None = None,
     ) -> LLMResult: ...

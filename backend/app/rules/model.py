@@ -35,9 +35,12 @@ class ExtractedCriterion(BaseModel):
     name: str = Field(min_length=1, max_length=200)
     max_score: Decimal | None = None
     score_type: ScoreType
+    # P0-C：评分表"主/客观分"明文列的照抄值（仅 hint，骨架 reconcile 仍是权威）
+    subjectivity_hint: str | None = None
     is_veto: bool = False
     veto_consequence: VetoConsequence | None = None
     description: str | None = None
+    required_evidence: str | None = None
     levels: list[ExtractedLevel] = Field(default_factory=list)
     check_type: str | None = None
     params: dict = Field(default_factory=dict)
@@ -45,6 +48,13 @@ class ExtractedCriterion(BaseModel):
     benchmark_method: str | None = None
     k: Decimal | None = None
     upper_bound: Decimal | None = None
+    lower_bound: Decimal | None = None
+    trim_ratio: Decimal | None = None
+    trim_count: int | None = None
+    trim_threshold: int | None = None
+    deduct_rate: Decimal | None = None
+    deduct_rate_down: Decimal | None = None
+    deduct_rate_up: Decimal | None = None
     rounding: int | None = None
     count_per_item: Decimal | None = None
     quote: str | None = None  # 招标文件原文（逐字）

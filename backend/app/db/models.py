@@ -6,8 +6,8 @@
   引用可达性校验与证据引用都依赖它。
 - rule_packages 是冻结载体：frozen 时写 content_hash + snapshot_json，此后业务表
   被误改也不影响已发生的评分（评分只认快照与哈希）。
-- score_records.final_score 只有三处能写：确定性引擎、人工确认、人工改分。
-  ai_suggested_score 永远只是建议。
+- 全自动运行由证据核验后的 AI 主观结论或确定性引擎写入 final_score；
+  历史人工运行保留确认、改分流程，AI 建议不能绕过对应运行的完成契约。
 - evidence_citations 即"证据四件套"落点：文件+页码+坐标+逐字原文（+条款号）；
   verified 只由 evidence/verifier.py 置位。
 """
@@ -75,7 +75,7 @@ class Document(Base):
     parse_status: Mapped[str] = mapped_column(String(16), default="pending", index=True)
     # pending|parsed|degraded|failed|ocr_required
     parse_engine: Mapped[str | None] = mapped_column(String(64))
-    author: Mapped[str | None] = mapped_column(String(255))  # 文档作者元数据（串通检测信号源）
+    author: Mapped[str | None] = mapped_column(String(255))  # 文档作者元数据（历史字段，无写入方）
     warnings_json: Mapped[list | None] = mapped_column(JSON)
     data_class: Mapped[str] = mapped_column(String(24), default="synthetic")
     # synthetic|redacted_sample|confidential
@@ -133,6 +133,45 @@ class DocNode(Base):
     depth: Mapped[int] = mapped_column(Integer, default=0)
 
     __table_args__ = (UniqueConstraint("document_id", "node_id", name="uq_doc_nodes_doc_node"),)
+
+
+class MaterialTag(Base):
+    """投标材料分类标签（页级 + 段级）。
+
+    锚点 (document_id, page_no)——rescue_* 会重算 char 区间，char 锚点不可用；
+    reparse 清页数据时必须同步删除本表（ingest_service.parse_document）。
+    category 管检索分桶（资格/商务/技术/报价），tags_json 管证据语义（营业执照/
+    社保证明/开标一览表…），解耦以对冲跨类材料误分类的影响。
+    """
+
+    __tablename__ = "material_tags"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    document_id: Mapped[int] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), index=True)
+    page_no: Mapped[int] = mapped_column(Integer)  # 从 1 开始，与 document_pages 一致
+    seg_kind: Mapped[str] = mapped_column(String(8), default="page")  # page|table|image|text
+    seg_index: Mapped[int] = mapped_column(Integer, default=0)  # 同页多段序号
+    bbox_json: Mapped[dict | None] = mapped_column(JSON)  # 段坐标（points）+ 面积占比，表格/图片段用
+    category: Mapped[str] = mapped_column(String(16))  # qualification|commercial|technical|price|other
+    tags_json: Mapped[list | None] = mapped_column(JSON)  # 细粒度标签 ["营业执照","社保证明"]…
+    method: Mapped[str] = mapped_column(String(8), default="rule")  # rule|llm|manual
+    confidence: Mapped[float] = mapped_column(Float, default=0.0)
+    basis: Mapped[str | None] = mapped_column(String(512))  # 命中关键词/标题链/LLM 理由摘要（审计）
+    text_sha: Mapped[str | None] = mapped_column(String(16))  # 页文本 sha256 前 16 位（失效检测）
+    classifier_version: Mapped[str | None] = mapped_column(String(32))
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    __table_args__ = (
+        UniqueConstraint(
+            "document_id", "page_no", "seg_kind", "seg_index", name="uq_material_tags_page_seg"
+        ),
+        CheckConstraint(
+            "category IN ('qualification','commercial','technical','price','other')",
+            name="material_category_valid",
+        ),
+        CheckConstraint("seg_kind IN ('page','table','image','text')", name="seg_kind_valid"),
+        CheckConstraint("method IN ('rule','llm','manual')", name="method_valid"),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -399,11 +438,8 @@ class EvaluationRun(Base):
 class ScoreRecord(Base):
     """一家投标人 × 一个评分项的评分记录。
 
-    final_score 的写入权限（服务层强制）：
-      1) 确定性引擎（价格分/count/match/veto 判定）
-      2) 人工确认（confirm，写入 human_score 与 final_score）
-      3) 人工改分（override）
-    ai_suggested_score 永远只是建议，不得直接成为 final_score。
+    全自动运行只有证据与终态校验通过后才事务写入 final_score；客观项和价格
+    由确定性引擎计算，主观项由 AI 按冻结细则评分。历史人工模式保留确认和改分。
     """
 
     __tablename__ = "score_records"
@@ -458,6 +494,7 @@ class EvidenceCitation(Base):
     """证据四件套落点：文件 + 页码 + 坐标 + 逐字原文（+ 条款号）。
 
     verified 只由 evidence/verifier.py 写入：L1 精确命中且引文 ≥ MIN_QUOTE_CHARS。
+    veto/match 的 LLM 裁决引文 role=veto|match（2026-11-05 起落库，created_by=llm）。
     """
 
     __tablename__ = "evidence_citations"
@@ -468,7 +505,7 @@ class EvidenceCitation(Base):
     )
     criterion_id: Mapped[int | None] = mapped_column(ForeignKey("criteria.id"), index=True)
     citation_role: Mapped[str] = mapped_column(String(24), default="score")
-    # score|criterion_source|veto|price|level
+    # score|criterion_source|veto|match|price|level
     document_id: Mapped[int | None] = mapped_column(ForeignKey("documents.id", ondelete="CASCADE"), index=True)
     page_no: Mapped[int | None] = mapped_column(Integer)
     node_id: Mapped[str | None] = mapped_column(String(512))
@@ -548,3 +585,75 @@ class Job(Base):
             "status IN ('queued','running','succeeded','failed','cancelled')", name="status_valid"
         ),
     )
+
+
+class ReviewCollectionSet(Base):
+    """Durable material collection; ready never substitutes for a final score."""
+
+    __tablename__ = "review_collection_sets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[int] = mapped_column(ForeignKey("evaluation_runs.id", ondelete="CASCADE"), index=True)
+    group_key: Mapped[str] = mapped_column(String(255))
+    criterion_id: Mapped[int] = mapped_column(ForeignKey("criteria.id"), index=True)
+    bidder_id: Mapped[int | None] = mapped_column(ForeignKey("bidders.id"), nullable=True)
+    input_signature: Mapped[str] = mapped_column(String(64))
+    plan_json: Mapped[dict] = mapped_column(JSON, default=dict)
+    state: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    generation: Mapped[int] = mapped_column(Integer, default=1)
+    error_json: Mapped[dict | None] = mapped_column(JSON)
+    metrics_json: Mapped[dict | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+    __table_args__ = (
+        UniqueConstraint("run_id", "group_key", "input_signature", name="uq_review_collection_run_group_input"),
+        CheckConstraint("state IN ('pending','running','completed','ready','failed')", name="state_valid"),
+        CheckConstraint("generation >= 1", name="generation_valid"),
+    )
+
+
+class ReviewCollectionBatch(Base):
+    """A checked source batch, committed independently of the final decision."""
+
+    __tablename__ = "review_collection_batches"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    collection_id: Mapped[int] = mapped_column(ForeignKey("review_collection_sets.id", ondelete="CASCADE"), index=True)
+    batch_key: Mapped[str] = mapped_column(String(128))
+    unit_ids_json: Mapped[list] = mapped_column(JSON, default=list)
+    state: Mapped[str] = mapped_column(String(16), default="pending", index=True)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    attempt_token: Mapped[str | None] = mapped_column(String(64))
+    generation: Mapped[int] = mapped_column(Integer, default=1)
+    result_json: Mapped[dict | None] = mapped_column(JSON)
+    error_json: Mapped[dict | None] = mapped_column(JSON)
+    metrics_json: Mapped[dict | None] = mapped_column(JSON)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+    __table_args__ = (
+        UniqueConstraint("collection_id", "batch_key", name="uq_review_collection_batch"),
+        CheckConstraint("state IN ('pending','running','completed','failed')", name="state_valid"),
+        CheckConstraint("attempt_count >= 0 AND generation >= 1", name="attempt_valid"),
+    )
+
+
+class LLMRequestDailyBudget(Base):
+    """Shared real HTTP-attempt counter across local worker processes."""
+
+    __tablename__ = "llm_request_daily_budget"
+
+    day_utc: Mapped[str] = mapped_column(String(10), primary_key=True)
+    calls: Mapped[int] = mapped_column(Integer, default=0)
+    __table_args__ = (CheckConstraint("calls >= 0", name="calls_valid"),)
+
+
+class ExecutionSchemaVersion(Base):
+    __tablename__ = "execution_schema_versions"
+
+    version: Mapped[int] = mapped_column(Integer, primary_key=True)
+    applied_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)

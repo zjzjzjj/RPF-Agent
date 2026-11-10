@@ -6,6 +6,7 @@ import {
   Card,
   Checkbox,
   Col,
+  Collapse,
   Drawer,
   Empty,
   Form,
@@ -26,23 +27,29 @@ import {
   Upload,
   message,
 } from "antd";
-import { PlayCircleOutlined, CheckOutlined, PlusOutlined, ThunderboltOutlined, ReloadOutlined, UploadOutlined, SwapOutlined } from "@ant-design/icons";
+import { CheckOutlined, PlusOutlined, ThunderboltOutlined, ReloadOutlined, UploadOutlined, SwapOutlined, ImportOutlined, SettingOutlined } from "@ant-design/icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
-import { useCoverage, useDocuments, useJob, useMatchProposal, useModels, useRules } from "../api/hooks";
+import { useJobProgress } from "../api/useJobStream";
+import {
+  useCoverage,
+  useDocuments,
+  useLawPacks,
+  useMatchProposal,
+  useMergeRecords,
+  useModels,
+  useRestoreCriterion,
+  useRetireCriterion,
+  useRules,
+  useTemplates,
+  useUseDefaultTemplate,
+} from "../api/hooks";
+import AutoMatchBanner from "../components/rules/AutoMatchBanner";
+import { JobProgress } from "../components/JobProgress";
+import RuleList from "../components/rules/RuleList";
+import TemplatePicker from "../components/rules/TemplatePicker";
 import type { CriterionOut, MatchCriterionBrief, MatchPair, ValidationOut } from "../types";
 import { CATEGORY_LABELS } from "../types";
-
-const STATUS_TAG: Record<string, { color: string; text: string }> = {
-  verified: { color: "green", text: "已确认" },
-  needs_input: { color: "orange", text: "待补全" },
-  ambiguous: { color: "gold", text: "歧义（原文未给分值）" },
-  gap: { color: "red", text: "缺口" },
-  conflict: { color: "red", text: "冲突" },
-  invalid: { color: "red", text: "非法" },
-  needs_signoff: { color: "orange", text: "兜底待签批" },
-  retired: { color: "default", text: "已退休" },
-};
 
 export default function TenderRules() {
   const { pid = "" } = useParams();
@@ -51,18 +58,50 @@ export default function TenderRules() {
   const { data: rules, isLoading } = useRules(pid);
   const { data: models } = useModels();
   const { data: coverage } = useCoverage(rules?.id ?? null);
+  const { data: lawPacks } = useLawPacks();
+  const { data: templates, isLoading: templatesLoading } = useTemplates();
   const [jobId, setJobId] = useState<number | null>(null);
+  const [parseJobId, setParseJobId] = useState<number | null>(null);
+  const [matchJobId, setMatchJobId] = useState<number | null>(null);
+  const [flow, setFlow] = useState<"idle" | "parsing" | "matching">("idle");
   const [selectedModel, setSelectedModel] = useState<string | undefined>(undefined);
-  const { data: job } = useJob(jobId);
+  const job = useJobProgress(jobId);
+  const parseJob = useJobProgress(parseJobId);
+  const matchJob = useJobProgress(matchJobId);
   const [detail, setDetail] = useState<CriterionOut | null>(null);
   const [signoffTarget, setSignoffTarget] = useState<CriterionOut | null>(null);
+  const [toggleTarget, setToggleTarget] = useState<CriterionOut | null>(null);
+  const [toggleReason, setToggleReason] = useState("");
   const [mergePackageId, setMergePackageId] = useState<number | null>(null);
   const [proposalOpen, setProposalOpen] = useState(false);
   const [unfreezeOpen, setUnfreezeOpen] = useState(false);
   const [unfreezeReason, setUnfreezeReason] = useState("");
+  const [lawOpen, setLawOpen] = useState(false);
+  const [lawPackId, setLawPackId] = useState("general-law");
+  const [addOpen, setAddOpen] = useState(false);
+  const [defaultOpen, setDefaultOpen] = useState(false);
+  const [addForm] = Form.useForm();
   const mergeCompileRef = useRef(false);
   const isTemplatePackage = rules?.origin === "template";
-  const canMerge = rules?.origin === "template" || rules?.origin === "merged";
+  // merge 只能写进草稿包；冻结/已确认时按钮必须禁用（否则后端 resolve 会失败）
+  const canMerge =
+    (rules?.origin === "template" || rules?.origin === "merged") && rules?.status === "draft";
+  // 法规包只能导入到草稿包（confirmed/frozen 会 409；无包时后端会新建草稿）
+  const canImportLaw = !rules || rules.status === "none" || rules.status === "draft";
+  const canAddCriterion = !!rules && rules.id > 0 && rules.status === "draft";
+  // 默认规则入口：无包、或已有草稿模板/合并包
+  const canUseDefault =
+    !rules ||
+    rules.id === 0 ||
+    rules.status === "none" ||
+    (rules.status === "draft" && (rules.origin === "template" || rules.origin === "merged"));
+  const hasNonTemplatePackage =
+    !!rules && rules.id > 0 && rules.origin !== "template" && rules.origin !== "merged";
+
+  const useDefault = useUseDefaultTemplate(pid);
+  const retireCriterion = useRetireCriterion(pid);
+  const restoreCriterion = useRestoreCriterion(pid);
+  const { data: mergeRecords } = useMergeRecords(rules?.id ?? null);
 
   const tenderDoc = documents?.find(
     (d) => d.kind === "tender" && (d.parse_status === "parsed" || d.parse_status === "degraded"),
@@ -77,10 +116,22 @@ export default function TenderRules() {
       formData.append("kind", "tender");
       return api.upload<{ document_id: number; job_id: number }>(`/projects/${pid}/documents`, formData);
     },
+    onSuccess: (r) => {
+      setParseJobId(r.job_id);
+      setFlow("parsing");
+      qc.invalidateQueries({ queryKey: ["documents", pid] });
+      qc.invalidateQueries({ queryKey: ["workbench", pid] });
+      message.success("招标文件已上传，解析完成后将自动匹配规则…");
+    },
+    onError: (e: Error) => message.error(e.message),
+  });
+
+  const reparseDoc = useMutation({
+    mutationFn: (documentId: number) => api.post(`/documents/${documentId}/reparse`),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["documents", pid] });
       qc.invalidateQueries({ queryKey: ["workbench", pid] });
-      message.success("招标文件已上传，解析中…");
+      message.success("已重新提交解析");
     },
     onError: (e: Error) => message.error(e.message),
   });
@@ -100,29 +151,131 @@ export default function TenderRules() {
     onError: (e: Error) => message.error(e.message),
   });
 
-  // merge 编译任务成功后：全自动模式已在后端自动采纳配对；人工模式进提案抽屉
+  // 编译任务终态：无论 replace 还是 merge 都要刷新规则表
+  // （此前只在自动合并分支刷新 coverage，replace 后页面仍显示旧包）
   useEffect(() => {
-    if (
-      job &&
-      job.status === "succeeded" &&
-      mergeCompileRef.current &&
-      job.result_json &&
-      typeof job.result_json.package_id === "number"
-    ) {
+    if (!job) return;
+    if (job.status === "failed" || job.status === "cancelled") {
       mergeCompileRef.current = false;
-      const r = job.result_json as Record<string, unknown>;
-      if (r.target_package_id != null) {
-        message.success("已自动合并：模板条目已按招标文件覆盖/追加/弃用（留痕可查）");
-        qc.invalidateQueries({ queryKey: ["coverage", r.target_package_id] });
-      } else {
-        setMergePackageId(job.result_json.package_id);
-        message.success("合并编译完成，已生成匹配提案，请逐对审核");
-        if (typeof r.auto_resolve_error === "string" && r.auto_resolve_error) {
-          message.warning(`自动合并未执行：${r.auto_resolve_error}`);
-        }
+      return;
+    }
+    if (job.status !== "succeeded") return;
+    qc.invalidateQueries({ queryKey: ["rules", pid] });
+    qc.invalidateQueries({ queryKey: ["coverage"] });
+    qc.invalidateQueries({ queryKey: ["workbench", pid] });
+    qc.invalidateQueries({ queryKey: ["mergeRecords"] });
+    if (!mergeCompileRef.current) return;
+    mergeCompileRef.current = false;
+    const r = (job.result_json ?? {}) as Record<string, unknown>;
+    if (typeof r.target_package_id === "number") {
+      const post = r.post_merge as { errors?: { code: string }[] } | undefined;
+      message.success("已自动合并：模板条目已按招标文件覆盖/追加/弃用（留痕可查）");
+      if (post?.errors?.length) {
+        message.warning(
+          `合并后规则不完整：${post.errors.map((e) => e.code).join("、")}，请修正后再确认/冻结`,
+        );
+      }
+    } else if (typeof r.package_id === "number") {
+      setMergePackageId(r.package_id as number);
+      message.success("合并编译完成，已生成匹配提案，请逐对审核");
+      if (typeof r.auto_resolve_error === "string" && r.auto_resolve_error) {
+        message.warning(`自动合并未执行：${r.auto_resolve_error}`);
       }
     }
-  }, [job]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [job?.status, job?.id, pid]);
+
+  // 解析任务终态：成功时跟随后端排队的自动匹配任务
+  useEffect(() => {
+    if (!parseJob) return;
+    if (parseJob.status === "succeeded") {
+      qc.invalidateQueries({ queryKey: ["documents", pid] });
+      qc.invalidateQueries({ queryKey: ["workbench", pid] });
+      const r = (parseJob.result_json ?? {}) as Record<string, unknown>;
+      if (
+        (r.auto_match === "scheduled" || r.auto_match === "scheduled_after_unfreeze") &&
+        typeof r.job_id === "number"
+      ) {
+        setMatchJobId(r.job_id as number);
+        setFlow("matching");
+      } else {
+        setFlow("idle");
+      }
+    } else if (parseJob.status === "failed" || parseJob.status === "cancelled") {
+      setFlow("idle");
+      message.error(parseJob.error || "招标文件解析失败");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [parseJob?.status, parseJob?.id, pid]);
+
+  // 自动匹配任务终态
+  useEffect(() => {
+    if (!matchJob) return;
+    if (matchJob.status === "succeeded") {
+      setFlow("idle");
+      qc.invalidateQueries({ queryKey: ["rules", pid] });
+      qc.invalidateQueries({ queryKey: ["coverage"] });
+      qc.invalidateQueries({ queryKey: ["workbench", pid] });
+      qc.invalidateQueries({ queryKey: ["mergeRecords"] });
+      const r = (matchJob.result_json ?? {}) as Record<string, unknown>;
+      const post = r.post_merge as { errors?: unknown[] } | undefined;
+      if (post?.errors?.length) {
+        message.warning("自动匹配完成，但规则总分/价格公式不完整，请修正后再确认冻结");
+      } else if (r.auto_resolved === true) {
+        message.success("自动匹配完成：规则已按招标文件更新（变更清单见上方）");
+      } else if (typeof r.auto_resolve_error === "string") {
+        message.warning(`自动匹配未完成：${r.auto_resolve_error}`);
+      }
+    } else if (matchJob.status === "failed" || matchJob.status === "cancelled") {
+      setFlow("idle");
+      message.error(matchJob.error || "自动匹配失败");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [matchJob?.status, matchJob?.id, pid]);
+
+  const handleUseDefault = (templateId: string, reason: string) => {
+    useDefault.mutate(
+      { template_id: templateId, reason: reason.trim() || null },
+      {
+        onSuccess: (r) => {
+          if (r.ok) {
+            setDefaultOpen(false);
+            message.success(
+              r.already_frozen
+                ? "默认规则已处于冻结状态，可直接发起评分"
+                : `已启用默认规则并冻结（${r.signed_off} 条签批）`,
+            );
+          } else {
+            const codes = r.blockers.map((b) => b.code).filter(Boolean).join("、");
+            message.error(`启用未完成：${codes || r.message || "校验未通过"}；请修正后重试`);
+          }
+        },
+        onError: (e: Error) => message.error(e.message),
+      },
+    );
+  };
+
+  const submitToggle = () => {
+    if (!toggleTarget) return;
+    const target = toggleTarget;
+    const isRestore = target.status === "retired";
+    if (!toggleReason.trim()) {
+      message.warning("请填写理由");
+      return;
+    }
+    const mutation = isRestore ? restoreCriterion : retireCriterion;
+    mutation.mutate(
+      { id: target.id, reason: toggleReason.trim() },
+      {
+        onSuccess: () => {
+          setToggleTarget(null);
+          setToggleReason("");
+          message.success(isRestore ? "已启用该评分项" : "已停用该评分项");
+        },
+        onError: (e: Error) => message.error(e.message),
+      },
+    );
+  };
 
   const acceptAll = useMutation({
     mutationFn: (reason: string) =>
@@ -177,13 +330,17 @@ export default function TenderRules() {
       message.success("规则包已确认");
     },
     onError: (e: Error & { detail?: { blockers?: unknown[] } }) => {
-      const blockers = e.detail?.blockers as { message?: string }[] | undefined;
+      qc.invalidateQueries({ queryKey: ["rules", pid] });
+      const blockers = e.detail?.blockers as { code?: string; message?: string }[] | undefined;
       Modal.error({
         title: "存在阻塞项，不能确认",
         content: (
           <ul>
             {(blockers ?? []).map((b, i) => (
-              <li key={i}>{b.message ?? JSON.stringify(b)}</li>
+              <li key={i}>
+                {b.code ? <Tag color="red">{b.code}</Tag> : null}
+                {b.message ?? JSON.stringify(b)}
+              </li>
             ))}
           </ul>
         ),
@@ -197,7 +354,27 @@ export default function TenderRules() {
       qc.invalidateQueries({ queryKey: ["rules", pid] });
       message.success("规则包已冻结（此后只读，评分只认该版本快照）");
     },
-    onError: (e: Error) => message.error(e.message),
+    onError: (e: Error & { detail?: { blockers?: { code?: string; message?: string }[] } }) => {
+      qc.invalidateQueries({ queryKey: ["rules", pid] });
+      const blockers = e.detail?.blockers;
+      if (blockers?.length) {
+        Modal.error({
+          title: "存在阻塞项，不能冻结",
+          content: (
+            <ul>
+              {blockers.map((b, i) => (
+                <li key={i}>
+                  {b.code ? <Tag color="red">{b.code}</Tag> : null}
+                  {b.message ?? JSON.stringify(b)}
+                </li>
+              ))}
+            </ul>
+          ),
+        });
+      } else {
+        message.error(e.message);
+      }
+    },
   });
 
   const signoff = useMutation({
@@ -212,25 +389,74 @@ export default function TenderRules() {
     onError: (e: Error) => message.error(e.message),
   });
 
+  // 导入仓库内固化的法规规则包（84 条通则，法条逐条核验 fail-closed）
+  const importLaw = useMutation({
+    mutationFn: (packId: string) =>
+      api.post<{ package_id: number; imported: number; created: boolean; skipped_codes: string[] }>(
+        `/projects/${pid}/rules/import-law-pack`,
+        { pack_id: packId },
+      ),
+    onSuccess: (r) => {
+      qc.invalidateQueries({ queryKey: ["rules", pid] });
+      qc.invalidateQueries({ queryKey: ["coverage", rules?.id] });
+      qc.invalidateQueries({ queryKey: ["workbench", pid] });
+      setLawOpen(false);
+      // 幂等重复导入：全部 code 已存在时后端返回 imported=0 —— 说明"已是最新"，而不是"新增 0 条"
+      message.success(
+        r.imported === 0 && r.skipped_codes.length > 0
+          ? `法规规则包已是最新：${r.skipped_codes.length} 条法规规则已存在，无需重复导入`
+          : `法规规则包已导入：新增 ${r.imported} 条${r.skipped_codes.length ? `，跳过 ${r.skipped_codes.length} 条（已存在）` : ""}（${r.created ? "新建草稿包" : "追加进现有草稿"}）`,
+      );
+    },
+    onError: (e: Error) => message.error(e.message),
+  });
+
+  // 人工新增评分项（仅草稿包；理由必填，编号自动为 x1、x2…）
+  const addCriterion = useMutation({
+    mutationFn: (values: Record<string, unknown>) =>
+      api.post<CriterionOut>(`/rules/packages/${rules!.id}/criteria`, values),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["rules", pid] });
+      qc.invalidateQueries({ queryKey: ["coverage", rules?.id] });
+      setAddOpen(false);
+      addForm.resetFields();
+      message.success("已新增评分项并留痕（编号 x 系列，主观分项可在表格里继续补档位）");
+    },
+    onError: (e: Error) => message.error(e.message),
+  });
+
+  // 校验结果默认折叠在全部规则下方；一旦出现 error 阻断项自动展开，避免被折叠掩盖
+  const validations = rules?.validations ?? [];
+  const errors = validations.filter((v) => v.severity === "error");
+  const warns = validations.filter((v) => v.severity !== "error");
+  const [validationsOpen, setValidationsOpen] = useState<string[]>([]);
+  useEffect(() => {
+    if (errors.length > 0) setValidationsOpen(["validations"]);
+  }, [errors.length]);
+
   if (isLoading) return <Spin />;
 
   const criteria = rules?.criteria ?? [];
-  const errors = (rules?.validations ?? []).filter((v) => v.severity === "error");
-  const warns = (rules?.validations ?? []).filter((v) => v.severity !== "error");
-  const unconfirmed = criteria.filter((c) => c.status !== "verified");
-  const verifiedCount = criteria.length - unconfirmed.length;
+  const unconfirmed = criteria.filter(
+    (c) => c.status !== "verified" && c.status !== "retired",
+  );
+  // 口径与后端 accept_all 一致：只认 verified（retired 不参与批量采纳，否则按钮描述会虚报条数）
+  const verifiedCount = criteria.filter((c) => c.status === "verified").length;
   const pendingSignoff = criteria.filter(
     (c) => c.origin === "template" && c.status === "needs_signoff",
   ).length;
+  // 批量动作只在草稿包生效：非草稿时按钮以禁用态保留（而不是凭空消失），并说明原因
+  const isDraft = rules?.status === "draft";
+  const draftHint = `仅草稿包可操作；当前规则包状态为「${rules?.status}」，请先「解冻并创建新版本」`;
 
   return (
     <div>
       <Row justify="space-between" align="middle" gutter={[16, 12]}>
         <Col>
-          <Typography.Title level={4}>招标文件与评分规则</Typography.Title>
+          <Typography.Title level={4}>规则库与招标文件</Typography.Title>
         </Col>
         <Col>
-          <Space>
+          <Space wrap>
             <Select
               style={{ minWidth: 210 }}
               placeholder="选择模型"
@@ -241,17 +467,36 @@ export default function TenderRules() {
                 label: `${m.label}（${m.family}）`,
               }))}
             />
-            <Button
-              type="primary"
-              icon={canMerge ? <SwapOutlined /> : <PlayCircleOutlined />}
-              disabled={!tenderDoc}
-              loading={compile.isPending}
-              onClick={() => compile.mutate()}
+            <Tooltip
+              title={
+                canUseDefault
+                  ? "无招标文件时，用内置模板一键启用并冻结（实例化 → 签批 → 确认 → 冻结）"
+                  : "当前规则包不能更换默认规则；如需更换请先冻结，再「解冻并创建新版本」"
+              }
             >
-              {canMerge
-                ? "编译并生成覆盖提案（merge）"
-                : "编译评分规则（AI 抽取 + 确定性校验）"}
-            </Button>
+              <Button
+                type="primary"
+                icon={<SettingOutlined />}
+                disabled={!canUseDefault}
+                onClick={() => setDefaultOpen(true)}
+              >
+                使用默认规则
+              </Button>
+            </Tooltip>
+            <Tooltip
+              title={
+                canImportLaw
+                  ? "导入仓库内固化的 84 条法规通用评审规则（免签批，法条逐条核验）"
+                  : draftHint
+              }
+            >
+              <Button
+                icon={<ImportOutlined />}
+                onClick={() => setLawOpen(true)}
+              >
+                导入法规包
+              </Button>
+            </Tooltip>
             {canMerge && (
               <Button
                 icon={<CheckOutlined />}
@@ -261,9 +506,41 @@ export default function TenderRules() {
                 匹配提案审核{mergePackageId ? "（有新提案）" : ""}
               </Button>
             )}
+            <Button
+              icon={<ReloadOutlined />}
+              onClick={() => {
+                qc.invalidateQueries({ queryKey: ["rules", pid] });
+                qc.invalidateQueries({ queryKey: ["coverage"] });
+                qc.invalidateQueries({ queryKey: ["mergeRecords"] });
+              }}
+            >
+              刷新
+            </Button>
           </Space>
         </Col>
       </Row>
+
+      <div style={{ marginTop: 12 }}>
+        <AutoMatchBanner
+          tenderDoc={tenderDoc}
+          tenderFailedDoc={tenderFailedDoc}
+          flow={flow}
+          parseJob={parseJob}
+          matchJob={matchJob}
+          uploading={uploadTender.isPending}
+          reparsePending={reparseDoc.isPending}
+          canRematch={
+            !!tenderDoc &&
+            (canMerge || !rules || rules.id === 0 || rules.status === "none")
+          }
+          rematchPending={compile.isPending}
+          onUpload={(file) => uploadTender.mutate(file)}
+          onReparse={(id) => reparseDoc.mutate(id)}
+          onRematch={() => compile.mutate()}
+          records={mergeRecords ?? []}
+          onRefreshRecords={() => qc.invalidateQueries({ queryKey: ["mergeRecords"] })}
+        />
+      </div>
 
       {isTemplatePackage && (
         <Alert
@@ -274,84 +551,26 @@ export default function TenderRules() {
           description={
             <Typography.Text type="secondary">
               当前条目均为模板兜底（P5 来源，招标文件未规定），可签批后确认、冻结。
-              上传招标文件后点击「编译并与模板合并」，配对将自动采纳：
+              上传招标文件后系统会自动匹配并更新规则：
               模板条目被招标文件条款逐条覆盖、新增条款追加、未规定条目弃用（全程留痕）。
             </Typography.Text>
           }
         />
       )}
-      {!tenderDoc && (
-        <Alert
-          style={{ marginTop: 12 }}
-          type="info"
-          showIcon
-          message={
-            isTemplatePackage
-              ? "上传招标文件以优化规则（将与模板自动合并）"
-              : "请先上传招标文件，解析完成后才能编译规则"
-          }
-          description={
-            <Space direction="vertical" size="small">
-              <Typography.Text type="secondary">
-                支持 PDF（含扫描件，自动 OCR）/ Word（.docx），系统将自动解析页文本与条款树。
-              </Typography.Text>
-              {tenderFailedDoc && (
-                <Alert
-                  type="error"
-                  showIcon
-                  message="上次上传的文件解析失败，原因如下（更换文件或点「重新解析」重试）："
-                  description={
-                    <ul style={{ margin: 0, paddingLeft: 18 }}>
-                      {(tenderFailedDoc.warnings_json ?? []).map((w, i) => (
-                        <li key={i}>
-                          {w.code ? `[${w.code}] ` : ""}
-                          {w.message}
-                        </li>
-                      ))}
-                    </ul>
-                  }
-                />
-              )}
-              <Space>
-                <Upload
-                  showUploadList={false}
-                  accept=".pdf,.docx"
-                  beforeUpload={(file) => {
-                    uploadTender.mutate(file);
-                    return false; // 阻止 antd 默认上传，统一走 mutation
-                  }}
-                >
-                  <Button type="primary" icon={<UploadOutlined />} loading={uploadTender.isPending}>
-                    上传招标文件
-                  </Button>
-                </Upload>
-                {tenderFailedDoc && (
-                  <Button
-                    icon={<ReloadOutlined />}
-                    onClick={async () => {
-                      const r = await api.post(`/documents/${tenderFailedDoc.id}/reparse`);
-                      qc.invalidateQueries({ queryKey: ["documents", pid] });
-                      message.success("已重新解析");
-                      void r;
-                    }}
-                  >
-                    重新解析
-                  </Button>
-                )}
-              </Space>
-            </Space>
-          }
-        />
-      )}
 
       {job && (
-        <Alert
-          style={{ marginTop: 12 }}
-          type={job.status === "failed" ? "error" : job.status === "succeeded" ? "success" : "info"}
-          showIcon
-          message={`编译任务：${job.status}（${job.done_steps}/${job.total_steps}）${job.message ?? ""}`}
-          description={job.error}
-        />
+        <Card size="small" style={{ marginTop: 12 }}>
+          <JobProgress
+            job={job}
+            width={160}
+            onCancel={() => api.post(`/jobs/${job.id}/cancel`).catch(() => undefined)}
+          />
+          {job.error && (
+            <Typography.Text type="danger" style={{ display: "block", marginTop: 4 }}>
+              {job.error}
+            </Typography.Text>
+          )}
+        </Card>
       )}
 
       {rules && rules.id !== 0 && (
@@ -373,14 +592,24 @@ export default function TenderRules() {
                   <Progress
                     size="small"
                     style={{ width: 180 }}
+                    // 分子必须含 law 桶：否则导入 84 条法规后进度条纹丝不动（纯法规包永远是 0/84）
                     percent={Math.round(
-                      ((coverage.document_backed + coverage.template_fallback_signed) /
+                      ((coverage.document_backed +
+                        coverage.template_fallback_signed +
+                        coverage.law) /
                         Math.max(1, coverage.total)) *
                         100,
                     )}
-                    format={() => `${coverage.document_backed + coverage.template_fallback_signed}/${coverage.total}`}
+                    format={() => {
+                      const covered =
+                        coverage.document_backed +
+                        coverage.template_fallback_signed +
+                        coverage.law;
+                      return `${covered}/${coverage.total}`;
+                    }}
                   />
-                  <Typography.Text type="secondary">文档覆盖</Typography.Text>
+                  <Typography.Text type="secondary">规则覆盖</Typography.Text>
+                  {coverage.law > 0 && <Tag color="purple">法规 {coverage.law}</Tag>}
                   {pendingSignoff > 0 && (
                     <Tag color="orange">签批待办 {pendingSignoff}</Tag>
                   )}
@@ -388,39 +617,69 @@ export default function TenderRules() {
               )}
               <span style={{ marginLeft: "auto" }}>
                 <Space>
-                  {rules.status === "draft" && verifiedCount > 0 && (
-                    <Popconfirm
-                      title="全部采纳？"
-                      description={`将批量确认 ${verifiedCount} 项已核验条目，理由统一记入留痕。`}
-                      okText="全部采纳"
-                      onConfirm={() => acceptAll.mutate("批量采纳：与招标文件原文核对一致")}
-                      cancelText="取消"
-                    >
-                      <Button loading={acceptAll.isPending}>全部采纳</Button>
-                    </Popconfirm>
+                  {verifiedCount > 0 && (
+                    <Tooltip title={isDraft ? "" : draftHint}>
+                      <span>
+                        <Popconfirm
+                          title="全部采纳？"
+                          description={
+                            `将为 ${verifiedCount} 项已核验条目写入复核留痕（不改变条目状态，` +
+                            `法规来源条目免签批）。理由统一记入留痕。` +
+                            (isDraft ? "" : `当前规则包不可写：${draftHint}。`)
+                          }
+                          okText="全部采纳"
+                          disabled={!isDraft}
+                          onConfirm={() => acceptAll.mutate("批量采纳：与招标文件原文核对一致")}
+                          cancelText="取消"
+                        >
+                          <Button loading={acceptAll.isPending} disabled={!isDraft}>
+                            全部采纳
+                          </Button>
+                        </Popconfirm>
+                      </span>
+                    </Tooltip>
                   )}
-                  {rules.status === "draft" && pendingSignoff > 0 && (
-                    <Popconfirm
-                      title="全部签批？"
-                      description={`将批量签批 ${pendingSignoff} 项模板兜底条目（启用须有依据，将留痕）。`}
-                      okText="全部签批"
-                      onConfirm={() =>
-                        signoffAll.mutate("批量签批：招标文件未细化该项，按通用评标惯例启用")
-                      }
-                      cancelText="取消"
-                    >
-                      <Button loading={signoffAll.isPending}>全部签批</Button>
-                    </Popconfirm>
+                  {pendingSignoff > 0 && (
+                    <Tooltip title={isDraft ? "" : draftHint}>
+                      <span>
+                        <Popconfirm
+                          title="全部签批？"
+                          description={`将批量签批 ${pendingSignoff} 项模板兜底条目（启用须有依据，将留痕）。`}
+                          okText="全部签批"
+                          disabled={!isDraft}
+                          onConfirm={() =>
+                            signoffAll.mutate("批量签批：招标文件未细化该项，按通用评标惯例启用")
+                          }
+                          cancelText="取消"
+                        >
+                          <Button loading={signoffAll.isPending} disabled={!isDraft}>
+                            全部签批
+                          </Button>
+                        </Popconfirm>
+                      </span>
+                    </Tooltip>
                   )}
-                  <Button
-                    disabled={rules.status !== "draft" || unconfirmed.length > 0}
-                    onClick={() => confirm.mutate()}
+                  <Tooltip
+                    title={
+                      rules.status !== "draft"
+                        ? draftHint
+                        : unconfirmed.length > 0
+                          ? `还有 ${unconfirmed.length} 项未确认：全自动模式会先自动采纳；人工模式会列出具体阻塞项`
+                          : ""
+                    }
                   >
-                    确认规则包
-                  </Button>
+                    <Button
+                      disabled={rules.status !== "draft"}
+                      loading={confirm.isPending}
+                      onClick={() => confirm.mutate()}
+                    >
+                      确认规则包
+                    </Button>
+                  </Tooltip>
                   <Button
                     type="primary"
                     disabled={rules.status !== "confirmed"}
+                    loading={freeze.isPending}
                     onClick={() => freeze.mutate()}
                   >
                     冻结（进入只读）
@@ -436,31 +695,23 @@ export default function TenderRules() {
             </Space>
           </Card>
 
-          {(errors.length > 0 || warns.length > 0) && (
-            <Card size="small" title="确定性校验结果（12 条校验器）" style={{ marginTop: 12 }}>
-              {errors.map((v) => (
-                <Alert
-                  key={v.code + (v.subject_id ?? "")}
-                  type="error"
-                  showIcon
-                  style={{ marginBottom: 6 }}
-                  message={`[${v.code}] ${v.message}`}
-                  description={v.hint}
-                />
-              ))}
-              {warns.map((v) => (
-                <Alert
-                  key={v.code + (v.subject_id ?? "")}
-                  type="warning"
-                  showIcon
-                  style={{ marginBottom: 6 }}
-                  message={`[${v.code}] ${v.message}`}
-                />
-              ))}
-            </Card>
-          )}
-
-          <Card title="评分项（支持全部采纳 / 全部签批，逐条留痕）" style={{ marginTop: 12 }}>
+          <div style={{ marginTop: 12 }}>
+            <Space style={{ marginBottom: 8 }}>
+              <Tooltip title="仅草稿包可新增；必须说明依据（评审期不得擅自新增标准）">
+                <Button
+                  icon={<PlusOutlined />}
+                  disabled={!canAddCriterion}
+                  onClick={() => setAddOpen(true)}
+                >
+                  新增评分项
+                </Button>
+              </Tooltip>
+              {!canAddCriterion && rules && rules.status !== "none" && (
+                <Typography.Text type="secondary">
+                  当前规则包状态为「{rules.status}」，仅草稿可新增评分项
+                </Typography.Text>
+              )}
+            </Space>
             {/* 解冻弹层 */}
             <Modal
               open={unfreezeOpen}
@@ -482,125 +733,141 @@ export default function TenderRules() {
                 onChange={(e) => setUnfreezeReason(e.target.value)}
               />
             </Modal>
-            <Table<CriterionOut>
-              scroll={{ x: 1000 }}
-              rowKey="id"
-              dataSource={criteria}
-              pagination={false}
-              size="small"
-              columns={[
-                { title: "编号", dataIndex: "code", width: 90 },
-                {
-                  title: "类别",
-                  dataIndex: "category",
-                  width: 110,
-                  render: (c: string) => CATEGORY_LABELS[c] ?? c,
-                },
-                { title: "名称", dataIndex: "name" },
-                {
-                  title: "满分",
-                  dataIndex: "max_score",
-                  width: 70,
-                  render: (v: string | null) => v ?? "—",
-                },
-                {
-                  title: "类型",
-                  dataIndex: "score_type",
-                  width: 90,
-                  render: (v: string, row) => (row.is_veto ? <Tag color="red">否决项</Tag> : <Tag>{v}</Tag>),
-                },
-                {
-                  title: "来源",
-                  dataIndex: "origin",
-                  width: 130,
-                  render: (_, row) => {
-                    if (row.origin === "template") {
-                      return row.signoff_json ? (
-                        <Tooltip title={`模板兜底（已签批：${row.signoff_json.by} ${row.signoff_json.at.slice(0, 10)}）`}>
-                          <Tag color="orange">模板兜底·已签批</Tag>
-                        </Tooltip>
-                      ) : (
-                        <Tag color="gold">模板兜底（待签批）</Tag>
-                      );
-                    }
-                    if (row.origin === "manual") {
-                      return <Tag color="purple">人工</Tag>;
-                    }
-                    return <Tag color="blue">招标文件</Tag>;
-                  },
-                },
-                {
-                  title: "状态",
-                  dataIndex: "status",
-                  width: 120,
-                  render: (s: string) => {
-                    const t = STATUS_TAG[s] ?? { color: "default", text: s };
-                    return <Tag color={t.color}>{t.text}</Tag>;
-                  },
-                },
-                {
-                  title: "原文依据",
-                  width: 120,
-                  render: (_, row) =>
-                    row.source_quote ? (
-                      <Tooltip title={row.source_quote}>
-                        <Typography.Text type="secondary">
-                          第 {row.source_page ?? "?"} 页 {row.source_node_id ? "· 已定位条款" : ""}
-                        </Typography.Text>
-                      </Tooltip>
+            <RuleList
+              criteria={criteria}
+              packageStatus={rules.status}
+              onEdit={(c) => setDetail(c)}
+              onSignoff={(c) => setSignoffTarget(c)}
+              onAccept={(c) => accept.mutate(c.id)}
+              onToggle={(c) => {
+                setToggleTarget(c);
+                setToggleReason("");
+              }}
+              pendingId={
+                retireCriterion.isPending || restoreCriterion.isPending
+                  ? (toggleTarget?.id ?? null)
+                  : null
+              }
+            />
+          </div>
+
+          {/* 确定性校验结果（12 条纯代码校验器）：置于全部规则下方，默认折叠 */}
+          <Collapse
+            style={{ marginTop: 12 }}
+            activeKey={validationsOpen}
+            onChange={(keys) =>
+              setValidationsOpen(Array.isArray(keys) ? keys.map(String) : [String(keys)])
+            }
+            items={[
+              {
+                key: "validations",
+                label: (
+                  <Space size={8} wrap>
+                    <span>确定性校验结果（12 条校验器）</span>
+                    {errors.length > 0 ? (
+                      <Tag color="red">{errors.length} 项阻断</Tag>
                     ) : (
-                      row.origin === "template" ? (
-                        <Tag color="orange">模板兜底</Tag>
-                      ) : (
-                        <Tag color="red">无引用</Tag>
-                      )
-                    ),
-                },
-                {
-                  title: "操作",
-                  width: 220,
-                  render: (_, row) => (
-                    <Space>
-                      <Button size="small" onClick={() => setDetail(row)}>
-                        查看/修正
-                      </Button>
-                      {row.origin === "template" && row.status === "needs_signoff" && (
-                        <Button
-                          size="small"
-                          type="primary"
-                          ghost
-                          icon={<CheckOutlined />}
-                          onClick={() => setSignoffTarget(row)}
-                        >
-                          签批
-                        </Button>
-                      )}
-                      {row.origin !== "template" && (
-                        <Button
-                          size="small"
-                          type="primary"
-                          ghost
-                          icon={<CheckOutlined />}
-                          disabled={row.status !== "verified"}
-                          onClick={() => accept.mutate(row.id)}
-                        >
-                          确认
-                        </Button>
-                      )}
+                      <Tag color="green">无阻断项</Tag>
+                    )}
+                    {warns.length > 0 && <Tag color="orange">{warns.length} 项提示</Tag>}
+                    {validations.length === 0 && (
+                      <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                        纯代码校验，不调用模型
+                      </Typography.Text>
+                    )}
+                  </Space>
+                ),
+                children:
+                  validations.length === 0 ? (
+                    <Typography.Text type="secondary">
+                      12 条确定性校验器全部通过：总分闭合、档位区间、条款引用可达、价格公式参数、
+                      权重范围、否决项设置等均无异常。
+                    </Typography.Text>
+                  ) : (
+                    <Space direction="vertical" size={6} style={{ width: "100%" }}>
+                      {errors.map((v) => (
+                        <Alert
+                          key={v.code + (v.subject_id ?? "")}
+                          type="error"
+                          showIcon
+                          message={`[${v.code}] ${v.message}`}
+                          description={v.hint}
+                        />
+                      ))}
+                      {warns.map((v) => (
+                        <Alert
+                          key={v.code + (v.subject_id ?? "")}
+                          type="warning"
+                          showIcon
+                          message={`[${v.code}] ${v.message}`}
+                        />
+                      ))}
                     </Space>
                   ),
-                },
-              ]}
-            />
-          </Card>
+              },
+            ]}
+          />
         </>
       )}
 
       {(!rules || rules.id === 0) && !isLoading && (
-        <Empty style={{ marginTop: 60 }} description="尚未编译规则：上传招标文件后点击上方按钮" />
+        <Empty
+          style={{ marginTop: 40 }}
+          description="尚无评分规则：上传招标文件自动匹配，或点「使用默认规则」选择内置模板直接评分"
+        />
       )}
 
-      <CriterionModal pid={pid} criterion={detail} onClose={() => setDetail(null)} />
+      <TemplatePicker
+        open={defaultOpen}
+        loading={templatesLoading}
+        submitting={useDefault.isPending}
+        hasNonTemplatePackage={hasNonTemplatePackage}
+        templates={templates ?? []}
+        onCancel={() => setDefaultOpen(false)}
+        onPick={handleUseDefault}
+      />
+
+      <Modal
+        open={toggleTarget != null}
+        title={toggleTarget?.status === "retired" ? "启用评分项" : "停用评分项"}
+        onCancel={() => setToggleTarget(null)}
+        okText={toggleTarget?.status === "retired" ? "启用" : "停用"}
+        okButtonProps={{
+          disabled: !toggleReason.trim(),
+          loading: retireCriterion.isPending || restoreCriterion.isPending,
+        }}
+        onOk={submitToggle}
+      >
+        <Typography.Paragraph>
+          {toggleTarget?.code} {toggleTarget?.name}
+        </Typography.Paragraph>
+        {toggleTarget && !toggleTarget.is_veto && toggleTarget.max_score != null && (
+          <Alert
+            type="warning"
+            showIcon
+            style={{ marginBottom: 8 }}
+            message={
+              toggleTarget.status === "retired"
+                ? `启用后总分将增加 ${toggleTarget.max_score} 分`
+                : `停用后该评分项退出计分，总分将减少 ${toggleTarget.max_score} 分`
+            }
+            description="总分变化后需通过「总分=100」校验才能确认/冻结；可继续启用其它项或调整分值。"
+          />
+        )}
+        <Input.TextArea
+          rows={2}
+          value={toggleReason}
+          onChange={(e) => setToggleReason(e.target.value)}
+          placeholder="理由（必填，记入留痕）"
+        />
+      </Modal>
+
+      <CriterionModal
+        key={detail?.id ?? "none"}
+        pid={pid}
+        criterion={detail}
+        onClose={() => setDetail(null)}
+      />
       <SignoffModal
         pid={pid}
         criterion={signoffTarget}
@@ -612,6 +879,109 @@ export default function TenderRules() {
         open={proposalOpen}
         onClose={() => setProposalOpen(false)}
       />
+
+      {/* 导入法规包（仓库内固化包，84 条通则） */}
+      <Modal
+        open={lawOpen}
+        title="导入法规规则包"
+        onCancel={() => setLawOpen(false)}
+        okText="导入"
+        okButtonProps={{ loading: importLaw.isPending, disabled: !canImportLaw }}
+        onOk={() => canImportLaw && importLaw.mutate(lawPackId)}
+      >
+        <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
+          仓库内固化的法规通用评审规则（形式 / 资格 / 响应性 / 否决四组），
+          依据《招标投标法》《实施条例》、30 号令、87 号令等编制，法条引用逐条核验
+          （核验不过直接拒绝导入）。导入后为 <Tag color="purple">法规来源</Tag>
+          <Tag color="blue">P0</Tag>，免签批；error 级校验只在确认/冻结时阻断。
+        </Typography.Paragraph>
+        <Select
+          style={{ width: "100%" }}
+          value={lawPackId}
+          onChange={setLawPackId}
+          options={(lawPacks ?? []).map((p) => ({
+            value: p.id,
+            label: `${p.name}（${p.rule_count} 条 · v${p.version}）`,
+          }))}
+        />
+        {!canImportLaw && (
+          <Alert
+            style={{ marginTop: 12 }}
+            type="warning"
+            showIcon
+            message="当前规则包已确认或冻结，不能直接导入"
+            description="请先「解冻并创建新版本」得到可编辑草稿，再导入法规包。"
+          />
+        )}
+      </Modal>
+
+      {/* 新增评分项（仅草稿包） */}
+      <Modal
+        open={addOpen}
+        title="新增评分项"
+        onCancel={() => setAddOpen(false)}
+        okText="新增并留痕"
+        okButtonProps={{ loading: addCriterion.isPending }}
+        onOk={() => addForm.submit()}
+      >
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 12 }}
+          message="仅限评审准备阶段，且必须说明依据"
+          description="新增条目编号自动为 x1、x2…，来源标为「人工」；主观分项保存后可在评分项表格里补录档位。"
+        />
+        <Form
+          form={addForm}
+          layout="vertical"
+          onFinish={(values) =>
+            addCriterion.mutate({
+              ...values,
+              max_score: values.max_score ?? null,
+              is_veto: values.is_veto ?? false,
+            })
+          }
+        >
+          <Form.Item name="category" label="类别" rules={[{ required: true }]}>
+            <Select
+              options={Object.entries(CATEGORY_LABELS).map(([value, label]) => ({ value, label }))}
+            />
+          </Form.Item>
+          <Form.Item name="name" label="名称" rules={[{ required: true, message: "请填写名称" }]}>
+            <Input placeholder="如：项目实施方案完整性" />
+          </Form.Item>
+          <Form.Item name="score_type" label="类型" rules={[{ required: true }]}>
+            <Select
+              options={[
+                { value: "subjective", label: "主观分（需档位判据）" },
+                { value: "count", label: "计数分（业绩/证书）" },
+                { value: "match", label: "判断项（满足即得，不打分）" },
+                { value: "veto", label: "否决项（资格/符合性）" },
+                { value: "formula", label: "价格分公式" },
+              ]}
+            />
+          </Form.Item>
+          <Form.Item name="max_score" label="满分">
+            <InputNumber min={0} step={0.5} style={{ width: "100%" }} />
+          </Form.Item>
+          <Form.Item name="description" label="判据描述">
+            <Input.TextArea rows={2} placeholder="原文要求或判据说明" />
+          </Form.Item>
+          <Form.Item name="is_veto" label="否决项" valuePropName="checked">
+            <Checkbox>不符合即建议否决（须评标委员会认定）</Checkbox>
+          </Form.Item>
+          <Form.Item name="source_quote" label="原文依据（逐字）">
+            <Input.TextArea rows={2} placeholder="招标文件原文；留空则该条目需人工核验来源" />
+          </Form.Item>
+          <Form.Item
+            name="reason"
+            label="新增理由（必填，记入留痕）"
+            rules={[{ required: true, message: "请填写新增依据" }]}
+          >
+            <Input.TextArea rows={2} placeholder="评审期不得擅自新增标准，须有依据" />
+          </Form.Item>
+        </Form>
+      </Modal>
     </div>
   );
 }
@@ -734,18 +1104,73 @@ function CriterionModal({
 
       <Form
         form={form}
-        layout="inline"
+        layout="vertical"
         initialValues={{
           name: criterion.name,
           max_score: criterion.max_score ? Number(criterion.max_score) : undefined,
+          description: criterion.description ?? "",
+          required_evidence: criterion.required_evidence ?? "",
+          score_type: criterion.score_type,
+          veto_consequence: criterion.veto_consequence,
         }}
       >
-        <Form.Item name="name" label="名称" rules={[{ required: true }]}>
-          <Input style={{ width: 260 }} />
+        <Space align="start" size={12}>
+          <Form.Item name="name" label="名称" rules={[{ required: true }]}>
+            <Input style={{ width: 320 }} />
+          </Form.Item>
+          <Form.Item name="max_score" label="满分">
+            <InputNumber min={0} />
+          </Form.Item>
+        </Space>
+        <Form.Item name="description" label="判据描述">
+          <Input.TextArea rows={2} placeholder="该评分项的判据说明" />
         </Form.Item>
-        <Form.Item name="max_score" label="满分">
-          <InputNumber min={0} />
+        <Form.Item
+          name="required_evidence"
+          label="证明材料要求"
+          extra="该项会注入 AI 评分的提示词，用于核验投标人是否提供了对应证明材料（材料不全将影响得分）。"
+        >
+          <Input.TextArea
+            rows={2}
+            placeholder="如：合同复印件（含金额页）+ 发票复印件 + 业主验收证明"
+          />
         </Form.Item>
+        {criterion.is_veto && (
+          <Space align="start" size={12}>
+            <Form.Item
+              name="veto_consequence"
+              label="否决后果"
+              extra="否决项必须声明后果（校验项 VETO_CONSEQUENCE_MISSING）。若该条其实不是否决条款（如「报价错误修正原则」），请把类型改为「判断项」。"
+              style={{ width: 340 }}
+            >
+              <Select
+                allowClear
+                placeholder="请选择否决后果"
+                options={[
+                  { value: "disqualify", label: "否决投标（disqualify）" },
+                  { value: "may_request", label: "可要求澄清后再定（may_request）" },
+                  { value: "discretionary", label: "评标委员会裁量（discretionary）" },
+                ]}
+              />
+            </Form.Item>
+            <Form.Item
+              name="score_type"
+              label="类型"
+              extra="把误标成否决项的规则改回判断项后，本项不再要求否决后果。"
+              style={{ width: 260 }}
+            >
+              <Select
+                options={[
+                  { value: "match", label: "判断项（满足即得，不打分）" },
+                  { value: "veto", label: "否决项（资格/符合性）" },
+                  { value: "count", label: "计数分（业绩/证书）" },
+                  { value: "subjective", label: "主观分" },
+                  { value: "formula", label: "价格分公式" },
+                ]}
+              />
+            </Form.Item>
+          </Space>
+        )}
       </Form>
 
       {isSubjective && (
@@ -822,15 +1247,6 @@ function CriterionModal({
             保存档位
           </Button>
         )}
-        <Tooltip title="新增评分项仅限评审准备阶段，且必须说明依据">
-          <Button
-            icon={<PlusOutlined />}
-            disabled
-            onClick={() => message.info("MVP 暂未开放：新增评分项接口已预留")}
-          >
-            新增评分项
-          </Button>
-        </Tooltip>
       </Space>
     </Modal>
   );
@@ -891,7 +1307,13 @@ function MatchProposalDrawer({
     const decisions: Record<string, unknown>[] = [];
     for (const p of proposal.pairs) {
       if (checkedPairs.has(p.pair_id)) {
-        decisions.push({ action: "override", pair_id: p.pair_id, reason: r });
+        decisions.push({
+          action: "override",
+          pair_id: p.pair_id,
+          template_criterion_id: p.template.id,
+          document_criterion_id: p.document.id,
+          reason: r,
+        });
       }
     }
     for (const id of dropIds) {

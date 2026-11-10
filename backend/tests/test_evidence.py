@@ -99,5 +99,138 @@ def test_verifier_fabricated(tender_document_id):
     assert not cit.verified
 
 
+def test_page_hint_string_coerced(client, tender_document_id):
+    """LLM 证据的 page_hint 是字符串形态（"第97页"/"97"）——入库归一为 int，
+    且存量字符串行核验不再 TypeError（2026-10-14 真实评分运行实证）。"""
+    from app.db.session import session_scope
+    from app.db.models import EvidenceCitation
+    from app.evidence.verifier import coerce_page_hint, create_citation, verify_citation
+
+    assert coerce_page_hint("第97页") == 97
+    assert coerce_page_hint("P3") == 3
+    assert coerce_page_hint(None) is None
+    assert coerce_page_hint("无数字") is None
+
+    cit_id = create_citation(
+        tender_document_id, PRICE_QUOTE, page_hint="第4页", role="criterion_source", verify=False
+    )
+    cit = verify_citation(cit_id)
+    assert cit.page_no == 4 and cit.verified
+
+    # 存量脏数据：直接把 page_no 写成字符串，核验仍要工作
+    with session_scope() as s:
+        row = s.get(EvidenceCitation, cit_id)
+        row.page_no = "4"
+        s.add(row)
+    cit = verify_citation(cit_id)
+    assert cit.page_no == 4 and cit.verified
+
+
 def test_normalize_quote_still_matches(normalize_check=True):
     assert normalize("价格分＝４０×") == "价格分=40x"
+
+
+def test_locate_cache_identical_to_fresh(tender_document_id):  # noqa: ANN001
+    """归一化缓存/行框懒加载/memo 不改变 LocateResult（不变式 I3）。
+
+    同一引文在「冷缓存」与「热缓存」两次 locate 结果必须逐字段一致。
+    """
+    from app.evidence.verifier import create_citation, verify_citation
+
+    with DocumentSource(tender_document_id) as src:
+        r1 = locate(REAL_QUOTE, src)   # 冷缓存
+        r2 = locate(REAL_QUOTE, src)   # 热缓存（归一化/行框已缓存）
+    assert r1.found and r2.found
+    assert r1.verified == r2.verified is True
+    assert r1.page_no == r2.page_no
+    assert r1.method == r2.method
+    assert r1.bbox == r2.bbox
+    assert r1.page_size == r2.page_size
+
+    # memo 路径（verify_citation 层）：两次核验结果一致
+    cid = create_citation(tender_document_id, REAL_QUOTE, page_hint=3, role="score")
+    c1 = verify_citation(cid)
+    c2 = verify_citation(cid)
+    assert c1.verified is True and c2.verified is True
+    assert c1.bbox_json == c2.bbox_json
+    assert c1.page_no == c2.page_no
+
+
+@pytest.mark.parametrize("revision", ["database", "reparse"])
+def test_verifier_cache_does_not_reuse_another_document_revision(app_env, monkeypatch, revision):
+    """同 ID 的另一数据库/重解析既不能复用旧 memo，也不能复用旧页文本。"""
+    from sqlalchemy import select
+
+    from app.db import session as db_session
+    from app.db.models import Document, DocumentPage, Project
+    from app.evidence.verifier import create_citation, verify_citation
+
+    original = "原始投标文件明确记录项目负责人具备高级工程师资格且证书在有效期内。"
+    replacement = "重新解析后的投标文件仅记载项目设备维保计划及服务响应时间要求。"
+    source_path = app_env / "cache-source.txt"
+    source_path.write_text("原始文件保持不变，仅改变解析页或数据库", encoding="utf-8")
+
+    def seed(text, width):
+        with db_session.session_scope() as s:
+            s.add(Project(id="evidence-cache", name="核验缓存版本测试"))
+            s.flush()
+            document = Document(project_id="evidence-cache", kind="tender",
+                                original_filename=source_path.name, stored_path=str(source_path),
+                                sha256="unchanged-file-metadata", parse_status="parsed", page_count=1)
+            s.add(document)
+            s.flush()
+            s.add(DocumentPage(document_id=document.id, page_no=1, text=text, width=width, height=800))
+            return document.id
+
+    document_id = seed(original, 600)
+    first_id = create_citation(document_id, original, page_hint=1)
+    first = verify_citation(first_id)
+    assert first.verified and first.page_size_json == [600, 800]
+    if revision == "database":
+        monkeypatch.setenv("DATABASE_URL", "sqlite:///" + (app_env / "second-cache.db").as_posix())
+        db_session.reset_engine()
+        db_session.init_db()
+        assert seed(replacement, 700) == document_id
+        first_id = create_citation(document_id, original, page_hint=1, verify=False)
+    else:
+        with db_session.session_scope() as s:
+            page = s.execute(select(DocumentPage).where(DocumentPage.document_id == document_id)).scalar_one()
+            page.text = replacement
+            page.width = 700
+
+    assert verify_citation(first_id).verified is False  # 原 quote/hint 相同，不能命中旧 memo
+    replacement_id = create_citation(document_id, replacement, page_hint=1)
+    current = verify_citation(replacement_id)
+    assert current.verified is True  # 新 quote 也须从新 source 读取
+    assert current.page_size_json == [700, 800]
+
+
+def test_verifier_cache_refreshes_original_file_coordinates(app_env, monkeypatch):
+    """原路径、文档 SHA 和解析文本不变时，文件版本变化仍须重新提取坐标。"""
+    import os
+
+    from app.db.models import Document, DocumentPage, Project
+    from app.db.session import session_scope
+    from app.evidence.verifier import create_citation, verify_citation
+
+    quote = "投标单位承诺按照技术规范提供完整设备维保服务并承担全部合同义务。"
+    path = app_env / "changed-source.pdf"
+    path.write_bytes(b"original")
+    original_stat = path.stat()
+    monkeypatch.setattr(DocumentSource, "_load_line_boxes", lambda self, page_no: [
+        (10.0 if path.read_bytes() == b"original" else 50.0, 20.0, 200.0, 40.0),
+    ])
+    with session_scope() as s:
+        s.add(Project(id="evidence-file-cache", name="原文件坐标更新"))
+        s.flush()
+        doc = Document(project_id="evidence-file-cache", kind="tender", original_filename=path.name,
+                       stored_path=str(path), sha256="unchanged", page_count=1, parse_status="parsed")
+        s.add(doc)
+        s.flush()
+        document_id = doc.id
+        s.add(DocumentPage(document_id=document_id, page_no=1, text=quote, width=600, height=800))
+    citation_id = create_citation(document_id, quote, page_hint=1)
+    assert verify_citation(citation_id).bbox_json == [[10.0, 20.0, 200.0, 40.0]]
+    path.write_bytes(b"replaced")
+    os.utime(path, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns + 1_000_000_000))
+    assert verify_citation(citation_id).bbox_json == [[50.0, 20.0, 200.0, 40.0]]

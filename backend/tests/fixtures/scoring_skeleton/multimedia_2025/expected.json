@@ -1,0 +1,122 @@
+{
+ "rows": [
+  {
+   "group": "投标人资质实力",
+   "sub_idx": 1,
+   "subjectivity": "objective",
+   "max_score": 2
+  },
+  {
+   "group": "投标人资质实力",
+   "sub_idx": 2,
+   "subjectivity": "objective",
+   "max_score": 2
+  },
+  {
+   "group": "投标人业绩实力",
+   "sub_idx": null,
+   "subjectivity": "objective",
+   "max_score": 6
+  },
+  {
+   "group": "投标方案评析",
+   "sub_idx": null,
+   "subjectivity": "subjective",
+   "max_score": 4
+  },
+  {
+   "group": "投标方案评析",
+   "sub_idx": null,
+   "subjectivity": "subjective",
+   "max_score": 4
+  },
+  {
+   "group": "投标方案评析",
+   "sub_idx": null,
+   "subjectivity": "subjective",
+   "max_score": 2
+  },
+  {
+   "group": "服务团队技术力量",
+   "sub_idx": 1,
+   "subjectivity": "subjective",
+   "max_score": 5
+  },
+  {
+   "group": "服务团队技术力量",
+   "sub_idx": 2,
+   "subjectivity": "objective",
+   "max_score": 2
+  },
+  {
+   "group": "服务团队技术力量",
+   "sub_idx": 3,
+   "subjectivity": "objective",
+   "max_score": 3
+  },
+  {
+   "group": "服务团队技术力量",
+   "sub_idx": 4,
+   "subjectivity": "objective",
+   "max_score": 3
+  },
+  {
+   "group": "服务团队技术力量",
+   "sub_idx": 5,
+   "subjectivity": "objective",
+   "max_score": 2
+  },
+  {
+   "group": "服务团队技术力量",
+   "sub_idx": 6,
+   "subjectivity": "objective",
+   "max_score": 2
+  },
+  {
+   "group": "服务团队技术力量",
+   "sub_idx": 7,
+   "subjectivity": "objective",
+   "max_score": 3
+  },
+  {
+   "group": "服务保障情况",
+   "sub_idx": 1,
+   "subjectivity": "objective",
+   "max_score": 2
+  },
+  {
+   "group": "服务保障情况",
+   "sub_idx": 2,
+   "subjectivity": "objective",
+   "max_score": 3
+  },
+  {
+   "group": "服务保障情况",
+   "sub_idx": 3,
+   "subjectivity": "subjective",
+   "max_score": 3
+  },
+  {
+   "group": "服务保障情况",
+   "sub_idx": 4,
+   "subjectivity": "subjective",
+   "max_score": 2
+  }
+ ],
+ "row_sum": 50,
+ "ledger": [
+  {
+   "label": "商务部分",
+   "max_score": 10
+  },
+  {
+   "label": "技术部分",
+   "max_score": 40
+  },
+  {
+   "label": "报价部分",
+   "max_score": 50
+  }
+ ],
+ "target_total": 100
+}

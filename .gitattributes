@@ -1,0 +1,6 @@
+# 部署产物固定 LF：Windows 上 core.autocrlf=true 会让 git archive 把 shell 脚本
+# 转成 CRLF，到 Linux 上报 "pipefail: invalid option name"（2026-10-20 实证）
+*.sh text eol=lf
+Dockerfile text eol=lf
+.dockerignore text eol=lf
+requirements-frozen.txt text eol=lf

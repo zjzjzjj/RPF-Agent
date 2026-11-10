@@ -46,7 +46,7 @@ def test_templates_api_list_and_detail(client) -> None:  # noqa: ANN001
     resp = client.get("/api/rules/templates")
     assert resp.status_code == 200
     ids = {t["template_id"] for t in resp.json()}
-    assert ids == {"comprehensive-goods", "comprehensive-works",
+    assert ids == {"comprehensive-default", "comprehensive-goods", "comprehensive-works",
                    "comprehensive-services", "lowest-price"}
     g = next(t for t in resp.json() if t["template_id"] == "comprehensive-goods")
     assert g["criteria_count"] == 14
@@ -68,7 +68,7 @@ def test_instantiate_chain(client) -> None:  # noqa: ANN001
     pkg = client.get(f"/api/rules/packages/{package_id}").json()
     assert pkg["origin"] == "template"
     assert pkg["template_id"] == "comprehensive-goods"
-    assert pkg["library_version"] == "1.0.0"
+    assert pkg["library_version"] == "2.0.0"
     assert pkg["source_document_id"] is None
 
     # 校验：只有 TEMPLATE_FALLBACK_SIGNOFF error（模板兜底未签批）
@@ -182,7 +182,7 @@ def test_demo_scoring_full_chain(client, samples_dir) -> None:  # noqa: ANN001
 
     resp = client.post(f"/api/projects/{pid}/runs",
                        json={"package_id": package_id, "bidder_ids": bidder_ids,
-                             "stages": ["objective", "price", "subjective"]})
+                             "stages": ["objective", "price"]})  # 客观+价格全确定性，无需任何模型
     assert resp.status_code == 200, resp.text
     job = wait_job(client, resp.json()["job_id"], timeout=180)
     assert job["status"] == "succeeded", job.get("error")

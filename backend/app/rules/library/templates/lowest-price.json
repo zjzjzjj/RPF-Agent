@@ -2,9 +2,11 @@
   "template_id": "lowest-price",
   "name": "最低评标价法通用模板",
   "method": "lowest-price",
-  "applicable": {"procurement": "goods"},
-  "library_version": "1.0.0",
-  "notes": "最低评标价法：满足招标文件全部实质性要求的投标中，投标报价最低者为中标候选人；本模板只含资格/符合性否决项与 100 分价格项，无技术/商务评分项。全部条目均为候选，未经招标文件覆盖并签批不得执行。",
+  "applicable": {
+    "procurement": "goods"
+  },
+  "library_version": "2.0.0",
+  "notes": "最低评标价法：满足招标文件全部实质性要求的投标中，投标报价最低者为中标候选人。本模板只含资格/符合性否决项与 100 分价格项，无技术/商务评分项。全部条目均为通用判据候选，未经招标文件覆盖并签批不得执行；门槛与证明材料可在覆盖时按招标文件替换。库内不收录品牌、型号或指向唯一供应商的条目。",
   "criteria": [
     {
       "template_code": "T1.1",
@@ -14,8 +16,16 @@
       "is_veto": true,
       "veto_consequence": "disqualify",
       "description": "投标人须为在中华人民共和国境内注册、具有独立承担民事责任能力的法人或其他组织。",
+      "required_evidence": "有效的营业执照副本复印件，加盖投标人公章。",
       "checks": [
-        {"check_type": "document_present", "field": null, "params": {"document": "营业执照"}, "on_fail": "recommend_reject"}
+        {
+          "check_type": "document_present",
+          "field": null,
+          "params": {
+            "document": "营业执照"
+          },
+          "on_fail": "recommend_reject"
+        }
       ],
       "max_score": null,
       "levels": [],
@@ -32,8 +42,16 @@
       "is_veto": true,
       "veto_consequence": "disqualify",
       "description": "投标人须具备招标文件载明的相应资质条件且在有效期内。",
+      "required_evidence": "招标文件要求的资质证书复印件（须在有效期内）。",
       "checks": [
-        {"check_type": "document_present", "field": null, "params": {"document": "资质证书"}, "on_fail": "recommend_reject"}
+        {
+          "check_type": "document_present",
+          "field": null,
+          "params": {
+            "document": "资质证书"
+          },
+          "on_fail": "recommend_reject"
+        }
       ],
       "max_score": null,
       "levels": [],
@@ -50,8 +68,16 @@
       "is_veto": true,
       "veto_consequence": "disqualify",
       "description": "投标人未被列入失信被执行人名单及招投标失信行为名单。",
+      "required_evidence": "信用中国（creditchina.gov.cn）查询结果截图，或加盖公章的信用承诺函。",
       "checks": [
-        {"check_type": "document_present", "field": null, "params": {"document": "信用承诺函"}, "on_fail": "recommend_reject"}
+        {
+          "check_type": "document_present",
+          "field": null,
+          "params": {
+            "document": "信用承诺函"
+          },
+          "on_fail": "recommend_reject"
+        }
       ],
       "max_score": null,
       "levels": [],
@@ -68,8 +94,14 @@
       "is_veto": true,
       "veto_consequence": "disqualify",
       "description": "投标函须由法定代表人或其授权代表签署并加盖投标人公章。",
+      "required_evidence": "投标函原件（法定代表人或授权代表签字，并加盖投标人公章）；授权代表签署的须附授权委托书。",
       "checks": [
-        {"check_type": "human_only", "field": null, "params": {}, "on_fail": "recommend_reject"}
+        {
+          "check_type": "human_only",
+          "field": null,
+          "params": {},
+          "on_fail": "recommend_reject"
+        }
       ],
       "max_score": null,
       "levels": [],
@@ -86,8 +118,16 @@
       "is_veto": true,
       "veto_consequence": "disqualify",
       "description": "投标人须按招标文件要求提交投标保证金。",
+      "required_evidence": "投标保证金缴纳凭证（银行回单/保函/电子凭证），金额与形式符合招标文件。",
       "checks": [
-        {"check_type": "document_present", "field": null, "params": {"document": "投标保证金缴纳凭证"}, "on_fail": "recommend_reject"}
+        {
+          "check_type": "document_present",
+          "field": null,
+          "params": {
+            "document": "投标保证金缴纳凭证"
+          },
+          "on_fail": "recommend_reject"
+        }
       ],
       "max_score": null,
       "levels": [],
@@ -104,8 +144,14 @@
       "is_veto": true,
       "veto_consequence": "disqualify",
       "description": "投标人须对同一项目提交唯一报价，且报价不得高于最高投标限价。",
+      "required_evidence": "开标一览表/投标报价表（报价唯一且不高于最高投标限价）。",
       "checks": [
-        {"check_type": "math_relation", "field": null, "params": {}, "on_fail": "recommend_reject"}
+        {
+          "check_type": "math_relation",
+          "field": null,
+          "params": {},
+          "on_fail": "recommend_reject"
+        }
       ],
       "max_score": null,
       "levels": [],
@@ -121,7 +167,8 @@
       "score_type": "formula",
       "is_veto": false,
       "veto_consequence": null,
-      "description": "最低评标价法价格项：经评审的最低投标报价得满分，其余报价按最低价与评标价的比值折算得分。",
+      "description": "最低评标价法价格项：经评审的最低投标报价得满分 100 分；其余投标人按其评标价与最低评标价的比值折算得分（得分 = 最低评标价 ÷ 该投标人评标价 × 100），结果按四舍五入保留两位小数。",
+      "required_evidence": null,
       "checks": [],
       "formula": {
         "formula_type": "lowest_ratio",
