@@ -50,11 +50,14 @@ export default function EvidencePanel({
   showViewer = true,
 }: Props) {
   const [selected, setSelected] = useState<number | null>(null);
+  const selectedCitation = citations.find((c) => c.id === selected && c.document_id && c.page_no)
+    ?? citations.find((c) => c.document_id && c.page_no);
+  const documentId = selectedCitation?.document_id ?? null;
 
   const highlights: Highlight[] = useMemo(() => {
     const out: Highlight[] = [];
     for (const cit of citations) {
-      if (!cit.bbox_json || !cit.page_no) continue;
+      if (cit.document_id !== documentId || !cit.bbox_json || !cit.page_no) continue;
       out.push({
         id: cit.id,
         page: cit.page_no,
@@ -70,13 +73,9 @@ export default function EvidencePanel({
       });
     }
     return out;
-  }, [citations, selected]);
+  }, [citations, selected, documentId]);
 
-  const focusPage =
-    citations.find((c) => c.id === selected)?.page_no ??
-    citations.find((c) => c.page_no)?.page_no ??
-    1;
-  const firstDoc = citations.find((c) => c.document_id && c.page_no)?.document_id ?? null;
+  const focusPage = selectedCitation?.page_no ?? 1;
 
   return (
     <>
@@ -117,10 +116,10 @@ export default function EvidencePanel({
         />
       </Card>
 
-      {showViewer && firstDoc != null && (
+      {showViewer && documentId != null && (
         <Card size="small" title="原件定位（高亮为证据所在位置）" style={{ marginTop: 12 }}>
           <PdfPageViewer
-            documentId={firstDoc}
+            documentId={documentId}
             focusPage={focusPage}
             highlights={highlights}
             height={viewerHeight}

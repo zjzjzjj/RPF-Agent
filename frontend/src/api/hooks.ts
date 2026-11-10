@@ -7,6 +7,8 @@ import type {
   Citation,
   Coverage,
   DocumentOut,
+  EvaluationRun,
+  ExecutionProgress,
   JobOut,
   LawPackSummary,
   MatchProposal,
@@ -95,14 +97,23 @@ export function useBidders(pid: string) {
 export function useRuns(pid: string) {
   return useQuery({
     queryKey: ["runs", pid],
-    queryFn: () => api.get<{ id: number; status: string; package_version: number }[]>(`/projects/${pid}/runs`),
+    queryFn: () => api.get<EvaluationRun[]>(`/projects/${pid}/runs`),
     enabled: !!pid,
     refetchInterval: 1500,
   });
 }
 
+export function useRunExecutionProgress(runId: number | null, active = false) {
+  return useQuery({
+    queryKey: ["executionProgress", runId],
+    queryFn: () => api.get<ExecutionProgress | null>(`/runs/${runId}/execution-progress`),
+    enabled: runId != null,
+    refetchInterval: active ? 1500 : false,
+  });
+}
+
 /**
- * 统一的「当前运行」选择：`?run=` 持久化，缺省取最近一次成功运行。
+ * 统一的「当前运行」选择：`?run=` 持久化，自动运行缺省展示最新进度。
  *
  * 评分结果页的矩阵 / 聚合 / 排名 / 报告必须共用同一个 runId——否则会出现
  * 「矩阵是上一次成功的运行、排名是最新那次失败的运行」这类串台。

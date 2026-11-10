@@ -292,6 +292,7 @@ export interface MatrixCell {
   evidence_status: string;
   veto_flag: boolean;
   machine_status: string | null;
+  auto_review_basis?: string | null;
 }
 
 export interface Matrix {
@@ -333,6 +334,7 @@ export interface ScoreOut {
   evaluator_actor: string | null;
   confirm_time: string | null;
   warnings_json: { message?: string; formula_explanation?: string; verdict_source?: string }[] | null;
+  auto_review?: AutoReviewMetadata | null;
   /** 工作台展示用（只读关联信息） */
   criterion_code: string | null;
   criterion_name: string | null;
@@ -342,6 +344,26 @@ export interface ScoreOut {
   source_page: number | null;
   levels: { label: string; min: string; max: string; criteria: string }[];
   bidder_name: string | null;
+}
+
+export interface AutoReviewMetadata {
+  state?: string;
+  basis?: string;
+  attempts?: number;
+  reasoning?: string;
+  error?: string;
+  error_code?: string;
+  calculation?: string | Record<string, unknown> | null;
+  confirmed_absent?: boolean;
+  coverage_complete?: boolean;
+  attempt_history?: { round: number; state: string; error?: string }[];
+  visual_evidence?: {
+    document_id: number;
+    page_no: number;
+    observation: string;
+    sha256?: string | null;
+    image_sha256?: string | null;
+  }[];
 }
 
 export interface Citation {
@@ -360,7 +382,7 @@ export interface Citation {
 }
 
 export interface RankingRow {
-  rank: number;
+  rank: number | null;
   bidder_id: number;
   bidder_name: string;
   bid_price: string | null;
@@ -387,6 +409,66 @@ export interface Ranking {
   run_id: number | null;
   rows: RankingRow[];
   warnings: string[];
+  is_final?: boolean;
+  provisional?: boolean;
+}
+
+export interface AutomationProgress {
+  expected: number;
+  completed: number;
+  failed: number;
+  remaining: number;
+  resumable: boolean;
+  last_error: string | null;
+  failure_policy?: "stop" | "continue";
+  skipped?: number;
+  processed?: number;
+  pending?: number;
+  execution_finished?: boolean;
+  result_available?: boolean;
+  execution_progress?: ExecutionProgress | null;
+}
+
+export interface ExecutionProgress {
+  executor_version: number;
+  phase: string;
+  qualification_mode?: "light" | "full";
+  count_deterministic_mode?: "off" | "shadow" | "on";
+  collections_total: number;
+  collections_ready: number;
+  batches_total: number;
+  batches_completed: number;
+  batches_running: number;
+  batches_pending?: number;
+  batches_failed: number;
+  requests_queued?: number;
+  requests_inflight?: number;
+  request_scope?: "run" | "collection";
+  read_units_total: number;
+  read_units_completed: number;
+  read_pages_total?: number;
+  read_pages_completed?: number;
+  failures?: {
+    collection_id: number;
+    batch_key: string;
+    batch_index: number | null;
+    criterion_id: number;
+    bidder_id: number | null;
+    documents: { document_id: number; filename: string | null; page_numbers: number[] }[];
+    code: string;
+    message: string;
+  }[];
+  last_progress_at: string | null;
+  metrics: Record<string, number>;
+}
+
+export interface EvaluationRun {
+  id: number;
+  status: string;
+  package_version: number;
+  automation?: AutomationProgress | null;
+  executor_version?: number;
+  execution_progress?: ExecutionProgress | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -474,6 +556,7 @@ export interface SummaryItem {
   human_score: string | null;
   human_level_label: string | null;
   review_status: string;
+  auto_review?: AutoReviewMetadata | null;
   evidence_status: "verified" | "unverified" | "none";
   verdict: string | null;
   /** 判定来源（仅 veto/match 有值）：llm＝AI 裁决（可能带引文），machine＝确定性判定（过程即证据，设计上无引文）。
@@ -560,6 +643,7 @@ export interface SummaryRun {
   auto_dropped_bidders: string[];
   started_at: string | null;
   finished_at: string | null;
+  automation?: AutomationProgress | null;
 }
 
 export interface ScoreSummary {
@@ -623,14 +707,16 @@ export interface OpenByCriterion {
 }
 
 export interface ReportOut {
-  status: "draft" | "final";
+  status: "draft" | "final" | "partial";
   status_label: string;
   progress: ReportProgress;
   open_questions: OpenQuestion[];
   open_by_criterion: OpenByCriterion[];
   project: { id: string; name: string };
-  run: { id: number; status: string };
+  run: { id: number; status: string; automation?: AutomationProgress | null };
   rule_package: { version: number | null; content_hash: string | null };
+  out_of_scope?: { code?: string; name?: string; reason?: string }[];
+  qualification_mode?: "light" | "full" | null;
   generated_at: string;
   ranking: Ranking;
 }
@@ -695,4 +781,6 @@ export const MACHINE_STATUS_LABELS: Record<string, string> = {
   recommend_reject: "建议否决",
   need_human: "待人工",
   conflict_flagged: "冲突",
+  unverifiable: "现有材料无法证实",
+  execution_failed: "执行失败",
 };

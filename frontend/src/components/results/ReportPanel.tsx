@@ -12,21 +12,69 @@ interface Props {
   report: ReportOut | undefined;
   /** 后端在无运行/运行失败时 404，此时给出可读提示而不是整页报错 */
   error?: boolean;
+  managed?: boolean;
 }
 
 /** 报告状态、KPI、待处置事项与说明（原「排名与报告」页的报告部分）。 */
-export default function ReportPanel({ report, error }: Props) {
+export default function ReportPanel({ report, error, managed = false }: Props) {
   if (error) {
     return (
       <Alert
         type="info"
         showIcon
         message="尚无可用的评标报告"
-        description="报告需要一次已完成的评分运行。请先在上方「发起评分运行」，完成后回到本页。"
+        description={managed ? "全部应评项自动完成后才生成正式报告。当前成功结果已保留，可在评分明细中查看；技术故障修复后可恢复评审。" : "报告需要一次已完成的评分运行。请先在上方「发起评分运行」，完成后回到本页。"}
       />
     );
   }
   if (!report) return <Card loading />;
+
+  if (managed) {
+    return (
+      <Space direction="vertical" size={12} style={{ width: "100%" }}>
+        <Alert
+          type={report.status === "final" ? "success" : "warning"}
+          showIcon
+          message={report.status === "final" ? "全自动评审已完成，正式报告可导出" : report.status === "partial" ? "评审已结束，评分结果与跳过项清单可导出" : "自动评审进行中"}
+          description={report.status === "final"
+            ? "系统已核对全部应评条款、最终分值和证据。符合性不通过和外部事实无法证实均为已评审结论，投标人继续参与计分和排名。"
+            : "评分结果仅合计有效完成项；故障项分值留空，原因保留。使用上方按钮可导出全部评分明细和故障清单。"}
+        />
+        <Card size="small" title="故障与未完成项">
+          <Table dataSource={report.open_questions} rowKey="score_record_id" size="small" pagination={{ pageSize: 10 }}
+            columns={[
+              { title: "投标人", dataIndex: "bidder_name" },
+              { title: "条款", dataIndex: "criterion_name" },
+              { title: "原因", dataIndex: "machine_message" },
+            ]} />
+        </Card>
+        {report.out_of_scope && report.out_of_scope.length > 0 ? (
+          <Card size="small" title="不在本系统评审范围（留空）">
+            <Space direction="vertical" size={4}>
+              <div>围串标核查由独立智能体负责，以下条款本系统不评审、不评分、不否决：</div>
+              <div>{report.out_of_scope.map((item) => `${item.code ?? ""} ${item.name ?? ""}`).join("；")}</div>
+            </Space>
+          </Card>
+        ) : null}
+        {report.qualification_mode === "light" ? (
+          <Card size="small" title="资格与符合性审核口径">
+            <Space direction="vertical" size={4}>
+              <div>资格与符合性采用确定性预检 + 每家投标人一次轻量快审，不构成完整资格审查。</div>
+              <div>预检结果仅作报告提示，不阻断计分、排名与价格基准价。</div>
+            </Space>
+          </Card>
+        ) : null}
+        <Card size="small" title="报告依据">
+          <Space direction="vertical" size={4}>
+            <div>运行 #{report.run.id} · 规则版本 {report.rule_package.version ?? "—"}</div>
+            <div>规则哈希：{report.rule_package.content_hash ?? "—"}</div>
+            <div>每项评审保留规则依据、原文或页图证据、自动补评过程和最终理由，可在评分明细中查看。</div>
+            <div>总分、价格分和并列次序由程序按冻结细则计算。</div>
+          </Space>
+        </Card>
+      </Space>
+    );
+  }
 
   const isDraft = report.status === "draft";
   const highQuestions = report.open_questions.filter((q) => q.severity === "high");

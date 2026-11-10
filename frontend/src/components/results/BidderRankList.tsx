@@ -5,6 +5,8 @@ interface Props {
   bidders: BidderSummary[];
   selectedId: number | null;
   onSelect: (bidderId: number) => void;
+  managed?: boolean;
+  provisional?: boolean;
 }
 
 const RANK_COLOR = ["#d4a017", "#8c8c8c", "#a97142"];
@@ -35,7 +37,7 @@ function isBucketMissingOnly(b: BidderSummary, key: string): boolean {
 }
 
 /** 左栏：排名列表。点选一家，右侧显示该家的分桶与逐项明细。 */
-export default function BidderRankList({ bidders, selectedId, onSelect }: Props) {
+export default function BidderRankList({ bidders, selectedId, onSelect, managed = false, provisional = false }: Props) {
   if (bidders.length === 0) {
     return (
       <Card size="small">
@@ -77,7 +79,7 @@ export default function BidderRankList({ bidders, selectedId, onSelect }: Props)
                       : (b.rank != null && RANK_COLOR[b.rank - 1]) || "#29745a",
                   }}
                 >
-                  {excluded ? "—" : (b.rank ?? "?")}
+                  {excluded || provisional ? "—" : (b.rank ?? "—")}
                 </div>
                 <div>
                   <Typography.Text strong style={{ fontSize: 14 }}>
@@ -92,7 +94,7 @@ export default function BidderRankList({ bidders, selectedId, onSelect }: Props)
                 <div style={{ fontSize: 20, fontWeight: 700, color: excluded ? "#999" : "#29745a" }}>
                   {b.summary?.total ?? "—"}
                 </div>
-                <div style={{ fontSize: 11, color: "#888" }}>总分</div>
+                <div style={{ fontSize: 11, color: "#888" }}>{provisional ? "已完成项合计" : "总分"}</div>
               </div>
             </Space>
 
@@ -105,11 +107,11 @@ export default function BidderRankList({ bidders, selectedId, onSelect }: Props)
             ) : (
               <Space size={4} wrap style={{ marginTop: 8 }}>
                 <Tag color={b.veto_flag ? "red" : "green"}>
-                  {b.veto_flag ? "存在否决建议" : "无否决建议"}
+                  {managed ? b.veto_flag ? "存在不符合项" : "评审结果" : b.veto_flag ? "存在否决建议" : "无否决建议"}
                 </Tag>
                 {(b.summary?.missing_count ?? 0) > 0 && (
-                  <Tooltip title={`未定分项不计入总分：${(b.summary?.missing_criteria ?? []).join("、")}`}>
-                    <Tag color="orange">{b.summary?.missing_count} 项未定分</Tag>
+                  <Tooltip title={`${managed ? "以下项目尚未自动完成" : "未定分项不计入总分"}：${(b.summary?.missing_criteria ?? []).join("、")}`}>
+                    <Tag color="orange">{b.summary?.missing_count} 项{managed ? "待自动完成" : "未定分"}</Tag>
                   </Tooltip>
                 )}
                 {b.summary && !b.summary.consistent && (

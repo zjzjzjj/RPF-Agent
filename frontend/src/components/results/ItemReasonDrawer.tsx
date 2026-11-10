@@ -1,14 +1,17 @@
 import { Alert, Button, Descriptions, Drawer, Empty, Space, Table, Tag, Typography } from "antd";
 import { useNavigate } from "react-router-dom";
 import EvidencePanel, { type EvidenceLike } from "../EvidencePanel";
+import AutoReviewDetails from "../AutoReviewDetails";
 import type { SummaryItem } from "../../types";
-import { evidenceCellLabel, evidenceEmptyText } from "../../utils/evidenceText";
+import { REVIEW_STATUS_LABELS } from "../../types";
+import { automaticEvidenceCellLabel, automaticEvidenceEmptyText, evidenceCellLabel, evidenceEmptyText } from "../../utils/evidenceText";
 
 interface Props {
   pid: string;
   item: SummaryItem | null;
   open: boolean;
   onClose: () => void;
+  managed?: boolean;
 }
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
@@ -33,7 +36,7 @@ function Quote({ text }: { text: string }) {
 }
 
 /** 逐项理由抽屉：AI / 机器 / 人工三段理由 + 评委、子项、材料核验、证据引文。只读。 */
-export default function ItemReasonDrawer({ pid, item, open, onClose }: Props) {
+export default function ItemReasonDrawer({ pid, item, open, onClose, managed = false }: Props) {
   const navigate = useNavigate();
   const citations: EvidenceLike[] = (item?.evidence.citations ?? []).map((c) => ({
     id: c.id,
@@ -63,7 +66,7 @@ export default function ItemReasonDrawer({ pid, item, open, onClose }: Props) {
             type="primary"
             onClick={() => navigate(`/p/${pid}/evidence/${item.score_record_id}`)}
           >
-            去证据核验页处置 →
+            {managed ? "查看证据与原页 →" : "去证据核验页处置 →"}
           </Button>
         ) : null
       }
@@ -84,10 +87,12 @@ export default function ItemReasonDrawer({ pid, item, open, onClose }: Props) {
                 "—"
               )}
             </Descriptions.Item>
-            <Descriptions.Item label="复核状态">{item.review_status}</Descriptions.Item>
+            <Descriptions.Item label={managed ? "执行状态" : "复核状态"}>
+              {managed && item.machine_status === "execution_failed" ? "执行失败，可恢复续评" : managed && item.review_status !== "auto_confirmed" && item.review_status !== "not_applicable" ? "待自动完成" : REVIEW_STATUS_LABELS[item.review_status] ?? item.review_status}
+            </Descriptions.Item>
             <Descriptions.Item label="证据">
               {item.evidence.total_count === 0
-                ? evidenceCellLabel(item.side, item.verdict_source)
+                ? managed ? automaticEvidenceCellLabel(item.auto_review) : evidenceCellLabel(item.side, item.verdict_source)
                 : `${item.evidence.verified_count}/${item.evidence.total_count} 已核验`}
             </Descriptions.Item>
             <Descriptions.Item label="失分算式">
@@ -95,8 +100,10 @@ export default function ItemReasonDrawer({ pid, item, open, onClose }: Props) {
             </Descriptions.Item>
           </Descriptions>
 
+          {managed && <AutoReviewDetails metadata={item.auto_review} />}
+
           <Section title="AI 评审理由">
-            {item.ai_locked ? (
+            {item.ai_locked && !managed ? (
               <Alert
                 type="warning"
                 showIcon
@@ -128,7 +135,7 @@ export default function ItemReasonDrawer({ pid, item, open, onClose }: Props) {
             </Section>
           )}
 
-          {reason?.human_reason && (
+          {!managed && reason?.human_reason && (
             <Section title="人工复核理由">
               <Quote text={reason.human_reason} />
               <Typography.Text type="secondary" style={{ fontSize: 12 }}>
@@ -235,7 +242,7 @@ export default function ItemReasonDrawer({ pid, item, open, onClose }: Props) {
             <EvidencePanel
               citations={citations}
               viewerHeight={420}
-              emptyText={evidenceEmptyText(item.side, item.verdict_source, item.state)}
+              emptyText={managed ? automaticEvidenceEmptyText(item.auto_review) : evidenceEmptyText(item.side, item.verdict_source, item.state)}
             />
           </Section>
         </>

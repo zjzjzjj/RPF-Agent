@@ -7,7 +7,7 @@
  * 条目性质分层，四个组件（ItemReasonDrawer/ItemTable/EvidencePanel/EvidenceWorkbench）
  * 共用本文件，防止逐处漂移。
  */
-import type { SummaryItem } from "../types";
+import type { AutoReviewMetadata, SummaryItem } from "../types";
 
 export type Side = SummaryItem["side"];
 export type VerdictSource = "llm" | "machine" | null | undefined;
@@ -61,4 +61,22 @@ export function evidenceCellLabel(
   if (verdictSource === "llm") return "无引用（AI 裁决未附引文）";
   if (side === "verdict") return "无引用（确定性判定）";
   return "无引用（确定性计算）";
+}
+
+export function automaticEvidenceCellLabel(metadata?: AutoReviewMetadata | null): string {
+  if (metadata?.visual_evidence?.length) return `原页视觉核验 ${metadata.visual_evidence.length} 页`;
+  if (metadata?.basis === "external") return "外部事实证据边界";
+  if (metadata?.confirmed_absent && metadata.coverage_complete) return "已确认材料缺失";
+  if (metadata?.basis === "deterministic") return "计算过程可复算";
+  if (metadata?.state === "failed") return "技术故障，可恢复";
+  return metadata?.state === "completed" ? "评审依据见自动记录" : "待自动核验";
+}
+
+export function automaticEvidenceEmptyText(metadata?: AutoReviewMetadata | null): string {
+  if (metadata?.visual_evidence?.length) return "本项采用原页视觉证据，观察记录和页图见上方。";
+  if (metadata?.basis === "external") return "本项已明确外部事实的证据边界，现有材料无法证实。";
+  if (metadata?.confirmed_absent && metadata.coverage_complete) return "已完成全部关联材料检索，确认所需证明缺失。";
+  if (metadata?.basis === "deterministic") return "本项依据程序计算，计算规则与理由见评审记录。";
+  if (metadata?.state === "failed") return "本项因技术故障尚未完成，故障修复后恢复自动评审。";
+  return metadata?.state === "completed" ? "本项评审依据见自动评审记录。" : "自动评审与证据核验尚未完成。";
 }

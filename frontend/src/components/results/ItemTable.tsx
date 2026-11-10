@@ -1,11 +1,12 @@
 import { Button, Space, Table, Tag, Tooltip, Typography } from "antd";
 import type { SummaryBucket, SummaryItem } from "../../types";
-import { evidenceCellLabel } from "../../utils/evidenceText";
+import { automaticEvidenceCellLabel, evidenceCellLabel } from "../../utils/evidenceText";
 
 interface Props {
   bucket: SummaryBucket;
   onOpenReason: (item: SummaryItem) => void;
   onOpenEvidence: (item: SummaryItem) => void;
+  managed?: boolean;
 }
 
 const STATE_TAG: Record<string, { color: string; text: string }> = {
@@ -34,26 +35,28 @@ function verdictTag(item: SummaryItem) {
   return <Tag color={color}>{t}</Tag>;
 }
 
-function scoreCell(item: SummaryItem) {
+function scoreCell(item: SummaryItem, managed: boolean) {
+  if (managed && item.machine_status === "execution_failed") return <Tag color="red">执行失败</Tag>;
   if (item.state === "veto" || item.state === "match") return verdictTag(item);
   if (item.state === "not_run") return <Typography.Text type="secondary">未执行</Typography.Text>;
   if (item.state === "missing_final") return <Tag color="orange">未定分</Tag>;
   return <b>{item.final}</b>;
 }
 
-function reasonSummary(item: SummaryItem): string {
-  if (item.ai_locked && !item.reason.human_reason && !item.reason.machine_reason) {
+function reasonSummary(item: SummaryItem, managed: boolean): string {
+  if (!managed && item.ai_locked && !item.reason.human_reason && !item.reason.machine_reason) {
     return "AI 理由未解锁（防锚定）";
   }
   const text =
-    item.reason.ai_reasoning ?? item.reason.machine_reason ?? item.reason.human_reason ?? "";
+    item.reason.ai_reasoning ?? item.reason.machine_reason ??
+    (managed ? item.auto_review?.reasoning ?? item.auto_review?.error : item.reason.human_reason) ?? "";
   const flat = text.replace(/\s+/g, " ").trim();
   if (!flat) return "—";
   return flat.length > 60 ? `${flat.slice(0, 60)}…` : flat;
 }
 
 /** 单个分桶的逐项明细表：得分 / 满分 / 失分 / 状态 / 理由 / 证据。 */
-export default function ItemTable({ bucket, onOpenReason, onOpenEvidence }: Props) {
+export default function ItemTable({ bucket, onOpenReason, onOpenEvidence, managed = false }: Props) {
   const isVerdictBucket = bucket.kind === "verdict";
 
   return (
@@ -95,7 +98,7 @@ export default function ItemTable({ bucket, onOpenReason, onOpenEvidence }: Prop
           title: "得分",
           width: 96,
           align: "right" as const,
-          render: (_, item) => scoreCell(item),
+          render: (_, item) => scoreCell(item, managed),
         },
         {
           title: "失分",
@@ -118,6 +121,9 @@ export default function ItemTable({ bucket, onOpenReason, onOpenEvidence }: Prop
           title: "状态",
           width: 92,
           render: (_, item) => {
+            if (managed && item.machine_status === "execution_failed") return <Tag color="red">执行失败</Tag>;
+            if (managed && item.review_status === "auto_confirmed") return <Tag color="green">已评审</Tag>;
+            if (managed) return <Tag color="blue">待自动完成</Tag>;
             const t = STATE_TAG[item.state] ?? { color: "default", text: item.state };
             return <Tag color={t.color}>{t.text}</Tag>;
           },
@@ -126,12 +132,12 @@ export default function ItemTable({ bucket, onOpenReason, onOpenEvidence }: Prop
           title: "理由",
           width: 280,
           render: (_, item) => {
-            const summary = reasonSummary(item);
+            const summary = reasonSummary(item, managed);
             const full =
               item.reason.ai_reasoning ?? item.reason.machine_reason ?? item.reason.human_reason ?? "";
             return (
               <Typography.Text
-                type={item.ai_locked ? "warning" : undefined}
+                type={!managed && item.ai_locked ? "warning" : undefined}
                 title={full || summary}
                 style={{
                   display: "block",
@@ -151,10 +157,19 @@ export default function ItemTable({ bucket, onOpenReason, onOpenEvidence }: Prop
           title: "证据",
           width: 110,
           render: (_, item) => {
+            if (managed && item.auto_review?.visual_evidence?.length) {
+              return <Tag color="green">原页视觉核验</Tag>;
+            }
+            if (managed && item.auto_review?.basis === "external") {
+              return <Tag color="gold">外部证据边界</Tag>;
+            }
+            if (managed && item.auto_review?.confirmed_absent) {
+              return <Tag>已确认缺失</Tag>;
+            }
             if (item.evidence.total_count === 0) {
               return (
                 <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                  {evidenceCellLabel(item.side, item.verdict_source)}
+                  {managed ? automaticEvidenceCellLabel(item.auto_review) : evidenceCellLabel(item.side, item.verdict_source)}
                 </Typography.Text>
               );
             }

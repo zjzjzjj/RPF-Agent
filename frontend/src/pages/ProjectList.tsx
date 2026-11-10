@@ -200,10 +200,10 @@ export default function ProjectList() {
       <div className="overview-banner">
         <div className="banner-copy">
           <span className="banner-kicker">
-            <span className="small-dot" /> AI 辅助评审，人工确认结果
+            <span className="small-dot" /> 全自动评审，逐项证据可查
           </span>
           <h2>每一分，都有据可循。</h2>
-          <p>以冻结规则为起点，用原文证据连接评分与复核。</p>
+          <p>按冻结规则自动评审，以原文和页图证据支撑每项结论。</p>
           <div className="banner-tags">
             <span>
               <CheckCircleOutlined /> 规则可追溯
@@ -229,7 +229,7 @@ export default function ProjectList() {
           <ArrowRightOutlined />
           <span className="flow-node">
             <AuditOutlined />
-            人工复核
+            自动复评
           </span>
         </div>
       </div>

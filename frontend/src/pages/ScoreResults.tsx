@@ -7,6 +7,7 @@ import {
   Col,
   Empty,
   Popconfirm,
+  Progress,
   Row,
   Select,
   Space,
@@ -36,7 +37,7 @@ import {
   useScoreSummary,
   useSelectedRun,
 } from "../api/hooks";
-import { JobProgress } from "../components/JobProgress";
+import { ExecutionProgressDetails, JobProgress } from "../components/JobProgress";
 import BucketCards from "../components/results/BucketCards";
 import BidderRankList from "../components/results/BidderRankList";
 import ItemReasonDrawer from "../components/results/ItemReasonDrawer";
@@ -80,6 +81,14 @@ export default function ScoreResults() {
   const { data: summary, isLoading: summaryLoading } = useScoreSummary(runId, pid, { live: currentRunActive });
   const { data: matrix, isLoading: matrixLoading } = useMatrix(runId, { live: currentRunActive });
   const { data: report, isError: reportError } = useReport(pid, runId);
+  const automation = currentRun?.automation ?? summary?.run.automation;
+  const managed = automation != null;
+  const partialResult = currentRun?.status === "partial";
+  const continueErrors = automation?.failure_policy === "continue";
+  const formalReady = currentRun != null && (!managed || (
+    currentRun.status === "succeeded" && automation.expected > 0 &&
+    automation.completed === automation.expected && automation.remaining === 0 && automation.failed === 0
+  ));
 
   const [jobId, setJobId] = useState<number | null>(null);
   const job = useJobProgress(jobId);
@@ -115,6 +124,8 @@ export default function ScoreResults() {
     qc.invalidateQueries({ queryKey: ["matrix"] });
     qc.invalidateQueries({ queryKey: ["ranking", pid] });
     qc.invalidateQueries({ queryKey: ["report", pid] });
+    qc.invalidateQueries({ queryKey: ["workbench", pid] });
+    qc.invalidateQueries({ queryKey: ["projects"] });
   };
 
   const startRun = useMutation({
@@ -124,12 +135,28 @@ export default function ScoreResults() {
         bidder_ids: (bidders ?? []).map((b) => b.id),
         stages: ["objective", "price", "subjective"],
         model: selectedModel ?? null,
+        failure_policy: "continue",
       }),
     onSuccess: (r) => {
       setJobId(r.job_id);
       setRunId(r.run_id);
       qc.invalidateQueries({ queryKey: ["runs", pid] });
       message.success("评分运行已发起");
+    },
+    onError: (e: Error) => message.error(e.message),
+  });
+
+  const resumeRun = useMutation({
+    mutationFn: async (id: number) => {
+      await api.patch(`/runs/${id}/failure-policy`, { failure_policy: "continue" });
+      return api.post<{ run_id: number; job_id: number }>(`/runs/${id}/resume`);
+    },
+    onSuccess: (r) => {
+      setJobId(r.job_id);
+      setRunId(r.run_id);
+      qc.invalidateQueries({ queryKey: ["runs", pid] });
+      invalidateResults();
+      message.success("已继续评审，已记录故障直接跳过，其余项目继续评分");
     },
     onError: (e: Error) => message.error(e.message),
   });
@@ -174,7 +201,7 @@ export default function ScoreResults() {
       const wasActive =
         prevRunStatus.current === "queued" || prevRunStatus.current === "running";
       const nowTerminal =
-        status === "succeeded" || status === "failed" || status === "cancelled";
+        status === "succeeded" || status === "partial" || status === "failed" || status === "cancelled";
       if (wasActive && nowTerminal) {
         invalidateResults();
       }
@@ -226,7 +253,7 @@ export default function ScoreResults() {
         </Button>
         <Select
           style={{ minWidth: 190 }}
-          placeholder="主观分模型"
+          placeholder="评审模型"
           value={selectedModel ?? models?.default_model}
           onChange={setSelectedModel}
           options={(models?.models ?? []).map((m) => ({ value: m.id, label: `${m.label}（${m.family}）` }))}
@@ -234,6 +261,17 @@ export default function ScoreResults() {
         <Button icon={<ReloadOutlined />} onClick={invalidateResults}>
           刷新
         </Button>
+        {automation?.resumable && runId != null && (
+          <Button
+            type="primary"
+            icon={<PlayCircleOutlined />}
+            loading={resumeRun.isPending}
+            disabled={hasActiveRun}
+            onClick={() => resumeRun.mutate(runId)}
+          >
+            跳过故障并继续评审
+          </Button>
+        )}
         {currentRunActive && runId != null && (
           <Popconfirm
             title="取消这次评分运行？"
@@ -249,7 +287,7 @@ export default function ScoreResults() {
           </Popconfirm>
         )}
         {report && (
-          <Tag color={report.status === "draft" ? "red" : "green"} style={{ fontSize: 13, padding: "2px 10px" }}>
+          <Tag color={report.status === "final" ? "green" : "orange"} style={{ fontSize: 13, padding: "2px 10px" }}>
             {report.status_label}
           </Tag>
         )}
@@ -263,26 +301,59 @@ export default function ScoreResults() {
       </Space>
 
       <Space style={{ marginBottom: 12 }} wrap>
+        {managed && <Button icon={<FileTextOutlined />} href={`/api/runs/${runId}/results.csv`} disabled={!runId}>
+          导出评分结果与故障清单（CSV）
+        </Button>}
         <Button
           icon={<FileTextOutlined />}
           href={reportUrl(pid, runId)}
           target="_blank"
           disabled={!runId}
         >
-          导出评标报告（HTML）
+          导出结果汇总（HTML）
         </Button>
         <Button
           icon={<TrophyOutlined />}
           href={reportFormalUrl(pid, runId)}
           target="_blank"
-          disabled={!runId}
+          disabled={!runId || !formalReady}
         >
           正式评审报告（HTML）
         </Button>
-        <Button icon={<FileWordOutlined />} href={reportDocxUrl(pid, runId)} disabled={!runId}>
+        <Button icon={<FileWordOutlined />} href={reportDocxUrl(pid, runId)} disabled={!runId || !formalReady}>
           正式评审报告（Word）
         </Button>
       </Space>
+
+      {automation && (
+        <Card size="small" style={{ marginBottom: 12 }} title="全自动评审进度">
+          <Progress
+            percent={automation.expected ? Math.round((continueErrors ? automation.processed ?? automation.completed : automation.completed) / automation.expected * 1000) / 10 : 0}
+            status={currentRun?.status === "failed" ? "exception" : partialResult || automation.execution_finished ? "normal" : formalReady ? "success" : "active"}
+          />
+          <Typography.Text>
+            已评分 {automation.completed} / {automation.expected} 项 · {continueErrors ? `待处理 ${automation.pending ?? automation.remaining}` : `剩余 ${automation.remaining}`} 项
+            {automation.failed > 0 ? ` · ${continueErrors ? "故障已跳过" : "技术故障"} ${automation.failed} 项` : ""}
+          </Typography.Text>
+          <div style={{ marginTop: 8 }}>
+            <ExecutionProgressDetails progress={currentRun?.execution_progress ?? automation.execution_progress} />
+          </div>
+          {currentRunActive && job?.message && (
+            <div style={{ marginTop: 8 }}>
+              <Typography.Text type="secondary">{job.message}</Typography.Text>
+            </div>
+          )}
+          {automation.last_error && (
+            <Alert
+              style={{ marginTop: 8 }}
+              type={continueErrors ? "warning" : "error"}
+              showIcon
+              message={partialResult ? "评审已结束，可导出评分结果及跳过项清单" : continueErrors ? "故障已记录，继续评审其余项目" : "自动评审未完成，已保留成功结果"}
+              description={`${automation.last_error}。${continueErrors ? "汇总仅合计已评分项，跳过项分值留空，具体原因可在明细或导出清单中查看。" : "故障修复后可恢复评审。"}`}
+            />
+          )}
+        </Card>
+      )}
 
       {rules?.status !== "frozen" && (
         <Alert
@@ -335,6 +406,8 @@ export default function ScoreResults() {
                       bidders={summary.bidders}
                       selectedId={selected?.bidder_id ?? null}
                       onSelect={selectBidder}
+                      managed={managed}
+                      provisional={managed && !formalReady}
                     />
                   </div>
                 </Col>
@@ -360,11 +433,11 @@ export default function ScoreResults() {
                             {selected.name}
                           </Typography.Title>
                           <Tag color={selected.veto_flag ? "red" : "green"}>
-                            {selected.veto_flag ? "存在否决建议" : "无否决建议"}
+                            {managed ? selected.veto_flag ? "存在不符合项，继续参评" : "AI 自动评审" : selected.veto_flag ? "存在否决建议" : "无否决建议"}
                           </Tag>
                           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                             报价 {selected.bid_price ? Number(selected.bid_price).toLocaleString() : "未录入"} 元
-                            （当前值）
+                            {selected.bid_price_is_run_snapshot ? "（本次运行快照）" : "（当前值）"}
                           </Typography.Text>
                           {selected.tie_explanations.map((t, i) => (
                             <Tag key={i} color="blue">
@@ -374,7 +447,7 @@ export default function ScoreResults() {
                         </Space>
                       </Card>
 
-                      <BucketCards bidder={selected} />
+                      <BucketCards bidder={selected} managed={managed} provisional={managed && !formalReady} />
 
                       {bucketsOf(selected).map(({ bucket }) => (
                         <Card
@@ -408,6 +481,7 @@ export default function ScoreResults() {
                               bucket={bucket}
                               onOpenReason={(item) => setDrawerItem(item)}
                               onOpenEvidence={openEvidence}
+                              managed={managed}
                             />
                           )}
                         </Card>
@@ -417,14 +491,14 @@ export default function ScoreResults() {
                         <Alert
                           type="warning"
                           showIcon
-                          message={`${selected.summary?.missing_count} 项未定分，不计入总分（与排名口径一致）`}
+                          message={managed ? `${selected.summary?.missing_count} 项尚未自动完成，当前仅展示已完成项合计，尚无最终排名` : `${selected.summary?.missing_count} 项未定分，不计入总分（与排名口径一致）`}
                           description={(selected.summary?.missing_criteria ?? []).join("、")}
                         />
                       )}
 
-                      <Tooltip title="逐项处置（确认 / 改分 / 标记冲突）请在证据核验页完成，本页只读">
+                      <Tooltip title={managed ? "评审与证据核验由系统自动完成，可查看每项依据和原页" : "逐项处置（确认 / 改分 / 标记冲突）请在证据核验页完成，本页只读"}>
                         <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                          本页只读：点任一项的「理由」查看完整依据，「核验」进证据页处置。
+                          {managed ? "评审与核验由系统自动完成：点「理由」查看依据，点「核验」查看原页与证据。" : "本页只读：点任一项的「理由」查看完整依据，「核验」进证据页处置。"}
                         </Typography.Text>
                       </Tooltip>
                     </Space>
@@ -436,12 +510,12 @@ export default function ScoreResults() {
           {
             key: "matrix",
             label: "完整矩阵",
-            children: <MatrixPanel pid={pid} matrix={matrix} isLoading={matrixLoading} />,
+            children: <MatrixPanel pid={pid} matrix={matrix} isLoading={matrixLoading} managed={managed} />,
           },
           {
             key: "report",
             label: "报告与导出",
-            children: <ReportPanel report={report} error={reportError} />,
+            children: <ReportPanel report={report} error={reportError} managed={managed} />,
           },
         ]}
       />
@@ -451,6 +525,7 @@ export default function ScoreResults() {
         item={drawerItem}
         open={drawerItem != null}
         onClose={() => setDrawerItem(null)}
+        managed={managed}
       />
     </div>
   );

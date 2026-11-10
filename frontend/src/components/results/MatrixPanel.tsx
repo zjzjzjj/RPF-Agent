@@ -9,10 +9,11 @@ interface Props {
   pid: string;
   matrix: Matrix | undefined;
   isLoading: boolean;
+  managed?: boolean;
 }
 
 /** 完整评分矩阵（投标人 × 评分项）。点单元格进证据核验页。 */
-export default function MatrixPanel({ pid, matrix, isLoading }: Props) {
+export default function MatrixPanel({ pid, matrix, isLoading, managed = false }: Props) {
   const navigate = useNavigate();
 
   const columns = useMemo(() => {
@@ -50,12 +51,12 @@ export default function MatrixPanel({ pid, matrix, isLoading }: Props) {
             width: cat === "qualification" || cat === "compliance" ? 92 : 100,
             render: (_: unknown, row: { bidder_id: number }) => {
               const cell = matrix.cells[String(row.bidder_id)]?.[String(c.criterion_id)];
-              const s = cellStyle(cell);
+              const s = cellStyle(cell, managed);
               return (
                 <Tooltip
                   title={
                     cell
-                      ? `${s.tip}（${REVIEW_STATUS_LABELS[cell.review_status] ?? cell.review_status}）`
+                      ? managed ? s.tip : `${s.tip}（${REVIEW_STATUS_LABELS[cell.review_status] ?? cell.review_status}）`
                       : s.tip
                   }
                 >
@@ -88,7 +89,7 @@ export default function MatrixPanel({ pid, matrix, isLoading }: Props) {
           }))
       ),
     ];
-  }, [matrix, pid, navigate]);
+  }, [matrix, pid, navigate, managed]);
 
   if (isLoading) return <Card loading />;
   if (!matrix) return <Card><Empty description="本次运行尚无评分矩阵" /></Card>;
@@ -108,23 +109,26 @@ export default function MatrixPanel({ pid, matrix, isLoading }: Props) {
           <span>
             <Tag color="geekblue">已自动裁决</Tag> 全自动模式终态（LLM 带原文证据，留痕可查）
           </span>
-          <span>
+          {!managed && <span>
             <Tag color="green">已确认</Tag> 人工确认的分数
-          </span>
-          <span>
+          </span>}
+          {!managed && <span>
             <Tag color="purple">AI建议</Tag> 待人工确认（未解锁不显示分值）
-          </span>
-          <span>
+          </span>}
+          {!managed && <span>
             <Tag color="orange">待人工/冲突</Tag> 需人工裁决
-          </span>
+          </span>}
+          {managed && <span><Tag color="blue">自动评审中</Tag> 自动补检与复评</span>}
+          {managed && <span><Tag color="red">执行失败</Tag> 保留进度，恢复后续评</span>}
+          {managed && <span><Tag color="gold">无法证实</Tag> 已评审的外部事实风险结论</span>}
           <span>
-            <Tag color="red">已否决/不通过</Tag> 裁决终态（自动或人工确认）
+            <Tag color="red">{managed ? "不通过" : "已否决/不通过"}</Tag> {managed ? "最终结论，投标人仍参与计分和排名" : "裁决终态（自动或人工确认）"}
           </span>
           <span>
             <Tag color="green">✓ 有据</Tag>
             <Tag color="orange">证据待核</Tag>
             <Tag color="red">无证据</Tag>
-            格内证据角注：红＝主观项缺引文需人工处置；确定性项（判定/计算）无引文属设计
+            {managed ? "格内证据角注：证据由系统自动核验；确定性项的计算过程可复算" : "格内证据角注：红＝主观项缺引文需人工处置；确定性项（判定/计算）无引文属设计"}
           </span>
         </Space>
       </div>

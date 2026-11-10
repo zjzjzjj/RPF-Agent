@@ -3,6 +3,8 @@ import type { BidderSummary } from "../../types";
 
 interface Props {
   bidder: BidderSummary;
+  managed?: boolean;
+  provisional?: boolean;
 }
 
 const VERDICT_META: Record<string, { label: string; color: string }> = {
@@ -10,6 +12,8 @@ const VERDICT_META: Record<string, { label: string; color: string }> = {
   recommend_reject: { label: "建议否决", color: "#cf1322" },
   need_human: { label: "待人工", color: "#d46b08" },
   fail: { label: "不通过", color: "#cf1322" },
+  unverifiable: { label: "现有材料无法证实", color: "#ad8b00" },
+  execution_failed: { label: "执行失败", color: "#cf1322" },
 };
 
 /** 分项口径标签：固定口径（不随数据变化）——价格/商务为确定性客观分，技术分含 AI 主观评审。 */
@@ -40,14 +44,14 @@ function SideTag({ side }: { side: keyof typeof SIDE_META }) {
 }
 
 /** 四个分桶的汇总卡：总分 / 价格分 / 技术分 / 商务分（资格桶显示判定计数）。 */
-export default function BucketCards({ bidder }: Props) {
+export default function BucketCards({ bidder, managed = false, provisional = false }: Props) {
   const summary = bidder.summary;
   if (!summary) return null;
 
   const tiles = [
     {
       key: "total",
-      label: "总分",
+      label: provisional ? "已完成项合计" : "总分",
       score: summary.total,
       max: null as string | null,
       extra: null,
@@ -108,7 +112,7 @@ export default function BucketCards({ bidder }: Props) {
                 </span>
                 {missingOnly ? (
                   <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                    {bucket?.missing_count} 项待人工
+                    {bucket?.missing_count} 项{managed ? "待自动完成" : "待人工"}
                   </Typography.Text>
                 ) : (
                   t.max && (
@@ -131,11 +135,11 @@ export default function BucketCards({ bidder }: Props) {
             <SideTag side="verdict" />
             {Object.entries(verdictBucket.verdicts).map(([k, v]) =>
               v > 0 ? (
-                <Tooltip key={k} title={VERDICT_META[k]?.label ?? k}>
+                <Tooltip key={k} title={managed && k === "need_human" ? "待自动完成" : VERDICT_META[k]?.label ?? k}>
                   <Typography.Text
                     style={{ color: VERDICT_META[k]?.color, fontSize: 13, marginRight: 12 }}
                   >
-                    {VERDICT_META[k]?.label ?? k} {v}
+                    {managed && k === "need_human" ? "待自动完成" : VERDICT_META[k]?.label ?? k} {v}
                   </Typography.Text>
                 </Tooltip>
               ) : null,
