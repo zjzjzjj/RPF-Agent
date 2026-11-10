@@ -5,13 +5,16 @@
 from __future__ import annotations
 
 import logging
+import random
 import re
 import time
 from urllib.parse import urlparse
 
 from app import config
-from app.errors import LLMNotConfigured
+from app.errors import AppError, LLMNotConfigured
 from app.llm.base import LLMError, LLMResult
+from app.llm.request_control import check_cancelled, cooperative_sleep, http_attempt
+from app.services.execution_version import current_execution_manifest, execution_config_value
 
 # 推理模型（DeepSeek-V4 / GLM 混合思考等）常把 <think>…</think> 内联在 content
 # 里，思考文本含花括号会污染下游 extract_json 的首个"{"定位——在源头剥掉。
@@ -43,6 +46,7 @@ def _clamp_max_tokens_for_context(message: str, current: int | None) -> int | No
 
 
 class OpenAICompatProvider:
+    controls_http_attempts = True
     def __init__(
         self,
         model: str | None = None,
@@ -51,7 +55,7 @@ class OpenAICompatProvider:
         timeout: float | None = None,
     ):
         key = api_key or config.llm_api_key()
-        url = base_url or config.llm_base_url()
+        url = base_url or execution_config_value("llm_base_url")
         # 配置缺失必须抛 LLMNotConfigured（AppError）而非 LLMError：
         # 网关惰性解析后，构造发生在首次调用处——抛 LLMError 会被逐项降级处理器
         # 吞掉（auto 模式静默把模糊项判 fail），配置错误必须让整个运行显式失败。
@@ -76,7 +80,9 @@ class OpenAICompatProvider:
             api_key=key,
             base_url=url,
             timeout=timeout or config.llm_timeout_s(),
-            max_retries=config.llm_sdk_max_retries(),
+            # Every physical request must acquire a shared slot and budget.
+            # Hidden SDK retries would evade both counters.
+            max_retries=0,
         )
 
     @staticmethod
@@ -89,13 +95,13 @@ class OpenAICompatProvider:
         - `chat_template_kwargs` 只对本地 vLLM 有用，保留以兼容既有部署。
         """
         extra: dict = {}
-        thinking = config.llm_thinking()
+        thinking = execution_config_value("llm_thinking")
         if thinking in ("disabled", "enabled"):
             extra["thinking"] = {"type": thinking}
-        if config.llm_disable_thinking():
+        if execution_config_value("llm_disable_thinking"):
             extra["chat_template_kwargs"] = {"enable_thinking": False}
-        if config.llm_seed() is not None:
-            extra["seed"] = config.llm_seed()
+        if execution_config_value("llm_seed") is not None:
+            extra["seed"] = execution_config_value("llm_seed")
         return extra
 
     def complete(
@@ -105,30 +111,49 @@ class OpenAICompatProvider:
         *,
         temperature: float = 0.0,
         max_tokens: int | None = None,
+        images: list[str] | None = None,
     ) -> LLMResult:
         started = time.time()
         extra_body = self._extra_body()
         # 推理模型的思考也算在 max_tokens 里：不给预算会被思考耗尽 → content 为空
         if max_tokens is None:
-            max_tokens = config.llm_default_max_tokens()
-        attempts = config.llm_transient_attempts() if config.llm_transient_retries() else 1
+            max_tokens = execution_config_value("llm_default_max_tokens")
+        attempts = min(4, max(1, config.llm_transient_attempts())) if config.llm_transient_retries() else 1
+        from app.services.execution_version import continue_after_errors
+
+        if continue_after_errors():
+            attempts = 1
         result: LLMResult | None = None
         last_error: Exception | None = None
         # 上下文钳制重试用**独立预算**，不占用瞬态重试次数
         clamp_retries = 1
         attempt = 1
+        content = user
+        if images:
+            content = [{"type": "text", "text": user}] + [
+                {"type": "image_url", "image_url": {"url": image}}
+                for image in images
+            ]
         while attempt <= attempts:
+            check_cancelled()
+            entered_attempt = False
             try:
-                resp = self._client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    temperature=temperature,
-                    max_tokens=max_tokens,
-                    extra_body=extra_body or None,
-                )
+                with http_attempt(provider=self.name, model=self.model,
+                                  images=len(images or [])) as request:
+                    entered_attempt = True
+                    resp = self._client.chat.completions.create(
+                        model=self.model,
+                        messages=[
+                            {"role": "system", "content": system},
+                            {"role": "user", "content": content},
+                        ],
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        extra_body=extra_body or None,
+                    )
+                    usage = getattr(resp, "usage", None)
+                    request.tokens_in = getattr(usage, "prompt_tokens", None)
+                    request.tokens_out = getattr(usage, "completion_tokens", None)
                 choice = resp.choices[0] if resp.choices else None
                 text = (choice.message.content if choice and choice.message else "") or ""
                 text = _THINK_RE.sub("", text).strip()
@@ -151,12 +176,23 @@ class OpenAICompatProvider:
                 )
                 break
             except Exception as exc:  # noqa: BLE001
+                from app.jobs.queue import JobCancelled
+
+                if not entered_attempt or isinstance(exc, (AppError, JobCancelled)):
+                    raise
                 last_error = exc
                 raw = str(exc)
                 msg = raw.lower()
+                status = getattr(exc, "status_code", None)
+                if status is None:
+                    status = getattr(getattr(exc, "response", None), "status_code", None)
 
                 # ① 上下文窗口不足：把 max_tokens 钳到剩余空间后立即重试
                 clamped = _clamp_max_tokens_for_context(raw, max_tokens)
+                if clamped is not None and current_execution_manifest() is not None:
+                    from app.llm.request_sizing import ReviewContextExceeded
+
+                    raise ReviewContextExceeded("模型上下文不足，须拆分完整材料或事实组；禁止降低冻结输出预算") from exc
                 if clamped is not None and clamp_retries > 0:
                     clamp_retries -= 1
                     logging.getLogger("bid_eval.llm").warning(
@@ -165,19 +201,31 @@ class OpenAICompatProvider:
                     max_tokens = clamped
                     continue  # 不递增 attempt，不消耗瞬态预算
 
+                if isinstance(status, int) and 400 <= status < 500 and status not in (408, 409, 429):
+                    # Re-reading documents cannot repair a provider rejection.
+                    # Preserve the failure and stop at this boundary; never
+                    # rewrite material to evade a content-policy response.
+                    if status == 451:
+                        message = "模型服务商拒绝该批材料请求（HTTP 451）；须由服务商核查，原件和已完成结果已保留"
+                    else:
+                        message = f"模型服务商拒绝请求（HTTP {status}），请核查账号、权限或请求配置"
+                    error = LLMError(message)
+                    error.review_attempts_exhausted = True
+                    raise error from exc
+
                 # ② 瞬态失败（网络/限流/服务波动）重试——分层评审调用量大，
                 # 单次偶发超时不重试会让整项评分随机降级（2026-10-16 实证：
                 # 一次 timed out 让龙即一个评分项被兜底 0 分）
-                transient = any(
+                transient = status in (408, 409, 429, 500, 502, 503, 504) or any(
                     token in msg
                     for token in ("timeout", "timed out", "rate limit", "429", "500", "502", "503", "504", "connection")
                 )
                 if transient and attempt < attempts:
-                    delay = 5 * attempt
+                    delay = _retry_delay(exc, attempt)
                     logging.getLogger("bid_eval.llm").warning(
-                        "瞬态失败（第 %d 次），%ds 后重试：%s", attempt, delay, msg[:120]
+                        "瞬态失败（第 %d 次），%.2fs 后重试：%s", attempt, delay, type(exc).__name__
                     )
-                    time.sleep(delay)
+                    cooperative_sleep(delay)
                     attempt += 1
                     continue
                 raise LLMError(f"模型调用失败：{exc}", transient=transient) from exc
@@ -186,3 +234,15 @@ class OpenAICompatProvider:
                 f"模型调用失败：{last_error}", transient=True
             ) from last_error
         return result
+
+
+def _retry_delay(error: Exception, attempt: int) -> float:
+    """Honor a bounded Retry-After; never retain an HTTP slot during backoff."""
+    headers = getattr(getattr(error, "response", None), "headers", {}) or {}
+    try:
+        retry_after = float(headers.get("retry-after") or headers.get("Retry-After") or 0)
+    except (TypeError, ValueError):
+        retry_after = 0
+    if retry_after > 0:
+        return min(retry_after, 60.0)
+    return 5 * attempt + random.uniform(0, 0.5)

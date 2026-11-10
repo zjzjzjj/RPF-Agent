@@ -10,15 +10,16 @@ import json
 import logging
 import os
 import threading
-import time
 from pathlib import Path
 from typing import TypeVar
 
 from pydantic import BaseModel, ValidationError
 
 from app import config
-from app.errors import DataClassDenied, LLMBudgetExceeded
+from app.errors import DataClassDenied
 from app.llm.base import LLMError, LLMProvider, LLMResult
+from app.llm.request_control import _BUDGET_STATE, emit_cache_hit, http_attempt  # _BUDGET_STATE: legacy diagnostics
+from app.services.execution_version import current_execution_manifest, execution_config_value, execution_prompt_version
 
 log = logging.getLogger("bid_eval.llm")
 
@@ -26,13 +27,9 @@ T = TypeVar("T", bound=BaseModel)
 
 _CACHE_LIMIT = 512
 
-# 缓存命中统计（阶段 1，2026-10-30）：mem=内存命中 / disk=磁盘命中 / miss=真实调用。
+# 缓存命中统计：mem=内存命中 / disk=磁盘命中 / miss=逻辑请求未命中。
 # 阶段 5 验收直接读它。+= 非原子，但只是观测计数，不参与判定。
 _CACHE_STATS: dict[str, int] = {"mem": 0, "disk": 0, "miss": 0}
-
-# 进程级预算计数（跨 Gateway 实例共享、按天滚动）
-_BUDGET_LOCK = threading.Lock()
-_BUDGET_STATE: dict[str, object] = {"day": "", "calls": 0}
 
 # 涉密数据发往外部端点的一次性告警去重（provider/host）；跨实例共享
 _REMOTE_CONFIDENTIAL_WARNED_LOCK = threading.Lock()
@@ -374,7 +371,6 @@ class Gateway:
         self._provider = provider
         self._cache: dict[str, LLMResult] = {}
         self._cache_lock = threading.Lock()
-        self._sem = threading.Semaphore(config.llm_max_concurrency())
 
     @property
     def provider(self) -> LLMProvider:
@@ -416,21 +412,6 @@ class Gateway:
                     detail={"host": host, "provider": self.provider.name},
                 )
 
-    def _check_budget(self) -> None:
-        budget = config.llm_daily_call_budget()
-        if budget <= 0:
-            return
-        # 预算计数必须**跨实例**共享（请求带 provider 覆盖会新建 Gateway）
-        # 且按天滚动，否则换 provider 名或过午夜就绕过上限。
-        today = time.strftime("%Y-%m-%d")
-        with _BUDGET_LOCK:
-            if _BUDGET_STATE["day"] != today:
-                _BUDGET_STATE["day"] = today
-                _BUDGET_STATE["calls"] = 0
-            if _BUDGET_STATE["calls"] >= budget:
-                raise LLMBudgetExceeded(f"今日模型调用已达上限 {budget} 次")
-            _BUDGET_STATE["calls"] += 1
-
     @staticmethod
     def _cache_key(
         system: str,
@@ -444,6 +425,7 @@ class Gateway:
         disable_thinking: bool = False,
         seed: int | None = None,
         base_url: str = "",
+        images: list[str] | None = None,
     ) -> str:
         # 影响输出的所有维度都要进键：temperature/max_tokens/thinking/seed/base_url
         # 任一不同 → 结果不同（2026-10-30 阶段 1：补 thinking/disable_thinking/seed/
@@ -461,6 +443,7 @@ class Gateway:
                 f"thinking={thinking}",
                 f"dt={disable_thinking}",
                 f"seed={seed}",
+                *["image=" + hashlib.sha256(image.encode("utf-8")).hexdigest() for image in (images or [])],
             ]
         )
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()
@@ -472,6 +455,7 @@ class Gateway:
         prompt_version: str,
         temperature: float,
         max_tokens: int | None,
+        images: list[str] | None = None,
     ) -> str:
         """chat / chat_json 共用的缓存键：现取 provider 与全部影响输出的配置维度。
 
@@ -484,11 +468,12 @@ class Gateway:
             self.provider.model,
             prompt_version,
             temperature,
-            max_tokens,
-            thinking=config.llm_thinking(),
-            disable_thinking=config.llm_disable_thinking(),
-            seed=config.llm_seed(),
+            max_tokens if max_tokens is not None else execution_config_value("llm_default_max_tokens"),
+            thinking=execution_config_value("llm_thinking"),
+            disable_thinking=execution_config_value("llm_disable_thinking"),
+            seed=execution_config_value("llm_seed"),
             base_url=getattr(self.provider, "base_url", ""),
+            images=images,
         )
 
     def _store_memory(self, key: str, result: LLMResult) -> None:
@@ -506,15 +491,17 @@ class Gateway:
         prompt_version: str | None = None,
         temperature: float = 0.0,
         max_tokens: int | None = None,
+        images: list[str] | None = None,
     ) -> LLMResult:
-        prompt_version = prompt_version or config.llm_prompt_version()
+        prompt_version = prompt_version or execution_prompt_version()
         self._check_data_class(data_class)
-        key = self._key_for(system, user, prompt_version, temperature, max_tokens)
+        key = self._key_for(system, user, prompt_version, temperature, max_tokens, images)
 
         with self._cache_lock:
             hit = self._cache.get(key)
         if hit is not None:
             _CACHE_STATS["mem"] += 1
+            emit_cache_hit("memory")
             return hit.model_copy(update={"cached": True})
 
         # 磁盘缓存（阶段 1，2026-10-30）：命中即回填内存并返回——不调 provider、
@@ -532,14 +519,24 @@ class Gateway:
             )
             self._store_memory(key, result)
             _CACHE_STATS["disk"] += 1
+            emit_cache_hit("disk")
             return result
 
         _CACHE_STATS["miss"] += 1
-        self._check_budget()
-        with self._sem:
+        image_kwargs = {"images": images} if images else {}
+        if getattr(self.provider, "controls_http_attempts", False):
             result = self.provider.complete(
-                system, user, temperature=temperature, max_tokens=max_tokens
+                system, user, temperature=temperature, max_tokens=max_tokens, **image_kwargs
             )
+        else:
+            # Custom providers implement one complete call. The production
+            # compatibility provider guards each physical retry itself.
+            with http_attempt(provider=self.provider.name, model=self.provider.model,
+                              images=len(images or [])) as attempt:
+                result = self.provider.complete(
+                    system, user, temperature=temperature, max_tokens=max_tokens, **image_kwargs
+                )
+                attempt.tokens_in, attempt.tokens_out = result.tokens_in, result.tokens_out
         log.info(
             "llm call provider=%s model=%s tokens_in=%s tokens_out=%s latency_ms=%s",
             result.provider, result.model, result.tokens_in, result.tokens_out, result.latency_ms,
@@ -573,8 +570,9 @@ class Gateway:
         prompt_version: str | None = None,
         temperature: float = 0.0,
         max_tokens: int | None = None,
+        images: list[str] | None = None,
     ) -> tuple[T, LLMResult]:
-        """调用并解析为 Pydantic 模型。解析失败抛 LLMError（上层降级为待人工，不猜）。
+        """调用并解析为 Pydantic 模型。解析失败抛 LLMError，由执行器自动补评或失败。
 
         JSON 解析/契约失败重试 2 次（采样偶发缺逗号/截断，换一次生成大概率就好；
         余额/配额类错误不重试——上层按 fail-fast 处理）。
@@ -582,15 +580,28 @@ class Gateway:
         失败重试前驱逐当前 attempt 的 key——chat() 刚把这份坏文本缓存了进去，
         不驱逐的话下一轮重试会直接命中它、永远不再调 provider（自缓存毒化）。
         """
-        prompt_version = prompt_version or config.llm_prompt_version()
-        key = self._key_for(system, user, prompt_version, temperature, max_tokens)
+        prompt_version = prompt_version or execution_prompt_version()
+        key = self._key_for(system, user, prompt_version, temperature, max_tokens, images)
         last_exc: LLMError | None = None
         result = None
         repair = False
-        for attempt in range(3):
+        from app.services.execution_version import continue_after_errors
+
+        max_attempts = 1 if continue_after_errors() else 3
+        for attempt in range(max_attempts):
             attempt_user = self._repair_user(user, out_model, attempt) if repair else user
+            if current_execution_manifest() is not None:
+                from app.llm.request_sizing import ReviewContextExceeded, assert_request_fits
+
+                usage = assert_request_fits(system, attempt_user, images)
+                # A repair suffix and an explicit larger output allowance must
+                # fit as sent; never repair context errors by shrinking output.
+                requested_output = max(usage["output_tokens"], max_tokens or 0)
+                if usage["context_tokens"] and (usage["text_token_upper_bound"] +
+                        usage["image_token_reserve"] + requested_output + 1024 > usage["context_tokens"]):
+                    raise ReviewContextExceeded("实际评审请求超过冻结模型上下文，须拆分完整输入，禁止降低输出预算")
             attempt_key = self._key_for(
-                system, attempt_user, prompt_version, temperature, max_tokens
+                system, attempt_user, prompt_version, temperature, max_tokens, images
             )
             result = self.chat(
                 system,
@@ -599,6 +610,7 @@ class Gateway:
                 prompt_version=prompt_version,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                **({"images": images} if images else {}),
             )
             try:
                 payload = extract_json(result.text)
@@ -626,14 +638,19 @@ class Gateway:
                 if attempt_key != key:
                     # 修复请求成功后，把已校验结果回填到原始请求键；后续原始请求
                     # 仍可命中规范缓存，而不会依赖带修复后缀的临时键。
+                    # Only the canonical key may survive: semantic evidence
+                    # validation can reject it immediately after this return.
+                    # A temporary alias would otherwise resurrect that result.
+                    self._evict_failed(attempt_key)
                     self._store_memory(key, result)
                 _disk_put(key, result)  # 校验通过才上盘（阶段 1，2026-10-30）
                 return validated, result
-            if attempt < 2:
+            if attempt < max_attempts - 1:
                 log.warning(
                     "chat_json 第 %d 次输出解析失败，重试：%s", attempt + 1, last_exc
                 )
         assert last_exc is not None and result is not None
+        last_exc.review_attempts_exhausted = True
         raise last_exc
 
     def _evict_failed(self, key: str) -> None:
@@ -666,7 +683,7 @@ def _is_private_host(host: str) -> bool:
 
 
 def get_gateway() -> Gateway:
-    """进程级单例（含缓存与预算计数）。"""
+    """进程级缓存单例；请求槽和持久预算由 request_control 共享。"""
     global _GATEWAY
     if _GATEWAY is None:
         _GATEWAY = Gateway()
@@ -677,7 +694,7 @@ _GATEWAY: Gateway | None = None
 
 
 def reset_gateway() -> None:
-    """测试用：重建网关（重读环境变量、清缓存与预算）。"""
+    """测试用：重建网关和缓存观测；不重置持久请求预算。"""
     global _GATEWAY
     _GATEWAY = None
     _CACHE_STATS.update({"mem": 0, "disk": 0, "miss": 0})

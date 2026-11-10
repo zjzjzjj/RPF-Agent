@@ -96,12 +96,60 @@ def static_dir() -> Path | None:
 def auto_mode() -> bool:
     """全自动模式（默认开）：模糊项由 LLM 带原文证据裁决，全链无人工环节。
 
-    开启时：human_only/冲突信号由 engine/auto_judge 裁决收敛终态；主观分 LLM
-    直接写 final_score；confirm/freeze 的阻断项自动采纳（actor="auto" 全留痕）；
-    报告"自动裁决记录"章节替代人工复核队列。
-    置 0 回退人工模式（三态 + 复核队列），旧护栏测试在 conftest 里显式关闭。
+    新运行使用 managed 执行器逐项评审并事务保存分数、证据及终态。按所选投标人
+    与应评条款的完整矩阵严格检查，全部完成才发布正式排名和报告。技术故障补评后
+    仍未解决则运行失败，保留成功项供续评。confirm/freeze 的自动采纳保留审计。
+    置 0 仅用于历史人工模式兼容；已有运行沿各自冻结配置执行。
     """
     return os.environ.get("BID_EVAL_AUTO_MODE", "1").strip().lower() not in ("0", "false", "no", "off")
+
+
+def qualification_mode_default() -> str:
+    """新运行默认资格审核模式（运行级冻结，后续可在 config_json 查看）。
+
+    light：确定性预检 + 每家投标人一次合并快审，不 OCR、不逐条款 LLM；
+           结论只报告，不阻断计分/排名/价格基准价。
+    full：旧的逐条款 LLM 深评（历史运行缺省）。
+    """
+    raw = os.environ.get("BID_EVAL_QUALIFICATION_MODE_DEFAULT", "light").strip().lower()
+    if raw not in ("light", "full"):
+        raise ValueError("BID_EVAL_QUALIFICATION_MODE_DEFAULT 只能为 light 或 full")
+    return raw
+
+
+def count_deterministic_default() -> str:
+    """新运行默认客观计数确定性快路径模式（off/shadow/on）。"""
+    raw = os.environ.get("BID_EVAL_COUNT_DETERMINISTIC", "on").strip().lower()
+    if raw not in ("off", "shadow", "on"):
+        raise ValueError("BID_EVAL_COUNT_DETERMINISTIC 只能为 off/shadow/on")
+    return raw
+
+
+def qualification_quick_chars() -> int:
+    """资格轻量快审的页面文本预算（字符）。"""
+    try:
+        return max(4000, int(os.environ.get("BID_EVAL_QUALIFICATION_QUICK_CHARS", "8000")))
+    except ValueError:
+        return 24000
+
+
+def score_closure_enabled() -> bool:
+    """Every scoring cell must settle even when the model/evidence path fails.
+
+    Production default is on: a terminal cell failure is written as an explicit
+    provisional score (basis=fallback) instead of leaving final_score NULL.
+    Tests that guard the historical execution_failed semantics set this to 0.
+    """
+    return os.environ.get("BID_EVAL_SCORE_CLOSURE", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def subjective_direct_enabled() -> bool:
+    """One-shot direct subjective scoring (no citation/subitem blocking)."""
+    return os.environ.get("BID_EVAL_SUBJECTIVE_DIRECT", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
 
 
 def auto_match_enabled() -> bool:
@@ -622,7 +670,7 @@ def llm_prompt_version() -> str:
     2026-11-05：围串标功能下线，<facts> 摘要删除 cross_bidder 两键（提示词内容
     变更），升版作废旧缓存。
     """
-    return os.environ.get("BID_EVAL_PROMPT_VERSION", "2026-11-05.1")
+    return os.environ.get("BID_EVAL_PROMPT_VERSION", "2026-11-06.1")
 
 
 def veto_batch_size() -> int:
@@ -653,12 +701,14 @@ def veto_human_only_batch_enabled() -> bool:
 
 
 def math_skip_llm_enabled() -> bool:
-    """math_relation 冲突跳过 LLM 开关（阶段 2，2026-10-30）。默认开。
+    """历史人工模式 math_relation 冲突跳过 LLM 开关。默认开。
 
     算术冲突（fail+need_human）由结构化事实比对确定（大小写不一致/超限价/
     分项合计不符均来自 facts 数值比较），LLM 读同一文本无法改变结构化结论
-    ——跳过 LLM 直接 conflict_flagged 转人工；未抽到报价的 unknown 保留 LLM。
+    ——历史路径跳过 LLM 后进入复核；未抽到报价的 unknown 保留 LLM。
     置 0（BID_EVAL_MATH_SKIP_LLM=0）回退冲突格逐格 LLM 旧路径。
+    新 managed 自动执行器不采用此开关，冲突和未抽取报价均须自动补证后形成终态，
+    无法解决时保留进度并明确失败。
     """
     return os.environ.get("BID_EVAL_MATH_SKIP_LLM", "1").strip().lower() not in (
         "0", "false", "no", "off",
@@ -666,17 +716,31 @@ def math_skip_llm_enabled() -> bool:
 
 
 def veto_llm_enabled() -> bool:
-    """veto 桶 LLM 深评开关（2026-11-04 资格审查弱化）。默认**关**（0=弱化）。
-
-    关：human_only 逐格/组批深评与 unknown/fail+need_human 的 LLM refine 全不跑，
-    按 Phase0 确定性预检结果 verdict_for 直出（unknown/human_only → need_human
-    转人工）；确定性硬 fail 仍出 recommend_reject（benchmark_ineligible 基准价
-    剔除通道完整保留）。只作用于 score_type=veto 桶：match（_match_cell）、
-    count/subjective、价格分不受影响。置 1（BID_EVAL_VETO_LLM=1）回旧行为。
-    """
-    return os.environ.get("BID_EVAL_VETO_LLM", "0").strip().lower() not in (
+    """资格与符合性 AI 深评默认开启；关闭时不能宣称全自动评审完成。"""
+    return os.environ.get("BID_EVAL_VETO_LLM", "1").strip().lower() not in (
         "0", "false", "no", "off",
     )
+
+
+def auto_review_rounds() -> int:
+    """初评后的业务补评轮数；重检、OCR 和视觉复核共享有界预算。"""
+    try:
+        return max(0, min(5, int(os.environ.get("BID_EVAL_AUTO_REVIEW_ROUNDS", "2"))))
+    except ValueError:
+        return 2
+
+
+def vision_model() -> str | None:
+    """视觉评审必须显式指定模型，不把文本模型当成视觉模型。"""
+    return os.environ.get("BID_EVAL_VISION_MODEL", "").strip() or None
+
+
+def vision_base_url() -> str | None:
+    return os.environ.get("BID_EVAL_VISION_BASE_URL", "").strip() or llm_base_url()
+
+
+def vision_api_key() -> str | None:
+    return os.environ.get("BID_EVAL_VISION_API_KEY", "").strip() or llm_api_key()
 
 
 def local_endpoint_hosts() -> list[str]:

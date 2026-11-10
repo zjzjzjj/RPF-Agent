@@ -61,11 +61,17 @@ class _SequenceProvider(_FakeProvider):
 def disk_env(tmp_path, monkeypatch):  # noqa: ANN001
     """隔离环境：临时 data 目录 + 显式开启磁盘缓存 + 清缓存统计/预算计数。"""
     monkeypatch.setenv("BID_EVAL_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("BID_EVAL_DB_PATH", str(tmp_path / "cache-test.db"))
     monkeypatch.setenv("BID_EVAL_LLM_DISK_CACHE", "1")  # pytest 内默认关，本用例组显式开
     monkeypatch.delenv("BID_EVAL_LLM_DAILY_BUDGET", raising=False)
     gw._CACHE_STATS.update({"mem": 0, "disk": 0, "miss": 0})
     gw._BUDGET_STATE.update({"day": "", "calls": 0})
+    from app.db import session as db_session
+
+    db_session.reset_engine()
+    db_session.init_db()
     yield tmp_path
+    db_session.reset_engine()
     gw._CACHE_STATS.update({"mem": 0, "disk": 0, "miss": 0})
     gw._BUDGET_STATE.update({"day": "", "calls": 0})
 
@@ -93,6 +99,21 @@ def test_disk_cache_hit_across_gateway_instances(disk_env) -> None:  # noqa: ANN
     assert fake.calls == 1, "第二次（新实例）应命中磁盘，provider 零调用"
     assert res2.cached is True and out2.a == "hello"
     assert gw._CACHE_STATS["disk"] == 1 and gw._CACHE_STATS["mem"] == 0
+
+
+def test_semantically_rejected_json_repair_cannot_survive_as_temporary_cache_alias(disk_env):
+    fake = _SequenceProvider(['{"a":', '{"a":"invalid evidence"}', '{"a":', '{"a":"valid evidence"}'])
+    gateway = Gateway(fake)
+    first, _ = gateway.chat_json("sys", "user", _Out, prompt_version="v1")
+    assert first.a == "invalid evidence" and fake.calls == 2
+    key = gateway._key_for("sys", "user", "v1", 0.0, None, None)
+    assert set(gateway._cache) == {key}
+    # This is the same eviction performed by the host evidence validator.
+    gateway._evict_failed(key)
+    second, _ = gateway.chat_json("sys", "user", _Out, prompt_version="v1")
+    assert second.a == "valid evidence" and fake.calls == 4
+    assert set(gateway._cache) == {key}
+    assert len(list((disk_env / "llm_cache").glob("*.json"))) == 1
 
 
 def test_contract_retry_changes_only_retry_user_and_repopulates_original_key(disk_env) -> None:  # noqa: ANN001

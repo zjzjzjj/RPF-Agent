@@ -2,15 +2,17 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Literal
+from typing import Annotated, Literal
 
 from fastapi import APIRouter, Depends, Query
-from pydantic import BaseModel, ConfigDict
+from fastapi.responses import Response
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.deps import get_actor
 from app.errors import NotFound
 from app.services import audit_service, scoring_service
 from app.services.ranking_service import compute_ranking
+from app.services.automation_service import progress as automation_progress
 
 router = APIRouter(tags=["runs"])
 
@@ -21,6 +23,12 @@ class RunCreate(BaseModel):
     stages: list[Literal["objective", "price", "subjective"]] | None = None
     provider: str | None = None
     model: str | None = None  # 前端可选模型（模型目录内的 id）
+    executor_version: Annotated[int, Field(strict=True, ge=1, le=2)] | None = None
+    failure_policy: Literal["stop", "continue"] = "continue"
+
+
+class FailurePolicyUpdate(BaseModel):
+    failure_policy: Literal["stop", "continue"]
 
 
 class RunOut(BaseModel):
@@ -38,6 +46,11 @@ class RunOut(BaseModel):
     started_at: datetime | None
     finished_at: datetime | None
     created_at: datetime
+    automation: dict | None = None
+    executor_version: int = 1
+    execution_progress: dict | None = None
+    qualification_mode: str | None = None
+    count_deterministic_mode: str | None = None
 
 
 class MatrixCell(BaseModel):
@@ -53,6 +66,7 @@ class MatrixCell(BaseModel):
     evidence_status: str
     veto_flag: bool
     machine_status: str | None
+    auto_review_basis: str | None = None
 
 
 @router.post("/projects/{project_id}/runs")
@@ -76,9 +90,12 @@ def create_run(project_id: str, body: RunCreate, actor: str = Depends(get_actor)
         actor,
         body.provider,
         body.model,
+        executor_version=body.executor_version,
+        failure_policy=body.failure_policy,
     )
     audit_service.log(project_id, actor, "run.create", "run", str(run_id),
-                      {"package_id": package_id, "bidders": body.bidder_ids, "model": body.model})
+                      {"package_id": package_id, "bidders": body.bidder_ids, "model": body.model,
+                       "executor_version": body.executor_version, "failure_policy": body.failure_policy})
     return {"run_id": run_id, "job_id": job_id}
 
 
@@ -94,7 +111,8 @@ def list_runs(project_id: str) -> list[RunOut]:
             select(EvaluationRun).where(EvaluationRun.project_id == project_id)
             .order_by(EvaluationRun.id.desc())
         ).scalars().all()
-        return [RunOut.model_validate(r) for r in rows]
+        from app.services.automation_service import progress
+        return [_run_out(r, progress(r.id, session=s)) for r in rows]
 
 
 @router.get("/runs/{run_id}", response_model=RunOut)
@@ -108,8 +126,55 @@ def get_run(run_id: int) -> RunOut:
         run = s.get(EvaluationRun, run_id)
         if run is None:
             raise NotFound("运行不存在")
-        s.expunge(run)
-        return RunOut.model_validate(run)
+        from app.services.automation_service import progress
+        return _run_out(run, progress(run_id, session=s))
+
+
+def _run_out(run, automation: dict | None) -> RunOut:
+    from app.services.execution_version import run_executor_version
+
+    cfg = run.config_json or {}
+    return RunOut.model_validate(run).model_copy(update={
+        "automation": automation, "executor_version": run_executor_version(run),
+        "execution_progress": (automation or {}).get("execution_progress"),
+        "qualification_mode": cfg.get("qualification_mode"),
+        "count_deterministic_mode": cfg.get("count_deterministic_mode"),
+    })
+
+
+@router.get("/runs/{run_id}/execution-progress")
+def get_execution_progress(run_id: int) -> dict | None:
+    from app.services.automation_service import execution_progress
+    from app.db.models import EvaluationRun
+    from app.db.session import session_scope
+
+    with session_scope() as s:
+        if s.get(EvaluationRun, run_id) is None:
+            raise NotFound("运行不存在")
+        return execution_progress(run_id, session=s)
+
+
+@router.get("/runs/{run_id}/results.csv")
+def export_results(run_id: int) -> Response:
+    from app.services.result_export_service import export_results_csv
+
+    return Response(export_results_csv(run_id), media_type="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f'attachment; filename="run{run_id}-results.csv"'})
+
+
+@router.post("/runs/{run_id}/resume")
+def resume_run(run_id: int, actor: str = Depends(get_actor)) -> dict:
+    from app.services.automation_service import resume_run as resume
+
+    continued_run_id, job_id = resume(run_id, actor)
+    return {"run_id": continued_run_id, "job_id": job_id}
+
+
+@router.patch("/runs/{run_id}/failure-policy")
+def update_failure_policy(run_id: int, body: FailurePolicyUpdate, actor: str = Depends(get_actor)) -> dict:
+    from app.services.automation_service import set_failure_policy
+
+    return set_failure_policy(run_id, body.failure_policy, actor)
 
 
 @router.get("/runs/{run_id}/stats")
@@ -144,13 +209,15 @@ def run_stats(run_id: int) -> dict:
                 ScoreRecord.run_id == run_id, ScoreRecord.evidence_status == "verified"
             )
         ).scalar_one()
+        automation = automation_progress(run_id, session=s)
     return {
         "score_records": int(total),
-        "need_human": int(need_human),
+        "need_human": 0 if automation is not None else int(need_human),
         "conflicts": int(conflicts),
         "cited": int(cited),
         "verified": int(verified),
         "verification_rate": round(verified / cited, 4) if cited else None,
+        "automation": automation,
     }
 
 
@@ -158,10 +225,15 @@ def run_stats(run_id: int) -> dict:
 def run_matrix(run_id: int) -> dict:
     from sqlalchemy import select
 
-    from app.db.models import Bidder, Criterion, ScoreRecord
+    from app.db.models import Bidder, Criterion, EvaluationRun, ScoreRecord
     from app.db.session import session_scope
 
     with session_scope() as s:
+        run = s.get(EvaluationRun, run_id)
+        if run is None:
+            raise NotFound("评分运行不存在")
+        automation = automation_progress(run_id, session=s)
+        manifest = (run.config_json or {}).get("automation_manifest") or {}
         rows = s.execute(
             select(ScoreRecord, Criterion, Bidder)
             .join(Criterion, Criterion.id == ScoreRecord.criterion_id)
@@ -172,30 +244,46 @@ def run_matrix(run_id: int) -> dict:
 
     bidders: dict[int, dict] = {}
     criteria_index: dict[int, dict] = {}
+    if automation is not None:
+        bidders = {int(b["id"]): {"bidder_id": int(b["id"]), "name": b["name"], "status": "pending"}
+                   for b in manifest.get("bidders", [])}
+        criteria_index = {int(c["id"]): {
+            "criterion_id": int(c["id"]), "code": c.get("code"), "name": c.get("name", c.get("code")),
+            "category": c.get("category"), "score_type": c.get("score_type"),
+            "max_score": str(c["max_score"]) if c.get("max_score") is not None else None,
+        } for c in manifest.get("criteria", [])}
     cells: dict[int, dict[int, MatrixCell]] = {}
     for score, crit, bidder in rows:
-        bidders[bidder.id] = {"bidder_id": bidder.id, "name": bidder.name, "status": bidder.status}
-        criteria_index[crit.id] = {
-            "criterion_id": crit.id, "code": crit.code, "name": crit.name,
-            "category": crit.category, "score_type": crit.score_type,
-            "max_score": str(crit.max_score) if crit.max_score else None,
-        }
+        if automation is not None:
+            if bidder.id not in bidders or crit.id not in criteria_index:
+                continue
+            meta = criteria_index[crit.id]
+        else:
+            bidders[bidder.id] = {"bidder_id": bidder.id, "name": bidder.name, "status": bidder.status}
+            meta = criteria_index[crit.id] = {
+                "criterion_id": crit.id, "code": crit.code, "name": crit.name,
+                "category": crit.category, "score_type": crit.score_type,
+                "max_score": str(crit.max_score) if crit.max_score is not None else None,
+            }
         cells.setdefault(bidder.id, {})[crit.id] = MatrixCell(
             score_record_id=score.id,
-            criterion_code=crit.code,
-            criterion_name=crit.name,
-            category=crit.category,
-            score_type=crit.score_type,
-            max_score=str(crit.max_score) if crit.max_score else None,
+            criterion_code=meta["code"] or crit.code,
+            criterion_name=meta["name"] or crit.name,
+            category=meta["category"] or crit.category,
+            score_type=meta["score_type"] or crit.score_type,
+            max_score=meta["max_score"],
             final_score=str(score.final_score) if score.final_score is not None else None,
             machine_score=str(score.machine_score) if score.machine_score is not None else None,
             review_status=score.review_status,
             evidence_status=score.evidence_status,
             veto_flag=score.veto_flag,
             machine_status=score.machine_status,
+            auto_review_basis=(score.ai_raw_json or {}).get("auto_review", {}).get("basis"),
         )
     return {
         "run_id": run_id,
+        "automation": automation,
+        "out_of_scope": (run.config_json or {}).get("excluded_criteria") or [],
         "bidders": list(bidders.values()),
         "criteria": list(criteria_index.values()),
         "cells": {str(b): {str(c): cell.model_dump() for c, cell in cols.items()}

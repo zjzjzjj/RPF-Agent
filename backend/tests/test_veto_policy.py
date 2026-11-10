@@ -1,7 +1,10 @@
 """AI 不否决策略单测：auto 模式否决条款 fail → 疑问（need_human），人工模式不变。"""
 from __future__ import annotations
 
+import pytest
+
 from app.engine.models import PrimitiveResult
+from app.llm.base import LLMError
 
 
 def test_review_status_auto_doubt_kept(monkeypatch):
@@ -211,14 +214,12 @@ def test_veto_batch_three_human_only_cells(monkeypatch):
     assert out[2]["message"] == "自动裁决（通过）：裁决 c3"
 
 
-def test_veto_batch_missing_code_degrades_that_cell(monkeypatch):
-    """批量输出缺某个 code → 该条按契约降 fail（need_human 疑问），其余照常。"""
+def test_veto_batch_missing_code_is_execution_error(monkeypatch):
+    """遗漏条款是输出契约故障，不能制造不符合结论。"""
     monkeypatch.setenv("BID_EVAL_AUTO_MODE", "1")
     monkeypatch.setenv("BID_EVAL_VETO_LLM", "1")  # 本组验旧 LLM 路径语义
     monkeypatch.setenv("BID_EVAL_VETO_HUMAN_ONLY_BATCH", "1")
-    from app.engine.auto_judge import AutoJudgements, BatchJudgementItem
-    from app.engine.facts import extract_bid_facts
-    from app.services import scoring_service as ss
+    from app.engine.auto_judge import AutoJudgements, BatchJudgementItem, refine_with_llm_batch
 
     class PartialGateway:
         def chat_json(self, system, user, model, data_class="synthetic"):  # noqa: ANN001
@@ -228,24 +229,12 @@ def test_veto_batch_missing_code_degrades_that_cell(monkeypatch):
                 BatchJudgementItem(code="c3", verdict="pass", reasoning="有对应内容"),
             ]), {}
 
-    facts = extract_bid_facts("正文")
-    cells = [(10, _ho("c1")), (10, _ho("c2")), (10, _ho("c3"))]
-    out = ss._resolve_veto_results(
-        cells,
-        facts_by_bidder={10: facts},
-        text_by_bidder={10: facts.text},
-        scan_hints={10: False},
-        gateway=PartialGateway(),
-        data_class="synthetic",
-    )
-    assert out[0]["verdict"] == "pass"
-    assert out[1]["verdict"] == "need_human"
-    assert "缺少该条" in out[1]["message"]
-    assert out[2]["verdict"] == "pass"
+    with pytest.raises(LLMError, match="缺少条款 c2"):
+        refine_with_llm_batch(PartialGateway(), [{"criterion": _ho(code)} for code in ("c1", "c2", "c3")], "正文")
 
 
-def test_refine_with_llm_batch_illegal_verdict_degrades_that_cell():
-    """条目级 verdict 非法 → 该条降 fail，不连坐其余条目。"""
+def test_refine_with_llm_batch_illegal_verdict_is_execution_error():
+    """非法 verdict 不是业务不符合，必须交自动补评处理。"""
     from app.engine.auto_judge import AutoJudgements, BatchJudgementItem, refine_with_llm_batch
 
     class G:
@@ -259,10 +248,8 @@ def test_refine_with_llm_batch_illegal_verdict_degrades_that_cell():
         {"criterion": _ho("c1"), "facts_text": "{}", "price_line": ""},
         {"criterion": _ho("c2"), "facts_text": "{}", "price_line": ""},
     ]
-    out = refine_with_llm_batch(G(), items, "短文本")
-    assert out["c1"].verdict == "pass"
-    assert out["c2"].verdict == "fail"
-    assert "verdict 非法" in out["c2"].reasoning
+    with pytest.raises(LLMError, match="契约无效"):
+        refine_with_llm_batch(G(), items, "短文本")
 
 
 def test_veto_batch_quota_error_raises_through(monkeypatch):
@@ -462,13 +449,13 @@ def test_registered_capital_variants():
 
 
 # ===========================================================================
-# A.1/A.2 资格审查弱化（2026-11-04）：BID_EVAL_VETO_LLM 默认关
+# 旧弱化路径兼容测试：必须显式关闭；新自动运行默认开启并禁止以此定稿。
 # ===========================================================================
 def test_veto_llm_disabled_skips_deep_eval(monkeypatch):
-    """弱化态（默认）：human_only/unknown 全跳过 LLM，按 Phase0 确定性结果直出；
+    """显式关闭时：human_only/unknown 全跳过 LLM，按 Phase0 确定性结果直出；
     确定性硬 fail 仍 recommend_reject（基准价剔除通道钉死）；弱化消息带溯源。"""
     monkeypatch.setenv("BID_EVAL_AUTO_MODE", "1")
-    monkeypatch.delenv("BID_EVAL_VETO_LLM", raising=False)
+    monkeypatch.setenv("BID_EVAL_VETO_LLM", "0")
     from decimal import Decimal
 
     from app.engine.facts import extract_bid_facts

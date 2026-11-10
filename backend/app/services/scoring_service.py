@@ -1,9 +1,7 @@
-"""评分运行编排：客观 → 价格 → 主观 → 汇总。
+"""评分运行入口与历史运行编排。
 
-前置（422 拦截）：规则包已冻结；所选投标人报价全部已确认（卡点 ③）。
-评分只认冻结快照（snapshot_json），与业务表解耦。
-final_score 写入权限：确定性引擎（价格分/count）、人工确认、人工改分——本模块
-只行使第一种权限；主观分永远只写 ai_* 字段。
+新自动运行使用冻结输入、AI 最终评审、逐项事务保存和完整矩阵终态检查。
+历史运行继续采用原有人工复核语义，结果不会被批量改写。
 """
 from __future__ import annotations
 
@@ -59,6 +57,7 @@ from app.errors import NotFound, ValidationFailed
 from app.jobs.handlers import register
 from app.jobs.queue import JobCancelled, JobContext
 from app.services import bidder_service
+from app.services.run_execution_lock import RunExecutionBusy
 
 log = logging.getLogger("bid_eval.scoring")
 
@@ -74,7 +73,15 @@ def create_run(
     actor: str,
     provider: str | None = None,
     model: str | None = None,
+    executor_version: int | None = None,
+    failure_policy: str = "continue",
 ) -> tuple[int, int]:
+    from app.services.execution_version import default_executor_version, validate_executor_version
+
+    selected_executor = (validate_executor_version(executor_version) if executor_version is not None
+                         else default_executor_version() if config.auto_mode() else 1)
+    if failure_policy not in ("stop", "continue"):
+        raise ValidationFailed("不支持的故障处理策略")
     with session_scope() as s:
         pkg = s.get(RulePackage, package_id)
         if pkg is None or pkg.project_id != project_id:
@@ -84,71 +91,59 @@ def create_run(
         if not bidder_ids:
             raise ValidationFailed("未选择投标人")
         unconfirmed: list[str] = []
-        dropped_no_price: list[str] = []
         auto = config.auto_mode()
+        if not auto and selected_executor != 1:
+            raise ValidationFailed("执行器版本 2 仅支持全自动评审运行")
         kept: list[int] = []
         for bid_id in bidder_ids:
             bidder = s.get(Bidder, bid_id)
             if bidder is None or bidder.project_id != project_id:
                 raise NotFound(f"投标人 {bid_id} 不存在")
+            if auto:
+                # 报价是自动评审的输入抽取任务，不能因首次抽取失败静默删除参评人。
+                kept.append(bid_id)
+                continue
             if bidder.price_status == "confirmed":
                 kept.append(bid_id)
                 continue
-            if not auto:
-                unconfirmed.append(bidder.name)
-                continue
-            # 全自动模式：抽取报价直接生效（报价冲突项由评分内 LLM 裁决并留痕）；
-            # 连报价都没抽到的无法评分，自动剔除并留痕，不阻塞整场。
-            if bidder.bid_price is None:
-                dropped_no_price.append(bidder.name)
-                s.add(
-                    ReviewRecord(
-                        subject_type="price", subject_id=str(bidder.id), action="flag_conflict",
-                        actor=actor,
-                        reason="全自动模式：未抽取到报价，无法参与评分，已自动剔除",
-                        old_value_json={"price_status": bidder.price_status},
-                    )
-                )
-                continue
-            bidder.price_status = "confirmed"
-            s.add(bidder)
-            s.add(
-                ReviewRecord(
-                    subject_type="price", subject_id=str(bidder.id), action="confirm",
-                    actor=actor,
-                    reason="全自动模式：抽取报价直接生效（冲突项由评分内 LLM 裁决并留痕）",
-                    old_value_json={"price_status": bidder.price_status},
-                    new_value_json={"price_status": "confirmed",
-                                    "price": str(bidder.bid_price)},
-                )
-            )
-            kept.append(bid_id)
+            unconfirmed.append(bidder.name)
         if unconfirmed:
             raise ValidationFailed(
                 f"以下投标人报价尚未人工确认：{'、'.join(unconfirmed)}（价格分输入必须经人工确认）"
             )
         if auto:
             bidder_ids = kept
-            if not bidder_ids:
-                raise ValidationFailed(
-                    f"所选投标人报价均无法自动确认（未抽取到报价：{'、'.join(dropped_no_price)}）"
-                )
         run = EvaluationRun(
             project_id=project_id,
             package_id=package_id,
             package_version=pkg.version,
             package_content_hash=pkg.content_hash,
             status="queued",
-            stages_json=stages or ["objective", "price", "subjective"],
+            # A managed run always evaluates the complete frozen matrix. Legacy
+            # callers may still request individual stages in the historical flow.
+            stages_json=["objective", "price", "subjective"] if auto else (stages or ["objective", "price", "subjective"]),
             llm_provider=provider,
+            llm_model=model,
             config_json={
                 "bidder_ids": bidder_ids,
-                **({"auto_dropped_bidders": dropped_no_price} if auto and dropped_no_price else {}),
+                **({"automation_version": 1, "executor_version": selected_executor,
+                    "failure_policy": failure_policy,
+                    "qualification_mode": config.qualification_mode_default(),
+                    "count_deterministic_mode": config.count_deterministic_default()} if auto else {}),
             },
         )
         s.add(run)
         s.flush()
         run_id = run.id
+
+    if auto:
+        from app.rules.scope import split_out_of_scope
+        from app.services.automation_service import initialize_run
+
+        _snapshot, _criteria = _snapshot_criteria(package_id)
+        evaluated, out_of_scope = split_out_of_scope(_criteria)
+        initialize_run(run_id, evaluated, provider=provider, model=model,
+                       excluded_criteria=out_of_scope)
 
     from app.jobs.queue import submit
 
@@ -171,6 +166,11 @@ def evaluate_job(ctx: JobContext, payload: dict) -> dict:
         provider = payload.get("provider")
         model = payload.get("model")
         summary = execute_run(run_id, provider=provider, model=model, ctx=ctx)
+    except RunExecutionBusy:
+        # A stale heartbeat can let another process reclaim this same job while
+        # its original worker is alive. The OS run lock keeps the owner running;
+        # the duplicate must not overwrite its run status with "failed".
+        raise
     except JobCancelled:
         # 用户取消：运行置 cancelled（不是 failed——那是另一种结局，语义不能混）
         if run_id is not None:
@@ -366,6 +366,20 @@ def _parallel_map(worker_fn, cells: list, *, ctx: JobContext | None, message_fmt
 def execute_run(
     run_id: int, provider: str | None = None, model: str | None = None, ctx: JobContext | None = None
 ) -> dict:
+    # 新自动运行使用带检查点的执行器；历史运行及人工模式仍可查看和复现。
+    with session_scope() as s:
+        managed = s.get(EvaluationRun, run_id)
+        use_automatic_executor = bool(
+            managed is not None and (managed.config_json or {}).get("automation_version") == 1
+        )
+    if use_automatic_executor:
+        from app.services.automatic_scoring_service import execute_automatic_run
+        from app.services.execution_version import bind_run_execution, run_executor_version
+
+        version = run_executor_version(managed)
+        manifest = (managed.config_json or {}).get("automation_manifest") or {}
+        with bind_run_execution(manifest, version):
+            return execute_automatic_run(run_id, ctx=ctx)
     with session_scope() as s:
         run = s.get(EvaluationRun, run_id)
         if run is None:
@@ -393,6 +407,15 @@ def execute_run(
         gateway = Gateway(get_provider(provider, model))
 
     snapshot, criteria = _snapshot_criteria(run.package_id)
+    from app.rules.scope import split_out_of_scope
+
+    criteria, out_of_scope = split_out_of_scope(criteria)
+    if out_of_scope:
+        with session_scope() as s:
+            run_row = s.get(EvaluationRun, run_id)
+            run_row.config_json = {**(run_row.config_json or {}),
+                                   "excluded_criteria": out_of_scope}
+            s.add(run_row)
     # 把规则版本绑定注入每个评分项（score_records 落库用）
     for c in criteria:
         c["package_id"] = run.package_id

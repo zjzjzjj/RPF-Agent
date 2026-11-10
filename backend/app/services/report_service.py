@@ -1,13 +1,14 @@
 """评标报告：数据组装（JSON）与 HTML 渲染。
 
-报告必须自证：规则版本哈希、每条分值的证据与核验状态、复核留痕（人/时间/理由）、
-以及"AI 为辅助、结论由评标委员会确认"的合规声明。
+报告必须自证：规则版本哈希、每条分值的证据与核验状态及操作留痕。
+自动运行描述实际执行的方法与最终结论，历史运行保留原有辅助评审口径。
 """
 from __future__ import annotations
 
 from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 from sqlalchemy import select
 
@@ -23,7 +24,12 @@ from app.db.models import (
     ScoreRecord,
 )
 from app.db.session import session_scope
-from app.errors import NotFound
+from app.errors import NotFound, ValidationFailed
+from app.services.automation_service import (
+    completed_keys as automatic_completed_keys,
+    progress as automation_progress,
+    public_auto_review,
+)
 from app.services.ranking_service import compute_ranking
 from app.services.score_summary_service import SCORE_TYPE_LABELS
 
@@ -48,6 +54,60 @@ REVIEW_LABELS = {
 }
 
 SETTLED_STATUSES = ("human_confirmed", "human_overridden", "auto_confirmed")
+
+AUTOMATIC_REVIEW_METHOD = (
+    "AI 按冻结细则核验资格与符合性事实，并按评分细则评定主观分值；"
+    "未解决项按需执行定向检索、补充 OCR、视觉核验与 AI 复评，"
+    "计数、客观分和价格分由程序按冻结规则确定性重算。"
+    "资格与符合性给出“符合”“不符合”或仅针对缺失外部事实的“现有材料无法证实”最终结论；"
+    "不符合的投标人仍参与评分和排名。"
+    "文件读取与模型故障不得替代材料缺失结论或生成兜底分。"
+)
+
+
+QUALIFICATION_LIGHT_METHOD = (
+    "资格与符合性采用确定性预检与每家投标人一次轻量快审，"
+    "仅作报告提示，不构成完整资格审查，不阻断计分、排名与价格基准价。"
+)
+
+
+def _report_verdict(status: str | None, automated: bool, lightweight: bool = False) -> str:
+    if automated:
+        if lightweight:
+            return {
+                "pass": "预检通过", "fail": "预检不符合",
+                "concern": "预检存疑（未深评）", "not_deeply_reviewed": "未深评",
+                "execution_failed": "评审执行失败",
+            }.get(status or "", "未深评")
+        return {
+            "pass": "符合", "fail": "不符合", "unverifiable": "现有材料无法证实",
+            "execution_failed": "评审执行失败",
+        }.get(status or "", "自动评审未完成")
+    return MACHINE_VERDICT_LABELS.get(status or "", status or "-")
+
+
+def _report_method(score_type: str, automated: bool, lightweight: bool = False) -> str:
+    if automated:
+        if lightweight and score_type in ("veto", "match"):
+            return "确定性预检 + 单次轻量快审（不构成完整审查）"
+        return {
+            "subjective": "AI 按细则评分",
+            "count": "AI 核验事实，程序确定性计数",
+            "formula": "程序按冻结公式计算",
+            "veto": "AI 事实核验与最终符合性判定",
+            "match": "AI 事实核验与最终符合性判定",
+        }.get(score_type, score_type)
+    return SCORE_TYPE_LABELS.get(score_type, score_type)
+
+
+def _is_lightweight(score) -> bool:
+    return ((score.ai_raw_json or {}).get("auto_review") or {}).get("basis") == "lightweight"
+
+
+def _report_reasoning(score, automated: bool) -> str:
+    if automated:
+        return score.ai_reasoning or (public_auto_review(score) or {}).get("reasoning") or ""
+    return score.ai_reasoning or ""
 
 # 疑问分类：报告"先出草稿、把疑问标出"的核心。每条待复核记录归入唯一一类，
 # 按严重度排序，让人一眼看到"哪几条真的需要现在裁决"。
@@ -113,7 +173,7 @@ QUESTION_KINDS: dict[str, dict[str, str]] = {
     "machine_fallback": {
         "severity": "high",
         "label": "兜底分（非评审结论）",
-        "action": "机器故障/无有效输出，按最低档兜底 0 分计入总分（零未定分政策）。"
+        "action": "机器故障/无有效输出，按最低档或 0 分暂定计入（零未定分政策）。"
                   "兜底分不是评审结论——请人工核看原件后改分，或重跑该格。",
     },
     "batch_confirmable": {
@@ -175,6 +235,11 @@ def _classify_question(score, crit) -> str | None:
     """给一条评分记录定性。返回 QUESTION_KINDS 的键；已处置且无疑问返回 None。"""
     if score.review_status == "not_applicable":
         return None
+    _auto_meta = (getattr(score, "ai_raw_json", None) or {}).get("auto_review") or {}
+    if ((_auto_meta.get("fallback") or {}).get("kind")) == "duplicate_summary":
+        return None
+    if _auto_meta.get("basis") == "fallback":
+        return "machine_fallback"
     if score.review_status in SETTLED_STATUSES:
         return None
 
@@ -302,6 +367,10 @@ def _build_open_questions(rows: list, run_id: int) -> tuple[list[dict], dict, li
         meta = QUESTION_KINDS[kind]
         blocks_final = not (
             crit.score_type in ("veto", "match") or score.veto_flag
+            # Provisional closure scores are explicit, visible and listed in
+            # the fallback appendix; they do not hide a missing matrix cell.
+            # The report remains publishable with the caveat banner.
+            or kind == "machine_fallback"
         )
         questions.append(
             {
@@ -373,6 +442,61 @@ def _build_open_questions(rows: list, run_id: int) -> tuple[list[dict], dict, li
     return questions, progress, by_criterion
 
 
+def _build_automatic_questions(run, rows: list, automation: dict, completed: set) -> tuple[list[dict], dict, list[dict]]:
+    """以冻结矩阵列出未完成项，缺失记录和技术故障均不得落入人工裁决文案。"""
+    manifest = (run.config_json or {}).get("automation_manifest") or {}
+    row_by_key = {(score.bidder_id, score.criterion_id): score for score, _crit, _bidder in rows}
+    questions = []
+    grouped = {}
+    for bidder in manifest.get("bidders", []):
+        for crit in manifest.get("criteria", []):
+            key = (int(bidder["id"]), int(crit["id"]))
+            if key in completed:
+                continue
+            score = row_by_key.get(key)
+            meta = public_auto_review(score) or {}
+            failed = meta.get("state") == "failed"
+            question = {
+                "kind": "execution_failed" if failed else "automatic_incomplete",
+                "severity": "high" if failed else "medium",
+                "label": "技术故障" if failed else "自动评审未完成",
+                "action": "故障恢复后继续本次运行，仅执行未完成项",
+                "machine_message": str(meta.get("error") or (score.ai_reasoning if score else "尚未产生评审记录") or "尚未形成有效终态"),
+                "bidder": bidder.get("name") or str(bidder["id"]),
+                "bidder_id": key[0], "score_id": score.id if score else None,
+                "code": crit.get("code"), "criterion": crit.get("name"),
+                "category": CATEGORY_LABELS.get(crit.get("category"), crit.get("category")),
+                "max_score": crit.get("max_score"),
+                "final_score": str(score.final_score) if score and score.final_score is not None else None,
+                "machine_status": score.machine_status if score else None,
+                "review_status": "评审执行失败" if failed else "自动评审未完成",
+                "evidence_status": score.evidence_status if score else "none",
+                "source_page": crit.get("source_page"), "source_quote": crit.get("source_quote"),
+                "blocks_final": True,
+            }
+            questions.append(question)
+            group = grouped.setdefault(key[1], {
+                **{field: question[field] for field in (
+                    "code", "criterion", "category", "max_score", "kind", "severity", "label", "action", "blocks_final"
+                )},
+                "bidders": [],
+            })
+            group["bidders"].append({field: question[field] for field in (
+                "bidder", "bidder_id", "score_id", "final_score", "machine_message"
+            )})
+            if failed:
+                group.update(severity="high", kind="execution_failed", label="技术故障")
+    questions.sort(key=lambda q: (_SEVERITY_ORDER.get(q["severity"], 9), q["bidder"], q["code"] or ""))
+    by_criterion = sorted(grouped.values(), key=lambda g: (_SEVERITY_ORDER.get(g["severity"], 9), g["code"] or ""))
+    progress = {
+        "total": automation["expected"], "settled": automation["completed"],
+        "open": automation["remaining"], "blocking": automation["failed"],
+        "blocking_open": automation["remaining"], "criteria_open": len(grouped),
+        "by_kind": {kind: sum(q["kind"] == kind for q in questions) for kind in {q["kind"] for q in questions}},
+    }
+    return questions, progress, by_criterion
+
+
 def _doc_name(document_id: int | None) -> str | None:
     """细则来源招标文件名（错配护栏标注用）。"""
     if not document_id:
@@ -408,8 +532,15 @@ def build_report(project_id: str, run_id: int | None = None) -> dict:
         if run is None or run.project_id != project_id:
             raise NotFound("评分运行不存在或不属于该项目")
         pkg = s.get(RulePackage, run.package_id)
+        automation = automation_progress(run_id, session=s)
+        automated = automation is not None
+        completed = automatic_completed_keys(run_id) if automated else set()
+        frozen_criteria = {
+            int(c["id"]): c for c in ((run.config_json or {}).get("automation_manifest") or {}).get("criteria", [])
+        }
 
         ranking = compute_ranking(project_id, run_id)
+        ranking_by_bidder = {r["bidder_id"]: r for r in ranking["rows"]}
 
         rows = s.execute(
             select(ScoreRecord, Criterion, Bidder)
@@ -430,22 +561,30 @@ def build_report(project_id: str, run_id: int | None = None) -> dict:
 
         bidders_detail: dict[int, dict] = {}
         for score, crit, bidder in rows:
+            frozen = frozen_criteria.get(crit.id, {}) if automated else {}
+            auto_review = public_auto_review(score) if automated else None
+            cell_completed = (bidder.id, crit.id) in completed
             entry = bidders_detail.setdefault(
                 bidder.id,
-                {"bidder_id": bidder.id, "name": bidder.name,
-                 "bid_price": str(bidder.bid_price) if bidder.bid_price else None,
+                {"bidder_id": bidder.id, "name": ranking_by_bidder.get(bidder.id, {}).get("bidder_name", bidder.name),
+                 "bid_price": ranking_by_bidder.get(bidder.id, {}).get("bid_price"),
                  "status": bidder.status, "items": []},
             )
             entry["items"].append(
                 {
-                    "code": crit.code,
-                    "name": crit.name,
-                    "category": CATEGORY_LABELS.get(crit.category, crit.category),
-                    "max_score": str(crit.max_score) if crit.max_score else None,
-                    "score_type": crit.score_type,
-                    "is_veto": crit.score_type == "veto",
+                    "code": frozen.get("code", crit.code),
+                    "name": frozen.get("name", crit.name),
+                    "category": CATEGORY_LABELS.get(frozen.get("category", crit.category), frozen.get("category", crit.category)),
+                    "max_score": str(frozen.get("max_score", crit.max_score)) if frozen.get("max_score", crit.max_score) is not None else None,
+                    "score_type": frozen.get("score_type", crit.score_type),
+                    "is_veto": frozen.get("score_type", crit.score_type) == "veto",
+                    "is_verdict": frozen.get("score_type", crit.score_type) in ("veto", "match"),
                     "machine_status": score.machine_status,
-                    "final_score": str(score.final_score) if score.final_score is not None else None,
+                    "verdict": _report_verdict(score.machine_status, automated, _is_lightweight(score)),
+                    "reasoning": _report_reasoning(score, automated) if automated or score.ai_revealed_at is not None or score.review_status in SETTLED_STATUSES else None,
+                    "auto_review": auto_review,
+                    "auto_completed": cell_completed,
+                    "final_score": str(score.final_score) if score.final_score is not None and (not automated or cell_completed) else None,
                     # 防锚定是服务端强制（见 api/scores.py）：未解锁前不得暴露 AI 建议分。
                     # 报告提前到复核前可生成后，这里若无条件输出就成了旁路——
                     # 评审人做独立判断前先看到 AI 建议，独立性即被破坏。
@@ -453,12 +592,14 @@ def build_report(project_id: str, run_id: int | None = None) -> dict:
                     if (score.ai_suggested_score is not None and score.ai_revealed_at is not None)
                     else None,
                     "ai_revealed": score.ai_revealed_at is not None,
-                    "review_status": REVIEW_LABELS.get(score.review_status, score.review_status),
+                    "review_status": ("自动评审完成" if cell_completed else
+                                      "评审执行失败" if (auto_review or {}).get("state") == "failed" else
+                                      "自动评审未完成") if automated else REVIEW_LABELS.get(score.review_status, score.review_status),
                     "evaluator_actor": score.evaluator_actor,
                     "confirm_time": score.confirm_time.isoformat() if score.confirm_time else None,
                     "evidence_status": score.evidence_status,
-                    "source_quote": crit.source_quote,
-                    "source_page": crit.source_page,
+                    "source_quote": frozen.get("source_quote") if automated else crit.source_quote,
+                    "source_page": frozen.get("source_page") if automated else crit.source_page,
                     "citations": [
                         {
                             "quote": c.quote,
@@ -482,13 +623,17 @@ def build_report(project_id: str, run_id: int | None = None) -> dict:
         ).scalars().all()
 
         open_questions, progress, by_criterion = _build_open_questions(rows, run_id)
+        if automation is not None:
+            open_questions, progress, by_criterion = _build_automatic_questions(run, rows, automation, completed)
         # 报告状态：**评分侧**疑问（count/subjective/formula/fallback/evidence 等）
         # 清零才定稿；veto/match 类疑问按 2026-11-04「资格审查弱化」决策降为提示
         # 不阻塞（仍列疑问清单，人工必须能看到）。草稿可生成但必须自带醒目声明。
         # 另有一条硬约束：评分运行未成功时绝不能出定稿——否则"0 条记录"会让
         # progress 归零，报告宣称"全部 0 项均已人工处置"，把失败读成完成。
-        run_ok = run.status == "succeeded" and bool(rows)
-        report_status = "final" if (progress["blocking_open"] == 0 and run_ok) else "draft"
+        run_ok = (automation["is_final"] if automation is not None
+                  else run.status == "succeeded" and bool(rows))
+        report_status = ("partial" if automated and run.status == "partial" else
+                         "final" if (progress["blocking_open"] == 0 and run_ok) else "draft")
         if not run_ok:
             progress["incomplete_reason"] = (
                 f"评分运行 #{run.id} 状态为 {run.status}，报告内容不完整"
@@ -501,13 +646,24 @@ def build_report(project_id: str, run_id: int | None = None) -> dict:
                 "max_price": str(project.max_price) if project.max_price else None,
             },
             "status": report_status,
-            "status_label": "报告定稿" if report_status == "final" else "报告草稿（待复核）",
+            "status_label": ("报告定稿" if report_status == "final" else
+                             "评审已结束（含故障跳过项）" if report_status == "partial" else
+                             "自动评审未完成" if automation is not None else "报告草稿（待复核）"),
             "progress": progress,
+            "automatic_method": (
+                QUALIFICATION_LIGHT_METHOD if (run.config_json or {}).get("qualification_mode") == "light"
+                else AUTOMATIC_REVIEW_METHOD
+            ) if automated else None,
+            "qualification_mode": (run.config_json or {}).get("qualification_mode", "full") if automated else None,
             "open_questions": open_questions,
             "fallback_scores": _fallback_items(rows),
             "open_by_criterion": by_criterion,
+            # 围串标条款由独立智能体负责：本系统不评审、不评分、不否决。
+            # 这里只列示留空范围与依据，避免报告出现"漏评"的误解。
+            "out_of_scope": (run.config_json or {}).get("excluded_criteria") or [],
             "run": {
                 "id": run.id, "status": run.status,
+                "automation": automation,
                 "package_version": run.package_version,
                 "package_content_hash": run.package_content_hash,
                 "llm_provider": run.llm_provider, "llm_model": run.llm_model,
@@ -567,6 +723,8 @@ TAX_RATE = Decimal("0.06")  # 不含税换算（真实报告口径：不含税=�
 JUDGE_LABEL = "AI 评委"
 
 MACHINE_VERDICT_LABELS = {
+    "unverifiable": "现有材料无法证实",
+    "execution_failed": "评审执行失败",
     "pass": "通过",
     "recommend_reject": "建议否决",
     "need_human": "待人工判定",
@@ -594,7 +752,7 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
     形态对齐真实评审资料（如浙江中烟项目）：正文（项目简介/过程/程序/结论）
     → 评审结果汇总表（投标人 × 评委 + 最终得分 + 名次）→ 评审情况说明（逐家
     零分/扣分依据）→ 附表（资格审查/符合性/分项得分/价格/AI 评审明细）。
-    合规：全程标注 AI 辅助评审，结论须评标委员会确认。
+    自动运行使用冻结输入并说明实际评审方法，历史运行保留原有辅助评审口径。
     """
     with session_scope() as s:
         project = s.get(Project, project_id)
@@ -611,11 +769,31 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
         run = s.get(EvaluationRun, run_id)
         if run is None or run.project_id != project_id:
             raise NotFound("评分运行不存在或不属于该项目")
+        automation = automation_progress(run_id, session=s)
+        automated = automation is not None
+        if automation is not None and not automation["is_final"]:
+            message = (f"自动评审尚有 {automation['remaining']} 项未完成，不能生成正式报告"
+                       if automation["remaining"] else "自动评审运行尚未成功结束，不能生成正式报告")
+            raise ValidationFailed(message)
         if run.status != "succeeded":
             raise NotFound(f"评分运行 #{run_id} 状态为 {run.status}，未成功不能出正式报告")
         pkg = s.get(RulePackage, run.package_id)
 
         bidders = s.execute(select(Bidder).where(Bidder.project_id == project_id).order_by(Bidder.id)).scalars().all()
+        if automation is not None:
+            selected = set((run.config_json or {}).get("bidder_ids", []))
+            bidders = [b for b in bidders if b.id in selected]
+        run_config = run.config_json or {}
+        resolved_prices = {
+            str(b["id"]): b.get("bid_price")
+            for b in (run_config.get("automation_manifest") or {}).get("bidders", [])
+        }
+        resolved_prices.update(run_config.get("resolved_prices", {}))
+        effective_prices = {
+            b.id: Decimal(str(resolved_prices[str(b.id)]))
+            if resolved_prices.get(str(b.id)) is not None else b.bid_price
+            if automation is None else None for b in bidders
+        }
         criteria = s.execute(
             select(Criterion).where(Criterion.package_id == run.package_id, Criterion.status != "retired")
             .order_by(Criterion.sort_order)
@@ -631,6 +809,24 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
                 EvidenceCitation.score_record_id.in_([r[0].id for r in score_rows] or [-1])
             )
         ).scalars().all()
+
+        if automated:
+            manifest = run_config.get("automation_manifest") or {}
+            live_bidders = {b.id: b for b in bidders}
+            bidders = [SimpleNamespace(
+                id=int(b["id"]), name=b.get("name"),
+                bid_price=effective_prices[int(b["id"])],
+                status=live_bidders[int(b["id"])].status,
+            ) for b in manifest.get("bidders", [])]
+            criteria = [SimpleNamespace(**{
+                "description": None, "source_quote": None, "source_page": None,
+                "max_score": None, **c, "id": int(c["id"]),
+            }) for c in manifest.get("criteria", [])]
+            frozen_by_id = {c.id: c for c in criteria}
+            bidder_by_id = {b.id: b for b in bidders}
+            score_rows = [(score, frozen_by_id[crit.id], bidder_by_id[bidder.id])
+                          for score, crit, bidder in score_rows
+                          if crit.id in frozen_by_id and bidder.id in bidder_by_id]
 
     ranking_rows = compute_ranking(project_id, run_id).get("rows", [])
     rank_by_bidder = {r["bidder_id"]: r for r in ranking_rows}
@@ -690,7 +886,7 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
             break
     show_judges = committee_size >= 2
     judge_labels = [f"{JUDGE_LABEL}{i}" for i in range(1, committee_size + 1)] if show_judges else []
-    if cluster_mode:
+    if cluster_mode and show_judges:
         judge_labels = [f"证据簇{i}" for i in range(1, committee_size + 1)]
 
     # ---- 评审结果汇总表（评委矩阵 + 最终得分 + 名次） ----
@@ -714,12 +910,28 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
         summary_rows.append({
             "bidder_id": bidder.id,
             "bidder": bidder.name,
-            "bid_price": str(bidder.bid_price) if bidder.bid_price is not None else None,
-            "price_no_tax": str(_no_tax(bidder.bid_price)) if bidder.bid_price is not None else None,
+            "bid_price": str(effective_prices[bidder.id]) if effective_prices[bidder.id] is not None else None,
+            "price_no_tax": str(_no_tax(effective_prices[bidder.id])) if not automated and effective_prices[bidder.id] is not None else None,
             "judge_totals": per_judge_totals,
             "final": str(rk.get("total")) if rk.get("total") is not None else None,
             "rank": rk.get("rank"),
             "veto_flag": rk.get("veto_flag", False),
+            "has_noncompliance": automated and any(
+                entry[0].machine_status == "fail" and not _is_lightweight(entry[0])
+                for crit in criteria if crit.score_type in ("veto", "match")
+                and (entry := score_by_key.get((bidder.id, crit.id))) is not None
+            ),
+            "has_external_boundary": automated and any(
+                entry[0].machine_status == "unverifiable" and not _is_lightweight(entry[0])
+                for crit in criteria if crit.score_type in ("veto", "match")
+                and (entry := score_by_key.get((bidder.id, crit.id))) is not None
+            ),
+            "has_precheck_alert": automated and any(
+                _is_lightweight(entry[0])
+                and entry[0].machine_status in ("fail", "concern", "not_deeply_reviewed")
+                for crit in criteria if crit.score_type in ("veto", "match")
+                and (entry := score_by_key.get((bidder.id, crit.id))) is not None
+            ),
             "status": bidder.status,
         })
 
@@ -733,10 +945,10 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
                 continue
             score = entry[0]
             is_zero = score.final_score is not None and Decimal(str(score.final_score)) == 0 and crit.score_type != "veto"
-            is_reject = score.machine_status in ("recommend_reject", "conflict_flagged")
+            is_reject = score.machine_status in (("fail", "unverifiable") if automated else ("recommend_reject", "conflict_flagged"))
             if not (is_zero or is_reject):
                 continue
-            reason = score.ai_reasoning or ""
+            reason = _report_reasoning(score, automated)
             if not reason:
                 for w in score.warnings_json or []:
                     if isinstance(w, dict) and w.get("message"):
@@ -747,7 +959,7 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
                 "criterion": crit.name,
                 "category": CATEGORY_LABELS.get(crit.category, crit.category),
                 "final": str(score.final_score) if score.final_score is not None else None,
-                "verdict": MACHINE_VERDICT_LABELS.get(score.machine_status or "", score.machine_status),
+                "verdict": _report_verdict(score.machine_status, automated, _is_lightweight(score)),
                 "reason": reason[:500],
             })
         if items:
@@ -776,14 +988,14 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
                     cells.append({"verdict": "未评", "reason": ""})
                     continue
                 score = entry[0]
-                reason = score.ai_reasoning or ""
+                reason = _report_reasoning(score, automated)
                 if not reason:
                     for w in score.warnings_json or []:
                         if isinstance(w, dict) and w.get("message"):
                             reason = str(w["message"])
                             break
                 cells.append({
-                    "verdict": MACHINE_VERDICT_LABELS.get(score.machine_status or "", score.machine_status or "-"),
+                    "verdict": _report_verdict(score.machine_status, automated, _is_lightweight(score)),
                     "reason": reason[:300],
                 })
             rows.append({
@@ -823,8 +1035,8 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
                 "code": crit.code,
                 "name": crit.name,
                 "factor": crit.source_quote or crit.description or "",
-                "max_score": str(crit.max_score) if crit.max_score else None,
-                "method": SCORE_TYPE_LABELS.get(crit.score_type, crit.score_type),
+                "max_score": str(crit.max_score) if crit.max_score is not None else None,
+                "method": _report_method(crit.score_type, automated, _is_lightweight(score)),
                 "per_bidder": per_bidder,
             })
         score_groups.append({"category": label, "items": items})
@@ -835,8 +1047,8 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
         rk = rank_by_bidder.get(bidder.id, {})
         price_rows.append({
             "bidder": bidder.name,
-            "bid_price": str(bidder.bid_price) if bidder.bid_price is not None else None,
-            "price_no_tax": str(_no_tax(bidder.bid_price)) if bidder.bid_price is not None else None,
+            "bid_price": str(effective_prices[bidder.id]) if effective_prices[bidder.id] is not None else None,
+            "price_no_tax": str(_no_tax(effective_prices[bidder.id])) if not automated and effective_prices[bidder.id] is not None else None,
             "score": str(rk.get("price_score")) if rk.get("price_score") is not None else "-",
             "explanations": base_by_bidder[bidder.id]["price_explanations"][:3],
         })
@@ -856,18 +1068,18 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
             items.append({
                 "code": crit.code,
                 "name": crit.name,
-                "max_score": str(crit.max_score) if crit.max_score else None,
-                "method": SCORE_TYPE_LABELS.get(crit.score_type, crit.score_type),
+                "max_score": str(crit.max_score) if crit.max_score is not None else None,
+                "method": _report_method(crit.score_type, automated, _is_lightweight(score)),
                 "judges": [
                     {
-                        "judge": f"{JUDGE_LABEL}{m.get('judge_no')}",
+                        "judge": f"{'证据簇' if cluster_mode else JUDGE_LABEL}{m.get('judge_no')}",
                         "score": str(m.get("score")) if m.get("score") is not None else "未给出",
                         "dropped": bool(m.get("dropped")),
                     }
                     for m in committee
                 ],
                 "final": str(score.final_score) if score.final_score is not None else None,
-                "reasoning": (score.ai_reasoning or "")[:600],
+                "reasoning": _report_reasoning(score, automated)[:600],
                 "citations": [
                     {"quote": c.quote[:160], "page_no": c.page_no, "verified": c.verified}
                     for c in citations_by_score.get(score.id, [])[:3]
@@ -878,8 +1090,37 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
 
     total_citations = len(citations)
     verified_citations = sum(1 for c in citations if c.verified)
+    if automated:
+        declaration_text = "本报告由全自动评标系统生成。" + AUTOMATIC_REVIEW_METHOD
+    else:
+        declaration_text = (
+            "本报告由 AI 辅助评审系统自动生成："
+            f"按 {committee_size} 个证据簇分层评审主观评分项"
+            "（逐簇评分后按子项跨簇平均/证据相关性加权聚合）"
+            if cluster_mode and committee_size >= 2
+            else (
+                "本报告由 AI 辅助评审系统自动生成："
+                f"{committee_size} 个 AI 评审 Agent 对主观评分项独立评分，"
+                "去除一个最高分和一个最低分后取平均作为该项最终得分"
+                if committee_size >= 2
+                else "本报告由 AI 辅助评审系统自动生成：AI 评审 Agent 对主观评分项"
+                "依据招标文件载明的判据独立评定分值"
+            )
+        ) + (
+            "；否决项、计数项与价格分由确定性引擎计算。本报告供评标委员会参考，"
+            "所有存疑事项、否决建议与最终结论须经评标委员会确认。"
+        )
+    declaration_text += (f"规则包版本 v{run.package_version}（内容哈希 {run.package_content_hash}）；"
+                         f"引文核验 {verified_citations}/{total_citations}。")
 
     return {
+        "report_title": "评审报告（全自动评审）" if automated else "评审报告（AI 辅助评审）",
+        "method_note": AUTOMATIC_REVIEW_METHOD if automated else None,
+        "score_table_title": "分项得分表（自动评审结果）" if automated else
+                             "分项得分表（证据簇明细）" if cluster_mode else "分项得分表（AI 评委矩阵）",
+        "final_score_label": "最终得分" if automated else "最终得分(去尾)",
+        "review_notes_title": "评审情况说明（零分、不符合与外部事实证据边界）" if automated else "评审情况说明（零分/否决依据）",
+        "no_review_notes": "无零分、不符合或外部事实无法证实事项。" if automated else "无零分或否决建议事项。",
         "project": {
             "id": project.id, "name": project.name, "purchaser": project.purchaser,
             "code": project.project_code,
@@ -887,6 +1128,7 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
         "generated_at": datetime.now().isoformat(timespec="seconds"),
         "run": {
             "id": run.id, "package_version": run.package_version,
+            "automation": automation,
             "package_content_hash": run.package_content_hash,
             "llm_model": run.llm_model,
             "started_at": run.started_at.isoformat() if run.started_at else None,
@@ -902,30 +1144,14 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
         "compliance_table": compliance_table,
         "score_groups": score_groups,
         "price_rows": price_rows,
-        "tax_rate": str(TAX_RATE),
+        "tax_rate": None if automated else str(TAX_RATE),
+        "tax_note": "未提供可核验税率，不推算不含税报价。" if automated else
+                    f"不含税价按 {TAX_RATE} 增值税率换算（不含税=含税/1.06）。",
         "ai_detail": ai_detail,
         "declaration": {
-            "ai_assisted": True,
-            "text": (
-                (
-                    "本报告由 AI 辅助评审系统自动生成："
-                    f"按 {committee_size} 个证据簇分层评审主观评分项"
-                    "（逐簇评分后按子项跨簇平均/证据相关性加权聚合）"
-                    if cluster_mode and committee_size >= 2
-                    else (
-                        "本报告由 AI 辅助评审系统自动生成："
-                        f"{committee_size} 个 AI 评审 Agent 对主观评分项独立评分，"
-                        "去除一个最高分和一个最低分后取平均作为该项最终得分"
-                        if committee_size >= 2
-                        else "本报告由 AI 辅助评审系统自动生成：AI 评审 Agent 对主观评分项"
-                        "依据招标文件载明的判据独立评定分值"
-                    )
-                )
-                + "；否决项、计数项与价格分由确定性引擎计算。本报告供评标委员会参考，"
-                "所有存疑事项、否决建议与最终结论须经评标委员会确认。"
-                f"规则包版本 v{run.package_version}（内容哈希 {run.package_content_hash}）；"
-                f"引文核验 {verified_citations}/{total_citations}。"
-            ),
+            "ai_assisted": not automated,
+            "automated": automated,
+            "text": declaration_text,
         },
     }
 
@@ -950,6 +1176,7 @@ def render_docx(report: dict) -> bytes:
     from docx.shared import Pt
 
     doc = DocxDocument()
+    automated = report["run"].get("automation") is not None
     style = doc.styles["Normal"]
     style.font.name = "宋体"
     style.font.size = Pt(11)
@@ -973,7 +1200,7 @@ def render_docx(report: dict) -> bytes:
     # 封面
     title = doc.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = title.add_run(report["project"]["name"] + "\n评审报告（AI 辅助评审）")
+    run = title.add_run(report["project"]["name"] + "\n" + report["report_title"])
     run.bold = True
     run.font.size = Pt(18)
     para(f"项目编号：{report['project']['code'] or '-'}")
@@ -990,12 +1217,16 @@ def render_docx(report: dict) -> bytes:
         rows.append(
             [r["bidder"], r["bid_price"] or "-", r["price_no_tax"] or "-"]
             + [j["total"] for j in r["judge_totals"]]
-            + [r["final"] or "-", str(r["rank"] or "-") + ("（有否决建议）" if r["veto_flag"] else "")]
+            + [r["final"] or "-", str(r["rank"] or "-") + (
+                "（存在不符合结论）" if automated and r.get("has_noncompliance") else
+                "（外部事实无法证实）" if automated and r.get("has_external_boundary") else
+                "（有否决建议）" if not automated and r["veto_flag"] else ""
+            )]
         )
     table(headers, rows)
-    heading("三、评审情况说明（零分/否决依据）", 1)
+    heading("三、" + report["review_notes_title"], 1)
     if not report["review_notes"]:
-        para("无零分或否决建议事项。")
+        para(report["no_review_notes"])
     for note in report["review_notes"]:
         para(f"{note['bidder']}：")
         for it in note["items"]:
@@ -1003,7 +1234,8 @@ def render_docx(report: dict) -> bytes:
                  + (f"，得 {it['final']} 分" if it["final"] is not None else "")
                  + f"。依据：{it['reason']}")
     if report.get("fallback_scores"):
-        para("兜底分清单（非评审结论）：以下格为全自动模式最低档兜底或机器未抽到事实的 "
+        para("以下记录含故障兜底标记，不构成有效最终分；恢复后继续自动评审。" if automated else
+             "兜底分清单（非评审结论）：以下格为全自动模式最低档兜底或机器未抽到事实的 "
              "0 分，已按零未定分政策计入总分，请人工核看原件后改分或重跑：")
         for f in report["fallback_scores"]:
             para(f"　· {f['bidder']}：{f['criterion']}（当前 {f['final_score']} 分，"
@@ -1015,7 +1247,9 @@ def render_docx(report: dict) -> bytes:
         para("按最终得分排序，推荐中标候选人如下：")
         for i, r in enumerate(ordered[:2], start=1):
             para(f"第{i}中标候选人：{r['bidder']}（最终得分 {r['final']}）")
-        para("以上排序为 AI 辅助评审结果，须评标委员会确认后生效。")
+        para("以上为系统完成全部评审后的评分排序；资格与符合性风险另见审查表。"
+             if report["run"].get("automation") is not None else
+             "以上排序为 AI 辅助评审结果，须评标委员会确认后生效。")
     doc.add_page_break()
 
     # 附表 A1 资格 / A2 符合性
@@ -1033,15 +1267,17 @@ def render_docx(report: dict) -> bytes:
                 [[tab["judges"][i], c["verdict"], c["reason"] or "-"] for i, c in enumerate(row["cells"])],
             )
     # A3 分项得分表
-    heading("附表 A3 分项得分表（AI 评委矩阵）", 1)
+    heading("附表 A3 " + report["score_table_title"], 1)
     for group in report["score_groups"]:
         heading(group["category"], 2)
         for item in group["items"]:
             heading(f"{item['code']} {item['name']}（满分 {item['max_score']}）", 3)
+            if automated:
+                para(f"评审方法：{item['method']}")
             if item["factor"]:
                 para(f"评审因素（原文）：{item['factor'][:400]}")
             table(
-                ["投标人"] + report["judge_labels"] + ["最终得分(去尾)"],
+                ["投标人"] + report["judge_labels"] + [report["final_score_label"]],
                 [[p["bidder"]] + p["judge_scores"] + [p["final"]] for p in item["per_bidder"]],
             )
     # A4 价格评审
@@ -1051,7 +1287,7 @@ def render_docx(report: dict) -> bytes:
         [[p["bidder"], p["bid_price"] or "-", p["price_no_tax"] or "-", p["score"],
           "；".join(p["explanations"])[:200] or "-"] for p in report["price_rows"]],
     )
-    para(f"注：不含税价按 {report['tax_rate']} 增值税率换算（不含税=含税/1.06）。")
+    para("注：" + report["tax_note"])
     # A5 AI 评审明细
     heading("附表 A5 AI 评审明细（主观项）", 1)
     for detail in report["ai_detail"]:
@@ -1062,7 +1298,9 @@ def render_docx(report: dict) -> bytes:
                 for j in it["judges"]
             )
             heading(f"{it['code']} {it['name']}（满分 {it['max_score']}）→ 最终 {it['final']}", 3)
-            para(f"评委分：{marks}")
+            if it["judges"]:
+                label = "证据簇得分" if report.get("committee_semantic") == "evidence_cluster" else "评委分"
+                para(f"{label}：{marks}")
             if it["reasoning"]:
                 para(f"评审依据：{it['reasoning']}")
             for c in it["citations"]:

@@ -15,16 +15,19 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+import time
 import traceback
 from contextlib import suppress
 from datetime import timedelta
 from typing import Any
 
 from sqlalchemy import func, or_, select, update
+from sqlalchemy.exc import OperationalError
 
 from app import config
 from app.db.models import Job, utcnow
 from app.db.session import session_scope
+from app.services.run_execution_lock import RunExecutionBusy
 
 log = logging.getLogger("bid_eval.jobs")
 
@@ -59,22 +62,50 @@ class JobContext:
         self._update(message)
         self.check_cancelled()
 
+    def report(self, message: str) -> None:
+        """Report real work within a step without inventing completed items."""
+        self._update(message)
+        self.check_cancelled()
+
     def check_cancelled(self) -> None:
-        with session_scope() as s:
-            job = s.get(Job, self.job_id)
-            if job is not None and job.cancel_requested:
-                raise JobCancelled()
+        # Progress and cancellation are control-plane writes; a transient
+        # SQLite lock must not kill an evaluation run (run 85: an OperationalError
+        # escaped from a progress update and failed the whole job).
+        for attempt in range(3):
+            try:
+                with session_scope() as s:
+                    job = s.get(Job, self.job_id)
+                    if job is not None and job.cancel_requested:
+                        raise JobCancelled()
+                return
+            except JobCancelled:
+                raise
+            except OperationalError:
+                if attempt == 2:
+                    log.warning("任务 %s 取消状态检查失败（数据库锁），本轮跳过", self.job_id,
+                                exc_info=True)
+                    return
+                time.sleep(0.2 * (attempt + 1))
 
     def _update(self, message: str | None) -> None:
-        with session_scope() as s:
-            job = s.get(Job, self.job_id)
-            if job is None:
+        for attempt in range(3):
+            try:
+                with session_scope() as s:
+                    job = s.get(Job, self.job_id)
+                    if job is None:
+                        return
+                    job.done_steps = self._done
+                    job.total_steps = self._total
+                    if message is not None:
+                        job.message = message[:500]
+                    job.heartbeat_at = utcnow()
                 return
-            job.done_steps = self._done
-            job.total_steps = self._total
-            if message is not None:
-                job.message = message[:500]
-            job.heartbeat_at = utcnow()
+            except OperationalError:
+                if attempt == 2:
+                    log.warning("任务 %s 进度更新失败（数据库锁），继续执行", self.job_id,
+                                exc_info=True)
+                    return
+                time.sleep(0.2 * (attempt + 1))
 
     # -- 心跳 ---------------------------------------------------------------
     # 进度更新只在 handler 调 advance() 时刷新 heartbeat_at，而 handler 可能长时间
@@ -192,6 +223,7 @@ def _claim_next_job() -> int | None:
             )
             .values(
                 status="failed",
+                message="执行失败：任务心跳超时",
                 error=f"任务心跳超时且重试次数已达上限（{config.JOB_MAX_ATTEMPTS} 次），已放弃",
                 finished_at=utcnow(),
             )
@@ -256,12 +288,18 @@ def _run_job(job_id: int) -> None:
             if job is None or job.cancel_requested:
                 if job is not None:
                     job.status = "cancelled"
+                    job.message = "已取消"
                     job.finished_at = utcnow()
                 return
             job.status = "succeeded"
             job.result_json = result
             job.message = "完成"
             job.finished_at = utcnow()
+    except RunExecutionBusy:
+        # Another process still owns this run. Leave the shared job receipt
+        # untouched: its original worker continues heartbeat/progress and will
+        # persist the result. If that worker dies, normal stale recovery retries.
+        log.info("任务 %s 已有运行中的评标进程，本次未重复执行", job_id)
     except JobCancelled:
         with session_scope() as s:
             job = s.get(Job, job_id)
@@ -275,6 +313,7 @@ def _run_job(job_id: int) -> None:
             job = s.get(Job, job_id)
             if job is not None:
                 job.status = "failed"
+                job.message = "执行失败"
                 job.error = f"{type(exc).__name__}: {exc}\n{traceback.format_exc()[-4000:]}"
                 job.finished_at = utcnow()
     finally:

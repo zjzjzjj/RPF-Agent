@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
-<title>{{ project.name }} 评审报告（AI 辅助评审）</title>
+<title>{{ project.name }} {{ report_title }}</title>
 <style>
   body { font-family: "SimSun","Songti SC",serif; margin: 32px auto; max-width: 1100px; color: #111; line-height: 1.7; }
   h1 { text-align: center; font-size: 22px; }
@@ -23,11 +23,11 @@
 </style>
 </head>
 <body>
-<h1>{{ project.name }}<br>评审报告（AI 辅助评审）</h1>
+<h1>{{ project.name }}<br>{{ report_title }}</h1>
 <p class="meta">项目编号：{{ project.code or "-" }} ｜ 评分运行 #{{ run.id }} ｜ 规则包 v{{ run.package_version }}（{{ run.package_content_hash }}）<br>
 生成时间：{{ generated_at }}</p>
 
-<div class="declaration"><strong>合规声明：</strong>{{ declaration.text }}</div>
+<div class="declaration"><strong>{{ "自动评审说明" if run.automation else "合规声明" }}：</strong>{{ declaration.text }}</div>
 
 <h2>一、评审结果汇总表</h2>
 <table>
@@ -36,21 +36,25 @@
     <th>最终得分</th><th>名次</th></tr>
   {% for r in summary_rows | sort(attribute="rank") %}
   <tr>
-    <td class="left">{{ r.bidder }}{% if r.veto_flag %} <span class="veto">〔有否决建议〕</span>{% endif %}</td>
+    <td class="left">{{ r.bidder }}{% if run.automation %}{% if r.has_noncompliance %} <span class="veto">〔存在不符合结论〕</span>{% endif %}{% if r.has_external_boundary %} <span class="note">〔外部事实无法证实〕</span>{% endif %}{% elif r.veto_flag %} <span class="veto">〔有否决建议〕</span>{% endif %}</td>
     <td>{{ r.bid_price or "-" }}</td><td>{{ r.price_no_tax or "-" }}</td>
     {% for j in r.judge_totals %}<td>{{ j.total }}{% if j.missing %}*</td>{% else %}</td>{% endif %}{% endfor %}
     <td><strong>{{ r.final or "-" }}</strong></td><td>{{ r.rank or "-" }}</td>
   </tr>
   {% endfor %}
 </table>
+{% if run.automation %}
+<p class="note">{{ method_note }} 各项实际分值、理由及证据列于附表；仅展示本次运行实际留存的评审明细。</p>
+{% else %}
 <p class="note">注：客观项（资格/符合性/计数）与价格分由确定性引擎计算，各评审单位共享；
 {% if committee_semantic == "evidence_cluster" %}主观分为证据簇分层评审：先在投标文件中定位多个独立证据簇，逐簇评分后按子项跨簇平均/证据相关性加权聚合计入最终得分。* 表示该证据簇在此投标人部分主观项未给出有效分。
 {% else %}主观分为各 AI 评委独立评分，按项去最高最低后取平均计入最终得分。* 表示该评委在此投标人部分主观项未给出有效分。
 {% endif %}<br/>
 分项口径：价格分（客观）、商务分（客观）、技术分（主观+客观）；各评分项所属口径在“附表 A3”与“附表 A5”逐项标注（主观＝{% if committee_semantic == "evidence_cluster" %}证据簇分层评审{% else %}AI 评委评审{% endif %}，客观＝公式/计数确定性计算，否决项与判断项只出结论不计分）。</p>
+{% endif %}
 
-<h2>二、评审情况说明（零分/否决依据）</h2>
-{% if not review_notes %}<p>无零分或否决建议事项。</p>{% endif %}
+<h2>二、{{ review_notes_title }}</h2>
+{% if not review_notes %}<p>{{ no_review_notes }}</p>{% endif %}
 {% for note in review_notes %}
 <h3>{{ note.bidder }}</h3>
 <ul>
@@ -67,7 +71,7 @@
 <ol>
 {% for r in ordered[:2] %}<li><strong>{{ r.bidder }}</strong>（最终得分 {{ r.final }}）</li>{% endfor %}
 </ol>
-<p>以上排序为 AI 辅助评审结果，须经评标委员会确认后生效。</p>
+<p>{% if run.automation %}以上为系统完成全部评审后的评分排序；资格与符合性风险另见审查表。{% else %}以上排序为 AI 辅助评审结果，须经评标委员会确认后生效。{% endif %}</p>
 {% else %}<p>暂无可排序的评分结果。</p>{% endif %}
 
 <h2>附表 A1 资格性审查表</h2>
@@ -88,13 +92,13 @@
 </table>
 {% endfor %}
 
-<h2>附表 A3 分项得分表（{% if committee_semantic == "evidence_cluster" %}证据簇明细{% else %}AI 评委矩阵{% endif %}）</h2>
+<h2>附表 A3 {{ score_table_title }}</h2>
 {% for group in score_groups %}
 <h3>{{ group.category }}</h3>
 {% for item in group['items'] %}
 <h4>{{ item.code }} {{ item.name }}（满分 {{ item.max_score }}）<span class="method">［{{ item.method }}］</span></h4>
 {% if item.factor %}<p class="factor">评审因素（原文）：{{ item.factor[:400] }}</p>{% endif %}
-<table><tr><th class="left">投标人</th>{% for j in judge_labels %}<th>{{ j }}</th>{% endfor %}<th>最终得分(去尾)</th></tr>
+<table><tr><th class="left">投标人</th>{% for j in judge_labels %}<th>{{ j }}</th>{% endfor %}<th>{{ final_score_label }}</th></tr>
 {% for p in item.per_bidder %}
 <tr><td class="left">{{ p.bidder }}</td>
 {% for s in p.judge_scores %}<td>{{ s }}</td>{% endfor %}
@@ -111,14 +115,14 @@
 <tr><td class="left">{{ p.bidder }}</td><td>{{ p.bid_price or "-" }}</td><td>{{ p.price_no_tax or "-" }}</td><td>{{ p.score }}</td><td class="left">{{ p.explanations | join("；") if p.explanations else "-" }}</td></tr>
 {% endfor %}
 </table>
-<p class="note">注：不含税价按 {{ tax_rate }} 增值税率换算（不含税=含税/1.06）。</p>
+<p class="note">注：{{ tax_note }}</p>
 
 <h2>附表 A5 AI 评审明细（主观项）</h2>
 {% for detail in ai_detail %}
 <h3>{{ detail.bidder }}</h3>
 {% for it in detail['items'] %}
 <h4>{{ it.code }} {{ it.name }}（满分 {{ it.max_score }}）<span class="method">［{{ it.method }}］</span> → 最终 {{ it.final }}</h4>
-<p>{% for j in it.judges %}<span {% if j.dropped %}class="dropped"{% endif %}>{{ j.judge }} {{ j.score }}{% if j.dropped %}（已弃）{% endif %}</span>{% if not loop.last %} ｜ {% endif %}{% endfor %}</p>
+{% if it.judges %}<p>{% for j in it.judges %}<span {% if j.dropped %}class="dropped"{% endif %}>{{ j.judge }} {{ j.score }}{% if j.dropped %}（已弃）{% endif %}</span>{% if not loop.last %} ｜ {% endif %}{% endfor %}</p>{% endif %}
 {% if it.reasoning %}<p class="left">评审依据：{{ it.reasoning }}</p>{% endif %}
 {% for c in it.citations %}<p class="note">引文（p{{ c.page_no }}{% if c.verified %}✓已核验{% else %}未核验{% endif %}）：{{ c.quote }}</p>{% endfor %}
 {% endfor %}

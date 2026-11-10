@@ -16,6 +16,12 @@ import pytest
 from app.llm.base import LLMError
 
 
+@pytest.fixture(autouse=True)
+def isolated_request_files(tmp_path, monkeypatch):
+    monkeypatch.setenv("BID_EVAL_DATA_DIR", str(tmp_path))
+    monkeypatch.setenv("BID_EVAL_LLM_DAILY_BUDGET", "0")
+
+
 class _FakeCompletions:
     def __init__(self, content: str, finish_reason: str = "stop"):
         self.content = content
@@ -94,6 +100,15 @@ def test_explicit_max_tokens_not_overridden(monkeypatch) -> None:  # noqa: ANN00
     assert fake.calls[0]["max_tokens"] == 20000
 
 
+def test_image_pages_use_multimodal_user_content(monkeypatch) -> None:
+    p, fake = _provider(monkeypatch)
+    p.complete("sys", "核验该原页", images=["data:image/png;base64,AAAA"])
+    assert fake.calls[0]["messages"][1]["content"] == [
+        {"type": "text", "text": "核验该原页"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+    ]
+
+
 def test_empty_content_with_length_raises_actionable_error(monkeypatch) -> None:  # noqa: ANN001
     """推理模型把预算耗在思考上：必须报"推理耗尽 max_tokens"，不能静默返回空。"""
     p, _fake = _provider(monkeypatch, content="", finish_reason="length")
@@ -109,7 +124,38 @@ def test_empty_content_with_stop_is_not_an_error(monkeypatch) -> None:  # noqa: 
     assert out.text == ""
 
 
-def test_sdk_max_retries_is_explicitly_configurable(monkeypatch) -> None:  # noqa: ANN001
+@pytest.mark.parametrize("status", [400, 401, 402, 403, 404, 422, 451])
+def test_permanent_provider_rejection_does_not_recollect_material(monkeypatch, status):
+    from app.services.automatic_scoring_service import _assess_cell
+
+    provider, fake = _provider(monkeypatch)
+    calls = []
+
+    def reject(**kwargs):
+        calls.append(kwargs)
+        error = RuntimeError("provider rejection")
+        error.status_code = status
+        raise error
+
+    fake.create = reject
+    monkeypatch.setenv("BID_EVAL_LLM_TRANSIENT_RETRIES", "1")
+    monkeypatch.setenv("BID_EVAL_LLM_TRANSIENT_ATTEMPTS", "4")
+    monkeypatch.setattr("app.services.automatic_scoring_service._supplement_pages",
+                        lambda *args, **kwargs: pytest.fail("permanent HTTP rejection must not trigger OCR"))
+
+    def reviewer(gateway, *args, **kwargs):
+        provider.complete("frozen system", "unchanged source material")
+
+    with pytest.raises(LLMError, match=f"HTTP {status}") as caught:
+        _assess_cell({"name": "文字响应", "score_type": "match"},
+                     [{"document_id": 1, "page_no": 1, "text": "原件响应文字"}],
+                     "synthetic", lambda: provider, reviewer=reviewer)
+    assert len(calls) == 1 and not caught.value.transient
+    assert caught.value.review_attempts_exhausted
+    assert len(caught.value.attempt_history) == 1
+
+
+def test_sdk_retries_stay_disabled_even_with_legacy_setting(monkeypatch) -> None:  # noqa: ANN001
     from app.llm.openai_compat import OpenAICompatProvider
 
     monkeypatch.setenv("BID_EVAL_LLM_PROVIDER", "siliconflow")
@@ -131,7 +177,7 @@ def test_sdk_max_retries_is_explicitly_configurable(monkeypatch) -> None:  # noq
 
     monkeypatch.setenv("BID_EVAL_LLM_SDK_MAX_RETRIES", "1")
     OpenAICompatProvider()
-    assert captured[-1]["max_retries"] == 1
+    assert captured[-1]["max_retries"] == 0, "hidden SDK retries must not bypass physical request control"
 
 
 def test_transient_retry_setting_still_controls_provider_attempts(monkeypatch) -> None:  # noqa: ANN001

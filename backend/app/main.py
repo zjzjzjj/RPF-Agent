@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app import config
-from app.db.session import init_db
+from app.db.session import initialize_application_database
 from app.errors import AppError
 
 log = logging.getLogger("bid_eval")
@@ -17,7 +17,7 @@ log = logging.getLogger("bid_eval")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    init_db()
+    initialize_application_database()
     config.upload_dir().mkdir(parents=True, exist_ok=True)
     config.render_dir().mkdir(parents=True, exist_ok=True)
     # 通用评分规则库：启动期强校验（坏模板 fail-fast，不让坏模板流入运行时）

@@ -45,6 +45,7 @@ def compute_benchmark(
     trim_count: int = 0,
     trim_threshold: int = 0,
     trim_tiers: list | None = None,
+    strict: bool = False,
 ) -> tuple[Decimal, str]:
     """返回 (基准价, 计算说明)。prices 非空由调用方保证。
 
@@ -73,10 +74,14 @@ def compute_benchmark(
         n = len(ordered)
         if trim_tiers:
             cut = _tiers_cut(n, trim_tiers)
+            if strict and n - 2 * cut < 1:
+                raise ValueError("有效报价家数不足以按冻结分档规则去极值，不能缩减剔除家数")
             cut = min(cut, max(0, (n - 1) // 2))  # 至少保留 1 家
             note = f"有效投标人 {n} 家命中分档规则，去掉最高最低各 {cut} 家"
         elif trim_count > 0:
             cut = trim_count if n > trim_threshold else 0
+            if strict and n - 2 * cut < 1:
+                raise ValueError("有效报价家数不足以按冻结规则去极值，不能缩减剔除家数")
             cut = min(cut, max(0, (n - 1) // 2))  # 至少保留 1 家
             note = (
                 f"有效投标人 {n} 家＞{trim_threshold}，去掉最高最低各 {cut} 家"
@@ -106,6 +111,8 @@ def compute_benchmark(
         ordered = sorted(prices)
         n = len(ordered)
         if trim_count > 0 and n > trim_threshold:
+            if strict and n - 2 * trim_count < 1:
+                raise ValueError("有效报价家数不足以按冻结规则去极值，不能缩减剔除家数")
             cut = min(trim_count, max(0, (n - 1) // 2))
             first_pool = ordered[cut : n - cut]
             first_note = f"有效投标人 {n} 家＞{trim_threshold}，首均前去掉最高最低各 {cut} 家"
@@ -143,7 +150,7 @@ def _gate_threshold(gate: dict) -> Decimal | None:
 
 
 def _gate_fail(
-    gate: dict, b: "PriceBid"
+    gate: dict, b: "PriceBid", *, strict: bool = False,
 ) -> bool | None:
     """门槛判定（P1-C）。True=未达标 False=达标 None=不可判定（不执行，机器看不见≠不符合）。
 
@@ -157,6 +164,8 @@ def _gate_fail(
     kind = gate.get("ratio_kind")
     on = gate.get("gate_on") or "tech"
     if on == "sample_or_composite":
+        if strict and not isinstance(b.sample_pass, bool):
+            return None
         if b.sample_pass is False:
             return True
         if b.gate_value is None:
@@ -175,7 +184,139 @@ def _gate_fail(
     return b.gate_value < b.gate_basis * ratio / Decimal(100)
 
 
-def compute_price_scores(bids: list[PriceBid], formula: dict) -> PriceComputation:
+def _strict_decimal(value, name: str) -> Decimal:
+    try:
+        number = Decimal(str(value))
+    except Exception as exc:
+        raise ValueError(f"{name}缺失或不是有效数值") from exc
+    if not number.is_finite():
+        raise ValueError(f"{name}必须是有限数值")
+    return number
+
+
+def _validate_strict_formula(bids: list[PriceBid], formula: dict) -> None:
+    """Reject incomplete executable rules instead of silently choosing a scoring policy."""
+    supported = {"benchmark_ratio", "lowest_ratio", "deviation_deduct", "above_deduct"}
+    methods = {"lowest", "second_lowest", "average", "average_trimmed", "average_below",
+               "average_trimmed_then_below"}
+    if formula.get("formula_type") not in supported:
+        raise ValueError("价格公式缺失或尚不支持，不能生成正式价格分")
+    if formula.get("benchmark_method") not in methods:
+        raise ValueError("价格基准价算法缺失或尚不支持")
+    if formula.get("max_score") is None:
+        raise ValueError("价格评分项缺少满分")
+    maximum = _strict_decimal(formula["max_score"], "价格满分")
+    coefficient = _strict_decimal(formula.get("k") if formula.get("k") is not None else 1, "基准价系数")
+    if maximum < ZERO or coefficient <= ZERO:
+        raise ValueError("价格满分或基准价系数无效")
+    if not bids or any(b.price is None or _strict_decimal(b.price, "投标报价") <= ZERO for b in bids):
+        raise ValueError("投标报价缺失或无效，必须完成自动补抽后再计算价格分")
+    ext = formula.get("params_json") or {}
+    if not isinstance(ext, dict):
+        raise ValueError("价格扩展参数格式无效")
+    lower = _strict_decimal(formula.get("lower_bound") if formula.get("lower_bound") is not None else 0, "价格分下限")
+    upper = _strict_decimal(formula.get("upper_bound") if formula.get("upper_bound") is not None else maximum, "价格分上限")
+    if not ZERO <= lower <= upper <= maximum:
+        raise ValueError("价格分上下限必须在零分与满分之间且顺序正确")
+    precision = formula.get("rounding") if formula.get("rounding") is not None else 2
+    if isinstance(precision, bool) or not str(precision).isdigit() or not 0 <= int(precision) <= 10:
+        raise ValueError("价格评分精度无效")
+    for key in ("deduct_rate",):
+        if formula.get(key) is not None and _strict_decimal(formula[key], "扣分率") < ZERO:
+            raise ValueError("价格扣分率不能为负")
+    for key in ("deduct_rate_down", "deduct_rate_up"):
+        if ext.get(key) is not None and _strict_decimal(ext[key], "扣分率") < ZERO:
+            raise ValueError("价格扣分率不能为负")
+    if formula["formula_type"] == "deviation_deduct":
+        for key, label in (("deduct_rate_down", "低于基准价扣分率"),
+                           ("deduct_rate_up", "高于基准价扣分率")):
+            _strict_decimal(ext.get(key, formula.get("deduct_rate")), label)
+    if formula["formula_type"] == "above_deduct":
+        rate = ext.get("deduct_rate_up", formula.get("deduct_rate"))
+        if _strict_decimal(rate, "高于基准价扣分率") <= ZERO:
+            raise ValueError("高于基准价扣分率必须大于零")
+    ratio = _strict_decimal(formula.get("trim_ratio") if formula.get("trim_ratio") is not None else 0, "去极值比例")
+    if not ZERO <= ratio < Decimal("0.5"):
+        raise ValueError("去极值比例必须在 0 与 0.5 之间")
+    for key in ("trim_count", "trim_threshold"):
+        if ext.get(key) is not None and (isinstance(ext[key], bool) or not str(ext[key]).isdigit()):
+            raise ValueError("去极值家数及门槛必须是非负整数")
+    tiers = ext.get("trim_tiers")
+    if tiers:
+        if not isinstance(tiers, list):
+            raise ValueError("去极值分档参数格式无效")
+        last = -1
+        for index, tier in enumerate(tiers):
+            if not isinstance(tier, (list, tuple)) or len(tier) != 2:
+                raise ValueError("去极值分档参数格式无效")
+            bound, cut = tier
+            if isinstance(cut, bool) or not str(cut).isdigit():
+                raise ValueError("去极值分档家数必须是非负整数")
+            if bound is None:
+                if index != len(tiers) - 1:
+                    raise ValueError("去极值兜底档只能位于末尾")
+            elif isinstance(bound, bool) or not str(bound).isdigit() or int(bound) <= last:
+                raise ValueError("去极值分档边界必须递增")
+            else:
+                last = int(bound)
+        if tiers[-1][0] is not None:
+            raise ValueError("去极值分档缺少兜底档")
+    if "lot_weights" in ext and ext["lot_weights"] is not None:
+        raise ValueError("多产品加权价格公式需要逐产品报价输入，不能按总价近似计算")
+    special = ext.get("special_rules") or []
+    if not isinstance(special, list):
+        raise ValueError("价格特殊条款格式无效")
+    for rule in special:
+        if not isinstance(rule, str) or not rule.strip():
+            raise ValueError("价格特殊条款缺少可执行定义")
+        if "不进入最佳报价计算" in rule:
+            if not ext.get("benchmark_gate"):
+                raise ValueError("价格特殊条款的基准价门槛未编译，不能跳过执行")
+        elif "剔除该报价后重新计算" in rule:
+            if not ext.get("outlier_policy"):
+                raise ValueError("价格特殊条款的离群重算规则未编译，不能跳过执行")
+        else:
+            raise ValueError("价格特殊条款尚未编译为可执行规则")
+    gate = ext.get("benchmark_gate")
+    if gate is not None:
+        if not isinstance(gate, dict):
+            raise ValueError("基准价门槛参数不完整")
+        threshold = _strict_decimal(gate.get("min_ratio"), "基准价门槛")
+        if threshold <= ZERO or (gate.get("ratio_kind") == "percent" and threshold > Decimal(100)):
+            raise ValueError("基准价门槛数值无效")
+        if gate.get("ratio_kind") not in ("percent", "absolute"):
+            raise ValueError("基准价门槛缺少百分比或绝对分口径")
+        if gate.get("on_fail") not in ("exclude", "half_max"):
+            raise ValueError("基准价门槛缺少明确的未达标处理规则")
+        if gate.get("gate_on") not in ("tech", "tech_qualification", "biz_tech", "sample_or_composite"):
+            raise ValueError("基准价门槛依据未识别")
+        if gate.get("on_fail") == "half_max":
+            ratio = _strict_decimal(gate.get("half_max_ratio"), "未达标赋分比例")
+            if not ZERO <= ratio <= Decimal(100):
+                raise ValueError("未达标固定赋分比例无效")
+        if gate.get("min_valid_bidders") is not None and (
+            isinstance(gate["min_valid_bidders"], bool) or not str(gate["min_valid_bidders"]).isdigit()
+        ):
+            raise ValueError("基准价门槛生效家数无效")
+        for bid in bids:
+            for value in (bid.gate_value, bid.gate_basis):
+                if value is not None and _strict_decimal(value, "门槛评分输入") < ZERO:
+                    raise ValueError("门槛评分输入不能为负")
+    policy = ext.get("outlier_policy")
+    if policy is not None:
+        if not isinstance(policy, dict) or policy.get("on_hit") != "zero_and_recompute":
+            raise ValueError("离群保护缺少可执行的命中处理规则")
+        bounds = [_strict_decimal(policy[key], "离群保护倍数") for key in ("min_mult", "max_mult")
+                  if policy.get(key) is not None]
+        if not bounds or any(not bound.is_finite() or bound <= ZERO for bound in bounds):
+            raise ValueError("离群保护倍数参数不完整或无效")
+        if len(bounds) == 2 and bounds[0] >= bounds[1]:
+            raise ValueError("离群保护上下限顺序无效")
+
+
+def compute_price_scores(
+    bids: list[PriceBid], formula: dict, *, strict: bool = False,
+) -> PriceComputation:
     """formula 来自规则包快照的 formula 字段。
 
     有效报价 = 已确认、未被否决/建议否决（exclude_invalid=true 时）、未超限价。
@@ -188,7 +329,10 @@ def compute_price_scores(bids: list[PriceBid], formula: dict) -> PriceComputatio
     - P1-B outlier_policy 离群保护（超倍→0 分→剔除后重算基准价，仅一轮）；
       参数缺失 → 不执行并注明人工复核。
     """
-    max_score = Decimal(str(formula.get("max_score") or 40))
+    if strict:
+        _validate_strict_formula(bids, formula)
+    max_score = Decimal(str(formula["max_score"])) if strict else Decimal(str(formula.get("max_score") or 40))
+    exclude_invalid = bool(formula.get("exclude_invalid", True))
     formula_type = str(formula.get("formula_type") or "").strip()
     if not formula_type:
         # 2026-10-28：公式未识别（空 formula_type）→ 全员"不可计算"，不产出数字。
@@ -211,7 +355,7 @@ def compute_price_scores(bids: list[PriceBid], formula: dict) -> PriceComputatio
     upper = Decimal(str(formula["upper_bound"])) if formula.get("upper_bound") is not None else max_score
     upper = min(upper, max_score)  # 评分项不得超过满分
     lower = Decimal(str(formula["lower_bound"])) if formula.get("lower_bound") is not None else ZERO
-    places = int(formula.get("rounding") or 2)
+    places = int(formula.get("rounding") if strict and formula.get("rounding") is not None else formula.get("rounding") or 2)
     exclude_invalid = bool(formula.get("exclude_invalid", True))
     deduct_rate = Decimal(str(formula.get("deduct_rate") or 0))
 
@@ -261,11 +405,13 @@ def compute_price_scores(bids: list[PriceBid], formula: dict) -> PriceComputatio
                 gate = None
     if gate:
         for b in valid:
-            fail = _gate_fail(gate, b)
+            fail = _gate_fail(gate, b, strict=strict)
             gate_state[b.bidder_id] = fail
             if fail is None:
                 gate_unknown = True
         if gate_unknown:
+            if strict:
+                raise ValueError("基准价门槛所需评分尚未完成，不能跳过门槛计算")
             gate_notes.append(
                 "部分投标人门槛所需分不可得，未因门槛排除（人工复核）"
             )
@@ -275,6 +421,16 @@ def compute_price_scores(bids: list[PriceBid], formula: dict) -> PriceComputatio
         # 按门槛前口径计算并注明（2026-10-27 实证：主观分被目录页压低 → 全员
         # <70% → 7 家全剔 → 价格分全 0 的灾难）。
         if n_fail and n_fail == len(valid):
+            if strict and gate.get("on_fail") == "half_max":
+                fixed = _q(min(max(max_score * Decimal(str(gate["half_max_ratio"])) / Decimal(100), lower), upper), places)
+                note = f"全部投标人未达基准价门槛，按细则固定赋满分的 {gate['half_max_ratio']}%={fixed} 分"
+                return PriceComputation(
+                    benchmark=None, formula_explanation=note,
+                    results=[PriceResult(b.bidder_id, b.name, b.price, fixed, ZERO, True, note)
+                             for b in valid],
+                )
+            if strict:
+                raise ValueError("基准价门槛排除全部报价，细则未给出无基准价时的计算规则")
             gate_notes.append(
                 f"门槛将排除全部 {len(valid)} 家（无一达到 {gate.get('min_ratio')}% 要求），"
                 "规则自相矛盾/分数输入异常——不执行门槛，按门槛前口径计算基准价（人工复核）"
@@ -301,6 +457,8 @@ def compute_price_scores(bids: list[PriceBid], formula: dict) -> PriceComputatio
 
     in_benchmark: list[Decimal] = [b.price for b in valid if _in_pool(b)]
     if not in_benchmark:
+        if strict:
+            raise ValueError("没有符合细则条件的基准价报价，不能生成价格分")
         return PriceComputation(
             benchmark=None,
             formula_explanation="没有有效报价，无法计算基准价",
@@ -314,8 +472,10 @@ def compute_price_scores(bids: list[PriceBid], formula: dict) -> PriceComputatio
     benchmark, bench_expl = compute_benchmark(
         in_benchmark, method, k, trim_ratio,
         trim_count=trim_count, trim_threshold=trim_threshold,
-        trim_tiers=trim_tiers,
+        trim_tiers=trim_tiers, strict=strict,
     )
+    if strict and (not benchmark.is_finite() or benchmark <= ZERO):
+        raise ValueError("按细则计算的基准价无效，不能生成价格分")
     parts = [bench_expl] + gate_notes
 
     # ---- P1-B 离群保护：超倍/半价 → 0 分 → 剔除后重算基准价（仅一轮） ----
@@ -343,9 +503,13 @@ def compute_price_scores(bids: list[PriceBid], formula: dict) -> PriceComputatio
                 benchmark, bench_expl2 = compute_benchmark(
                     survivors, method, k, trim_ratio,
                     trim_count=trim_count, trim_threshold=trim_threshold,
-                    trim_tiers=trim_tiers,
+                    trim_tiers=trim_tiers, strict=strict,
                 )
+                if strict and (not benchmark.is_finite() or benchmark <= ZERO):
+                    raise ValueError("离群剔除后重算的基准价无效")
                 parts.append(f"剔除后重算{bench_expl2}")
+            elif strict:
+                raise ValueError("离群保护排除全部基准报价，无法按细则重算基准价")
     elif policy and max_mult is None and min_mult is None:
         parts.append("离群保护参数不全，未执行离群剔除（人工复核）")
 
@@ -369,7 +533,7 @@ def compute_price_scores(bids: list[PriceBid], formula: dict) -> PriceComputatio
             )
             results.append(
                 PriceResult(b.bidder_id, b.name, b.price, score, ZERO,
-                            bool(b.excluded and exclude_invalid),
+                            not _in_pool(b) if strict else bool(b.excluded and exclude_invalid),
                             parts[-1])
             )
             continue
@@ -379,7 +543,7 @@ def compute_price_scores(bids: list[PriceBid], formula: dict) -> PriceComputatio
             parts.append(f"{b.name}：报价为离群值，价格分记 0{note}")
             results.append(
                 PriceResult(b.bidder_id, b.name, b.price, ZERO, ZERO,
-                            bool(b.excluded and exclude_invalid),
+                            True if strict else bool(b.excluded and exclude_invalid),
                             parts[-1])
             )
             continue
@@ -426,7 +590,7 @@ def compute_price_scores(bids: list[PriceBid], formula: dict) -> PriceComputatio
                 price=b.price,
                 price_score=score,
                 deviation_pct=_q(deviation, 2),
-                excluded_from_benchmark=bool(b.excluded and exclude_invalid),
+                excluded_from_benchmark=(not _in_pool(b)) if strict else bool(b.excluded and exclude_invalid),
                 explanation=parts[-1],
             )
         )

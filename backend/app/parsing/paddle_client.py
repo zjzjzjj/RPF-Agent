@@ -15,9 +15,11 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import threading
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 
 from app import config
 
@@ -26,6 +28,20 @@ log = logging.getLogger("bid_eval.parsing.paddle")
 _PROBE_OK: bool | None = None  # 成功永久缓存
 _PROBE_FAILED_AT: float | None = None  # 失败 30s TTL（防一次抖动让整批文档零 OCR）
 _PROBE_FAIL_TTL_S = 30.0
+_OCR_HTTP_SLOTS = threading.BoundedSemaphore(2)
+
+
+@contextmanager
+def _ocr_http_slot():
+    from app.llm.request_control import check_cancelled
+
+    while not _OCR_HTTP_SLOTS.acquire(timeout=0.1):
+        check_cancelled()
+    try:
+        check_cancelled()
+        yield
+    finally:
+        _OCR_HTTP_SLOTS.release()
 
 
 def _chat_payload(png_bytes: bytes, prompt: str) -> dict:
@@ -89,9 +105,8 @@ def remote_ocr_page(
 ) -> str:
     """单页 PNG → PaddleOCR-VL 整页文本。失败抛 RuntimeError（调用方回退 rapidocr）。
 
-    `allow_truncated=True`（材料页救援用）：输出被 max_tokens 截断时返回**已识别
-    部分**（发票号/甲乙方等材料信号通常在前半段），而不是丢弃。正常解析仍保持
-    严格（截断=不可信，抛错由调用方记警告）。
+    `allow_truncated=True` 仅供历史检索线索使用，不能作为完整读取证明。
+    自动评审采用默认严格路径；整页及所有分段都必须没有输出截断。
     """
     try:
         answer = _post(png_bytes, prompt, config.paddle_ocr_max_tokens())
@@ -126,8 +141,7 @@ def remote_ocr_page(
 def _ocr_segmented(png_bytes: bytes, prompt: str | None) -> str:
     """截断页的分段识别：竖切上下两半（5% 重叠）各识别一次后拼接。
 
-    只切一层：单半再截断时接受部分输出（配合拼接已远优于整体丢弃）。
-    分段调用失败抛 RuntimeError（调用方按既有熔断/回退路径处置）。
+    只切一层。任何分段仍截断或没有内容均明确失败，部分文本不冒充完整读取。
     """
     import io
 
@@ -155,15 +169,21 @@ def _ocr_segmented(png_bytes: bytes, prompt: str | None) -> str:
         except (OSError, ValueError, urllib.error.URLError) as exc:
             raise RuntimeError(f"PaddleOCR-VL 调用失败：{exc}") from exc
         try:
-            text = str(answer["choices"][0]["message"]["content"] or "")
+            choice = answer["choices"][0]
+            text = str(choice["message"]["content"] or "")
         except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError(f"PaddleOCR-VL 响应缺少内容：{str(answer)[:200]}") from exc
-        if text.strip():
-            parts.append(text.strip())
+        if choice.get("finish_reason") == "length":
+            raise RuntimeError("PaddleOCR-VL 分段输出仍被 max_tokens 截断，原页尚未完整读取")
+        if not text.strip():
+            raise RuntimeError("PaddleOCR-VL 分段未产生内容，原页尚未完整读取")
+        parts.append(text.strip())
     return "\n".join(parts)
 
 
 def _post(png_bytes: bytes, prompt: str | None, max_tokens: int) -> dict:
+    from app.llm.request_control import http_attempt
+
     payload = _chat_payload(png_bytes, prompt or config.paddle_ocr_prompt())
     payload["max_tokens"] = max_tokens
     url = config.paddle_ocr_url().rstrip("/") + "/v1/chat/completions"
@@ -171,5 +191,9 @@ def _post(png_bytes: bytes, prompt: str | None, max_tokens: int) -> dict:
         url, data=json.dumps(payload).encode("utf-8"),
         headers={"Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(request, timeout=config.paddle_ocr_timeout_s()) as response:
-        return json.loads(response.read().decode("utf-8"))
+    # OCR remains independently bounded to two calls and also shares the global
+    # model request slots. It retains the existing separate OCR budget policy.
+    with _ocr_http_slot():
+        with http_attempt(provider="remote_paddle", model=config.paddle_ocr_model(), images=1, budget=False):
+            with urllib.request.urlopen(request, timeout=config.paddle_ocr_timeout_s()) as response:
+                return json.loads(response.read().decode("utf-8"))

@@ -46,14 +46,20 @@ def get_formal_report_docx(project_id: str, run_id: int | None = None) -> Respon
 def export_report(project_id: str, format: str = "html", run_id: int | None = None) -> dict:
     """导出接口：html（疑问清单版）/ formal.html / docx（正式评审报告）。"""
     if format == "html":
-        return {"format": "html", "url": f"/api/projects/{project_id}/report.html"}
+        report = report_service.build_report(project_id, run_id)
+        selected_run_id = report["run"]["id"]
+        return {"format": "html", "url": f"/api/projects/{project_id}/report.html?run_id={selected_run_id}",
+                "run_id": selected_run_id}
     if format == "formal_html":
-        return {"format": "formal_html", "url": f"/api/projects/{project_id}/report/formal.html"}
+        report = report_service.build_formal_report(project_id, run_id)
+        selected_run_id = report["run"]["id"]
+        return {"format": "formal_html", "url": f"/api/projects/{project_id}/report/formal.html?run_id={selected_run_id}",
+                "run_id": selected_run_id}
     if format == "docx":
         report = report_service.build_formal_report(project_id, run_id)
         return {
             "format": "docx",
-            "url": f"/api/projects/{project_id}/report/docx",
+            "url": f"/api/projects/{project_id}/report/docx?run_id={report['run']['id']}",
             "run_id": report["run"]["id"],
         }
     from app.errors import AppError

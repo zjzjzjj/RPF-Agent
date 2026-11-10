@@ -699,13 +699,95 @@ def _tier_shape(tiers) -> str:
     return shapes.pop() if len(shapes) == 1 else "mixed"
 
 
+def _managed_certificate_subset(criterion: dict, certificates: list[str]) -> list[str]:
+    """Keep ISO families explicitly named by this frozen automatic rule.
+
+    A verified certificate proves that certificate exists; it does not make an
+    unrelated ISO family eligible for a rule naming a closed set of families.
+    Historical evaluations retain their original interpretation.
+    """
+    if criterion.get("verified_facts") is None:
+        return certificates
+    rule = " ".join(str(criterion.get(key) or "") for key in (
+        "name", "description", "source_quote", "required_evidence",
+        "required_artifacts", "required_artifacts_raw",
+    ))
+    compact = re.sub(r"\s+", "", rule).upper()
+    targets: set[str] = set()
+    for match in re.finditer(
+        r"ISO(?:/?IEC)?\d{4,5}(?:[、,，/](?:ISO(?:/?IEC)?)?\d{4,5})*", compact,
+    ):
+        targets.update("ISO" + number for number in re.findall(r"\d{4,5}", match.group()))
+    for match in _RE_GB_STD.finditer(compact):
+        key = normalize_cert(match.group())
+        if key.startswith("ISO"):
+            targets.add(key)
+    for name, key in _CERT_ZH_MAP:
+        if name in compact:
+            targets.add(key)
+    cmmi_named = "CMMI" in compact
+    if not targets and not cmmi_named:
+        return certificates
+    generic_iso = bool(re.search(r"ISO(?:认证|体系|证书)", compact))
+    restrict_iso = bool(targets) or not generic_iso
+    return [cert for cert in certificates if (
+        not normalize_cert(cert).startswith("ISO")
+        or not restrict_iso or normalize_cert(cert) in targets
+    ) and (normalize_cert(cert) != "CMMI" or cmmi_named)]
+
+
+def _amount_tier_rate(tiers: list[dict], amount: Decimal) -> Decimal:
+    """Exact rate for one verified case; amount bands default to [min, max)."""
+    bands = []
+    for tier in tiers:
+        if not isinstance(tier, dict):
+            raise ValueError("金额分档必须是结构化档位")
+        lo = Decimal(str(tier.get("min_amount_yuan", 0)))
+        hi = Decimal(str(tier["max_amount_yuan"])) if tier.get("max_amount_yuan") is not None else None
+        rate = Decimal(str(tier.get("per_item")))
+        boundaries = []
+        for side, default in (("min", True), ("max", False)):
+            values = [tier[key] for key in (
+                f"{side}_inclusive", f"{side}_amount_inclusive", f"include_{side}",
+            ) if key in tier]
+            if any(not isinstance(value, bool) for value in values) or len(set(values)) > 1:
+                raise ValueError("金额分档的边界包含条件无效")
+            boundaries.append(values[0] if values else default)
+        include_lo, include_hi = boundaries
+        if (not lo.is_finite() or lo < 0 or not rate.is_finite() or rate < 0
+                or (hi is not None and (not hi.is_finite() or hi < lo
+                    or (hi == lo and not (include_lo and include_hi))))):
+            raise ValueError("金额分档缺少合法边界或每项分值")
+        bands.append((lo, hi, include_lo, include_hi, rate))
+    if not bands:
+        raise ValueError("金额分档没有完整档位")
+    bands.sort(key=lambda band: band[0])
+    for previous, current in zip(bands, bands[1:]):
+        if (previous[1] is None or previous[1] > current[0]
+                or (previous[1] == current[0] and previous[3] and current[2])):
+            raise ValueError("冻结金额分档存在重叠，不能选取近似分值")
+    if not amount.is_finite() or amount < 0:
+        raise ValueError("案例金额必须是已核验的非负有限值")
+    for lo, hi, include_lo, include_hi, rate in bands:
+        lower_match = amount >= lo if include_lo else amount > lo
+        upper_match = hi is None or (amount <= hi if include_hi else amount < hi)
+        if lower_match and upper_match:
+            return rate
+    return Decimal(0)
+
+
 def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
     """count 类评分项。
 
     证书类：只计证书表内的（有复印件的）；正文声称但无证书的 → 冲突标记交人工。
     人员级（person_scope）：只用 LLM 逐案例核验结果，不退回公司级业绩桶。
     """
-    per_item = Decimal(str(params.get("per_item") or 0))
+    tier_shape = _tier_shape(params.get("tiers"))
+    if (criterion.get("verified_facts") is not None and params.get("tiers")
+            and tier_shape not in ("count_tier", "amount_tier")):
+        raise ValueError("冻结计数档位结构混杂或不完整，不能生成正式分数")
+    managed_amount_tiers = criterion.get("verified_facts") is not None and tier_shape == "amount_tier"
+    per_item = Decimal(0) if managed_amount_tiers else Decimal(str(params.get("per_item") or 0))
     max_items = int(params.get("max_items") or 0)
     max_score = Decimal(str(criterion.get("max_score") or 0))
     field = params.get("field") or ""
@@ -724,7 +806,8 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
         guessed = None if person_scope else _infer_count_field(criterion)
         if guessed:
             field = guessed
-            inferred = "（计数字段由评分项名称推断，请核对）"
+            inferred = ("（计数字段由冻结评分项名称解析）" if criterion.get("verified_facts") is not None
+                        else "（计数字段由评分项名称推断，请核对）")
         elif not person_scope:
             unresolved = "field_missing"
 
@@ -742,7 +825,7 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
         _backing = criterion.get("cert_backing") or {}
         _unbacked = 0
         _unverified_c = 0
-        certs_for_count = list(facts.certificates)
+        certs_for_count = _managed_certificate_subset(criterion, list(facts.certificates))
         if _backing:
             _kept_c = []
             for cert in certs_for_count:
@@ -776,7 +859,9 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
         # 得 N 分」，存在性计分、与 ISO 项互斥。LLM 曾把此条标 match 丢失满分，
         # 现按单一证书计数（remote_reconcile 2026-10-30）。
         iso_set = set()
-        has_cmmi = any(normalize_cert(c) == "CMMI" for c in facts.certificates)
+        backing = criterion.get("cert_backing") or {}
+        has_cmmi = any(normalize_cert(c) == "CMMI" and backing.get("CMMI", True) is not False
+                       for c in facts.certificates)
         count = 1 if has_cmmi else 0
         detail = f"提供 CMMI 认证 {count} 项（{('有' if has_cmmi else '无')}有效期内 CMMI 证书）"
         if not facts.certificates and not facts.cert_claims:
@@ -805,6 +890,9 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
             + str(criterion.get("description") or "")
             + str(criterion.get("required_artifacts_raw") or criterion.get("required_artifacts") or "")
         )
+        if criterion.get("verified_facts") is not None:
+            _cert_text = (_cert_text + str(criterion.get("source_quote") or "")
+                          + str(criterion.get("required_evidence") or "")).upper()
         _iso_shaped = bool(re.search(
             r"ISO|CMMI|三体系|GB/?T\s*\d"
             r"|质量管理体系|信息安全管理体系|信息技术服务管理体系",
@@ -951,6 +1039,13 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
     #（材料齐全性本质需翻原件核对，AI 判定只作为疑问线索，不直接扣分）
     artifacts = str(criterion.get("required_artifacts") or "")
     cases = criterion.get("verified_cases") or []
+    if managed_amount_tiers and not cases:
+        return CountResult(Decimal(0), "金额分档缺少逐案例金额核验", True, unresolved="no_facts")
+    if managed_amount_tiers:
+        for case in cases:
+            if not isinstance(case, dict) or case.get("amount_yuan") is None:
+                raise ValueError("金额分档的每个案例都必须有已核验金额")
+            _amount_tier_rate(params["tiers"], Decimal(str(case["amount_yuan"])))
     if cases:
         # 引文全部被 sanitize 降级（照抄要求文本/过短且无实体）→ 计数无依据，
         # 不能把 0 分当成评审结论（与"机器看不见 ≠ 不符合"同一哲学）
@@ -1039,6 +1134,17 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                         _ntype = 0
                         _nsure = 0
                         for _c in cases:
+                            if criterion.get("verified_facts") is not None:
+                                # Managed automatic reviews resolve project type
+                                # against the actual contract, not its short title.
+                                eligible = _c.get("type_eligible")
+                                if eligible is True:
+                                    kept.append(_c)
+                                elif eligible is False:
+                                    _ntype += 1
+                                else:
+                                    raise ValueError("已核验案例缺少明确的项目类型结论")
+                                continue
                             _nm = str(_c.get("name") or "")
                             if _RE_OPS_TYPE.search(_nm):
                                 kept.append(_c)
@@ -1126,6 +1232,12 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
             # unverified 在后——max_items 封顶先砍未核验案例，锚定且材料确认的案例
             # 优先计满（run77 c41：11 个不可读案例全计满 4 分，人工只认 3 个有效）。
             complete = complete + unverified_pool
+            if managed_amount_tiers:
+                # Amount bands define the value of each case. A generic top-level
+                # per_item must never replace these frozen rates.
+                complete.sort(key=lambda case: _amount_tier_rate(
+                    params["tiers"], Decimal(str(case.get("amount_yuan"))),
+                ), reverse=True)
             _verified_n = len(complete) - unverified_counted
             kept = complete[:max_items] if max_items else complete
             # 计入的未核验数（被封顶砍掉的不计入、不触发 need_human）——语义是
@@ -1138,7 +1250,10 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
             # per_item 线性——查表无命中强制 0 分曾让可计案例全归零（run79 回归）。
             _tshape = _tier_shape(params.get("tiers"))
             _use_tiers = _tshape == "count_tier"
-            if _use_tiers:
+            if managed_amount_tiers:
+                score = sum((_amount_tier_rate(params["tiers"], Decimal(str(case.get("amount_yuan"))))
+                             for case in kept), Decimal(0)).quantize(Decimal("0.01"))
+            elif _use_tiers:
                 _ts = _tier_score(params.get("tiers"), effective)
                 score = _ts if _ts is not None else Decimal(0)
             else:
@@ -1147,7 +1262,14 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                 score = max_score
             # 可复算双分值：剔除全部未核验案例后的分数（warnings 附给人工一眼复算）
             _kept_verified = min(_verified_n, max_items) if max_items else _verified_n
-            if _use_tiers:
+            if managed_amount_tiers:
+                verified_cases = [case for case in complete if not case.get("unverified")]
+                if max_items:
+                    verified_cases = verified_cases[:max_items]
+                score_verified_only = sum((_amount_tier_rate(
+                    params["tiers"], Decimal(str(case.get("amount_yuan"))),
+                ) for case in verified_cases), Decimal(0)).quantize(Decimal("0.01"))
+            elif _use_tiers:
                 _tsv = _tier_score(params.get("tiers"), Decimal(_kept_verified))
                 score_verified_only = _tsv if _tsv is not None else Decimal(0)
             else:
@@ -1164,12 +1286,18 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                    if null_dropped else "")
                 + _type_gate_note
             )
+            if managed_amount_tiers:
+                detail += "；逐案例金额分档：" + "、".join(
+                    f"{case.get('name', '?')} {case.get('amount_yuan')}元→"
+                    f"{_amount_tier_rate(params['tiers'], Decimal(str(case.get('amount_yuan'))))}分"
+                    for case in kept
+                )
             # 零分理由：unverified 案例已计入 → score>0，故下面只在回退模式/全 False/
             # 类型剔空时可达。诚实化（2026-11-04）：线性路径下案例**已计入**却算不出
             # 分值（per_item=0 的机器口径问题）绝不伪装"确认未提供"；计数档不命中
             # （低于最低档）是规则结论，走既有 confirmed_absent 映射。
             if score == 0:
-                if kept and zero_reason is None and not _use_tiers and per_item <= 0:
+                if kept and zero_reason is None and not _use_tiers and not managed_amount_tiers and per_item <= 0:
                     zero_reason = "cases_unverified"
                     conflict = True
                     detail += "；案例已计入但未算出分值（机器口径问题，非确认未提供，转人工核看）"
@@ -1197,6 +1325,8 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                 )
                 if score == 0 and zero_reason in (None, "confirmed_absent"):
                     zero_reason = "cases_unverified"
+    elif artifacts and criterion.get("verified_facts") is not None and field in ("certificates", "cmmi"):
+        detail += "；证书及本条要求的证明材料已逐本核验"
     elif artifacts:
         conflict = True
         detail += "；该评分项含证明材料要求，材料齐全性需人工核对原件（AI 逐案例核验未执行）"
@@ -1532,7 +1662,22 @@ def score_deviation_deduct_table(
             Decimal(0), "偏离扣分参数非法（非数字）", True, unresolved="field_missing"
         )
     max_score = criterion.get("max_score")
+    verified = criterion.get("verified_facts") or {}
     counts, snippet = _extract_deviation_counts(facts.text or "")
+    if criterion.get("verified_facts") is not None:
+        counts, snippet = None, ""
+    if isinstance(verified.get("deviation_counts"), dict):
+        supplied = verified["deviation_counts"]
+        try:
+            values = {key: Decimal(str(supplied[key])) for key in ("total", "missing", "negative")}
+            if any(not value.is_finite() or value != value.to_integral_value() for value in values.values()):
+                raise ValueError("deviation counts must be integers")
+            counts = {key: int(value) for key, value in values.items()}
+            if any(value < 0 for value in counts.values()) or counts["missing"] + counts["negative"] > counts["total"]:
+                raise ValueError("invalid deviation counts")
+            snippet = "AI 已逐页核验的偏离表事实"
+        except (KeyError, ValueError, TypeError, ArithmeticError):
+            return CountResult(Decimal(0), "已核验偏离表事实结构非法", True, unresolved="no_facts")
     if counts is None:
         return CountResult(
             Decimal(0),
@@ -1569,7 +1714,16 @@ def score_value_tier(
     # 窗口文本（索引指针/承诺章节解析）优先——criterion 由 scoring_service 注入
     # value_window_text（2026-11-02 run77：偏离表"8小时"首匹配抢掉承诺函"4小时"）
     _window = criterion.get("value_window_text") if isinstance(criterion, dict) else None
-    if field == "response_hours":
+    verified = criterion.get("verified_facts") or {}
+    if criterion.get("verified_facts") is not None:
+        try:
+            value = Decimal(str(verified.get(field)))
+            if not value.is_finite() or value < 0:
+                raise ValueError("invalid verified value")
+            snippet = "AI 已逐页核验的承诺值"
+        except (ValueError, TypeError, ArithmeticError):
+            value, snippet = None, ""
+    elif field == "response_hours":
         value, snippet = _extract_response_hours(facts.text or "", window=_window)
     else:
         value, snippet = _extract_warranty_months(facts.text or "", window=_window)
@@ -1632,7 +1786,16 @@ def score_value_linear(
             unresolved="field_missing",
         )
     _window = criterion.get("value_window_text") if isinstance(criterion, dict) else None
-    if field == "warranty_months":
+    verified = criterion.get("verified_facts") or {}
+    if criterion.get("verified_facts") is not None:
+        try:
+            value = Decimal(str(verified.get(field)))
+            if not value.is_finite() or value < 0:
+                raise ValueError("invalid verified value")
+            snippet = "AI 已逐页核验的承诺值"
+        except (ValueError, TypeError, ArithmeticError):
+            value, snippet = None, ""
+    elif field == "warranty_months":
         value, snippet = _extract_warranty_months(facts.text or "", window=_window)
     else:
         value, snippet = _extract_response_hours(facts.text or "", window=_window)
@@ -1682,6 +1845,7 @@ def score_attribute_tier(
                 Decimal(0), "未在证书表/正文中抽取到证书清单（按 0 分记，待人工核对）",
                 True, unresolved="no_facts",
             )
+        objects = _managed_certificate_subset(criterion, objects)
         # 证书背书三态软闸门（同 score_count_tier）：False 不计，None 计入+疑问
         _backing = criterion.get("cert_backing") or {}
         _unbacked = 0
@@ -1838,6 +2002,7 @@ def score_count_tier(criterion: dict, params: dict, facts: BidFacts) -> CountRes
                 Decimal(0), "未抽取到证书清单（分档计数按 0 记，待人工核对）",
                 True, unresolved="no_facts",
             )
+        certs = _managed_certificate_subset(criterion, certs)
         # 证书背书三态软闸门（2026-11-02 P0-5）：True 计入；None 计入+疑问
         # （防截图文本层看不见→误杀）；False 不计入（可读文本确认无背书页）。
         # 无 backing 信息（旧链路/分类未跑）→ 照计 + conflict（不误杀）。

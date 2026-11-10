@@ -177,6 +177,9 @@ def qualification_preview(bidder_id: int) -> dict:
     if pkg is None:
         raise NotFound("项目还没有规则包")
     _snapshot, criteria = scoring_service._snapshot_criteria(pkg.id)
+    from app.rules.scope import split_out_of_scope
+
+    criteria, _out_of_scope = split_out_of_scope(criteria)
     text, _titles, _docs = bidder_service.bid_text(bidder_id)
     facts = extract_bid_facts(text)
     results = []

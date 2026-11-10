@@ -79,12 +79,21 @@ def _score_side(score_type: str | None) -> str:
 
 
 MACHINE_VERDICT_LABELS = {
+    "unverifiable": "现有材料无法证实",
+    "execution_failed": "评审执行失败",
     "pass": "通过",
     "recommend_reject": "建议否决",
     "need_human": "待人工判定",
     "conflict_flagged": "冲突待裁决",
     "fail": "不通过",
     "unknown": "无法自动判定",
+    "concern": "预检存疑（未深评）",
+    "not_deeply_reviewed": "未深评",
+}
+
+LIGHTWEIGHT_VERDICT_LABELS = {
+    "pass": "预检通过", "fail": "预检不符合",
+    "concern": "预检存疑（未深评）", "not_deeply_reviewed": "未深评",
 }
 
 REASON_LIMIT_DEFAULT = 1200
@@ -258,6 +267,8 @@ def _build_item(
     max_reason_chars: int,
     max_score_parts: list[Decimal],
 ) -> dict:
+    from app.services.automation_service import public_auto_review
+
     score_type = (score.score_type if score is not None and score.score_type else None) or crit.score_type
     is_veto = bool(score.veto_flag) if score is not None else bool(crit.is_veto)
 
@@ -310,9 +321,13 @@ def _build_item(
         _clip(review.reason, max_reason_chars) if review is not None else (None, 0, False)
     )
 
+    auto_review_out = public_auto_review(score)
+    lightweight = (auto_review_out or {}).get("basis") == "lightweight"
+
     verdict = None
     if state in ("veto", "match") and score is not None and score.machine_status:
-        verdict = MACHINE_VERDICT_LABELS.get(score.machine_status, score.machine_status)
+        labels = LIGHTWEIGHT_VERDICT_LABELS if lightweight else MACHINE_VERDICT_LABELS
+        verdict = labels.get(score.machine_status, score.machine_status)
 
     cit_out = [
         {
@@ -339,7 +354,8 @@ def _build_item(
         "category": crit.category,
         "score_type": score_type,
         "side": _score_side(score_type),
-        "scoring_method": SCORE_TYPE_LABELS.get(score_type or "", score_type or "—"),
+        "scoring_method": (SCORE_TYPE_LABELS.get(score_type or "", score_type or "—")
+                           + ("（轻量）" if lightweight else "")),
         "is_veto": is_veto,
         "bucket": BUCKET_BY_CATEGORY.get(crit.category, "qualification_compliance"),
         "state": state,
@@ -348,6 +364,12 @@ def _build_item(
         "final": _s(final_dec),
         "machine_score": _s(machine_dec),
         "machine_status": score.machine_status if score is not None else None,
+        "auto_review": auto_review_out,
+        "fallback": (
+            (auto_review_out or {}).get("basis") == "fallback"
+            and (((score.ai_raw_json or {}).get("auto_review") or {}).get("fallback") or {}).get("kind")
+            != "duplicate_summary"
+        ),
         "ai_suggested": _s(_dec(score.ai_suggested_score)) if ai_visible and score is not None else None,
         "ai_level_label": score.ai_level_label if ai_visible and score is not None else None,
         "ai_confidence": score.ai_confidence if ai_visible and score is not None else None,
@@ -408,6 +430,8 @@ def build_score_summary(
         if run is None or run.project_id != project_id:
             raise NotFound("评分运行不存在或不属于该项目")
         pkg = s.get(RulePackage, run.package_id)
+        from app.services.automation_service import progress as automation_progress
+        automation = automation_progress(run_id, session=s)
 
         criteria = list(
             s.execute(
@@ -470,7 +494,9 @@ def build_score_summary(
         run_meta = {
             "id": run.id,
             "status": run.status,
-            "ready": run.status == "succeeded" and bool(scores),
+            "ready": (automation["is_final"] if automation is not None
+                      else run.status == "succeeded" and bool(scores)),
+            "automation": automation,
             "package_id": run.package_id,
             "package_version": run.package_version,
             "package_content_hash": run.package_content_hash,
@@ -510,6 +536,8 @@ def build_score_summary(
 
     if not run_meta["ready"]:
         run_meta["incomplete_reason"] = (
+            f"评审已结束：已评分 {automation['completed']} 项，故障跳过 {automation['skipped']} 项；下表合计仅包含已评分项"
+            if automation and run_meta["status"] == "partial" else
             f"评分运行 #{run_meta['id']} 状态为 {run_meta['status']}，结果可能不完整"
         )
         warnings.append(run_meta["incomplete_reason"])
@@ -585,11 +613,13 @@ def build_score_summary(
 
             scored_count = sum(1 for i in items if i["state"] == "scored")
             missing_count = sum(1 for i in items if i["state"] == "missing_final")
+            fallback_count = sum(1 for i in items if i.get("fallback"))
             subjective_count = sum(1 for i in items if i["side"] == "subjective")
             objective_count = sum(1 for i in items if i["side"] == "objective")
             verdicts = None
             if bdef["kind"] == "verdict":
-                verdicts = {"pass": 0, "recommend_reject": 0, "need_human": 0, "fail": 0}
+                verdicts = {"pass": 0, "recommend_reject": 0, "need_human": 0, "fail": 0,
+                            "unverifiable": 0, "execution_failed": 0}
                 for i in items:
                     ms = i["machine_status"] or "need_human"
                     if ms in verdicts:
@@ -622,6 +652,7 @@ def build_score_summary(
                     "item_count": len(items),
                     "scored_count": scored_count,
                     "missing_count": missing_count,
+                    "fallback_count": fallback_count,
                     "subjective_count": subjective_count,
                     "objective_count": objective_count,
                     "verdicts": verdicts,
@@ -654,6 +685,10 @@ def build_score_summary(
                 "scored_items": sum(b["scored_count"] for b in buckets_out),
                 "missing_count": sum(b["missing_count"] for b in buckets_out),
                 "missing_criteria": list(rank_row.get("missing_final") or []),
+                "fallback_count": sum(b["fallback_count"] for b in buckets_out),
+                "fallback_criteria": [
+                    i["name"] for b in buckets_out for i in b["items"] if i.get("fallback")
+                ],
             }
         else:
             summary = None
@@ -664,8 +699,8 @@ def build_score_summary(
                 "name": bidder.name,
                 "state": "scored",
                 "excluded_reason": None,
-                "bid_price": _s(_dec(bidder.bid_price)),
-                "bid_price_is_run_snapshot": False,
+                "bid_price": _s(_dec((rank_row or {}).get("bid_price", bidder.bid_price))),
+                "bid_price_is_run_snapshot": automation is not None,
                 "bidder_status": bidder.status,
                 "bidder_status_is_run_snapshot": False,
                 "rank": rank_row.get("rank") if rank_row else None,

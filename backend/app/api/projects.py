@@ -128,7 +128,10 @@ def get_workbench(project_id: str) -> WorkbenchOut:
             ).scalar_one_or_none()
         )
         pending_review = 0
+        automation = None
         if run is not None:
+            from app.services.automation_service import progress as automation_progress
+            automation = automation_progress(run.id, session=s)
             pending_review = s.execute(
                 select(func.count(ScoreRecord.id)).where(
                     ScoreRecord.run_id == run.id,
@@ -223,6 +226,17 @@ def get_workbench(project_id: str) -> WorkbenchOut:
             stages.append(StageState(key="results", label="评分结果", state="blocked",
                                      detail=f"运行 #{run.id} 失败"))
             blockers.append(f"评分运行 #{run.id} 失败，请查看运行详情")
+        elif run.status == "partial" and automation is not None:
+            stages.append(StageState(key="results", label="评分结果", state="done",
+                                     detail=f"评审已结束：已评分 {automation['completed']} 项，跳过 {automation['skipped']} 项，可导出结果"))
+        elif automation is not None and not automation["is_final"]:
+            stages.append(StageState(key="results", label="评分结果", state="blocked",
+                                     detail=f"自动评审已完成 {automation['completed']}/{automation['expected']} 项，尚不能定稿",
+                                     todo_count=automation["remaining"]))
+            blockers.append("自动评审未全部完成，不能发布正式结果")
+        elif automation is not None and automation["is_final"]:
+            stages.append(StageState(key="results", label="评分结果", state="done",
+                                     detail=f"自动评审全部完成（{automation['completed']} 项），可生成正式报告"))
         elif not config.auto_mode() and pending_review:
             # 复核不阻断：报告可先出草稿（未复核项在报告内逐条标注为疑问），复核后刷新即定稿。
             stages.append(StageState(key="results", label="评分结果", state="active",
