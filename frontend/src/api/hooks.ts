@@ -48,6 +48,20 @@ export function useProject(pid: string) {
   });
 }
 
+/** 重命名评标项目（PATCH name）。成功后失效列表/详情/工作台缓存（AppShell 头部也走 useProject）。 */
+export function useRenameProject() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ pid, name }: { pid: string; name: string }) =>
+      api.patch<Project>(`/projects/${pid}`, { name }),
+    onSuccess: (project) => {
+      qc.invalidateQueries({ queryKey: ["projects"] });
+      qc.invalidateQueries({ queryKey: ["project", project.id] });
+      qc.invalidateQueries({ queryKey: ["workbench", project.id] });
+    },
+  });
+}
+
 export function useWorkbench(pid: string) {
   return useQuery({
     queryKey: ["workbench", pid],

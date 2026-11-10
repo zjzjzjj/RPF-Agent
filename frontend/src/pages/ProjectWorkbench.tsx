@@ -1,4 +1,5 @@
 import type { ReactNode } from "react";
+import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
   Alert,
@@ -9,12 +10,14 @@ import {
   Skeleton,
   Steps,
   Tag,
+  Tooltip,
 } from "antd";
 import {
   ArrowRightOutlined,
   AuditOutlined,
   CheckCircleOutlined,
   ClockCircleOutlined,
+  EditOutlined,
   FileProtectOutlined,
   FileTextOutlined,
   SafetyCertificateOutlined,
@@ -25,6 +28,7 @@ import {
 } from "@ant-design/icons";
 import { useWorkbench } from "../api/hooks";
 import DashboardMetrics from "../components/DashboardMetrics";
+import RenameProjectModal from "../components/RenameProjectModal";
 import { formatPrice, projectStatus } from "../utils/project";
 
 const STATE_LABEL = {
@@ -52,6 +56,7 @@ const STAGE_ICON: Record<string, ReactNode> = {
 
 export default function ProjectWorkbench() {
   const { pid = "" } = useParams();
+  const [renameOpen, setRenameOpen] = useState(false);
   const { data, isLoading, isError, error, refetch, isFetching } =
     useWorkbench(pid);
   if (isLoading)
@@ -99,7 +104,17 @@ export default function ProjectWorkbench() {
       <div className="page-heading">
         <div>
           <div className="eyebrow">PROJECT WORKBENCH</div>
-          <h1>{data.project.name}</h1>
+          <div className="project-title-row">
+            <h1>{data.project.name}</h1>
+            <Tooltip title="重命名项目">
+              <Button
+                type="text"
+                icon={<EditOutlined />}
+                aria-label="重命名项目"
+                onClick={() => setRenameOpen(true)}
+              />
+            </Tooltip>
+          </div>
           <p>
             {data.project.project_code || data.project.id}
             <span className="meta-divider">/</span>
@@ -309,6 +324,11 @@ export default function ProjectWorkbench() {
           </div>
         </div>
       </Card>
+      <RenameProjectModal
+        project={data.project}
+        open={renameOpen}
+        onClose={() => setRenameOpen(false)}
+      />
     </div>
   );
 }

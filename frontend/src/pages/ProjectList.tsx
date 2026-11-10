@@ -26,6 +26,7 @@ import {
   CheckCircleOutlined,
   ClockCircleOutlined,
   DeleteOutlined,
+  EditOutlined,
   FileProtectOutlined,
   FolderOpenOutlined,
   PlusOutlined,
@@ -38,6 +39,7 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import { useProjects, useTemplates } from "../api/hooks";
 import DashboardMetrics from "../components/DashboardMetrics";
+import RenameProjectModal from "../components/RenameProjectModal";
 import {
   formatDate,
   formatPrice,
@@ -59,6 +61,7 @@ export default function ProjectList() {
     window.matchMedia("(max-width: 767px)").matches ? "grid" : "table",
   );
   const [page, setPage] = useState(1);
+  const [renameTarget, setRenameTarget] = useState<Project | null>(null);
   const [form] = Form.useForm();
   const navigate = useNavigate();
   const qc = useQueryClient();
@@ -432,6 +435,18 @@ export default function ProjectList() {
                     <Link className="project-enter" to={`/p/${p.id}`}>
                       进入项目 <ArrowRightOutlined />
                     </Link>
+                    <Tooltip title="重命名">
+                      <Button
+                        type="text"
+                        size="small"
+                        icon={<EditOutlined />}
+                        aria-label={`重命名项目 ${p.name}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setRenameTarget(p);
+                        }}
+                      />
+                    </Tooltip>
                     <Popconfirm
                       title="删除该项目？"
                       description="文档、规则、评分与报告数据将一并删除且不可恢复。"
@@ -491,6 +506,20 @@ export default function ProjectList() {
                         </span>
                       </div>
                     </Link>
+                    <Tooltip title="重命名">
+                      <Button
+                        type="text"
+                        size="small"
+                        icon={<EditOutlined />}
+                        aria-label={`重命名项目 ${p.name}`}
+                        className="project-grid-rename"
+                        onClick={(e) => {
+                          e.preventDefault();
+                          e.stopPropagation();
+                          setRenameTarget(p);
+                        }}
+                      />
+                    </Tooltip>
                     <Popconfirm
                       title="删除该项目？"
                       description="文档、规则、评分与报告数据将一并删除且不可恢复。"
@@ -609,6 +638,11 @@ export default function ProjectList() {
           </Form.Item>
         </Form>
       </Modal>
+      <RenameProjectModal
+        project={renameTarget}
+        open={!!renameTarget}
+        onClose={() => setRenameTarget(null)}
+      />
     </div>
   );
 }

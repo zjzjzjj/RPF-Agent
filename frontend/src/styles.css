@@ -304,6 +304,11 @@ a:focus-visible {
   letter-spacing: 0;
   overflow-wrap: anywhere;
 }
+.project-title-row {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+}
 .page-heading p {
   margin: 9px 0 0;
   color: #7d887f;
@@ -681,14 +686,26 @@ a:focus-visible {
   display: block;
   color: inherit;
 }
-.project-grid-card .project-grid-delete {
+.project-grid-card .project-grid-delete,
+.project-grid-card .project-grid-rename {
   position: absolute;
   top: 10px;
-  right: 10px;
   opacity: 0;
   transition: opacity 0.15s;
+  /* 不透明芯片底：hover 浮现时盖在状态 Tag 上仍读作悬浮控件，而非图标压字 */
+  border: 1px solid #e3e9dc;
+  border-radius: 6px;
+  background: #fff;
+  box-shadow: 0 1px 4px rgba(34, 54, 43, 0.08);
 }
-.project-grid-card:hover .project-grid-delete {
+.project-grid-card .project-grid-delete {
+  right: 10px;
+}
+.project-grid-card .project-grid-rename {
+  right: 44px;
+}
+.project-grid-card:hover .project-grid-delete,
+.project-grid-card:hover .project-grid-rename {
   opacity: 1;
 }
 .project-grid-card:hover {

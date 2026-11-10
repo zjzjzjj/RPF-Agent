@@ -87,6 +87,50 @@ def test_project_not_found(client):
     assert resp.json()["code"] == "NOT_FOUND"
 
 
+def test_project_rename(client):
+    """重命名：PATCH name 生效并留痕；空名 422；不存在 404。"""
+    from sqlalchemy import select
+
+    from app.db.models import AuditLog
+    from app.db.session import session_scope
+
+    resp = client.post("/api/projects", json={"name": "旧项目名"}, headers={"X-Actor": "zhang-reviewer"})
+    assert resp.status_code == 200
+    pid = resp.json()["id"]
+
+    resp = client.patch(
+        f"/api/projects/{pid}",
+        json={"name": "新项目名"},
+        headers={"X-Actor": "zhang-reviewer"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["name"] == "新项目名"
+    assert client.get(f"/api/projects/{pid}").json()["name"] == "新项目名"
+
+    with session_scope() as s:
+        logs = (
+            s.execute(select(AuditLog).where(AuditLog.project_id == pid, AuditLog.action == "project.patch"))
+            .scalars()
+            .all()
+        )
+    assert logs, "重命名必须写 project.patch 审计留痕"
+    assert logs[-1].detail_json.get("name") == "新项目名"
+
+    # 空名/纯空白名都不能把项目名清掉；带首尾空白的按 strip 归一
+    resp = client.patch(f"/api/projects/{pid}", json={"name": ""})
+    assert resp.status_code == 422
+    resp = client.patch(f"/api/projects/{pid}", json={"name": "   "})
+    assert resp.status_code == 422
+    assert client.get(f"/api/projects/{pid}").json()["name"] == "新项目名"
+
+    resp = client.patch(f"/api/projects/{pid}", json={"name": "  归一项目名  "})
+    assert resp.status_code == 200
+    assert resp.json()["name"] == "归一项目名"
+
+    resp = client.patch("/api/projects/PRJ-19700101-XXXX", json={"name": "x"})
+    assert resp.status_code == 404
+
+
 @pytest.mark.anyio
 async def test_job_queue_runs_handler(app_env):
     """任务队列：提交 → worker 领取 → 处理器执行 → 结果落库。"""
