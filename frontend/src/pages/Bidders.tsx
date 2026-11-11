@@ -429,6 +429,7 @@ export default function Bidders() {
       setOpen(false);
       form.resetFields();
     },
+    onError: (e: Error) => message.error(e.message || "添加投标人失败，请稍后重试"),
   });
 
   const docsByBidder = (bidderId: number) =>
@@ -507,9 +508,47 @@ export default function Bidders() {
         ]}
       />
 
-      <Modal title="新建投标人" open={open} onCancel={() => setOpen(false)} onOk={() => form.submit()}>
-        <Form form={form} layout="vertical" onFinish={(v) => create.mutate(v)}>
-          <Form.Item name="name" label="投标人名称" rules={[{ required: true }]}>
+      <Modal
+        title="新建投标人"
+        open={open}
+        onCancel={() => {
+          if (!create.isPending) setOpen(false);
+        }}
+        onOk={() => form.submit()}
+        okText="添加"
+        cancelText="取消"
+        confirmLoading={create.isPending}
+        closable={!create.isPending}
+        maskClosable={!create.isPending}
+        keyboard={!create.isPending}
+        cancelButtonProps={{ disabled: create.isPending }}
+      >
+        <Form
+          form={form}
+          layout="vertical"
+          disabled={create.isPending}
+          onFinish={(v) => {
+            // 防回车/连点重复提交（2026-11-10 实证：一秒 36 份同名重复插入）
+            if (create.isPending) return;
+            const name = String(v.name ?? "").trim();
+            if ((bidders ?? []).some((b) => b.name === name)) {
+              message.error(`该项目已有投标人「${name}」，请勿重复添加`);
+              return;
+            }
+            create.mutate({
+              name,
+              unified_code:
+                typeof v.unified_code === "string" && v.unified_code.trim()
+                  ? v.unified_code.trim()
+                  : undefined,
+            });
+          }}
+        >
+          <Form.Item
+            name="name"
+            label="投标人名称"
+            rules={[{ required: true, whitespace: true, message: "请输入投标人名称" }]}
+          >
             <Input />
           </Form.Item>
           <Form.Item name="unified_code" label="统一社会信用代码">

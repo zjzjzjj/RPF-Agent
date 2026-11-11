@@ -5,6 +5,7 @@ import {
   Button,
   Card,
   Col,
+  Collapse,
   Empty,
   Popconfirm,
   Progress,
@@ -378,12 +379,33 @@ export default function ScoreResults() {
           }
         />
       )}
-      {/* incomplete_reason 同时被服务端塞进 warnings——不滤掉就双条同文黄幅 */}
-      {summary?.warnings
-        .filter((w) => w !== summary.run.incomplete_reason)
-        .map((w, i) => (
-          <Alert key={i} type="warning" showIcon message={w} style={{ marginBottom: 8 }} />
-        ))}
+      {/* incomplete_reason 同时被服务端塞进 warnings——不滤掉就双条同文黄幅。
+          提醒默认折叠（2026-11-11 用户要求：十几条暂定分黄幅平铺太占屏）。 */}
+      {(() => {
+        const warns = (summary?.warnings ?? []).filter(
+          (w) => w !== summary?.run.incomplete_reason,
+        );
+        return warns.length ? (
+          <Collapse
+            style={{ marginBottom: 12 }}
+            items={[
+              {
+                key: "warnings",
+                label: `提醒（${warns.length} 条，需人工复核等）`,
+                children: warns.map((w, i) => (
+                  <Alert
+                    key={i}
+                    type="warning"
+                    showIcon
+                    message={w}
+                    style={{ marginBottom: i === warns.length - 1 ? 0 : 8 }}
+                  />
+                )),
+              },
+            ]}
+          />
+        ) : null;
+      })()}
 
       <Tabs
         activeKey={tab}
