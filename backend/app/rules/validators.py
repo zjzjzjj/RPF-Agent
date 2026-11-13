@@ -32,6 +32,87 @@ class Finding:
         }
 
 
+# 基准价门槛依据 → 技术/商务类别口径（与 automatic_scoring_service._price_stage 同源）
+_GATE_CATEGORIES = {
+    "tech": {"technical"},
+    "tech_qualification": {"technical", "commercial", "qualification"},
+    "biz_tech": {"technical", "commercial"},
+    "sample_or_composite": {"technical", "commercial"},
+}
+
+
+def _same_number(a: Any, b: Any) -> bool:
+    try:
+        return Decimal(str(a)) == Decimal(str(b))
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _check_formula_source(c: dict, f: dict, ext: dict, criteria: list[dict]) -> list[Finding]:
+    """价格公式「原文 vs 执行参数」冻结前比对（P0-2）。
+
+    原文 = 评分项描述/引文 + 编译时锚定的公式原文段（params_json._price_source）。原文明示的
+    扣分率、基准法、截尾门槛、资格门槛、离群规则须与执行参数一致，否则报错——不再静默执行
+    近似口径（实证：原文不对称扣率却按对称扣率执行、门槛句丢失却按无门槛计算）。
+    门槛原文绝对分（"70%即32.2分"）与"百分比×技术部分总分"不一致 → 告警（多见于类别归位误差）。
+    """
+    from app.rules.compiler import parse_price_formula_text  # 延迟导入：避免与 compiler 循环依赖
+
+    src = "\n".join(str(x or "") for x in (c.get("description"), c.get("source_quote"), ext.get("_price_source")))
+    want = parse_price_formula_text(src)
+    if not want:
+        return []
+    code, name = c["code"], c["name"]
+    out: list[Finding] = []
+
+    def bad(detail: str, hint: str) -> None:
+        out.append(Finding("PRICE_FORMULA_SOURCE_MISMATCH", "error",
+                           f"评分项「{name}」的价格公式与原文不一致：{detail}", "formula", code, hint))
+
+    for key, label in (("deduct_rate_down", "低于最佳报价"), ("deduct_rate_up", "高于最佳报价")):
+        if want.get(key) is not None and not _same_number(ext.get(key), want[key]):
+            got = ext.get(key)
+            bad(f"原文{label}每 1 个百分点扣 {want[key]} 分，执行公式为 {got if got is not None else '未设定'}",
+                "请按原文修正扣分率后重新冻结")
+    if want.get("benchmark_method") and f.get("benchmark_method") != want["benchmark_method"]:
+        bad(f"原文基准价算法为 {want['benchmark_method']}，执行公式为 {f.get('benchmark_method') or '未设定'}",
+            "请按原文修正基准价算法后重新冻结")
+    if want.get("trim_threshold") is not None and ext.get("trim_threshold") is not None:
+        want_op = want.get("trim_threshold_op") or "gt"
+        got_op = ext.get("trim_threshold_op") or "gt"
+        if not _same_number(ext["trim_threshold"], want["trim_threshold"]) or want_op != got_op:
+            bad(f"原文截尾门槛为{'≥' if want_op == 'ge' else '超过'}{want['trim_threshold']}家，执行公式为"
+                f"{'≥' if got_op == 'ge' else '超过'}{ext['trim_threshold']}家",
+                "请按原文修正截尾家数门槛后重新冻结")
+    wg = want.get("benchmark_gate")
+    if wg:
+        eg = ext.get("benchmark_gate")
+        if not isinstance(eg, dict):
+            bad("原文载明基准价资格门槛，执行公式未编译该门槛（将按无门槛计算）", "请补全基准价资格门槛后重新冻结")
+        elif (not _same_number(eg.get("min_ratio"), wg["min_ratio"])
+              or eg.get("gate_on") != wg.get("gate_on") or eg.get("on_fail") != wg.get("on_fail")):
+            bad(f"原文门槛为 {wg['min_ratio']}{'%' if wg.get('ratio_kind') == 'percent' else '分'}"
+                f"（{wg.get('gate_on')}），执行公式为 {eg.get('min_ratio')}（{eg.get('gate_on')}）",
+                "请按原文修正基准价资格门槛后重新冻结")
+        if wg.get("stated_min_score") and wg.get("ratio_kind") == "percent":
+            cats = _GATE_CATEGORIES.get(wg.get("gate_on") or "tech", {"technical"})
+            base = sum((Decimal(str(x["max_score"])) for x in criteria
+                        if x.get("category") in cats and x.get("max_score") is not None
+                        and x.get("score_type") not in ("veto", "match")), Decimal(0))
+            expected = base * Decimal(str(wg["min_ratio"])) / Decimal(100)
+            stated = Decimal(str(wg["stated_min_score"]))
+            if abs(expected - stated) > Decimal("0.05"):
+                out.append(Finding(
+                    "PRICE_GATE_BASE_MISMATCH", "warn",
+                    f"评分项「{name}」的基准价门槛：原文写明即 {stated} 分，按冻结类别计算的基数 {base} × "
+                    f"{wg['min_ratio']}% = {expected.quantize(Decimal('0.01'))} 分，不一致",
+                    "formula", code,
+                    "多见于评分项类别归位错误（如免费质保类误归商务），请核对类别后确认"))
+    if want.get("outlier_policy") and not isinstance(ext.get("outlier_policy"), dict):
+        bad("原文载明超倍/半价剔除重算，执行公式未编译该规则（将不执行离群保护）", "请补全离群保护规则后重新冻结")
+    return out
+
+
 def run_validators(
     snapshot: dict,
     node_exists: Callable[[str], bool] | None = None,
@@ -118,10 +199,15 @@ def run_validators(
             elif formula_type in ("benchmark_ratio", "lowest_ratio"):
                 if not f.get("k"):
                     missing.append("k")
+            # 二次平均必须有原文明示的截尾家数门槛（2026-11-13：旧实现默认 6，引擎无门槛时恒截尾）
+            if f.get("benchmark_method") == "average_trimmed_then_below" and ext.get("trim_threshold") is None:
+                missing.append("trim_threshold（二次平均的截尾家数门槛，原文须明示）")
             if missing:
                 findings.append(Finding("PRICE_PARAMS_INCOMPLETE", "error",
                                         f"评分项「{c['name']}」的价格公式缺少参数：{('、'.join(missing))}",
                                         "formula", code, "请人工补全公式参数后确认"))
+            # 原文 vs 执行参数（P0-2）：原文明示的扣分率/基准法/门槛/离群规则必须与冻结参数一致
+            findings += _check_formula_source(c, f, ext, criteria)
             upper = f.get("upper_bound")
             if (
                 upper is not None

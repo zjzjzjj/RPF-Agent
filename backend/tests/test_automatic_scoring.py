@@ -1000,3 +1000,24 @@ def test_delayed_job_retry_returns_completed_result_without_loading_or_reviewing
         run = s.get(EvaluationRun, managed_run["id"])
         assert run.status == "succeeded" and run.finished_at == finished_at
         assert len(list(s.execute(select(EvidenceCitation)).scalars())) == citations
+
+
+def test_closure_reading_gap_keeps_unscored(managed_run, monkeypatch):
+    """P0-3：读取故障的闭合定格是"未定分"——不写暂定 0 分冒充材料缺失/评审结论。"""
+    monkeypatch.setenv("BID_EVAL_SCORE_CLOSURE", "1")
+    criterion = managed_run["criteria"][1]
+    err = LLMError("关联材料仍有未完成 OCR 或原页视觉核验的不可读页面：doc1第7页；须补读")
+    err.reading_incomplete = True
+    err.unreadable_pages = [{"document_id": 1, "page_no": 7}]
+    scoring._persist_cell(managed_run["id"], managed_run["bidder"], criterion, None, err)
+    with session_scope() as s:
+        row = s.execute(select(ScoreRecord)).scalar_one()
+        assert row.final_score is None                       # 未定分，不是 0
+        assert row.ai_raw_json["auto_review"]["basis"] == "fallback"
+        fb = row.ai_raw_json["auto_review"]["fallback"]
+        assert fb["kind"] == "reading_incomplete"
+        assert fb["unreadable_pages"] == [{"document_id": 1, "page_no": 7}]
+        assert "读取故障未定分" in (row.ai_reasoning or "")
+    state = automation.progress(managed_run["id"])
+    assert state["completed"] == 1                           # 计完成（运行可收口）
+    assert state["fallback"] == 1

@@ -36,6 +36,22 @@ def _tiers_cut(n: int, tiers: list) -> int:
     return 0
 
 
+def _exceeds_threshold(n: int, threshold: int, op: str = "gt") -> bool:
+    """截尾触发口径：op="gt" → 有效家数 > threshold（原文"超过N家"）；op="ge" → ≥ threshold（原文"≥N家"）。
+
+    2026-11-13：旧实现只有 >，原文"≥6个"时 6 家不截（差一错误）；口径改由冻结参数 trim_threshold_op 决定。
+    """
+    return n >= threshold if op == "ge" else n > threshold
+
+
+def _hit_text(threshold: int, op: str) -> str:
+    return f"≥{threshold}" if op == "ge" else f"＞{threshold}"
+
+
+def _miss_text(threshold: int, op: str) -> str:
+    return f"<{threshold}" if op == "ge" else f"≤{threshold}"
+
+
 def compute_benchmark(
     prices: list[Decimal],
     method: str = "average",
@@ -44,6 +60,7 @@ def compute_benchmark(
     *,
     trim_count: int = 0,
     trim_threshold: int = 0,
+    trim_threshold_op: str = "gt",
     trim_tiers: list | None = None,
     strict: bool = False,
 ) -> tuple[Decimal, str]:
@@ -79,14 +96,14 @@ def compute_benchmark(
             cut = min(cut, max(0, (n - 1) // 2))  # 至少保留 1 家
             note = f"有效投标人 {n} 家命中分档规则，去掉最高最低各 {cut} 家"
         elif trim_count > 0:
-            cut = trim_count if n > trim_threshold else 0
+            cut = trim_count if _exceeds_threshold(n, trim_threshold, trim_threshold_op) else 0
             if strict and n - 2 * cut < 1:
                 raise ValueError("有效报价家数不足以按冻结规则去极值，不能缩减剔除家数")
             cut = min(cut, max(0, (n - 1) // 2))  # 至少保留 1 家
             note = (
-                f"有效投标人 {n} 家＞{trim_threshold}，去掉最高最低各 {cut} 家"
+                f"有效投标人 {n} 家{_hit_text(trim_threshold, trim_threshold_op)}，去掉最高最低各 {cut} 家"
                 if cut
-                else f"有效投标人 {n} 家≤{trim_threshold}，不剔除最高最低"
+                else f"有效投标人 {n} 家{_miss_text(trim_threshold, trim_threshold_op)}，不剔除最高最低"
             )
         else:
             cut = int(n * trim_ratio)  # 两端各截去
@@ -110,15 +127,17 @@ def compute_benchmark(
         # 再对低于首均者二次算术平均；<N 家不去极值直接首均。
         ordered = sorted(prices)
         n = len(ordered)
-        if trim_count > 0 and n > trim_threshold:
+        if trim_count > 0 and _exceeds_threshold(n, trim_threshold, trim_threshold_op):
             if strict and n - 2 * trim_count < 1:
                 raise ValueError("有效报价家数不足以按冻结规则去极值，不能缩减剔除家数")
             cut = min(trim_count, max(0, (n - 1) // 2))
             first_pool = ordered[cut : n - cut]
-            first_note = f"有效投标人 {n} 家＞{trim_threshold}，首均前去掉最高最低各 {cut} 家"
+            first_note = (
+                f"有效投标人 {n} 家{_hit_text(trim_threshold, trim_threshold_op)}，首均前去掉最高最低各 {cut} 家"
+            )
         else:
             first_pool = ordered
-            first_note = f"有效投标人 {n} 家≤{trim_threshold}，首均不去极值"
+            first_note = f"有效投标人 {n} 家{_miss_text(trim_threshold, trim_threshold_op)}，首均不去极值"
         first = sum(first_pool) / Decimal(len(first_pool))
         below = [p for p in prices if p <= first]
         below = below or [first]
@@ -241,6 +260,8 @@ def _validate_strict_formula(bids: list[PriceBid], formula: dict) -> None:
     for key in ("trim_count", "trim_threshold"):
         if ext.get(key) is not None and (isinstance(ext[key], bool) or not str(ext[key]).isdigit()):
             raise ValueError("去极值家数及门槛必须是非负整数")
+    if ext.get("trim_threshold_op") not in (None, "gt", "ge"):
+        raise ValueError("去极值门槛口径无效（须为超过N家 gt / ≥N家 ge）")
     tiers = ext.get("trim_tiers")
     if tiers:
         if not isinstance(tiers, list):
@@ -368,6 +389,7 @@ def compute_price_scores(
     rate_up = Decimal(str(ext.get("deduct_rate_up", deduct_rate)))
     trim_count = int(ext.get("trim_count") or 0)
     trim_threshold = int(ext.get("trim_threshold") or 0)
+    trim_threshold_op = str(ext.get("trim_threshold_op") or "gt")
     trim_tiers = ext.get("trim_tiers") or None
     gate = ext.get("benchmark_gate") if isinstance(ext.get("benchmark_gate"), dict) else None
     policy = ext.get("outlier_policy") if isinstance(ext.get("outlier_policy"), dict) else None
@@ -472,7 +494,7 @@ def compute_price_scores(
     benchmark, bench_expl = compute_benchmark(
         in_benchmark, method, k, trim_ratio,
         trim_count=trim_count, trim_threshold=trim_threshold,
-        trim_tiers=trim_tiers, strict=strict,
+        trim_threshold_op=trim_threshold_op, trim_tiers=trim_tiers, strict=strict,
     )
     if strict and (not benchmark.is_finite() or benchmark <= ZERO):
         raise ValueError("按细则计算的基准价无效，不能生成价格分")
@@ -503,7 +525,7 @@ def compute_price_scores(
                 benchmark, bench_expl2 = compute_benchmark(
                     survivors, method, k, trim_ratio,
                     trim_count=trim_count, trim_threshold=trim_threshold,
-                    trim_tiers=trim_tiers, strict=strict,
+                    trim_threshold_op=trim_threshold_op, trim_tiers=trim_tiers, strict=strict,
                 )
                 if strict and (not benchmark.is_finite() or benchmark <= ZERO):
                     raise ValueError("离群剔除后重算的基准价无效")

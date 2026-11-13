@@ -117,3 +117,87 @@ def test_objective_fastpath_reports_zero_with_reason_when_absent():
     assert result is not None
     assert result.score == Decimal("0.00")
     assert result.zero_reason in ("no_facts", "confirmed_absent")
+
+
+# ==== P0-5（测试10 run113）：三件套材料链（细则"未提供的不得分"制裁句）====
+
+from decimal import Decimal as _D  # noqa: E402
+
+from app.engine.facts import BidFacts  # noqa: E402
+from app.engine.material_inventory import ContractRecord, MaterialInventory  # noqa: E402
+
+RULE10 = (
+    "投标产品业绩：根据投标人提供自2022年1月1日（合同签订时间为准）至今的同类产品业绩，"
+    "要求合同金额100万及以上，每个得1分，最高得2分。"
+    "【证明材料】须提供业绩合同、验收证明材料及合同配套的至少一张发票复印件并加盖投标人公章，"
+    "以上资料未提供的不得分。"
+)
+
+
+def _contract_inv(records):
+    return MaterialInventory(
+        bidder_id=1, pages=[], full_text="", facts=BidFacts(text=""),
+        contracts=records, performance_section_found=True,
+    )
+
+
+def _perf_rule(description, **param_changes):
+    params = {"field": "performance", "per_item": "1",
+              "min_amount_yuan": "1000000", **param_changes}
+    return {"code": "c25", "name": "投标产品业绩", "score_type": "count",
+            "max_score": "2", "description": description, "params": params}
+
+
+def test_hard_sanction_rejects_case_missing_acceptance_or_invoice():
+    """细则三件套制裁句：缺验收/发票的案例不计分（表格行不豁免）。"""
+    record = ContractRecord(name="某研究所维保", amount_yuan=_D("1200000"),
+                            pages=[1], materials={"contract": [1]}, source="table")
+    result = score_objective(_perf_rule(RULE10), _contract_inv([record]))
+    assert result is not None
+    assert result.score == Decimal("0.00")
+    assert "未提供的不得分" in result.detail
+    assert "缺" in result.detail
+
+
+def test_hard_sanction_counts_case_with_full_three_piece_chain():
+    """三件套齐全（合同+验收+发票≥1）的案例照计。"""
+    record = ContractRecord(
+        name="某研究所维保", amount_yuan=_D("1200000"), pages=[1, 2, 3],
+        materials={"contract": [1], "acceptance": [2], "invoice": [3]}, source="table")
+    result = score_objective(_perf_rule(RULE10), _contract_inv([record]))
+    assert result is not None
+    assert result.score == Decimal("1.00")
+    assert result.verdict == "pass"
+
+
+def test_hard_sanction_accepts_text_contract_block_as_contract_copy():
+    """正文合同块（source=text）本身就是提供的合同复印件；仍需验收+发票。"""
+    record = ContractRecord(
+        name="某研究所维保", amount_yuan=_D("1200000"), pages=[1, 2, 3],
+        materials={"acceptance": [2], "invoice": [3]}, source="text")
+    result = score_objective(_perf_rule(RULE10), _contract_inv([record]))
+    assert result is not None
+    assert result.score == Decimal("1.00")
+
+
+def test_or_material_group_needs_only_one():
+    """"发票或验收材料"+制裁句：OR 组任一即可（不误杀）。"""
+    rule_text = ("同类产品业绩，合同金额100万及以上每个得1分，最高得2分。"
+                 "【证明材料】须提供合同复印件及发票或验收材料，未提供的不得分。")
+    record = ContractRecord(name="某维保", amount_yuan=_D("1200000"), pages=[1, 2],
+                            materials={"contract": [1], "acceptance": [2]}, source="table")
+    result = score_objective(_perf_rule(rule_text), _contract_inv([record]))
+    assert result is not None
+    assert result.score == Decimal("1.00")
+
+
+def test_no_sanction_keeps_legacy_lenient_material_gate():
+    """无制裁句的细则不设硬闸（不猜）：表格行主张照计（legacy 契约不动）。"""
+    rule_text = ("合同金额50万及以上的业绩的，每个得2分，最高不超过6分。"
+                 "【证明材料】：合同复印件及发票或验收材料。")
+    record = ContractRecord(name="某维保", amount_yuan=_D("570000"),
+                            pages=[1], materials={"contract": [1]}, source="table")
+    result = score_objective(_perf_rule(rule_text, min_amount_yuan="500000",
+                                        per_item="2"), _contract_inv([record]))
+    assert result is not None
+    assert result.score == Decimal("2.00")

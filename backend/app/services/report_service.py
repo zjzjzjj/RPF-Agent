@@ -197,6 +197,16 @@ def _machine_message(score) -> str:
     return ""
 
 
+def _is_provisional_fallback(score) -> bool:
+    """P0-1（测试10 run113）：closure 故障兜底暂定格判定——auto_review.basis
+    == "fallback"（duplicate_summary 是设计内的"不重复计分"，不算）。
+    与 ranking_service / automation_service._state 同口径。"""
+    meta = (getattr(score, "ai_raw_json", None) or {}).get("auto_review") or {}
+    if meta.get("basis") != "fallback":
+        return False
+    return ((meta.get("fallback") or {}).get("kind")) != "duplicate_summary"
+
+
 def _fallback_marker(score) -> dict | None:
     """兜底分标记（R3-5，2026-11-03）：读 warnings 的结构化 fallback_score 键；
     旧数据兼容：message 含「按最低档兜底」。返回标记 dict 或 None。
@@ -849,7 +859,9 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
             if entry is None:
                 continue
             score = entry[0]
-            if crit.score_type != "subjective" and score.final_score is not None:
+            # P0-1：故障兜底暂定分不是评审结论，不进合计（与 ranking 同口径）。
+            if (crit.score_type != "subjective" and score.final_score is not None
+                    and not _is_provisional_fallback(score)):
                 base += Decimal(str(score.final_score))
             if crit.category == "price":
                 for w in score.warnings_json or []:
@@ -914,6 +926,9 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
             "price_no_tax": str(_no_tax(effective_prices[bidder.id])) if not automated and effective_prices[bidder.id] is not None else None,
             "judge_totals": per_judge_totals,
             "final": str(rk.get("total")) if rk.get("total") is not None else None,
+            # P0-1 双分值：final=已定分合计；provisional_total=含故障兜底暂定分合计。
+            "provisional_total": rk.get("provisional_total"),
+            "incomplete": bool(rk.get("missing_final")) or bool(rk.get("fallback")),
             "rank": rk.get("rank"),
             "veto_flag": rk.get("veto_flag", False),
             "has_noncompliance": automated and any(
@@ -1214,16 +1229,23 @@ def render_docx(report: dict) -> bytes:
     headers = ["投标人", "投标报价(含税)", "投标报价(不含税)"] + report["judge_labels"] + ["最终得分", "名次"]
     rows = []
     for r in report["summary_rows"]:
+        final_cell = r["final"] or "-"
+        # P0-1：含故障兜底暂定格时标注不完整，并给含暂定合计双分值。
+        if r.get("incomplete") and r.get("provisional_total"):
+            final_cell += f"（不完整；含暂定 {r['provisional_total']}）"
         rows.append(
             [r["bidder"], r["bid_price"] or "-", r["price_no_tax"] or "-"]
             + [j["total"] for j in r["judge_totals"]]
-            + [r["final"] or "-", str(r["rank"] or "-") + (
+            + [final_cell, str(r["rank"] or "-") + (
                 "（存在不符合结论）" if automated and r.get("has_noncompliance") else
                 "（外部事实无法证实）" if automated and r.get("has_external_boundary") else
                 "（有否决建议）" if not automated and r["veto_flag"] else ""
             )]
         )
     table(headers, rows)
+    if any(r.get("incomplete") for r in report["summary_rows"]):
+        para("注：以上「最终得分」仅合计已定分格；带「不完整」标注的投标人尚有未定分或故障兜底暂定分格"
+             "（见下方兜底分清单），暂定分不是评审结论，不发布最终名次。")
     heading("三、" + report["review_notes_title"], 1)
     if not report["review_notes"]:
         para(report["no_review_notes"])
@@ -1238,8 +1260,13 @@ def render_docx(report: dict) -> bytes:
              "兜底分清单（非评审结论）：以下格为全自动模式最低档兜底或机器未抽到事实的 "
              "0 分，已按零未定分政策计入总分，请人工核看原件后改分或重跑：")
         for f in report["fallback_scores"]:
-            para(f"　· {f['bidder']}：{f['criterion']}（当前 {f['final_score']} 分，"
-                 f"类型 {f['kind']}）")
+            if f["kind"] == "reading_incomplete":
+                # P0-3：读取故障待补读——未定分，既不是 0 分也不是材料缺失。
+                para(f"　· {f['bidder']}：{f['criterion']}（读取故障待补读，未定分；"
+                     f"{f.get('machine_message') or '须补读原页图像后重评'}）")
+            else:
+                para(f"　· {f['bidder']}：{f['criterion']}（当前 {f['final_score']} 分，"
+                     f"类型 {f['kind']}）")
     heading("四、评标结论", 1)
     ordered = [r for r in report["summary_rows"] if r["rank"]]
     ordered.sort(key=lambda r: r["rank"])
@@ -1250,6 +1277,11 @@ def render_docx(report: dict) -> bytes:
         para("以上为系统完成全部评审后的评分排序；资格与符合性风险另见审查表。"
              if report["run"].get("automation") is not None else
              "以上排序为 AI 辅助评审结果，须评标委员会确认后生效。")
+    elif any(r.get("incomplete") for r in report["summary_rows"]):
+        # P0-1：含故障兜底暂定格时不出中标候选人推荐——暂定分不是评审结论，
+        # 按其排序会误导（测试10 run113：15 个暂定格把人工末位顶成 AI 第 1）。
+        para("因存在未定分或故障兜底暂定分格（非评审结论，见兜底分清单），"
+             "总分不构成完整评审结论，暂不推荐中标候选人；补评或人工改分后重新汇总排名。")
     doc.add_page_break()
 
     # 附表 A1 资格 / A2 符合性

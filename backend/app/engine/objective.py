@@ -1663,11 +1663,9 @@ def score_deviation_deduct_table(
         )
     max_score = criterion.get("max_score")
     verified = criterion.get("verified_facts") or {}
-    counts, snippet = _extract_deviation_counts(facts.text or "")
-    if criterion.get("verified_facts") is not None:
-        counts, snippet = None, ""
-    if isinstance(verified.get("deviation_counts"), dict):
-        supplied = verified["deviation_counts"]
+    supplied = verified.get("deviation_counts") if isinstance(verified, dict) else None
+    if isinstance(supplied, dict):
+        # LLM 逐页核验的偏离表事实优先（托管路径）。
         try:
             values = {key: Decimal(str(supplied[key])) for key in ("total", "missing", "negative")}
             if any(not value.is_finite() or value != value.to_integral_value() for value in values.values()):
@@ -1678,6 +1676,12 @@ def score_deviation_deduct_table(
             snippet = "AI 已逐页核验的偏离表事实"
         except (KeyError, ValueError, TypeError, ArithmeticError):
             return CountResult(Decimal(0), "已核验偏离表事实结构非法", True, unresolved="no_facts")
+    else:
+        # P0-4（测试10 run113）：托管路径 verified_facts 存在但未供 deviation_counts
+        # 时不得清空确定性计数——旧短路（verified_facts 非 None 即整表作废）把
+        # 技术指标符合性（20 分扣分制）整格打成 no_facts→0。确定性偏离表计数
+        # （_extract_deviation_counts）兜底，LLM 供了核验值才让位。
+        counts, snippet = _extract_deviation_counts(facts.text or "")
     if counts is None:
         return CountResult(
             Decimal(0),

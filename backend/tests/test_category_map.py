@@ -190,3 +190,59 @@ def test_merge_pairs_after_category_correction(client) -> None:  # noqa: ANN001
     ]
     assert paired, "类别校正后模板 commercial 条目应与文档业绩条目配对"
     assert paired[0]["document"]["category"] == "commercial"
+
+
+# ---------------------------------------------------------------------------
+# 不变式：score_type == "formula" ⇒ category = "price"（2026-11-11 烟丝仪器项目）
+# 真实故障：报价得分挂「商务部分（0-50 分）」节点下被标 commercial，价格链路
+# （enrich 正则补全 / PriceFormula 落库 / normalize 重解析）全按 category=="price"
+# 过门被拦死 → PRICE_FORMULA_UNRECOGNIZED + 缺 benchmark_method。
+# ---------------------------------------------------------------------------
+
+
+def test_formula_forces_price_in_extracted(app_env) -> None:  # noqa: ANN001
+    """编译期（enrich/落库之前）：formula 条目强制归 price，且幂等。"""
+    from app.rules.model import ExtractedCriterion
+
+    c = ExtractedCriterion(
+        category="commercial",
+        name="商务报价得分",
+        score_type="formula",
+        max_score=Decimal("50"),
+        description="次低价为最佳报价值，每低1个百分点扣0.3分；每高1个百分点扣0.5分。",
+        quote="次低价为最佳报价值",
+    )
+    changed = category_map.apply_category_to_extracted([c], 0)
+    assert c.category == "price"
+    assert changed == 1
+    assert category_map.apply_category_to_extracted([c], 0) == 0  # 幂等
+
+
+def test_plan_fixes_formula_forces_price_and_blocks_downgrade() -> None:
+    """DB 权威修复（compile/normalize 后置）：公式项强制 price，
+    且不被「商务部分」节点映射改回 commercial。"""
+    base = dict(
+        package_id=0,
+        code="c30",
+        name="商务报价得分",
+        description="x",
+        score_type="formula",
+        max_score=Decimal("50"),
+        is_veto=False,
+        source_node_id="t:root:SEC6:I5:N3",
+        source_page=101,
+        source_quote="次低价为最佳报价值",
+        origin="document",
+        status="verified",
+        sort_order=1,
+    )
+    titles = {"t:root:SEC6:I5:N3": "商务部分（0-50 分）"}
+
+    wrong = Criterion(category="commercial", **base)
+    fixes = category_map.plan_category_fixes([wrong], 1, titles, [])
+    assert [(f[1], f[2], f[3]) for f in fixes] == [
+        ("commercial", "price", "formula 类型强制归价格")
+    ]
+
+    ok = Criterion(category="price", **{**base, "code": "c31"})
+    assert category_map.plan_category_fixes([ok], 1, titles, []) == []

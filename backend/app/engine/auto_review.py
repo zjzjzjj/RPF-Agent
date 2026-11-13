@@ -492,39 +492,77 @@ def _anchor_person_sources(decision: AutoReviewDecision, pages: list[dict]) -> N
             break
 
 
-def _validate_fact_sources(decision: AutoReviewDecision) -> None:
-    for field in ("verified_cases", "person_attributes"):
+_FACT_FIELDS_BY_PARAM = {
+    "performance": ("verified_cases", "performance_amounts"),
+    "certificates": ("certificates", "cert_section_present"),
+}
+
+
+def _consumed_fact_fields(criterion: dict | None) -> set[str] | None:
+    """本格计分会消费的共享事实字段（P0-4b）。None = 无显式契约，保持全量严格校验（旧口径）。
+
+    只认显式计分契约（params 的 field / engine / person_scope，含路由补入的）：确定性引擎
+    只读契约字段，契约外的事实不影响本格分数，校验失败只剔除、不连坐。不靠文本关键词猜消费关系。
+    测试10 run113 c27 实证：技术偏离表（扣分制，引擎只读 deviation_counts）因模型从"技术响应…"
+    语句抽出的 response_hours 无法复算而整格判失败，计分本身与该事实无关。
+    """
+    if criterion is None:
+        return None
+    params = criterion.get("params") or {}
+    field = str(params.get("field") or "")
+    engine = str(params.get("engine") or "")
+    if not (field or engine or params.get("person_scope")):
+        return None
+    consumed: set[str] = set(_FACT_FIELDS_BY_PARAM.get(field, (field,))) if field else set()
+    if engine == "deviation_deduct_table":
+        consumed.add("deviation_counts")
+    if params.get("person_scope"):
+        consumed.update(("person_attributes", "verified_cases"))
+    return consumed
+
+
+def _validate_fact_sources(decision: AutoReviewDecision, criterion: dict | None = None) -> None:
+    consumed = _consumed_fact_fields(criterion)
+
+    def guarded(field: str, check, *args) -> None:
+        # 未被本格消费的共享事实校验失败 → 剔除该事实，不连坐本格（它不参与本格计分）；
+        # 本格消费的字段或无法判定（consumed is None）仍严格报错，保持原口径。
+        try:
+            check(*args)
+        except LLMError:
+            if consumed is None or field in consumed:
+                raise
+            decision.facts.pop(field, None)
+
+    def check_list(field: str) -> None:
         records = decision.facts.get(field) or []
         if not isinstance(records, list):
             raise LLMError(f"事实字段 {field} 必须是列表")
         for record in records:
             if not isinstance(record, dict) or not _has_fact_source(record, decision.evidence):
                 raise LLMError(f"{field} 条目缺少逐条核验的原页证据")
-    certificates = decision.facts.get("certificates") or []
-    backing = decision.facts.get("certificate_evidence") or decision.facts.get("cert_backing") or {}
-    for cert in certificates:
-        references = backing.get(str(cert)) if isinstance(backing, dict) else None
-        if isinstance(references, list):
-            references = {"evidence": references}
-        if not isinstance(references, dict) or not _has_fact_source(references, decision.evidence):
-            raise LLMError(f"证书 {cert} 缺少逐本原页证据")
-    if decision.facts.get("performance_amounts") and not decision.facts.get("verified_cases"):
-        raise LLMError("业绩金额列表缺少逐案例证明材料核验")
-    fact_refs = decision.facts.get("fact_evidence") or {}
-    yearly_fields = tuple(key for key in decision.facts if re.fullmatch(r"yearly_bid_price_[1-9]\d*", key))
-    # has_qualification_cert is recomputed deterministically from the full text
-    # by _verified_count; requiring a model source for it only caused skips.
-    for field in ("bid_price", "price_items_total", "registered_capital", "response_hours",
-                  "warranty_months", "deviation_counts", "has_guarantee", "credit_statement",
-                  "cert_section_present") + yearly_fields:
-        if field not in decision.facts or decision.facts[field] is None:
-            continue
+
+    def check_certificates() -> None:
+        certificates = decision.facts.get("certificates") or []
+        backing = decision.facts.get("certificate_evidence") or decision.facts.get("cert_backing") or {}
+        for cert in certificates:
+            references = backing.get(str(cert)) if isinstance(backing, dict) else None
+            if isinstance(references, list):
+                references = {"evidence": references}
+            if not isinstance(references, dict) or not _has_fact_source(references, decision.evidence):
+                raise LLMError(f"证书 {cert} 缺少逐本原页证据")
+
+    def check_performance_amounts() -> None:
+        if not decision.facts.get("verified_cases"):
+            raise LLMError("业绩金额列表缺少逐案例证明材料核验")
+
+    def check_scalar(field: str, fact_refs, is_yearly: bool) -> None:
         references = fact_refs.get(field) if isinstance(fact_refs, dict) else None
         if isinstance(references, list):
             references = {"evidence": references}
         if not isinstance(references, dict) or not _has_fact_source(references, decision.evidence):
             raise LLMError(f"事实 {field} 缺少对应原页证据，不能只凭模型数值计分")
-        if field in ("bid_price", "price_items_total", "registered_capital", "response_hours", "warranty_months") or field in yearly_fields:
+        if field in ("bid_price", "price_items_total", "registered_capital", "response_hours", "warranty_months") or is_yearly:
             try:
                 value = Decimal(str(decision.facts[field]))
             except (InvalidOperation, ValueError, TypeError) as exc:
@@ -545,6 +583,24 @@ def _validate_fact_sources(decision: AutoReviewDecision) -> None:
             visual = any(isinstance(ref, dict) and ref.get("kind") == "visual" for ref in linked)
             if not visual and not any(value in _numeric_values(quote, field) for quote in quotes):
                 raise LLMError(f"事实 {field} 数值无法从关联原文复算，须补充准确引文")
+
+    for field in ("verified_cases", "person_attributes"):
+        if decision.facts.get(field):
+            guarded(field, check_list, field)
+    if decision.facts.get("certificates"):
+        guarded("certificates", check_certificates)
+    if decision.facts.get("performance_amounts"):
+        guarded("performance_amounts", check_performance_amounts)
+    fact_refs = decision.facts.get("fact_evidence") or {}
+    yearly_fields = tuple(key for key in decision.facts if re.fullmatch(r"yearly_bid_price_[1-9]\d*", key))
+    # has_qualification_cert is recomputed deterministically from the full text
+    # by _verified_count; requiring a model source for it only caused skips.
+    for field in ("bid_price", "price_items_total", "registered_capital", "response_hours",
+                  "warranty_months", "deviation_counts", "has_guarantee", "credit_statement",
+                  "cert_section_present") + yearly_fields:
+        if field not in decision.facts or decision.facts[field] is None:
+            continue
+        guarded(field, check_scalar, field, fact_refs, field in yearly_fields)
 
 
 def _numeric_values(text: str, field: str) -> set[Decimal]:
@@ -705,7 +761,7 @@ def _validate_subjective_score(decision: AutoReviewDecision, criterion: dict) ->
         if not decision.score.is_finite() or not Decimal(0) <= decision.score <= maximum:
             raise LLMError("主观评分超出冻结细则的合法范围")
         return
-    parsed = parse_subitems(criterion.get("description"))
+    parsed = parse_subitems(criterion.get("description"), criterion.get("max_score"))
     if decision.sub_scores and not parsed:
         raise LLMError("主观子项未在冻结细则中定义，不能按模型新增子项给分")
     if parsed:
@@ -1021,7 +1077,7 @@ def _call(gateway: Gateway, criterion: dict, pages: list[dict], *, data_class: s
     payload = {"rule": criterion, "fact_schema": fact_schema,
                "required_price_components": price_components,
                "frozen_subitems": [{"name": name, "max_score": str(cap)}
-                                   for name, cap in parse_subitems(criterion.get("description"))],
+                                   for name, cap in parse_subitems(criterion.get("description"), criterion.get("max_score"))],
                "external_requirement": external,
                "allowed_verdicts": ["pass", "fail", "unverifiable"] if allow_abstention else ["pass", "fail"],
                "round": round_no, "pages": material, "prior": semantic_value(previous),
@@ -1195,7 +1251,7 @@ def _call(gateway: Gateway, criterion: dict, pages: list[dict], *, data_class: s
                 refs = decision.facts.get("fact_evidence")
                 if isinstance(refs, dict):
                     refs.pop("bid_price", None)
-            _validate_fact_sources(decision)
+            _validate_fact_sources(decision, criterion)
         except (LLMError, ValidationError) as exc:
             invalidate()
             if isinstance(exc, ReviewContextExceeded) or (isinstance(exc, LLMError) and exc.transient):
@@ -1655,8 +1711,12 @@ def synthesis_decision(gateway, criterion, pages, *, data_class, previous,
         # exhausted before the remaining visual recovery could ever run.
         locations = "、".join(f"doc{item['document_id']}第{item['page_no']}页"
                              for item in material_state["unresolved_read_pages"])
-        raise LLMError("关联材料仍有未完成 OCR 或原页视觉核验的不可读页面：" + locations
+        err = LLMError("关联材料仍有未完成 OCR 或原页视觉核验的不可读页面：" + locations
                        + "；须补读上述原页图像并视觉核验后再综合，不能作为外部事实缺失结项")
+        # P0-3：读取故障标记——外层补读轮接住（不受 continue 快速失败捷径影响）。
+        err.reading_incomplete = True
+        err.unreadable_pages = list(material_state["unresolved_read_pages"])
+        raise err
 
     kwargs = dict(data_class=data_class, previous=previous, round_no=round_no,
                   use_vision=use_vision, send_images=False, material_state=material_state)
@@ -1765,7 +1825,7 @@ def synthesis_decision(gateway, criterion, pages, *, data_class, previous,
             checked = AutoReviewDecision.model_validate(raw)
             _validate_synthesis_sources(checked, decisions)
             _validate_evidence(checked, pages, use_vision=use_vision)
-            _validate_fact_sources(checked)
+            _validate_fact_sources(checked, criterion)
             for item in checked.evidence:
                 source_reference(item, index)
 
@@ -1809,7 +1869,7 @@ def synthesis_decision(gateway, criterion, pages, *, data_class, previous,
     try:
         _validate_synthesis_sources(final, [ledger_decision])
         _validate_evidence(final, pages, use_vision=use_vision)
-        _validate_fact_sources(final)
+        _validate_fact_sources(final, criterion)
         for item in final.evidence:
             source_reference(item, -1)
     except Exception:
@@ -1901,7 +1961,7 @@ def review_criterion(gateway: Gateway, criterion: dict, pages: list[dict], *,
             def validate(raw):
                 checked = AutoReviewDecision.model_validate(raw)
                 _validate_evidence(checked, batch, use_vision=vision)
-                _validate_fact_sources(checked)
+                _validate_fact_sources(checked, criterion)
 
             # One-batch responses are final candidates and must not be cached
             # before the final subjective/absence checks below have passed.
@@ -2015,7 +2075,7 @@ def _finish_decision(decision: AutoReviewDecision, criterion: dict, pages: list[
     else:
         _validate_subjective_score(decision, criterion)
     if not direct_subjective:
-        _validate_fact_sources(decision)
+        _validate_fact_sources(decision, criterion)
     # A valid quote on one page cannot discharge a known reading failure on
     # another page. Long, readable inputs may still finish from sufficient
     # retrieved evidence; only unresolved technical readability blocks them.
@@ -2025,7 +2085,14 @@ def _finish_decision(decision: AutoReviewDecision, criterion: dict, pages: list[
               if use_vision and page.get("image_url")}
     if not direct_subjective and any(
             not _readable(page, use_vision and _page_key(page) in imaged) for page in pages):
-        raise LLMError("关联材料仍有未完成 OCR 或原页视觉核验的不可读页面，须自动补评后才能形成终态")
+        err = LLMError("关联材料仍有未完成 OCR 或原页视觉核验的不可读页面，须自动补评后才能形成终态")
+        # P0-3：读取故障标记——外层补读轮接住，闭合层不得折成暂定 0 分。
+        err.reading_incomplete = True
+        err.unreadable_pages = [
+            {"document_id": int(page.get("document_id") or 0), "page_no": int(page.get("page_no") or 0)}
+            for page in pages if not _readable(page, use_vision and _page_key(page) in imaged)
+        ]
+        raise err
     if direct_subjective and any(
             not _readable(page, use_vision and _page_key(page) in imaged) for page in pages):
         decision.coverage_complete = False

@@ -719,14 +719,21 @@ def _assess_cell(criterion: dict, pages: list[dict], data_class: str, gateway_fa
                 # or contract repair must not trigger a full OCR/visual reread.
                 exc.attempt_history = attempts + [{"round": round_no, "state": "failed", "error": str(exc)}]
                 raise
+            # P0-3（测试10 run113）：读取故障不是语义失败——continue 快速失败捷径
+            # 不适用，必须走完补读轮（round 1 补 OCR、round 2+ 视觉补读）再定论，
+            # 否则"须补读原页图像并视觉核验"的错误在第 0 轮就被折成暂定 0 分。
+            reading_gap = isinstance(exc, LLMError) and exc.reading_incomplete
             previous = {"execution_attempt": execution_attempt, "error": str(exc), "round": round_no}
             attempts.append({**previous, "state": "failed"})
-            if continue_after_errors() and not preparation_step:
+            if continue_after_errors() and not preparation_step and not reading_gap:
                 exc.attempt_history = attempts
                 raise
             if round_no == rounds:
                 error = LLMError(f"自动补评 {rounds} 轮后仍未完成：{exc}")
                 error.attempt_history = attempts
+                if reading_gap:
+                    error.reading_incomplete = True
+                    error.unreadable_pages = list(getattr(exc, "unreadable_pages", []) or [])
                 raise error from exc
     raise LLMError("自动评审未产生有效结论")
 
@@ -760,16 +767,29 @@ def _fallback_score_for(criterion: dict) -> Decimal | None:
 
 def _write_closure_fallback(s, row: ScoreRecord, criterion: dict, error: BaseException) -> None:
     score_type = criterion.get("score_type")
-    value = _fallback_score_for(criterion)
-    detail = str(error).strip()[:500] or type(error).__name__
-    reason = (
-        f"自动评审未产生有效结论，按暂定 {value} 分兜底（非证据结论）：{detail}"
-        if value is not None else
-        f"自动评审未产生有效结论，按存疑结项（非证据结论）：{detail}"
-    )
-    kind = "min_level_floor" if score_type == "subjective" and value else (
-        "provisional_zero" if value is not None else "provisional_conclusion"
-    )
+    reading_gap = bool(getattr(error, "reading_incomplete", False))
+    if reading_gap:
+        # P0-3（测试10 run113）：读取故障既不是评审结论也不是材料缺失——
+        # 保持未定分（不写暂定 0），kind=reading_incomplete 供报告标注
+        # "读取故障待补读"；补读完成后可经续评重跑该格。
+        value = None
+        kind = "reading_incomplete"
+        detail = str(error).strip()[:500] or type(error).__name__
+        reason = (
+            f"读取故障未定分（非评审结论、非材料缺失结论）：{detail}"
+            "；须补读上述原页图像并视觉核验后再评，不得按 0 分或缺失计入"
+        )
+    else:
+        value = _fallback_score_for(criterion)
+        detail = str(error).strip()[:500] or type(error).__name__
+        reason = (
+            f"自动评审未产生有效结论，按暂定 {value} 分兜底（非证据结论）：{detail}"
+            if value is not None else
+            f"自动评审未产生有效结论，按存疑结项（非证据结论）：{detail}"
+        )
+        kind = "min_level_floor" if score_type == "subjective" and value else (
+            "provisional_zero" if value is not None else "provisional_conclusion"
+        )
     fallback = {
         "kind": kind,
         "value": str(value) if value is not None else None,
@@ -777,6 +797,8 @@ def _write_closure_fallback(s, row: ScoreRecord, criterion: dict, error: BaseExc
         "reason": detail,
         "score_type": score_type,
     }
+    if reading_gap:
+        fallback["unreadable_pages"] = list(getattr(error, "unreadable_pages", []) or [])
     row.final_score = value
     row.machine_score = value if score_type != "subjective" else None
     row.ai_suggested_score = value if score_type == "subjective" else None

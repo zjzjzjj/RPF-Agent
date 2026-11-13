@@ -254,8 +254,13 @@ _RE_TRIM_N_PAIR = re.compile(
     r"(?:去掉?|剔除|扣除)\s*(\d+)\s*个(?:最高的?|投标报价|报价)[^。；\n]{0,30}?"
     r"(?:去掉?|剔除|扣除)?\s*(\d+)\s*个(?:最低的?|投标报价|报价)"
 )
-# 家数条件（单档截尾阈值）："＞5 个" / "超过 5 家" / "≥6 家"
-_RE_TRIM_GT = re.compile(r"(?:[＞>]|超过|大于|≥)\s*(\d+)\s*(?:个|家|户)")
+# 家数条件（单档截尾阈值）：口径由 op 决定（2026-11-13 修复 ≥N 被当 >N 的差一错误）——
+# "超过N家/＞N/大于N" → gt（有效家数 > N 才截）；"≥N家/不少于N家/至少N家" → ge（≥ N 才截）。
+# 测试10 run113 价格规则"若有效投标人≥6个…扣除一个最高价和一个最低价"实证：6 家须截尾。
+_RE_COUNT_OP = re.compile(r"(≥|不少于|不低于|至少|超过|大于|＞|>)\s*(\d+)\s*(?:个|家|户)")
+_GE_OPS = frozenset(("≥", "不少于", "不低于", "至少"))
+# 只认含截尾动词的句子，避免把"不足6家全平均"之类的基准句误当截尾门槛
+_RE_TRIM_VERB = re.compile(r"扣除|去掉|剔除")
 # 基准价乘系数："算术平均值*0.95" / "平均价×0.95"（K 只认原文明示数值）
 _RE_K_FACTOR = re.compile(r"(?:平均值|平均价|评标基准价|基准价)\s*[*×xX]\s*(0\.\d{1,2}|1\.\d{1,2})")
 # 次低价基准（"次低价为最佳报价值"/"次低投标报价为最佳报价值"）；
@@ -268,6 +273,40 @@ _RE_SECOND_AVG_BELOW = re.compile(r"低于[^。；\n]{0,20}(?:平均值|平均�
 _RE_SPECIAL_70 = re.compile(r"[^。；\n]{0,60}不进入最佳报价计算[^。；\n]{0,20}")
 _RE_SPECIAL_OUTLIER = re.compile(r"[^。；\n]{0,80}剔除该报价后重新计算[^。；\n]{0,20}")
 _PRICE_HINTS = ("报价", "价格", "评标价", "基准价", "投标价")
+# 价格公式原文段锚定（P0-2）：以扣分句"每低/高…个百分点"为锚，取前后窗口；
+# 同段公式词命中最多者为准（多处扣分句时择优，防落到目录/摘要表）
+_RE_RATE_ANCHOR = re.compile(r"每(?:低(?:于)?|下浮|高(?:于)?|上浮)[^。；\n]{0,8}?个百分点")
+_FORMULA_MARKERS = ("最佳报价", "评标基准价", "算术平均", "不进入", "剔除该报价后重新计算", "扣除一个最高")
+_FORMULA_WIN_BEFORE = 900  # 门槛句、二次平均句位于扣分句之前
+_FORMULA_WIN_AFTER = 1200  # 离群"注"位于扣分句之后
+_PRICE_SOURCE_MAX = 3000
+
+
+def _trim_threshold_of(text: str) -> tuple[int, str] | None:
+    """截尾家数门槛 → (N, op)。op="gt"：有效家数 > N 才截；op="ge"：有效家数 ≥ N 才截。
+
+    只认含截尾动词（扣除/去掉/剔除）的句子；原文未明示家数时返回 None（不猜默认值）。
+    """
+    for seg in re.split(r"[。；\n]", text or ""):
+        if not _RE_TRIM_VERB.search(seg):
+            continue
+        m = _RE_COUNT_OP.search(seg)
+        if m:
+            return int(m.group(2)), ("ge" if m.group(1) in _GE_OPS else "gt")
+    return None
+
+
+def formula_source_window(text: str) -> str:
+    """从任意文本中锚定价格公式原文段（去空白后取窗口）；无扣分句锚或无公式词 → 空串。"""
+    t = re.sub(r"[\s　]+", "", text or "")
+    best: tuple[int, int, int] | None = None
+    for m in _RE_RATE_ANCHOR.finditer(t):
+        lo = max(0, m.start() - _FORMULA_WIN_BEFORE)
+        hi = min(len(t), m.end() + _FORMULA_WIN_AFTER)
+        score = sum(1 for marker in _FORMULA_MARKERS if marker in t[lo:hi])
+        if score and (best is None or score > best[0]):
+            best = (score, lo, hi)
+    return t[best[1]:best[2]] if best else ""
 
 
 def _rate_per_point(match: re.Match[str]) -> Decimal:
@@ -377,6 +416,11 @@ def _parse_benchmark_gate(text: str) -> dict[str, Any] | None:
         if m_pct:
             gate["min_ratio"] = m_pct.group(1)
             gate["ratio_kind"] = "percent"
+            # 原文同句明示的绝对分线（"70%即32.2分"）：仅作交叉核对留档（校验端 PRICE_GATE_BASE_MISMATCH），
+            # 执行口径仍按"百分比 × 技术部分总分"，不以绝对分覆盖
+            stated = re.search(r"即\s*(\d+(?:\.\d+)?)\s*分", seg)
+            if stated:
+                gate["stated_min_score"] = stated.group(1)
         elif m_abs:
             gate["min_ratio"] = m_abs.group(1)
             gate["ratio_kind"] = "absolute"
@@ -393,11 +437,12 @@ def _parse_benchmark_gate(text: str) -> dict[str, Any] | None:
         # 超过 N 家 → min_valid_bidders=N+1（有效家数 ≤ N 时门槛不生效）。
         # 缺此条件会把有条件门槛当无条件执行（2026-10-27 二维码项目实证）。
         m_valid = re.search(
-            r"(?:有效(?:投标)?(?:家数|投标人数量|投标人|家))[^。；\n]{0,15}(?:超过|大于|＞|>)\s*(\d+)\s*(?:家|个)?",
+            r"(?:有效(?:投标)?(?:家数|投标人数量|投标人|家))[^。；\n]{0,15}(超过|大于|＞|>|不少于|不低于|至少|≥)\s*(\d+)\s*(?:家|个)?",
             seg,
         )
         if m_valid:
-            gate["min_valid_bidders"] = int(m_valid.group(1)) + 1
+            n_valid = int(m_valid.group(2))
+            gate["min_valid_bidders"] = n_valid if m_valid.group(1) in _GE_OPS else n_valid + 1
         if re.search(r"未参与评标基准价计算[^。；\n]{0,30}(?:可以|方可|仍可)进入", t):
             gate["still_reviewable"] = True
         return gate
@@ -474,9 +519,12 @@ def parse_price_formula_text(text: str) -> dict[str, Any]:
     elif _RE_SECOND_AVG_FIRST.search(text) and _RE_SECOND_AVG_BELOW.search(text):
         # 复合：≥N 家首均先去极值，再对低于首均者二次算术平均（实验室设备/第二批检测/重招）
         out["benchmark_method"] = "average_trimmed_then_below"
-        m_gt = _RE_TRIM_GT.search(text)
         out["trim_count"] = 1
-        out["trim_threshold"] = int(m_gt.group(1)) if m_gt else 6
+        # 门槛须原文明示（2026-11-13 去掉旧的默认 6）：未明示 → 不写入，
+        # 校验端 PRICE_PARAMS_INCOMPLETE 阻断（引擎无门槛时会恒截尾，属静默算错）
+        thr = _trim_threshold_of(text)
+        if thr is not None:
+            out["trim_threshold"], out["trim_threshold_op"] = thr
     else:
         tiers = _parse_trim_tiers(text)
         if tiers is not None:
@@ -488,9 +536,9 @@ def parse_price_formula_text(text: str) -> dict[str, Any]:
         elif _RE_TRIM_BOTH.search(text):
             out["benchmark_method"] = "average_trimmed"
             out["trim_count"] = 1
-            m_gt = _RE_TRIM_GT.search(text)
-            if m_gt:
-                out["trim_threshold"] = int(m_gt.group(1))
+            thr = _trim_threshold_of(text)
+            if thr is not None:
+                out["trim_threshold"], out["trim_threshold_op"] = thr
             # 2026-10-28：不再默认 trim_threshold=5（硬编码猜测）——未明示家数
             # 阈值时不写入，引擎侧 trim_threshold or 0 → 无条件截尾，与
             # "扣除一个最高价和一个最低价后的算术平均值"原文一致。
@@ -581,13 +629,20 @@ def parse_count_params_text(
 
 
 def _price_window(c: "ExtractedCriterion", tender_text: str) -> str:
-    """价格项的正则作用域：先看自身描述/quote，再看 quote 之后的窗口。
+    """价格项的正则作用域：自身文本 + 扣分句锚定的公式原文段。
 
-    不能扫全文——正文里的工期/违约条款也会出现"每低/每高 1 个百分点扣…"。
+    不能扫全文——正文里的工期/违约条款也会出现"每低/每高 1 个百分点扣…"，故只取
+    扣分句锚前后的窗口（formula_source_window）。
+    2026-11-13 修复（测试10 run113 实证）：自身已含扣分率时旧实现早退，丢失同段的
+    基准价门槛/二次平均/超倍剔除句，执行成"最低价基准+对称扣率"。现 own 在前（扣分率
+    取首匹配=自身），锚定段补全其余公式要素。
     """
     own = f"{c.description or ''}\n{c.quote or ''}"
+    anchored = formula_source_window(tender_text)
     if _RE_RATE_DOWN.search(own) or _RE_RATE_UP.search(own):
-        return own
+        return f"{own}\n{anchored}" if anchored else own
+    if anchored:
+        return anchored
     quote = (c.quote or "").strip()
     if quote:
         # 前 20 字里通常没有换行，直接定位；找不到再用去空白匹配
@@ -700,6 +755,11 @@ def enrich_extracted(
                 for key in ("trim_tiers", "special_rules", "benchmark_gate", "outlier_policy"):
                     if parsed.get(key) is not None:
                         params.setdefault(key, parsed[key])
+                if parsed.get("trim_threshold_op"):
+                    params["trim_threshold_op"] = parsed["trim_threshold_op"]
+                # 编译时锚定的公式原文段：冻结前校验端据此比对执行参数（PRICE_FORMULA_SOURCE_MISMATCH）
+                if window.strip():
+                    params["_price_source"] = window[:_PRICE_SOURCE_MAX]
                 # 基准法：确定性目录优先（G20 归一）；与模型自报标签冲突时留痕
                 if parsed.get("benchmark_method"):
                     if (
@@ -721,9 +781,10 @@ def enrich_extracted(
                     c.trim_count = 1
                     # 2026-10-28：不再硬编码 trim_threshold=5（语料分档阈值依原文而定），
                     # 只在原文明示家数阈值时才写入，否则交阻断。
-                    m_gt_fb = _RE_TRIM_GT.search(re.sub(r"[\s　]+", "", window))
-                    if m_gt_fb:
-                        c.trim_threshold = int(m_gt_fb.group(1))
+                    thr_fb = _trim_threshold_of(re.sub(r"[\s　]+", "", window))
+                    if thr_fb is not None:
+                        c.trim_threshold = thr_fb[0]
+                        params["trim_threshold_op"] = thr_fb[1]
                 elif _RE_ARITH_AVG.search(window) and not c.benchmark_method:
                     c.benchmark_method = "average"
                 if params:
@@ -1174,7 +1235,8 @@ def _persist_criterion(
             ext["trim_threshold"] = str(c.trim_threshold)
         # 分档截尾/特殊规则/门槛/离群：引擎暂按近似执行（trim_count/trim_threshold），
         # 完整原文与结构化参数进 params_json 留档，供 PRICE_ENGINE_APPROX 提示与后续引擎扩展
-        for key in ("trim_tiers", "special_rules", "benchmark_gate", "outlier_policy", "_label_mismatch"):
+        for key in ("trim_tiers", "special_rules", "benchmark_gate", "outlier_policy", "_label_mismatch",
+                    "trim_threshold_op", "_price_source"):
             if (c.params or {}).get(key) is not None:
                 ext[key] = c.params[key]
         s.add(

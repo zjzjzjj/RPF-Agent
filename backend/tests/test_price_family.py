@@ -492,3 +492,47 @@ def test_engine_empty_formula_type_returns_uncomputable() -> None:
     for r in comp.results:
         assert r.price_score == D("0")
         assert "不可计算" in r.explanation
+
+
+# --- 真实项目回归（2026-11-11 PRJ-20261111-YIE5 烟丝仪器） -------------------
+# 该包报价得分挂「商务部分（0-50 分）」下被标 commercial，类别门槛拦死整条
+# 价格链路 → PRICE_FORMULA_UNRECOGNIZED + 缺 benchmark_method。原文实录作回归锚。
+
+YIE5_PRICE_DESCRIPTION = (
+    "投标价格的合理性：分析投标价格是否合理，投标价格范围是否完整，有否重大错漏项，"
+    "报价口径是否一致。（注：投标人报价税率不一致时按不含税报价评审）1）进入商务报价"
+    "最佳报价值需满足以下条件：（1）有效投标报价，或经修正后的有效投标报价；（2）技术"
+    "部分评审得分达到技术部分总分的70%及以上；2）商务报价得分计算 最佳报价值：满足进入"
+    "商务报价最佳报价值条件的全部有效投标总价中的次低价为最佳报价值。投标人评标价与最佳"
+    "报价值对比，计算各投标人的报价得分：1）等于最佳报价值的评标价得满分50分；2）评标价"
+    "偏离（高于或低于）最佳报价值的，按评标价偏离最佳报价值的正负百分率，计算报价得分："
+    "每低1个百分点扣0.3分；每高1个百分点扣0.5分。扣完为止。采用直线插入法计算报价得分，"
+    "百分率四舍五入取小数点后2位。注：有效投标报价高于最佳报价的两倍或低于最佳报价的"
+    "一半，其商务报价得分为0分，并剔除该报价后重新计算得出最佳报价，然后再依此计算其它"
+    "未剔除的有效投标报价的得分。"
+)
+
+
+def test_real_yie5_commercial_formula_forces_price_and_enriches(app_env) -> None:  # noqa: ANN001
+    """commercial 标注的 formula 条目：类别强制 → enrich 解析出完整公式。"""
+    from app.rules.category_map import apply_category_to_extracted
+    from app.rules.compiler import enrich_extracted
+    from app.rules.model import ExtractedCriterion
+
+    c = ExtractedCriterion(
+        category="commercial",
+        name="商务报价得分",
+        score_type="formula",
+        max_score=Decimal("50"),
+        description=YIE5_PRICE_DESCRIPTION,
+        quote="最佳报价值：满足进入商务报价最佳报价值条件的全部有效投标总价中的次低价为最佳报价值。",
+    )
+    apply_category_to_extracted([c], 0)
+    assert c.category == "price"
+    enrich_extracted([c], "")
+    assert c.formula_type == "deviation_deduct"
+    assert c.benchmark_method == "second_lowest"
+    assert c.deduct_rate_down == Decimal("0.3")
+    assert c.deduct_rate_up == Decimal("0.5")
+    assert (c.params or {}).get("benchmark_gate", {}).get("min_ratio") == "70"
+    assert (c.params or {}).get("outlier_policy", {}).get("max_mult") == "2"

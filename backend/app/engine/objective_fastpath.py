@@ -198,6 +198,73 @@ def _contract_material_ok(record: ContractRecord, requires_material: bool) -> bo
                 or record.materials.get("owner_proof") or record.materials.get("contract"))
 
 
+# P0-5（测试10 run113）：三件套材料链——细则点名材料 + 硬制裁句（"以上资料
+# 未提供的不得分"）时逐案例 AND 核验；无制裁句不设闸（不猜）。
+_RE_HARD_SANCTION = re.compile(
+    r"(?:未提供|不提供|未按要求提供|未提交)[^。；]{0,30}不得分"
+    r"|不提供或提供[^。；]{0,15}不全的不得分"
+)
+_MATERIAL_NAME2KIND = {
+    "合同": "contract", "中标通知书": "contract",
+    "发票": "invoice", "验收": "acceptance",
+    "业主证明": "owner_proof", "用户证明": "owner_proof", "使用证明": "owner_proof",
+}
+_RE_OR_MATERIAL = re.compile(
+    r"(发票|验收|业主证明|用户证明|使用证明|中标通知书|合同)[^。；，,]{0,4}"
+    r"或[^。；，,]{0,4}(发票|验收|业主证明|用户证明|使用证明|中标通知书|合同)"
+)
+
+
+def _hard_material_requirements(text: str) -> tuple[frozenset, frozenset]:
+    """细则点名的必备材料（AND 口径，"A或B"对除外）；无硬制裁句 → 空集。
+
+    规则文本驱动：制裁句（"…未提供的不得分"）+ 材料名单（【证明材料】段优先）
+    双条件才启用硬闸门；细则未点名的材料类型一律不查（红线：不猜）。
+    返回 (必备材料 kinds, OR 组 kinds——组内任一即可)。
+    """
+    if not _RE_HARD_SANCTION.search(text or ""):
+        return frozenset(), frozenset()
+    seg = text or ""
+    marker = re.search(r"【?\s*证明材料\s*】?", seg)
+    if marker:
+        seg = seg[marker.start():]
+    req: set = set()
+    for name, kind in _MATERIAL_NAME2KIND.items():
+        if name in seg:
+            req.add(kind)
+    or_group: set = set()
+    m_or = _RE_OR_MATERIAL.search(seg)
+    if m_or:
+        or_group = {_MATERIAL_NAME2KIND[m_or.group(1)], _MATERIAL_NAME2KIND[m_or.group(2)]}
+    return frozenset(req), frozenset(or_group & req)
+
+
+def _missing_required_materials(
+    record: ContractRecord, required: frozenset, or_group: frozenset
+) -> list:
+    """逐案例必备材料核验（细则"未提供的不得分"制裁句的执行）。
+
+    合同件：正文合同块（source=text）本身就是投标文件提供的合同复印件；
+    业绩表行（source=table）只是主张，必须另有关联合同页才认。
+    发票："至少一张发票复印件" → 关联发票页非空。
+    """
+    def present(kind: str) -> bool:
+        if kind == "contract":
+            return bool(record.materials.get("contract") or record.source == "text")
+        return bool(record.materials.get(kind))
+
+    labels = {"contract": "合同", "invoice": "发票",
+              "acceptance": "验收证明", "owner_proof": "业主证明"}
+    satisfied_or = bool(or_group) and any(present(k) for k in or_group)
+    missing = []
+    for kind in sorted(required):
+        if kind in or_group and satisfied_or:
+            continue
+        if not present(kind):
+            missing.append(labels[kind])
+    return missing
+
+
 def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathResult:
     text = _rule_text(criterion)
     maximum = _max(criterion) or Decimal(0)
@@ -209,6 +276,9 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
         if per_item > 0:
             tiers = [{"min_amount_yuan": str(min_amount), "per_item": str(per_item)}]
     requires_material = any(word in text for word in ("发票", "验收", "业主证明", "用户证明"))
+    # P0-5：细则有硬制裁句（"以上资料未提供的不得分"）+ 点名材料 → 逐案例
+    # AND 核验（"至少一张发票"、业主证明不单独替代验收证明）；表格行不豁免。
+    required_materials, or_group = _hard_material_requirements(text)
     qualifying: list[tuple[ContractRecord, Decimal]] = []
     rejected: list[str] = []
     for record in inventory.contracts:
@@ -218,7 +288,12 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
             continue
         if tiers and amount < Decimal(str(tiers[0].get("min_amount_yuan", 0))):
             continue
-        if not _contract_material_ok(record, requires_material):
+        if required_materials:
+            missing = _missing_required_materials(record, required_materials, or_group)
+            if missing:
+                rejected.append(f"{record.name}（缺{'/'.join(missing)}，细则：未提供的不得分）")
+                continue
+        elif not _contract_material_ok(record, requires_material):
             rejected.append(f"{record.name}（缺发票/验收）")
             continue
         rate = _contract_rate(tiers, amount) if tiers else Decimal(0)
@@ -243,7 +318,7 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
     # located and every one carries a readable amount.  Otherwise let the LLM
     # path attempt the missing blocks; the closure pass is still the backstop.
     unknown_amounts = any(record.amount_yuan is None for record in inventory.contracts)
-    missing_materials = any("缺发票/验收" in reason for reason in rejected)
+    missing_materials = any("缺" in reason for reason in rejected)
     complete = (inventory.performance_section_found and bool(inventory.contracts)
                 and not unknown_amounts and not missing_materials)
     zero_reason = None

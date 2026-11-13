@@ -142,6 +142,15 @@ def plan_category_fixes(
     for c in criteria:
         if c.origin not in ("document", "template"):
             continue  # 法规/人工条目不自动改
+        # 不变式：formula 类型只属于价格评分（与 apply_category_to_extracted 同源）。
+        # 报价得分常挂在「商务部分（0-50 分）」节点下（2026-11-11 烟丝仪器项目
+        # PRJ-20261111-YIE5 实证），节点映射会给 commercial——而 enrich/落库/
+        # normalize 全按 category=="price" 过门，类别错整条价格链路失效。
+        # 先于节点映射判断，兼防已被标 price 的公式项被节点映射改回 commercial。
+        if c.score_type == "formula":
+            if c.category != "price":
+                out.append((c.id, c.category, "price", "formula 类型强制归价格"))
+            continue
         if not c.source_node_id and not (c.source_quote or "").strip():
             continue
         cat = None
@@ -275,5 +284,11 @@ def apply_category_to_extracted(criteria: list, document_id: int) -> int:
         if cat and cat != c.category:
             log.info("category 编译期校正：%s %s→%s", c.name, c.category, cat)
             c.category = cat
+            changed += 1
+        # 不变式：formula ⇒ price（报价得分挂「商务部分」下时引文回扫会给
+        # commercial，会拦死 enrich/落库/normalize 的价格链路——见 plan_category_fixes）
+        if c.score_type == "formula" and c.category != "price":
+            log.info("category 编译期校正：%s %s→price（formula 类型强制）", c.name, c.category)
+            c.category = "price"
             changed += 1
     return changed

@@ -1024,12 +1024,16 @@ def normalize_package(package_id: int, actor: str = "auto") -> dict[str, int]:
                 for key in ("deduct_rate_down", "deduct_rate_up"):
                     if parsed.get(key) is not None:
                         ext[key] = str(parsed[key])
-                for key in ("trim_count", "trim_threshold"):
+                for key in ("trim_count", "trim_threshold", "trim_threshold_op"):
                     if parsed.get(key) is not None:
                         ext[key] = str(parsed[key])
                 for key in ("trim_tiers", "special_rules", "benchmark_gate", "outlier_policy"):
                     if parsed.get(key) is not None:
                         ext.setdefault(key, parsed[key])
+                # 公式原文段（P0-2，锚定在扣分句前后，长度已有界）：冻结前校验端据此比对执行参数
+                source_window = compiler.formula_source_window("\n".join(texts))
+                if source_window:
+                    ext["_price_source"] = source_window
                 formula.params_json = ext
                 if parsed.get("benchmark_method"):
                     formula.benchmark_method = parsed["benchmark_method"]

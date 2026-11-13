@@ -19,6 +19,12 @@ class LLMError(Exception):
         # recovery must fail the cell. Re-reading its entire material as an
         # outer supplementation round would silently multiply those attempts.
         self.review_attempts_exhausted = False
+        # P0-3（测试10 run113）：读取故障（未完成 OCR/视觉核验的不可读页面）
+        # 是"材料还没读完"，不是语义失败——外层补读轮必须接住它继续补读，
+        # 闭合层也不得把它折成暂定 0 分冒充材料缺失结论。
+        self.reading_incomplete = False
+        # 结构化的未读页清单 [{"document_id": int, "page_no": int}]（尽力而为）。
+        self.unreadable_pages: list = []
         super().__init__(message)
 
 

@@ -25,6 +25,7 @@ from app import config
 from app.llm.base import LLMError
 from app.llm.gateway import Gateway
 from app.rules import prompts
+from app.rules.check_infer import checklist_subitems
 
 log = logging.getLogger("bid_eval.subjective")
 
@@ -36,8 +37,14 @@ _RE_SUBITEM = re.compile(
 )
 
 
-def parse_subitems(description: str | None) -> list[tuple[str, Decimal]]:
-    """从评分项描述中提取"名称（0-X 分）"子项，去重保序。"""
+def parse_subitems(description: str | None,
+                   max_score: Decimal | str | int | None = None) -> list[tuple[str, Decimal]]:
+    """从评分项描述中提取子项及分值上限，去重保序。
+
+    两种形态：①"名称（0-X 分）"；②清单式编号子项"1、…得X分 2、…得Y分"（P0-4③：测试10 run113
+    售后服务/安装调试实证，子项各自取证、单项缺证只该项计 0）。②仅在给出满分且子项上限之和恰等于
+    满分时采用——分值口径不闭合即不结构化（歧义不猜，退回整项判读）。
+    """
     out: list[tuple[str, Decimal]] = []
     seen: set[str] = set()
     for m in _RE_SUBITEM.finditer(description or ""):
@@ -46,7 +53,14 @@ def parse_subitems(description: str | None) -> list[tuple[str, Decimal]]:
             continue
         seen.add(name)
         out.append((name, Decimal(m.group(2))))
-    return out
+    if out or max_score is None:
+        return out
+    items = checklist_subitems(description or "")
+    if not items:
+        return []
+    if sum((cap for _name, cap in items), Decimal(0)) != Decimal(str(max_score)):
+        return []
+    return items
 
 
 # 尾部"（2 分）/(1分)"类分值后缀：模型输出子项名常带它，先剥掉再归一
@@ -94,7 +108,7 @@ def aggregate_subitems(
     返回 model_score，避免因为名称不一致把整项归零。normalized 条目带 `quote`
     （供证据闸门逐子项核验）。
     """
-    parsed = parse_subitems(criterion.get("description"))
+    parsed = parse_subitems(criterion.get("description"), max_score)
     if not parsed or not sub_scores:
         return model_score, sub_scores, []
     keys = [str(s.get("name") or "") for s in sub_scores if isinstance(s, dict)]
@@ -777,7 +791,7 @@ def suggest_score_hierarchical(
     # 技术分被簇数整除、普遍压到满分 0-30%（2026-10-29 run 60 实证）。
     # 更早的实现①取最高分簇/子项——把分数推向满分（2026-10-21 实证：T4.2 四家全 8/8）。
     scores = [s.score for _cl, s in suggestions if s.score is not None]
-    parsed = parse_subitems(criterion.get("description"))
+    parsed = parse_subitems(criterion.get("description"), max_score)
     merged_subs: list[dict] = []
     merged_score: Decimal | None = None
     parse_keys = [name for name, _cap in parsed]

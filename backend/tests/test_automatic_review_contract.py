@@ -363,6 +363,21 @@ def test_scalar_fact_requires_its_own_source():
     assert got.facts["response_hours"] == "4"
 
 
+def test_unverifiable_fact_outside_the_criterion_contract_is_dropped_not_fatal():
+    # 扣分制技术偏离表：引擎只读 deviation_counts；模型从"技术响应…"语句抽出的 response_hours
+    # 无法复算，不得连坐整格（P0-4b）。
+    deviation = {**RULE, "score_type": "count", "params": {
+        "engine": "deviation_deduct_table", "per_missing": "2", "per_negative": "1"}}
+    got = review_criterion(Replies(decision(facts={"response_hours": "4"})), deviation, [PAGE])
+    assert "response_hours" not in got.facts
+    # 同一个无来源事实若属于本格契约字段（value_tier 读 response_hours），仍须严格报错
+    value_tier = {**RULE, "score_type": "count", "params": {
+        "engine": "value_tier", "field": "response_hours", "direction": "lower_better",
+        "tiers": [{"max_value": "4", "score": "2"}]}}
+    with pytest.raises(LLMError, match="对应原页证据"):
+        review_criterion(Replies(*repair_attempts(decision(facts={"response_hours": "4"}))), value_tier, [PAGE])
+
+
 def test_long_count_review_reads_all_batches_before_final_facts(monkeypatch):
     monkeypatch.setattr(auto_review, "TEXT_BUDGET", 2000)
     second_quote = "第二份材料载明本公司另有一项完整且有效的认证证明。"
@@ -683,3 +698,35 @@ def test_direct_subjective_context_is_a_single_bounded_batch():
     assert len(selected) <= 6
     assert sum(len(page["text"]) for page in selected) <= 24_000
     assert all(page["source_id"] for page in selected)
+
+
+def test_reading_incomplete_error_reaches_supplement_rounds_under_continue(monkeypatch):
+    """P0-3（测试10 run113）：读取故障不是语义失败——continue 快速失败捷径不适用，
+    必须走完补读轮（round 1 调 _supplement_pages 补 OCR）再定论。"""
+    from app.services import automatic_scoring_service as scoring
+    from app.services.execution_version import bind_run_execution
+
+    monkeypatch.setenv("BID_EVAL_AUTO_REVIEW_ROUNDS", "2")
+    supplemented = []
+    monkeypatch.setattr(
+        scoring, "_supplement_pages",
+        lambda rule, pages, visual, **kwargs: supplemented.append(visual) or pages)
+
+    calls = {"n": 0}
+
+    def reviewer(gateway, criterion, pages, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            err = LLMError("关联材料仍有未完成 OCR 或原页视觉核验的不可读页面，须自动补评后才能形成终态")
+            err.reading_incomplete = True
+            err.unreadable_pages = [{"document_id": 7, "page_no": 3}]
+            raise err
+        return AutoReviewDecision(
+            verdict="pass", reasoning="补读后原页核验通过",
+            evidence=[{"document_id": 7, "page_no": 3, "quote": QUOTE}])
+
+    with bind_run_execution({"scoring_config": {}}, 1, failure_policy="continue"):
+        outcome = scoring._assess_cell(RULE, [PAGE], "synthetic", lambda: None, reviewer=reviewer)
+    assert calls["n"] == 2        # 读取故障触发补读轮，不是第 0 轮就折成失败
+    assert supplemented           # 补读轮实际调用了 _supplement_pages
+    assert outcome.verdict == "pass"

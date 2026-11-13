@@ -130,6 +130,16 @@ def failed_keys(run_id: int) -> set[tuple[int, int]]:
         ).scalars() if ((row.ai_raw_json or {}).get("auto_review") or {}).get("state") == "failed"}
 
 
+def _is_reading_gap_row(row: ScoreRecord) -> bool:
+    """P0-3：读取故障待补读格（closure 以 reading_incomplete 定格、未定分）。
+
+    这类格是"已定格但未定分"的终态：计完成（运行可收口、报告可出），
+    但没有数值分；补读完成后经 resume_run 重置重跑。"""
+    meta = (row.ai_raw_json or {}).get("auto_review") or {}
+    return (meta.get("state") == "completed"
+            and ((meta.get("fallback") or {}).get("kind")) == "reading_incomplete")
+
+
 def public_auto_review(score: ScoreRecord | None) -> dict | None:
     """Expose the review trail without request payloads or embedded page images."""
     if score is None:
@@ -268,6 +278,11 @@ def _valid_cell(score: ScoreRecord, criterion: dict, citations: list[EvidenceCit
     if score.machine_status in ("need_human", "conflict_flagged", "execution_failed", "failed"):
         return False
     basis = meta.get("basis")
+    if basis == "fallback" and ((meta.get("fallback") or {}).get("kind")) == "reading_incomplete":
+        # P0-3（测试10 run113）：读取故障待补读格是"已定格但未定分"的终态——
+        # 计完成（运行可收口、报告可出），但没有数值分（ranking 按未定分排除，
+        # 报告标注"读取故障待补读"，补读完成后可续评重跑）。
+        return bool(score.ai_reasoning or meta.get("reasoning"))
     for warning in score.warnings_json or []:
         if isinstance(warning, dict) and (warning.get("fallback_score") or warning.get("unresolved")):
             # A closure fallback is a settled provisional score, not an
@@ -606,7 +621,14 @@ def resume_run(run_id: int, actor: str) -> tuple[int, int]:
         ).order_by(Job.id.desc()).limit(1)).scalar_one_or_none()
         if active is not None:
             return run_id, active.id
-        if run.status in ("succeeded", "partial") and int((run.config_json or {}).get("resume_count", 0)) > 0:
+        # P0-3（测试10 run113）：读取故障待补读格（kind=reading_incomplete）可续评——
+        # 补读（OCR/视觉）完成后重跑这些格"读完再评"，不受"仅失败运行可续评"限制；
+        # 重跑前重置这些格（ReviewRecord 审计链保留）。
+        gap_rows = [row for row in s.execute(
+            select(ScoreRecord).where(ScoreRecord.run_id == run_id)).scalars()
+            if _is_reading_gap_row(row)]
+        if (run.status in ("succeeded", "partial") and not gap_rows
+                and int((run.config_json or {}).get("resume_count", 0)) > 0):
             resumed_job = s.execute(select(Job).where(
                 Job.kind == "evaluate", Job.payload_json["run_id"].as_integer() == run_id,
                 Job.payload_json["resume"].as_boolean().is_(True),
@@ -615,13 +637,20 @@ def resume_run(run_id: int, actor: str) -> tuple[int, int]:
                 # A delayed HTTP retry may arrive after the resumed job has
                 # finished. Return the original receipt without another job.
                 return run_id, resumed_job.id
-        if run.status != "failed":
+        if run.status != "failed" and not gap_rows:
             raise Conflict("仅失败的自动评审运行可以续评")
         manifest = (run.config_json or {})["automation_manifest"]
         current = _inputs(s, run, manifest["criteria"], manifest.get("provider"), manifest.get("model"))
         manifest = _bind_unused_capabilities(s, run, manifest, current, actor)
         if current != manifest:
             raise Conflict("运行输入或评审配置已变化，请新建评分运行")
+        if gap_rows:
+            gap_ids = [row.id for row in gap_rows]
+            for cit in s.execute(select(EvidenceCitation).where(
+                    EvidenceCitation.score_record_id.in_(gap_ids or [-1]))).scalars():
+                s.delete(cit)
+            for row in gap_rows:
+                s.delete(row)
         job = Job(kind="evaluate", project_id=run.project_id, status="queued", payload_json={
             "run_id": run.id, "provider": manifest.get("provider"), "model": manifest.get("model"),
             "actor": actor, "resume": True,

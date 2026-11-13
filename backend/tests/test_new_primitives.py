@@ -374,3 +374,16 @@ def test_run_check_unknown_type_falls_through() -> None:
         assert r.status == "unknown", r
         assert r.need_human is True
         assert "未知检查类型" in r.message
+
+
+def test_infer_deviation_deduct_chinese_numerals_and_missing_one() -> None:
+    """P0-4（测试10 run113）：'扣两分/扣一分'中文数字与'缺一个扣0.5分'变体可推断。"""
+    p = infer_engine_params(
+        "每缺失一条扣两分，每负偏离一条扣一分，正偏离不加分。最高20 分，最低得0 分。"
+    )
+    assert p["engine"] == "deviation_deduct_table"
+    assert p["per_missing"] == "2"
+    assert p["per_negative"] == "1"
+    p2 = infer_engine_params("提供第三方计量检校证书，缺一个扣0.5 分，最高得4 分，最低得0 分。")
+    assert p2["engine"] == "deviation_deduct_table"
+    assert p2["per_missing"] == "0.5"

@@ -590,3 +590,183 @@ def test_legacy_formal_report_retains_assisted_review_wording(managed):
     assert "AI 辅助评审" in output
     assert "须经评标委员会确认后生效" in output
     assert "全自动评标系统" not in output
+
+
+# ==== P0-1（测试10 run113）：故障兜底暂定分不进总分/名次 ====
+
+def _fallback_meta(kind="provisional_zero", value="0"):
+    return {
+        "state": "completed", "basis": "fallback", "reasoning":
+            "自动评审未产生有效结论，按暂定分兜底（非证据结论）：关联材料不可读页面",
+        "coverage_complete": False,
+        "fallback": {"kind": kind, "value": value, "basis": "machine_fallback",
+                     "reason": "关联材料不可读页面", "score_type": "count"},
+    }
+
+
+def test_fallback_cell_excluded_from_total_and_rank(managed):
+    """故障兜底暂定分不是评审结论：不进总分、不发名次，双分值留审计。"""
+    from app.services.ranking_service import compute_ranking
+
+    _cell(managed, managed["veto_id"])
+    _cell(managed, managed["score_id"], score=Decimal("0"),
+          meta=_fallback_meta(), warnings=[{"message": "兜底", "fallback_score": {
+              "kind": "provisional_zero", "value": "0"}}])
+    auto.finish_run(managed["run_id"])
+    out = compute_ranking("auto-test", managed["run_id"])
+    row = out["rows"][0]
+    # 已定分合计不含暂定 0 分格的分值（该格 max 10、暂定 0 → 两口径同为 0，
+    # 但 fallback 计数与名次抑制必须生效）
+    assert row["total"] == "0.00"
+    assert row["provisional_total"] == "0.00"
+    assert row["fallback"] == ["商务分"]
+    assert row["rank"] is None
+    assert out["has_fallback"] is True
+    assert any("暂定分" in w for w in out["warnings"])
+    assert any("不发布最终排名" in w for w in out["warnings"])
+
+
+def test_fallback_provisional_value_shown_in_dual_total(managed):
+    """暂定值非 0 时双分值可分辨：total=已定分、provisional_total=含暂定。"""
+    from app.services.ranking_service import compute_ranking
+
+    _cell(managed, managed["veto_id"])
+    _cell(managed, managed["score_id"], score=Decimal("4"),
+          meta=_fallback_meta(kind="min_level_floor", value="4"),
+          warnings=[{"message": "兜底", "fallback_score": {
+              "kind": "min_level_floor", "value": "4"}}])
+    auto.finish_run(managed["run_id"])
+    row = compute_ranking("auto-test", managed["run_id"])["rows"][0]
+    assert row["total"] == "0.00"
+    assert row["provisional_total"] == "4.00"
+    assert row["rank"] is None
+
+
+def test_fallback_blocks_candidate_recommendation(managed):
+    """含暂定格的正式报告不出中标候选人推荐，汇总表标注不完整。"""
+    from io import BytesIO
+
+    from docx import Document as DocxDocument
+
+    from app.services.report_service import build_formal_report, render_docx, render_formal_html
+
+    _cell(managed, managed["veto_id"])
+    _cell(managed, managed["score_id"], score=Decimal("7"),
+          meta=_fallback_meta(), warnings=[{"message": "兜底", "fallback_score": {
+              "kind": "provisional_zero", "value": "0"}}])
+    auto.finish_run(managed["run_id"])
+    report = build_formal_report("auto-test", managed["run_id"])
+    assert report["summary_rows"][0]["incomplete"] is True
+    assert report["summary_rows"][0]["rank"] is None
+    assert report["summary_rows"][0]["provisional_total"] == "7.00"
+    html = render_formal_html(report)
+    assert "暂不推荐中标候选人" in html
+    assert "不完整" in html
+    assert "中标候选人：" not in html
+    doc = DocxDocument(BytesIO(render_docx(report)))
+    text = "\n".join(p.text for p in doc.paragraphs)
+    assert "暂不推荐中标候选人" in text
+    assert "第1中标候选人" not in text
+
+
+def test_settled_run_without_fallback_still_ranks_and_recommends(managed):
+    """对照：无暂定格的正常运行照常出名次与推荐（防 P0-1 过度抑制）。"""
+    from app.services.report_service import build_formal_report, render_formal_html
+    from app.services.ranking_service import compute_ranking
+
+    _cell(managed, managed["veto_id"])
+    _cell(managed, managed["score_id"], score=Decimal("7"))
+    auto.finish_run(managed["run_id"])
+    out = compute_ranking("auto-test", managed["run_id"])
+    assert out["rows"][0]["rank"] == 1
+    assert out["has_fallback"] is False
+    report = build_formal_report("auto-test", managed["run_id"])
+    html = render_formal_html(report)
+    assert "推荐中标候选人为" in html
+    assert "暂不推荐中标候选人" not in html
+
+
+# ==== P0-3（测试10 run113）：读取故障待补读格（未定分、可续评） ====
+
+def _reading_gap_meta(pages=None):
+    return {
+        "state": "completed", "basis": "fallback", "reasoning":
+            "读取故障未定分（非评审结论、非材料缺失结论）：关联材料仍有未完成 OCR 的不可读页面",
+        "coverage_complete": False,
+        "fallback": {"kind": "reading_incomplete", "value": None,
+                     "basis": "machine_fallback", "score_type": "count",
+                     "reason": "关联材料仍有未完成 OCR 的不可读页面",
+                     "unreadable_pages": pages or [{"document_id": 1, "page_no": 7}]},
+    }
+
+
+def test_reading_gap_cell_is_settled_but_unscored(managed):
+    """读取故障格：计完成（运行可收口），但未定分——不进总分、不发名次。"""
+    from app.services.ranking_service import compute_ranking
+
+    _cell(managed, managed["veto_id"])
+    _cell(managed, managed["score_id"], score=None, meta=_reading_gap_meta(),
+          warnings=[{"message": "读取故障", "fallback_score": {
+              "kind": "reading_incomplete", "value": None}}])
+    with session_scope() as s:
+        s.get(EvaluationRun, managed["run_id"]).status = "succeeded"
+    out = compute_ranking("auto-test", managed["run_id"])
+    row = out["rows"][0]
+    assert row["total"] == "0.00"
+    assert row["fallback"] == ["商务分"]
+    assert row["missing_final"] == []          # 不重复挂未定分清单
+    assert row["rank"] is None                  # 总分不完整不发名次
+    assert out["has_fallback"] is True
+
+
+def test_reading_gap_run_can_resume_and_reruns_only_gap_cells(managed):
+    """补读完成后可续评：重置待补读格重跑，已定格不受影响。"""
+    from app.services import automation_service as auto2
+    from app.db.models import EvidenceCitation
+
+    _cell(managed, managed["veto_id"])
+    gap_id = _cell(managed, managed["score_id"], score=None, meta=_reading_gap_meta(),
+                   warnings=[{"message": "读取故障", "fallback_score": {
+                       "kind": "reading_incomplete", "value": None}}])
+    with session_scope() as s:
+        s.add(EvidenceCitation(score_record_id=gap_id, criterion_id=managed["score_id"],
+                               document_id=None, page_no=1, quote="x", created_by="llm"))
+        s.get(EvaluationRun, managed["run_id"]).status = "succeeded"
+    assert auto2.progress(managed["run_id"])["completed"] == 2   # 已定格计完成
+    run_id, job_id = auto2.resume_run(managed["run_id"], "tester")
+    assert job_id is not None
+    with session_scope() as s:
+        rows = {r.criterion_id: r for r in s.execute(select(ScoreRecord)).scalars()}
+        assert managed["score_id"] not in rows          # 待补读格已重置
+        assert managed["veto_id"] in rows               # 已定格保留
+        assert s.get(EvaluationRun, run_id).status == "queued"
+
+
+def test_succeeded_run_without_reading_gap_still_rejects_resume(managed):
+    """对照：无待补读格的成功运行仍不可续评（防 P0-3 放开过度）。"""
+    _cell(managed, managed["veto_id"])
+    _cell(managed, managed["score_id"], score=Decimal("7"))
+    auto.finish_run(managed["run_id"])
+    with pytest.raises(Conflict):
+        auto.resume_run(managed["run_id"], "tester")
+
+
+def test_reading_gap_report_labels_gap_not_zero(managed):
+    """报告把读取故障格标为"待补读，未定分"，不写成 0 分结论。"""
+    from io import BytesIO
+
+    from docx import Document as DocxDocument
+
+    from app.services.report_service import build_formal_report, render_docx
+
+    _cell(managed, managed["veto_id"])
+    _cell(managed, managed["score_id"], score=None, meta=_reading_gap_meta(),
+          warnings=[{"message": "读取故障", "fallback_score": {
+              "kind": "reading_incomplete", "value": None}}])
+    auto.finish_run(managed["run_id"])
+    report = build_formal_report("auto-test", managed["run_id"])
+    assert report["summary_rows"][0]["incomplete"] is True
+    doc = DocxDocument(BytesIO(render_docx(report)))
+    text = "\n".join(p.text for p in doc.paragraphs)
+    assert "读取故障待补读，未定分" in text
+    assert "当前 None 分" not in text

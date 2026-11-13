@@ -117,9 +117,11 @@ def _infer_count_tier(text: str) -> dict[str, Any] | None:
     """
     from app.engine.objective import _CN_NUM, _RE_COUNT_TIER
 
-    matches = _RE_COUNT_TIER.findall(text)
-    if len(matches) < 2:
+    count_m = list(_RE_COUNT_TIER.finditer(text))
+    # 子句级闭合（同 R0）：多子项清单里的其他计分句不得被本族档位"借用"闭合
+    if len(count_m) < 2 or not _tier_scores_closed(text, [m.span() for m in count_m]):
         return None
+    matches = [(m.group(1), m.group(2)) for m in count_m]
     tiers: list[dict[str, Any]] = []
     seen_min: set[int] = set()
     for raw_n, raw_score in matches:
@@ -174,8 +176,24 @@ def infer_check(c: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
 # --- P1-E：新计分原语的引擎参数推断（只认规则文本明示，推断不出不设 engine） ---
 
 # 偏离表逐条扣分："每缺失一条扣 2 分" / "每负偏离一条扣 1 分"
-_RE_DEV_PER_MISSING = re.compile(r"每缺失一条扣\s*(\d+(?:\.\d+)?)\s*分")
-_RE_DEV_PER_NEG = re.compile(r"每负偏离一条扣\s*(\d+(?:\.\d+)?)\s*分")
+# 中文数字容错（测试10 run113 实证："每缺失一条扣两分，每负偏离一条扣一分"）；
+# 词形变体："缺一个扣0.5 分"（承诺响应缺证扣分，run113 c31）
+_CN_NUM_MAP = {"一": "1", "两": "2", "二": "2", "三": "3", "四": "4", "五": "5",
+               "六": "6", "七": "7", "八": "8", "九": "9", "十": "10", "半": "0.5"}
+_NUM_TOKEN = r"(\d+(?:\.\d+)?|一|两|二|三|四|五|六|七|八|九|十|半)"
+
+
+def _num_value(raw: str) -> str:
+    """阿拉伯数字原样返回；中文数字/半 → 对应数值字符串。"""
+    return _CN_NUM_MAP.get(raw, raw)
+
+
+_RE_DEV_PER_MISSING = re.compile(
+    r"每?\s*缺(?:失)?(?:一)?\s*(?:条|个|本|张|项)\s*扣\s*" + _NUM_TOKEN + r"\s*分"
+)
+_RE_DEV_PER_NEG = re.compile(
+    r"每?\s*负偏离\s*(?:一)?\s*(?:条|个|张|项)?\s*扣\s*" + _NUM_TOKEN + r"\s*分"
+)
 # 响应时间档："2 小时内…得 3 分"（≥2 档才认）
 # 断行容错（2026-11-04）：OCR 断行常见"小时\n内"，\s* 覆盖不放宽档数守卫
 _RE_HOURS_TIER = re.compile(
@@ -201,6 +219,98 @@ _RE_TITLE_TIER = re.compile(
 )
 
 
+# --- 清单式多子项计分（P0-4③：测试10 run113 c30 售后服务「1、…得2分 2、…得2分 3、…各得1分」）---
+# 子项编号：全角"（1）"任意位置；半角"1、"只认句首/句末标点之后（防把数量"2、"误作子项）。
+_RE_SUB_PAREN = re.compile(r"（\s*(\d{1,2})\s*）")
+_RE_SUB_ENUM = re.compile(r"(\d{1,2})\s*[、．.]")
+_RE_FIXED_SCORE_ANY = re.compile(r"得\s*\d+(?:\.\d+)?\s*分")
+# 「提供A及B的各得N分」：每件各得 N 分（说明书及简章各 1 分）
+_RE_EACH_SCORE = re.compile(r"(?:提供|具有|配备)?\s*(.{1,40}?)\s*的?\s*各得\s*(\d+(?:\.\d+)?)\s*分")
+# 子项内「得N分」数值：子项上限取其最高档（"不得分"无数字不匹配）
+_RE_GET_N = re.compile(r"得\s*(\d+(?:\.\d+)?)\s*分")
+_CHECKLIST_NOISE_PREFIX = ("投标产品", "投标人", "投标", "明确", "相关", "相应", "详细", "完整")
+
+
+def _checklist_markers(text: str) -> list[tuple[int, int, int]]:
+    marks: list[tuple[int, int, int]] = [
+        (int(m.group(1)), m.start(), m.end()) for m in _RE_SUB_PAREN.finditer(text)
+    ]
+    for m in _RE_SUB_ENUM.finditer(text):
+        before = text[: m.start()].rstrip()
+        if before and before[-1] not in "：:。；;\n分）)":
+            continue
+        marks.append((int(m.group(1)), m.start(), m.end()))
+    return sorted(marks, key=lambda t: t[1])
+
+
+def _checklist_segments(text: str) -> list[str] | None:
+    """按 1,2,3… 连续编号切出子项正文；每个子项须含明示「得N分」，否则不是清单形态。"""
+    seq: list[tuple[int, int, int]] = []
+    expect = 1
+    for num, start, end in _checklist_markers(text):
+        if num == expect:
+            seq.append((num, start, end))
+            expect += 1
+    if len(seq) < 2:
+        return None
+    segs: list[str] = []
+    for i, (_num, _start, end) in enumerate(seq):
+        stop = seq[i + 1][1] if i + 1 < len(seq) else len(text)
+        segs.append(text[end:stop])
+    if not all(_RE_FIXED_SCORE_ANY.search(seg) for seg in segs):
+        return None
+    return segs
+
+
+def _clean_checklist_keywords(raw: str) -> list[str]:
+    out: list[str] = []
+    for part in re.split(r"[、，,及和与或/]", raw):
+        p = re.sub(r"[（(][^）)]*[）)]", "", part).strip()
+        for pre in _CHECKLIST_NOISE_PREFIX:
+            while p.startswith(pre) and len(p) > len(pre):
+                p = p[len(pre):]
+        if len(p) >= 2 and p not in out:
+            out.append(p)
+    return out
+
+
+def _checklist_name(seg: str, idx: int) -> str:
+    """子项名：子项首个分句（去空白、剥尾部"的/各"，≤24 字）；无可用名时以序号兜底。"""
+    head = re.split(r"[，,。；;：:]|得\s*\d", seg, maxsplit=1)[0]
+    head = re.sub(r"\s+", "", head)
+    head = re.sub(r"的各$|各$|的$", "", head).strip()
+    return head[:24] or f"第{idx}项"
+
+
+def checklist_subitems(text: str) -> list[tuple[str, Decimal]] | None:
+    """清单式多子项（编号子项各自计分）→ [(子项名, 分值上限)]，供主观分子项独立核验（P0-4③）。
+
+    子项上限：子项内「得N分」取最高档；「A及B的各得N分」按并列项个数相乘。
+    编号不连续、子项无明示分值、或子项名重复 → None（歧义不猜，退回整项判读）。
+    """
+    segs = _checklist_segments(text or "")
+    if segs is None:
+        return None
+    items: list[tuple[str, Decimal]] = []
+    names: set[str] = set()
+    for idx, seg in enumerate(segs, start=1):
+        each = _RE_EACH_SCORE.search(seg)
+        if each:
+            n_items = len(_clean_checklist_keywords(each.group(1))) or 1
+            cap = Decimal(each.group(2)) * n_items
+        else:
+            scores = [Decimal(s) for s in _RE_GET_N.findall(seg)]
+            if not scores:
+                return None
+            cap = max(scores)
+        name = _checklist_name(seg, idx)
+        if name in names:
+            return None
+        names.add(name)
+        items.append((name, cap))
+    return items
+
+
 def infer_engine_params(text: str) -> dict:
     """新计分原语（P1-E）的 params 推断；识别不出返回 {}（走原有 count 口径）。
 
@@ -211,10 +321,10 @@ def infer_engine_params(text: str) -> dict:
         out: dict = {"engine": "deviation_deduct_table"}
         m = _RE_DEV_PER_MISSING.search(text)
         if m:
-            out["per_missing"] = m.group(1)
+            out["per_missing"] = _num_value(m.group(1))
         m = _RE_DEV_PER_NEG.search(text)
         if m:
-            out["per_negative"] = m.group(1)
+            out["per_negative"] = _num_value(m.group(1))
         return out
 
     # 分档计数（P3）："ISO体系认证两项得1分，三项得2分"——计数命中最高档，
@@ -247,11 +357,9 @@ def infer_engine_params(text: str) -> dict:
                 out["cap"] = mc.group(1)
             return out
 
-    hours = [
-        (Decimal(hg), Decimal(sg))
-        for hg, sg in _RE_HOURS_TIER.findall(text)
-    ]
-    if len(hours) >= 2:
+    hours_m = list(_RE_HOURS_TIER.finditer(text))
+    hours = [(Decimal(hm.group(1)), Decimal(hm.group(2))) for hm in hours_m]
+    if len(hours) >= 2 and _tier_scores_closed(text, [hm.span() for hm in hours_m]):
         # lower_better：档位编码为 [0..h]→score（文本给的是"≤h 得 s 分"语义）
         tiers = [{"max_value": str(h), "score": str(s)} for h, s in hours]
         # 同值多档去重（保分数更高者）
@@ -267,13 +375,15 @@ def infer_engine_params(text: str) -> dict:
             "tiers": [dedup[k] for k in sorted(dedup, key=lambda x: Decimal(x))],
         }
 
-    years = [(int(y), Decimal(s)) for y, s in _RE_YEARS_TIER.findall(text)]
-    if len(years) >= 2:
+    years_m = list(_RE_YEARS_TIER.finditer(text))
+    years = [(int(ym.group(1)), Decimal(ym.group(2))) for ym in years_m]
+    if len(years) >= 2 and _tier_scores_closed(text, [ym.span() for ym in years_m]):
         tiers = [{"min": str(y), "score": str(s)} for y, s in years]
         return {"engine": "attribute_tier", "attr": "years", "tiers": tiers}
 
-    titles = [(lv, Decimal(s)) for lv, s in _RE_TITLE_TIER.findall(text)]
-    if len(titles) >= 2:
+    titles_m = list(_RE_TITLE_TIER.finditer(text))
+    titles = [(tm.group(1), Decimal(tm.group(2))) for tm in titles_m]
+    if len(titles) >= 2 and _tier_scores_closed(text, [tm.span() for tm in titles_m]):
         tiers = [{"level": lv, "score": str(s)} for lv, s in titles]
         return {"engine": "attribute_tier", "attr": "title", "tiers": tiers}
 
@@ -285,8 +395,6 @@ def infer_engine_params(text: str) -> dict:
 # 服务承诺「4小时内到达得4分,5小时得3分…」被编译成 subjective 后丢确定性引擎
 # （证据簇均分只得 2/4），是 run78 中科「该给没给」的主因之一。
 
-# 通用「得N分」计分提及（闭合性检查用；"不得分"无数字不匹配）
-_RE_GET_SCORE = re.compile(r"得\s*(\d+(?:\.\d+)?)\s*分")
 # 响应时间档（宽松版：不强制「内/以内」——"5小时得3分"类省略式同样明示）
 _RE_HOURS_TIER_LOOSE = re.compile(
     r"(\d+(?:\.\d+)?)\s*(?:个)?\s*小时\s*(?:内|以内)?[^。；，,]{0,16}?得\s*(\d+(?:\.\d+)?)\s*分"
@@ -326,22 +434,32 @@ def _cert_level_expand(token: str) -> list[str]:
             if v <= rank]
 
 
-def _tier_scores_closed(text: str, parsed_scores: set[str]) -> bool:
-    """闭合性：细则里所有「得N分」计分提及都被已解析档位覆盖。
+# 计分提及：「得N分」，排除「最高得N分」封顶句与「最低得N分」保底句（二者都不是档位分值）
+_RE_SCORE_CLAUSE = re.compile(r"(?<![高低])得\s*(\d+(?:\.\d+)?)\s*分")
 
-    文本另有解析不出的计分提及（散文式"酌情得N分"混写）→ 不闭合 → 不路由
-    （歧义不猜）。档表是打分规则的全部 → 闭合 → 客观形态。
+
+def _tier_scores_closed(text: str, tier_spans: list[tuple[int, int]]) -> bool:
+    """子句级闭合：细则里每一处「得N分」计分提及都必须落在已解析的档位子句之内。
+
+    旧判据只比对分值集合（提及分值 ⊆ 档位分值），多子项清单（售后服务 1/2/3 子项）的
+    「得2分」「得1分」会被同值的响应时限档"借用"闭合，把整条细则误路由成单一档位
+    （测试10 run113 c30 实证）。子句级判据只看位置：另一子项的计分句、散文式"酌情得N分"
+    都会让闭合失败 → 不路由，交主观整体判读（歧义不猜）。客观分标注/主客观 hint 不再绕过
+    本判据——标注不能让未被档位覆盖的计分子句消失。
     """
-    mentions = {s for s in _RE_GET_SCORE.findall(text)}
-    return bool(mentions) and mentions <= parsed_scores
+    if not tier_spans:
+        return False
+    mentions = [m.span() for m in _RE_SCORE_CLAUSE.finditer(text)]
+    return bool(mentions) and all(
+        any(ts <= ms and me <= te for ts, te in tier_spans) for ms, me in mentions
+    )
 
 
 def infer_objective_route(criterion: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
     """主观格评分时的客观路由推断（R0）。返回 (engine_kind, params) 或 None。
 
     engine_kind: "value_tier" | "attribute_tier" | "count_tier" | "count"。
-    守卫（防把主观散文客观化）：档表 ≥2 明示档，且
-    （`_subjectivity_hint=="objective"` 或文本含「客观分」 或 档表闭合）。
+    守卫（防把主观散文客观化）：档表 ≥2 明示档，且档表子句闭合（每处「得N分」都落在档位子句内）。
     纯确定性零 LLM；只读 criteria 字典不回写，兼容冻结包。推断不出 → None
     （回退 subjective，歧义不猜）。
     """
@@ -349,19 +467,17 @@ def infer_objective_route(criterion: dict[str, Any]) -> tuple[str, dict[str, Any
     name = str(criterion.get("name") or "")
     if not text.strip():
         return None
-    gated_hint = (criterion.get("params") or {}).get("_subjectivity_hint") == "objective"
-    gated_mark = "客观分" in text
-
-    def _accept(parsed_scores: set[str]) -> bool:
-        return gated_hint or gated_mark or _tier_scores_closed(text, parsed_scores)
+    def _accept(tier_spans: list[tuple[int, int]]) -> bool:
+        return _tier_scores_closed(text, tier_spans)
 
     # ① 数值承诺档（响应时间）："4小时内到达得4分,5小时得3分…"
-    hours: list[tuple[str, str]] = _RE_HOURS_TIER_LOOSE.findall(text)
+    hours_m = list(_RE_HOURS_TIER_LOOSE.finditer(text))
     dedup: dict[str, str] = {}
-    for h, s in hours:
+    for hm in hours_m:
+        h, s = hm.group(1), hm.group(2)
         if h not in dedup or Decimal(s) > Decimal(dedup[h]):
             dedup[h] = s
-    if len(dedup) >= 2 and _accept(set(dedup.values())):
+    if len(dedup) >= 2 and _accept([hm.span() for hm in hours_m]):
         tiers = [{"max_value": k, "score": v}
                  for k, v in sorted(dedup.items(), key=lambda kv: Decimal(kv[0]))]
         return "value_tier", {
@@ -369,24 +485,26 @@ def infer_objective_route(criterion: dict[str, Any]) -> tuple[str, dict[str, Any
         }
 
     # ② 证书等级档："四级得1分，三级及以上得2分"
-    levels: list[tuple[str, str]] = _RE_CERT_LEVEL_TIER.findall(text)
+    level_m = list(_RE_CERT_LEVEL_TIER.finditer(text))
     lv_dedup: dict[tuple[str, ...], str] = {}
-    for token, s in levels:
-        key = tuple(_cert_level_expand(token))
+    for lm in level_m:
+        key = tuple(_cert_level_expand(lm.group(1)))
         if not key:
             continue
-        if key not in lv_dedup or Decimal(s) > Decimal(lv_dedup[key]):
-            lv_dedup[key] = s
-    if len(lv_dedup) >= 2 and _accept(set(lv_dedup.values())):
+        if key not in lv_dedup or Decimal(lm.group(2)) > Decimal(lv_dedup[key]):
+            lv_dedup[key] = lm.group(2)
+    if len(lv_dedup) >= 2 and _accept([lm.span() for lm in level_m]):
         tiers = [{"match_any": list(k), "score": v} for k, v in lv_dedup.items()]
         return "attribute_tier", {"attr": "cert_level", "tiers": tiers}
 
     # ③ 分档计数："2个及以上…经验，得1分；4个…得2分" / "提供两项得1分，四项得2分"
     from app.engine.objective import _CN_NUM
 
+    count_m = list(_RE_COUNT_TIER_NOUN.finditer(text))
     cnt: dict[int, str] = {}
     cnt_noun = ""
-    for raw_n, noun, s in _RE_COUNT_TIER_NOUN.findall(text):
+    for cm in count_m:
+        raw_n, noun, s = cm.group(1), cm.group(2), cm.group(3)
         n = _CN_NUM.get(raw_n)
         if n is None:
             try:
@@ -399,7 +517,7 @@ def infer_objective_route(criterion: dict[str, Any]) -> tuple[str, dict[str, Any
         noun_norm = re.sub(r"\s+", "", noun or "")
         if _EXP_KW.search(noun_norm):
             cnt_noun = noun_norm
-    if len(cnt) >= 2 and _accept(set(cnt.values())):
+    if len(cnt) >= 2 and _accept([cm.span() for cm in count_m]):
         tiers = [{"min_count": k, "score": v} for k, v in sorted(cnt.items())]
         if _EXP_KW.search(cnt_noun):
             # 计数源=人员/公司经验（verified_cases 逐案例核验路径）
@@ -412,8 +530,9 @@ def infer_objective_route(criterion: dict[str, Any]) -> tuple[str, dict[str, Any
         return "count_tier", {"field": "certificates", "tiers": tiers}
 
     # ④ per_item 线性："每1人得1分，最高不超过3分"
-    m = _RE_PER_ITEM.search(text)
-    if m:
+    per_m = list(_RE_PER_ITEM.finditer(text))
+    if per_m:
+        m = per_m[0]
         out = {"per_item": m.group(1)}
         cap = _RE_CAP.search(text)
         if cap:
@@ -423,7 +542,7 @@ def infer_objective_route(criterion: dict[str, Any]) -> tuple[str, dict[str, Any
                 per_d = Decimal(0)
             if per_d > 0:
                 out["max_items"] = str(int(Decimal(cap.group(1)) / per_d))
-        if _accept({m.group(1)}):
+        if _accept([pm.span() for pm in per_m]):
             if _LEADER_KW.search(name):
                 out["person_scope"] = "leader"
             elif _MEMBER_KW.search(name):

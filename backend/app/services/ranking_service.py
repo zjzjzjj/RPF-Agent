@@ -86,6 +86,9 @@ def compute_ranking(project_id: str, run_id: int | None = None) -> dict:
                     "tech": Decimal(0),
                     "commercial": Decimal(0),
                     "price": None,
+                    # P0-1（测试10 run113）：故障兜底暂定分的合计（不含进 total），
+                    # 供报告双分值展示「已定分合计 / 含暂定合计」。
+                    "provisional": Decimal(0),
                     "breakdown": [],
                     # 否决标记：人工已确认否决，或存在"建议否决但尚未人工处置"的项
                     "veto_flag": bidder.status in ("recommend_reject", "rejected"),
@@ -102,16 +105,26 @@ def compute_ranking(project_id: str, run_id: int | None = None) -> dict:
             final = score.final_score
             _auto_meta = (score.ai_raw_json or {}).get("auto_review") or {}
             _fallback_kind = (_auto_meta.get("fallback") or {}).get("kind")
-            if _auto_meta.get("basis") == "fallback" and _fallback_kind != "duplicate_summary":
+            _is_fallback_cell = (
+                _auto_meta.get("basis") == "fallback" and _fallback_kind != "duplicate_summary"
+            )
+            if _is_fallback_cell:
                 entry["fallback"].append(criterion_name)
             # match 判断项按设计不打分（final 恒 None）：不进 missing_final、不计总分，
             # 但照常落 breakdown（否则法律包的 8 条检查在评分矩阵里彻底消失）。
             if score_type not in ("veto", "match"):
-                if final is None:
+                _skip_total = in_total_by_crit.get(crit.id) is False
+                if _is_fallback_cell:
+                    # P0-1（测试10 run113 教训）：故障兜底暂定分不是评审结论（报告
+                    # 自己声明"不构成有效最终分"），不得混进总分冒充定论——单列
+                    # provisional 供报告双分值展示（已定分合计 / 含暂定合计）。
+                    # reading_incomplete 格无暂定值（未定分），只挂 fallback 清单。
+                    if final is not None and not _skip_total:
+                        entry["provisional"] += Decimal(str(final))
+                elif final is None:
                     entry["missing_final"].append(criterion_name)
                     continue
-                _skip_total = in_total_by_crit.get(crit.id) is False
-                if not _skip_total:
+                elif not _skip_total:
                     entry["total"] += Decimal(str(final))
                     if category == "technical":
                         entry["tech"] += Decimal(str(final))
@@ -127,6 +140,7 @@ def compute_ranking(project_id: str, run_id: int | None = None) -> dict:
                     "final_score": str(final) if final is not None else None,
                     "review_status": score.review_status,
                     "veto": score_type == "veto",
+                    "provisional": _is_fallback_cell or None,
                 }
             )
 
@@ -147,6 +161,7 @@ def compute_ranking(project_id: str, run_id: int | None = None) -> dict:
         out_rows = []
         for r in ranked:
             e = bidders[r.bidder_id]
+            provisional_total = e["total"] + e["provisional"]
             out_rows.append(
                 {
                     "rank": r.rank,
@@ -154,6 +169,9 @@ def compute_ranking(project_id: str, run_id: int | None = None) -> dict:
                     "bidder_name": r.name,
                     "bid_price": str(r.bid_price) if r.bid_price is not None else None,
                     "total": str(r.total),
+                    # P0-1 双分值：total=已定分合计（不含暂定兜底）；
+                    # provisional_total=含暂定分合计（审计对照用）。
+                    "provisional_total": str(provisional_total),
                     "tech_total": str(r.tech_total),
                     "commercial_total": str(r.commercial_total),
                     "price_score": str(e["price"]) if e["price"] is not None else None,
@@ -174,6 +192,15 @@ def compute_ranking(project_id: str, run_id: int | None = None) -> dict:
                 row["tie_break_level"] = None
                 row["tie_explanations"] = []
             warnings.append("自动评审尚未全部完成，当前仅展示已完成分数，不发布最终排名")
+        elif any(row["fallback"] for row in out_rows):
+            # P0-1：含故障兜底暂定格的总分不是完整评审结论（报告自述"不构成
+            # 有效最终分"），不发布名次，防止暂定 0 分误导排序（测试10 run113
+            # 的 15 个暂定格直接顶出错误名次）。
+            for row in out_rows:
+                row["rank"] = None
+                row["tie_break_level"] = None
+                row["tie_explanations"] = []
+            warnings.append("存在故障兜底暂定分（非评审结论），总分不完整，不发布最终排名；请补评或人工改分后重算")
         for row in out_rows:
             if row["missing_final"]:
                 warnings.append(
@@ -192,4 +219,5 @@ def compute_ranking(project_id: str, run_id: int | None = None) -> dict:
             "automation": automation,
             "is_final": automation["is_final"] if automation is not None else True,
             "provisional": automation is not None and not automation["is_final"],
+            "has_fallback": any(row["fallback"] for row in out_rows),
         }
