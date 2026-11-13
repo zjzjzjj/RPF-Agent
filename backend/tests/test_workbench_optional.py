@@ -24,7 +24,7 @@ def test_no_tender_is_optional_when_default_rules_frozen(client) -> None:  # noq
     assert r.json()["frozen"] is True
 
     data = client.get(f"/api/projects/{pid}/workbench").json()
-    assert [s["key"] for s in data["stages"]] == ["rules", "import", "results"]
+    assert [s["key"] for s in data["stages"]] == ["import", "rules", "results"]
     stages = {s["key"]: s for s in data["stages"]}
     assert stages["rules"]["state"] == "done"
     assert stages["rules"]["optional"] is True

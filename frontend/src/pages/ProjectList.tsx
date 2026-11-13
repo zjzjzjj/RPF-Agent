@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import {
   Alert,
@@ -20,14 +20,12 @@ import {
   Tag,
   Tooltip,
   Typography,
-  Upload,
 } from "antd";
 import {
   ArrowRightOutlined,
   AuditOutlined,
   CheckCircleOutlined,
   ClockCircleOutlined,
-  CloudUploadOutlined,
   DeleteOutlined,
   EditOutlined,
   FileProtectOutlined,
@@ -40,9 +38,8 @@ import {
 } from "@ant-design/icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
-import { useJob, useProjects, useTemplates } from "../api/hooks";
+import { useProjects, useTemplates } from "../api/hooks";
 import DashboardMetrics from "../components/DashboardMetrics";
-import JobProgress from "../components/JobProgress";
 import RenameProjectModal from "../components/RenameProjectModal";
 import {
   formatDate,
@@ -66,12 +63,6 @@ export default function ProjectList() {
   );
   const [page, setPage] = useState(1);
   const [renameTarget, setRenameTarget] = useState<Project | null>(null);
-  const [importOpen, setImportOpen] = useState(false);
-  const [importFile, setImportFile] = useState<File | null>(null);
-  const [importName, setImportName] = useState("");
-  const [importJobId, setImportJobId] = useState<number | null>(null);
-  const [importedPid, setImportedPid] = useState<string | null>(null);
-  const importJob = useJob(importJobId);
   const [form] = Form.useForm();
   const navigate = useNavigate();
   const qc = useQueryClient();
@@ -147,47 +138,11 @@ export default function ProjectList() {
       }
       setOpen(false);
       form.resetFields();
-      navigate(`/p/${project.id}`);
+      navigate(`/p/${project.id}/upload`);
     },
     onError: (e: Error) =>
       message.error(e.message || "创建项目失败，请稍后重试"),
   });
-
-  // 项目包（zip）一键导入：招标/ + 投标/公司名/ → 自动建档、自动抽价
-  const importBundle = useMutation({
-    mutationFn: () => {
-      if (!importFile) throw new Error("请先选择项目包 zip 文件");
-      const fd = new FormData();
-      fd.append("file", importFile);
-      if (importName.trim()) fd.append("name", importName.trim());
-      return api.upload<{ project_id: string; job_id: number }>(
-        "/projects/import-bundle",
-        fd,
-      );
-    },
-    onSuccess: (r) => {
-      setImportJobId(r.job_id);
-      setImportedPid(r.project_id);
-      qc.invalidateQueries({ queryKey: ["projects"] });
-    },
-    onError: (e: Error) => message.error(e.message || "导入失败，请检查项目包结构"),
-  });
-
-  // 导入 job 终态：成功后进入项目工作台
-  useEffect(() => {
-    const st = importJob.data?.status;
-    if (st === "succeeded" && importedPid) {
-      message.success("项目包导入完成");
-      setImportOpen(false);
-      setImportFile(null);
-      setImportName("");
-      setImportJobId(null);
-      navigate(`/p/${importedPid}`);
-    }
-    if (st === "failed") {
-      qc.invalidateQueries({ queryKey: ["projects"] });
-    }
-  }, [importJob.data?.status, importedPid]);
 
   const remove = useMutation({
     mutationFn: (pid: string) => api.del<{ deleted: string }>(`/projects/${pid}`),
@@ -238,13 +193,6 @@ export default function ProjectList() {
           <p>从招标规则到评标报告，让每一步评审清晰、有据。</p>
         </div>
         <Space size="middle" wrap>
-          <Button
-            size="large"
-            icon={<CloudUploadOutlined />}
-            onClick={() => setImportOpen(true)}
-          >
-            导入项目包（zip）
-          </Button>
           <Button
             type="primary"
             size="large"
@@ -692,66 +640,6 @@ export default function ProjectList() {
             />
           </Form.Item>
         </Form>
-      </Modal>
-      <Modal
-        title="导入项目包（zip）"
-        open={importOpen}
-        onCancel={() => {
-          if (importBundle.isPending || (importJobId && !importJob.data)) return;
-          setImportOpen(false);
-          setImportFile(null);
-          setImportName("");
-        }}
-        onOk={() => importBundle.mutate()}
-        okText="开始导入"
-        cancelText="取消"
-        confirmLoading={importBundle.isPending}
-        okButtonProps={{ disabled: !importFile || !!importJobId }}
-        closable={!importBundle.isPending}
-      >
-        <p className="modal-intro">
-          一个 zip 含两个顶层文件夹：<b>招标</b>（招标文件 PDF/Word）与
-          <b>投标</b>
-          （每个公司一个文件夹，文件夹名 = 投标人名称，内含开标一览表与投标文件）。
-          导入后自动建档投标人并从「开标一览表」（Excel/PDF）抽取报价，无需人工确认。
-        </p>
-        <Space direction="vertical" style={{ width: "100%" }} size="middle">
-          <Upload
-            accept=".zip"
-            maxCount={1}
-            beforeUpload={(file) => {
-              setImportFile(file);
-              if (!importName.trim()) {
-                setImportName(file.name.replace(/\.zip$/i, ""));
-              }
-              return false;
-            }}
-            onRemove={() => setImportFile(null)}
-            fileList={
-              importFile
-                ? [{ uid: "1", name: importFile.name, status: "done" as const }]
-                : []
-            }
-          >
-            <Button icon={<CloudUploadOutlined />} disabled={!!importJobId}>
-              选择项目包 zip
-            </Button>
-          </Upload>
-          <Input
-            placeholder="项目名称（缺省取 zip 文件名）"
-            value={importName}
-            onChange={(e) => setImportName(e.target.value)}
-            maxLength={200}
-            disabled={!!importJobId}
-          />
-          {importJobId != null && (
-            <JobProgress job={importJob.data ?? null} width={220} />
-          )}
-          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            结构不合法（缺招标/投标文件夹、公司重名等）会直接报错且不产生项目数据；
-            抽不到报价的公司自动跳过价格分并在结果中标注。
-          </Typography.Text>
-        </Space>
       </Modal>
       <RenameProjectModal
         project={renameTarget}

@@ -17,6 +17,7 @@ import {
   ApartmentOutlined,
   ArrowLeftOutlined,
   CheckCircleOutlined,
+  CloudUploadOutlined,
   FileProtectOutlined,
   FileTextOutlined,
   FolderOpenOutlined,
@@ -32,7 +33,8 @@ import { useProject } from "../api/hooks";
 
 const NAVIGATION = [
   { path: "", label: "项目工作台", icon: <HomeOutlined /> },
-  { path: "/rules", label: "规则库与招标文件", icon: <FileTextOutlined /> },
+  { path: "/upload", label: "上传文件", icon: <CloudUploadOutlined /> },
+  { path: "/rules", label: "规则库管理", icon: <FileTextOutlined /> },
   { path: "/results", label: "评分结果", icon: <TrophyOutlined /> },
 ];
 

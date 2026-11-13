@@ -6,6 +6,7 @@ interface Props {
   bucket: SummaryBucket;
   onOpenReason: (item: SummaryItem) => void;
   onOpenEvidence: (item: SummaryItem) => void;
+  onViewSource: (item: SummaryItem) => void;
   managed?: boolean;
 }
 
@@ -56,7 +57,7 @@ function reasonSummary(item: SummaryItem, managed: boolean): string {
 }
 
 /** 单个分桶的逐项明细表：得分 / 满分 / 失分 / 状态 / 理由 / 证据。 */
-export default function ItemTable({ bucket, onOpenReason, onOpenEvidence, managed = false }: Props) {
+export default function ItemTable({ bucket, onOpenReason, onOpenEvidence, onViewSource, managed = false }: Props) {
   const isVerdictBucket = bucket.kind === "verdict";
 
   return (
@@ -182,7 +183,7 @@ export default function ItemTable({ bucket, onOpenReason, onOpenEvidence, manage
         },
         {
           title: "操作",
-          width: 110,
+          width: 150,
           fixed: "right" as const,
           render: (_, item) => (
             <Space size={0}>
@@ -194,6 +195,14 @@ export default function ItemTable({ bucket, onOpenReason, onOpenEvidence, manage
                   核验
                 </Button>
               )}
+              {/* 价格分（客观-公式）不需要原文定位；其余评分项有引文时显示「查看原文」 */}
+              {item.score_type !== "formula" &&
+                item.category !== "price" &&
+                item.evidence.citations.length > 0 && (
+                  <Button size="small" type="link" onClick={() => onViewSource(item)}>
+                    查看原文
+                  </Button>
+                )}
             </Space>
           ),
         },

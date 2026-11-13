@@ -46,6 +46,9 @@ log = logging.getLogger("bid_eval.zip_intake")
 
 TENDER_DIR = "招标"
 BID_DIR = "投标"
+# 真实数据中常见别名（如"招标文件/"、"投标文件/"）
+TENDER_DIR_ALIASES = ("招标", "招标文件")
+BID_DIR_ALIASES = ("投标", "投标文件")
 TENDER_SUFFIXES = {".pdf", ".docx"}
 _ARCHIVE_SUFFIXES = {".zip", ".7z", ".rar"}
 _IGNORE_NAMES = {".DS_Store"}
@@ -162,22 +165,24 @@ def _child_dirs(entries: list[tuple[PurePosixPath, bool]], prefix: str) -> list[
     return sorted(kids)
 
 
-def _resolve_roots(entries: list[tuple[PurePosixPath, bool]]) -> tuple[str, bool]:
-    """定位 招标/投标 两目录（容错剥包装根）。返回 (前缀, 是否剥了包装根)。"""
+def _resolve_roots(entries: list[tuple[PurePosixPath, bool]]) -> tuple[str, str, str, bool]:
+    """定位 招标/投标 两目录（容错剥包装根、接受别名）。
+    返回 (前缀, 招标目录名, 投标目录名, 是否剥了包装根)。
+    """
     prefix = ""
     for _ in range(_MAX_WRAPPER_DEPTH + 1):
-        t_found = _has_dir(entries, f"{prefix}{TENDER_DIR}")
-        b_found = _has_dir(entries, f"{prefix}{BID_DIR}")
-        if t_found and b_found:
-            return prefix, bool(prefix)
-        if t_found != b_found:
+        t_name = _find_dir(entries, prefix, TENDER_DIR_ALIASES)
+        b_name = _find_dir(entries, prefix, BID_DIR_ALIASES)
+        if t_name and b_name:
+            return prefix, t_name, b_name, bool(prefix)
+        if t_name or b_name:
             # 只有一半：缺哪个报哪个，比笼统报错可操作
-            if t_found:
+            if t_name:
                 raise ZipMissingBidDir(
-                    f"项目包缺少「{BID_DIR}」文件夹（找到「{TENDER_DIR}」但无配对目录）"
+                    f"项目包缺少「{BID_DIR}」文件夹（找到「{t_name}」但无配对目录）"
                 )
             raise ZipMissingTenderDir(
-                f"项目包缺少「{TENDER_DIR}」文件夹（找到「{BID_DIR}」但无配对目录）"
+                f"项目包缺少「{TENDER_DIR}」文件夹（找到「{b_name}」但无配对目录）"
             )
         kids = _child_dirs(entries, prefix)
         if len(kids) != 1:
@@ -185,7 +190,16 @@ def _resolve_roots(entries: list[tuple[PurePosixPath, bool]]) -> tuple[str, bool
         prefix = f"{prefix}{kids[0]}/"
     raise ZipMissingTenderDir(
         f"项目包缺少「{TENDER_DIR}」与「{BID_DIR}」两个顶层文件夹"
+        f"（也接受「{'/'.join(TENDER_DIR_ALIASES[1:])}」等别名）"
     )
+
+
+def _find_dir(entries: list[tuple[PurePosixPath, bool]], prefix: str, aliases: tuple[str, ...]) -> str | None:
+    """在 prefix 下找别名目录，返回实际目录名（找不到返回 None）。"""
+    for alias in aliases:
+        if _has_dir(entries, f"{prefix}{alias}"):
+            return alias
+    return None
 
 
 def plan_from_names(names: Iterable[str]) -> BundlePlan:
@@ -201,9 +215,9 @@ def plan_from_names(names: Iterable[str]) -> BundlePlan:
     if not entries:
         raise ImportBundleError("项目包内没有任何文件")
 
-    prefix, wrapper_stripped = _resolve_roots(entries)
-    tender_root = f"{prefix}{TENDER_DIR}"
-    bid_root = f"{prefix}{BID_DIR}"
+    prefix, t_name, b_name, wrapper_stripped = _resolve_roots(entries)
+    tender_root = f"{prefix}{t_name}"
+    bid_root = f"{prefix}{b_name}"
     t_head, b_head = tender_root + "/", bid_root + "/"
 
     # ---- 招标侧 ----

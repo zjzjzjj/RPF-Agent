@@ -712,8 +712,12 @@ def build_score_summary(
             }
         )
 
-    # 排序：有排名的按名次，被剔除的放最后
-    bidders_out.sort(key=lambda b: (b["rank"] is None, b["rank"] if b["rank"] is not None else 10**9))
+    # 排序：有排名的按名次；无排名（含故障兜底/评审未完）按总分降序展示；被剔除的放最后
+    bidders_out.sort(key=lambda b: (
+        b["rank"] is None and b.get("state") == "excluded",  # 被剔除的排最后
+        b["rank"] if b["rank"] is not None else 10**9,        # 有名次的按名次
+        -float((b.get("summary") or {}).get("total") or 0),   # 无名次的按总分降序
+    ))
 
     return {
         "project_id": project_id,

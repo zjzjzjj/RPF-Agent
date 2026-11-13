@@ -1,5 +1,5 @@
-import { Alert, Button, Card, Collapse, Empty, List, Space, Spin, Tag, Tooltip, Typography, Upload } from "antd";
-import { InboxOutlined, ReloadOutlined, SyncOutlined } from "@ant-design/icons";
+import { Alert, Button, Card, Collapse, Empty, List, Space, Spin, Tag, Tooltip, Typography } from "antd";
+import { ReloadOutlined, SyncOutlined } from "@ant-design/icons";
 import type { DocumentOut, JobOut, MergeRecord } from "../../types";
 
 const ACTION_META: Record<string, { color: string; text: string }> = {
@@ -25,11 +25,9 @@ interface Props {
   flow: "idle" | "parsing" | "matching";
   parseJob?: JobOut | null;
   matchJob?: JobOut | null;
-  uploading: boolean;
   canRematch: boolean;
   rematchPending: boolean;
   reparsePending: boolean;
-  onUpload: (file: File) => void;
   onReparse: (docId: number) => void;
   onRematch: () => void;
   records: MergeRecord[];
@@ -55,18 +53,16 @@ function postMergeErrors(job?: JobOut | null): { code: string; message: string }
   return Array.isArray(pm?.errors) ? pm!.errors : [];
 }
 
-/** 上传招标文件 → 解析 → 自动匹配规则，并展示变更清单与护栏告警。 */
+/** 招标文件解析 → 自动匹配规则，并展示变更清单与护栏告警。 */
 export default function AutoMatchBanner({
   tenderDoc,
   tenderFailedDoc,
   flow,
   parseJob,
   matchJob,
-  uploading,
   canRematch,
   rematchPending,
   reparsePending,
-  onUpload,
   onReparse,
   onRematch,
   records,
@@ -83,18 +79,6 @@ export default function AutoMatchBanner({
       title="招标文件与自动匹配"
       extra={
         <Space size={6}>
-          <Upload
-            showUploadList={false}
-            accept=".pdf,.docx"
-            beforeUpload={(file) => {
-              onUpload(file);
-              return false;
-            }}
-          >
-            <Button size="small" icon={<InboxOutlined />} loading={uploading}>
-              {tenderDoc ? "替换招标文件" : "上传招标文件并自动匹配"}
-            </Button>
-          </Upload>
           <Tooltip title="以当前招标文件重新编译并与现有默认规则合并（需草稿包）">
             <Button
               size="small"
@@ -129,7 +113,7 @@ export default function AutoMatchBanner({
         />
       ) : !tenderDoc ? (
         <Typography.Text type="secondary">
-          上传招标文件后，系统会自动解析并按评分办法匹配、更新现有规则；
+          招标文件已随项目包导入，系统会自动解析并按评分办法匹配规则；
           没有招标文件也可以直接「使用默认规则」完成评分。
         </Typography.Text>
       ) : (

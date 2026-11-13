@@ -29,8 +29,8 @@ def annotate_page_readability(
 
     copied = [dict(page) for page in pages]
     path = Path(stored_path)
-    if path.suffix.lower() == ".txt":
-        # Internal plain-text records cannot contain omitted bitmap material.
+    if path.suffix.lower() in (".txt", ".xlsx", ".xls", ".csv"):
+        # 结构化数据（文本/表格）不存在被遗漏的扫描位图，跳过可读性核验。
         return copied
     if path.suffix.lower() == ".docx":
         _check_docx_images(path)

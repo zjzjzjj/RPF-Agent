@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from "react";
-import { useParams } from "react-router-dom";
+import { useNavigate, useParams } from "react-router-dom";
 import {
   Alert,
   Button,
@@ -24,10 +24,9 @@ import {
   Tag,
   Tooltip,
   Typography,
-  Upload,
   message,
 } from "antd";
-import { CheckOutlined, PlusOutlined, ThunderboltOutlined, ReloadOutlined, UploadOutlined, SwapOutlined, ImportOutlined, SettingOutlined } from "@ant-design/icons";
+import { CheckOutlined, PlusOutlined, ThunderboltOutlined, ReloadOutlined, SwapOutlined, ImportOutlined, SettingOutlined } from "@ant-design/icons";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { api } from "../api/client";
 import { useJobProgress } from "../api/useJobStream";
@@ -53,6 +52,7 @@ import { CATEGORY_LABELS } from "../types";
 
 export default function TenderRules() {
   const { pid = "" } = useParams();
+  const navigate = useNavigate();
   const qc = useQueryClient();
   const { data: documents } = useDocuments(pid);
   const { data: rules, isLoading } = useRules(pid);
@@ -108,23 +108,6 @@ export default function TenderRules() {
   );
   const tenderFailedDoc = documents?.find((d) => d.kind === "tender" && d.parse_status === "failed");
   const tenderFailed = !!tenderFailedDoc;
-
-  const uploadTender = useMutation({
-    mutationFn: (file: File) => {
-      const formData = new FormData();
-      formData.append("file", file);
-      formData.append("kind", "tender");
-      return api.upload<{ document_id: number; job_id: number }>(`/projects/${pid}/documents`, formData);
-    },
-    onSuccess: (r) => {
-      setParseJobId(r.job_id);
-      setFlow("parsing");
-      qc.invalidateQueries({ queryKey: ["documents", pid] });
-      qc.invalidateQueries({ queryKey: ["workbench", pid] });
-      message.success("招标文件已上传，解析完成后将自动匹配规则…");
-    },
-    onError: (e: Error) => message.error(e.message),
-  });
 
   const reparseDoc = useMutation({
     mutationFn: (documentId: number) => api.post(`/documents/${documentId}/reparse`),
@@ -242,9 +225,10 @@ export default function TenderRules() {
             setDefaultOpen(false);
             message.success(
               r.already_frozen
-                ? "默认规则已处于冻结状态，可直接发起评分"
-                : `已启用默认规则并冻结（${r.signed_off} 条签批）`,
+                ? "默认规则已冻结，进入评分"
+                : `已启用默认规则并冻结（${r.signed_off} 条签批），进入评分`,
             );
+            navigate(`/p/${pid}/results`);
           } else {
             const codes = r.blockers.map((b) => b.code).filter(Boolean).join("、");
             message.error(`启用未完成：${codes || r.message || "校验未通过"}；请修正后重试`);
@@ -352,7 +336,8 @@ export default function TenderRules() {
     mutationFn: () => api.post(`/rules/packages/${rules!.id}/freeze`),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["rules", pid] });
-      message.success("规则包已冻结（此后只读，评分只认该版本快照）");
+      message.success("规则包已冻结，进入评分");
+      navigate(`/p/${pid}/results`);
     },
     onError: (e: Error & { detail?: { blockers?: { code?: string; message?: string }[] } }) => {
       qc.invalidateQueries({ queryKey: ["rules", pid] });
@@ -453,7 +438,7 @@ export default function TenderRules() {
     <div>
       <Row justify="space-between" align="middle" gutter={[16, 12]}>
         <Col>
-          <Typography.Title level={4}>规则库与招标文件</Typography.Title>
+          <Typography.Title level={4}>规则库管理</Typography.Title>
         </Col>
         <Col>
           <Space wrap>
@@ -527,14 +512,12 @@ export default function TenderRules() {
           flow={flow}
           parseJob={parseJob}
           matchJob={matchJob}
-          uploading={uploadTender.isPending}
           reparsePending={reparseDoc.isPending}
           canRematch={
             !!tenderDoc &&
             (canMerge || !rules || rules.id === 0 || rules.status === "none")
           }
           rematchPending={compile.isPending}
-          onUpload={(file) => uploadTender.mutate(file)}
           onReparse={(id) => reparseDoc.mutate(id)}
           onRematch={() => compile.mutate()}
           records={mergeRecords ?? []}
@@ -551,7 +534,7 @@ export default function TenderRules() {
           description={
             <Typography.Text type="secondary">
               当前条目均为模板兜底（P5 来源，招标文件未规定），可签批后确认、冻结。
-              上传招标文件后系统会自动匹配并更新规则：
+              招标文件解析后系统会自动匹配并更新规则：
               模板条目被招标文件条款逐条覆盖、新增条款追加、未规定条目弃用（全程留痕）。
             </Typography.Text>
           }
@@ -813,7 +796,7 @@ export default function TenderRules() {
       {(!rules || rules.id === 0) && !isLoading && (
         <Empty
           style={{ marginTop: 40 }}
-          description="尚无评分规则：上传招标文件自动匹配，或点「使用默认规则」选择内置模板直接评分"
+          description="尚无评分规则：上传项目包后自动匹配，或点「使用默认规则」选择内置模板直接评分"
         />
       )}
 

@@ -41,6 +41,7 @@ import {
 import { ExecutionProgressDetails, JobProgress } from "../components/JobProgress";
 import BucketCards from "../components/results/BucketCards";
 import BidderRankList from "../components/results/BidderRankList";
+import EvidencePdfModal from "../components/results/EvidencePdfModal";
 import ItemReasonDrawer from "../components/results/ItemReasonDrawer";
 import ItemTable from "../components/results/ItemTable";
 import MatrixPanel from "../components/results/MatrixPanel";
@@ -95,6 +96,7 @@ export default function ScoreResults() {
   const job = useJobProgress(jobId);
   const [selectedModel, setSelectedModel] = useState<string | undefined>(undefined);
   const [drawerItem, setDrawerItem] = useState<SummaryItem | null>(null);
+  const [pdfModalItem, setPdfModalItem] = useState<SummaryItem | null>(null);
 
   const rawBidder = params.get("bidder");
   const selectedBidderId = rawBidder ? Number(rawBidder) : null;
@@ -361,7 +363,7 @@ export default function ScoreResults() {
           type="warning"
           showIcon
           style={{ marginBottom: 12 }}
-          message="规则包尚未冻结：请先在「规则库与招标文件」页完成确认与冻结，才能发起评分"
+          message="规则包尚未冻结：请先在「规则库管理」页完成确认与冻结，才能发起评分"
         />
       )}
       {summary && !summary.run.ready && (
@@ -503,6 +505,7 @@ export default function ScoreResults() {
                               bucket={bucket}
                               onOpenReason={(item) => setDrawerItem(item)}
                               onOpenEvidence={openEvidence}
+                              onViewSource={(item) => setPdfModalItem(item)}
                               managed={managed}
                             />
                           )}
@@ -548,6 +551,23 @@ export default function ScoreResults() {
         open={drawerItem != null}
         onClose={() => setDrawerItem(null)}
         managed={managed}
+      />
+
+      <EvidencePdfModal
+        open={pdfModalItem != null}
+        onClose={() => setPdfModalItem(null)}
+        citations={(pdfModalItem?.evidence.citations ?? []).map((c) => ({
+          id: c.id,
+          document_id: c.document_id,
+          page_no: c.page_no,
+          node_id: c.node_id,
+          quote: c.quote ?? "",
+          verified: c.verified,
+          verify_method: c.verify_method,
+          bbox_json: c.bbox_json,
+          page_size_json: c.page_size_json,
+        }))}
+        title={pdfModalItem ? `投标书原文 · ${pdfModalItem.name}` : "投标书原文"}
       />
     </div>
   );

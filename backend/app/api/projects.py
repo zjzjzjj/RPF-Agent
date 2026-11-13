@@ -139,7 +139,30 @@ def get_workbench(project_id: str) -> WorkbenchOut:
                 )
             ).scalar_one()
 
-        # ① 规则库与招标文件：规则页同时承载招标文件上传与规则管理，合成一个阶段。
+        # ① 上传文件（2026-11-13 输入格式重构：投标人由项目包导入自动生成，
+        #    报价开标一览表自动抽取即生效——不再有"报价已确认"卡点）
+        bidder_count = s.execute(
+            select(func.count(Bidder.id)).where(Bidder.project_id == project_id)
+        ).scalar_one()
+        priced_count = s.execute(
+            select(func.count(Bidder.id)).where(
+                Bidder.project_id == project_id, Bidder.price_status != "missing"
+            )
+        ).scalar_one()
+        unpriced = int(bidder_count - priced_count)
+        if bidder_count == 0:
+            stages.append(StageState(key="import", label="上传文件", state="pending",
+                                     detail="尚未导入项目包（zip：招标文件 + 各公司投标文件夹）"))
+        elif unpriced > 0:
+            stages.append(StageState(key="import", label="上传文件", state="active",
+                                     detail=f"{bidder_count} 家公司 / {priced_count} 家抽价成功，"
+                                            f"{unpriced} 家未抽到报价（不参与价格分）",
+                                     todo_count=unpriced))
+        else:
+            stages.append(StageState(key="import", label="上传文件", state="done",
+                                     detail=f"{bidder_count} 家公司，报价抽取全部成功"))
+
+        # ② 规则库管理：招标文件解析后自动匹配规则，规则确认后可冻结评分。
         # 状态优先级（首条命中）：解析失败 > 解析中 > 无规则包 > 已冻结 > 草稿待确认。
         if failed:
             tender_frag = f"{len(failed)} 份招标文件解析被拒绝"
@@ -171,51 +194,28 @@ def get_workbench(project_id: str) -> WorkbenchOut:
             rules_frag = f"v{pkg.version} 草稿：{total - unverified}/{total} 已确认"
 
         if failed:
-            stages.append(StageState(key="rules", label="规则库与招标文件", state="blocked",
+            stages.append(StageState(key="rules", label="规则库管理", state="blocked",
                                      detail=f"{tender_frag}；{rules_frag}", todo_count=len(failed)))
             blockers.append("招标文件解析被拒绝，请更换文件或查看拒绝原因")
         elif tender_docs and not parsed:
-            stages.append(StageState(key="rules", label="规则库与招标文件", state="active",
+            stages.append(StageState(key="rules", label="规则库管理", state="active",
                                      detail=f"{tender_frag}；{rules_frag}",
                                      todo_count=len(tender_docs)))
         elif pkg is None:
             stages.append(StageState(
-                key="rules", label="规则库与招标文件",
+                key="rules", label="规则库管理",
                 state="active" if parsed else "pending",
                 detail=f"{tender_frag}；{rules_frag}"))
         elif pkg.status == "frozen":
-            stages.append(StageState(key="rules", label="规则库与招标文件", state="done",
+            stages.append(StageState(key="rules", label="规则库管理", state="done",
                                      detail=f"{tender_frag}；{rules_frag}",
                                      optional=not tender_docs))
         else:
-            stages.append(StageState(key="rules", label="规则库与招标文件", state="active",
+            stages.append(StageState(key="rules", label="规则库管理", state="active",
                                      detail=f"{tender_frag}；{rules_frag}",
                                      todo_count=int(unverified)))
             if unverified:
                 blockers.append(f"评分规则有 {unverified} 项待确认（未确认不能冻结）")
-
-        # ② 数据导入（2026-11-13 输入格式重构：投标人由项目包导入自动生成，
-        #    报价开标一览表自动抽取即生效——不再有"报价已确认"卡点）
-        bidder_count = s.execute(
-            select(func.count(Bidder.id)).where(Bidder.project_id == project_id)
-        ).scalar_one()
-        priced_count = s.execute(
-            select(func.count(Bidder.id)).where(
-                Bidder.project_id == project_id, Bidder.price_status != "missing"
-            )
-        ).scalar_one()
-        unpriced = int(bidder_count - priced_count)
-        if bidder_count == 0:
-            stages.append(StageState(key="import", label="数据导入", state="pending",
-                                     detail="尚未导入项目包（zip：招标文件 + 各公司投标文件夹）"))
-        elif unpriced > 0:
-            stages.append(StageState(key="import", label="数据导入", state="active",
-                                     detail=f"{bidder_count} 家公司 / {priced_count} 家抽价成功，"
-                                            f"{unpriced} 家未抽到报价（不参与价格分）",
-                                     todo_count=unpriced))
-        else:
-            stages.append(StageState(key="import", label="数据导入", state="done",
-                                     detail=f"{bidder_count} 家公司，报价抽取全部成功"))
 
         # ③ 评分结果：评分运行、复核与报告都在评分结果页，合成一个阶段。
         # 状态优先级：无运行 > 运行中 > 运行失败 > 人工复核待办（仅人工模式）> 报告定稿 > 可查看/可生成。

@@ -76,7 +76,7 @@ def test_project_crud(client):
     # 审计留痕已写入；工作台为三阶段（规则库与招标文件 / 投标人 / 评分结果）
     resp = client.get(f"/api/projects/{pid}/workbench")
     assert resp.status_code == 200
-    assert [s["key"] for s in resp.json()["stages"]] == ["rules", "import", "results"]
+    assert [s["key"] for s in resp.json()["stages"]] == ["import", "rules", "results"]
     stages = {s["key"]: s for s in resp.json()["stages"]}
     assert stages["rules"]["state"] == "pending"
 
