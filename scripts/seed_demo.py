@@ -9,11 +9,14 @@ from __future__ import annotations
 
 import json
 import sys
+import tempfile
 import time
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "backend"))
+sys.path.insert(0, str(REPO / "scripts"))
+from build_import_zip import build_zip  # noqa: E402  项目包打包（与导入端同构）
 
 BIDDER_KEYS = ["jia", "yi", "bing", "ding", "wu"]
 
@@ -26,6 +29,17 @@ def _wait(client, job_id: int, timeout: float = 300.0) -> dict:  # noqa: ANN001
             return job
         time.sleep(0.2)
     raise TimeoutError(f"任务 {job_id} 超时")
+
+
+def _wait_project_jobs(client, pid: str, timeout: float = 600.0) -> None:  # noqa: ANN001
+    """等项目全部任务终态（导入把解析任务异步排队，后续步骤前必须等完）。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        jobs = client.get(f"/api/projects/{pid}/jobs").json()
+        if not any(j["status"] in ("queued", "running") for j in jobs):
+            return
+        time.sleep(0.5)
+    raise TimeoutError(f"项目 {pid} 任务未在 {timeout}s 内完成")
 
 
 def main() -> None:
@@ -73,12 +87,22 @@ def main() -> None:
         }).json()["id"]
         print(f"项目：{pid}")
 
-        out = upload(client, pid, tender_pdf, "tender")
-        job = _wait(client, out["job_id"])
-        assert job["status"] == "succeeded", job.get("error")
+        # ---- 项目包导入（招标 + 5 家投标）：报价开标一览表自动抽取即生效 ----
+        pdfs = sorted((samples / "bids").glob("*_投标文件.pdf"))
+        zip_path = build_zip([tender_pdf],
+                             {p.stem.split("_")[1]: [p] for p in pdfs},
+                             Path(tempfile.mkdtemp(prefix="bid-eval-import-")) / "项目包.zip")
+        with open(zip_path, "rb") as fh:
+            imp = client.post(f"/api/projects/{pid}/import-bundle",
+                              files={"file": (zip_path.name, fh.read(), "application/zip")})
+        assert imp.status_code == 202, imp.text
+        imp_job = _wait(client, imp.json()["job_id"], timeout=600)
+        assert imp_job["status"] == "succeeded", imp_job.get("error")
+        tender_doc_id = imp_job["result_json"]["tender_documents"][0]["document_id"]
+        _wait_project_jobs(client, pid)
 
         resp = client.post(f"/api/projects/{pid}/rules/compile",
-                           json={"document_id": out["document_id"]})
+                           json={"document_id": tender_doc_id})
         job = _wait(client, resp.json()["job_id"])
         assert job["status"] == "succeeded", job.get("error")
         package_id = job["result_json"]["package_id"]
@@ -107,23 +131,11 @@ def main() -> None:
         client.post(f"/api/rules/packages/{package_id}/freeze")
         print(f"规则包 v1 已冻结：{len(pkg['criteria'])} 个评分项")
 
-        bid_pdfs = sorted((samples / "bids").glob("*_投标文件.pdf"))
-        bidder_ids = []
-        for key in BIDDER_KEYS:
-            pdf = next(p for p in bid_pdfs if p.name.startswith(f"{key}_"))
-            b = client.post(f"/api/projects/{pid}/bidders",
-                            json={"name": pdf.stem.split("_")[1]}).json()
-            bo = upload(client, pid, pdf, "bid", bidder_id=b["id"])
-            jb = _wait(client, bo["job_id"])
-            assert jb["status"] == "succeeded", jb.get("error")
-            client.get(f"/api/bidders/{b['id']}/price")
-            client.post(f"/api/bidders/{b['id']}/price/confirm", json={"reason": "与开标一览表核对一致"})
-            bidder_ids.append(b["id"])
-        print(f"5 家投标人已就绪：{bidder_ids}")
+        bidder_ids = [b["id"] for b in client.get(f"/api/projects/{pid}/bidders").json()]
+        print(f"5 家投标人已由项目包导入建档（报价自动抽取即生效）：{bidder_ids}")
 
         resp = client.post(f"/api/projects/{pid}/runs", json={
-            "package_id": package_id,
-            "bidder_ids": bidder_ids,
+            "package_id": package_id,  # 不传 bidder_ids = 项目全部投标人（导入自动生成）
             "stages": ["objective", "price", "subjective"],
         })
         job = _wait(client, resp.json()["job_id"])

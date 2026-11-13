@@ -5,12 +5,12 @@ p1 封面 / p2 投标函 / p3 开标一览表 / p4 资格证明文件 / p5-6 技
 """
 from __future__ import annotations
 
-from .conftest import upload_pdf, wait_job
+from .conftest import add_bidder, upload_pdf, wait_job
 
 
 def test_classify_job_runs_after_parse(client, app_env, samples_dir) -> None:  # noqa: ANN001
     pid = client.post("/api/projects", json={"name": "材料分类测试"}).json()["id"]
-    b = client.post(f"/api/projects/{pid}/bidders", json={"name": "甲公司"}).json()
+    b = add_bidder(pid, "甲公司")
     bid_pdf = samples_dir / "bids" / "bing_恒通软件科技有限公司_投标文件.pdf"
     out = upload_pdf(client, pid, bid_pdf, "bid", bidder_id=b["id"])
     parse_job = wait_job(client, out["job_id"])
@@ -53,7 +53,7 @@ def test_classify_job_runs_after_parse(client, app_env, samples_dir) -> None:  #
 
 def test_classify_rerun_idempotent(client, app_env, samples_dir) -> None:  # noqa: ANN001
     pid = client.post("/api/projects", json={"name": "分类重跑幂等"}).json()["id"]
-    b = client.post(f"/api/projects/{pid}/bidders", json={"name": "乙公司"}).json()
+    b = add_bidder(pid, "乙公司")
     bid_pdf = samples_dir / "bids" / "jia_华信科技股份有限公司_投标文件.pdf"
     out = upload_pdf(client, pid, bid_pdf, "bid", bidder_id=b["id"])
     parse_job = wait_job(client, out["job_id"])
@@ -93,7 +93,7 @@ def test_price_domain_hard_filter(client, app_env, samples_dir) -> None:  # noqa
     from app.services.bidder_service import _price_domain_text
 
     pid = client.post("/api/projects", json={"name": "报价检索域"}).json()["id"]
-    b = client.post(f"/api/projects/{pid}/bidders", json={"name": "丙公司"}).json()
+    b = add_bidder(pid, "丙公司")
     bid_pdf = samples_dir / "bids" / "bing_恒通软件科技有限公司_投标文件.pdf"
     out = upload_pdf(client, pid, bid_pdf, "bid", bidder_id=b["id"])
     parse_job = wait_job(client, out["job_id"])

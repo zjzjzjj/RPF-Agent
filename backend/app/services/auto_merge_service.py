@@ -40,6 +40,21 @@ def maybe_schedule_auto_match(project_id: str, document_id: int) -> dict:
             return _skip("not_tender")
         if doc.parse_status not in ("parsed", "degraded"):
             return _skip("not_parsed")
+        # 补遗解析完成触发时，编译必须以**主招标文件**为源（kind=tender、最小 id）：
+        # 否则补遗会覆盖招标文件编出的规则。主文件还没解析完就先跳过——
+        # 它解析完成时自然再触发（in_flight 防抖同在）。
+        if doc.kind == "addendum":
+            primary = s.execute(
+                select(Document.id, Document.parse_status)
+                .where(Document.project_id == project_id, Document.kind == "tender")
+                .order_by(Document.id)
+                .limit(1)
+            ).first()
+            if primary is None:
+                return _skip("no_primary_tender")
+            if primary[1] not in ("parsed", "degraded"):
+                return _skip("primary_tender_not_parsed")
+            document_id = int(primary[0])
         in_flight = s.execute(
             select(Job.id)
             .where(

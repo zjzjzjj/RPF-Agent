@@ -42,6 +42,26 @@ def get_job(job_id: int) -> JobOut:
     return out
 
 
+@router.get("/projects/{project_id}/jobs", response_model=list[JobOut])
+def list_project_jobs(project_id: str, kind: str | None = None, limit: int = 20) -> list[JobOut]:
+    """按项目列任务（导入进度持久展示用）：默认取最近 20 条，可按 kind 过滤。"""
+    from sqlalchemy import select
+
+    from app.db.models import Job
+    from app.db.session import session_scope
+
+    with session_scope() as s:
+        q = select(Job).where(Job.project_id == project_id)
+        if kind:
+            q = q.where(Job.kind == kind)
+        rows = (
+            s.execute(q.order_by(Job.id.desc()).limit(max(1, min(limit, 100))))
+            .scalars()
+            .all()
+        )
+        return [JobOut.model_validate(j) for j in rows]
+
+
 @router.post("/jobs/{job_id}/cancel")
 def cancel_job(job_id: int) -> dict:
     ok = queue.request_cancel(job_id)

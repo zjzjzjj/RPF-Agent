@@ -239,32 +239,6 @@ def _find_price_quote(text: str, price: Decimal | None = None) -> str | None:
     return None
 
 
-def confirm_price(bidder_id: int, actor: str, reason: str) -> Bidder:
-    """人工确认报价。冲突状态也允许确认（人工裁决本身就是确认），但理由必填。"""
-    if not reason.strip():
-        raise ValidationFailed("确认报价必须填写理由")
-    with session_scope() as s:
-        bidder = s.get(Bidder, bidder_id)
-        if bidder is None:
-            raise NotFound("投标人不存在")
-        if bidder.bid_price is None:
-            raise ValidationFailed("该投标人尚未抽取到报价，无法确认；请使用人工录入接口")
-        old_status = bidder.price_status
-        bidder.price_status = "confirmed"
-        s.add(bidder)
-        s.add(
-            ReviewRecord(
-                subject_type="price", subject_id=str(bidder_id), action="confirm",
-                actor=actor, reason=reason,
-                old_value_json={"price_status": old_status, "price": str(bidder.bid_price)},
-                new_value_json={"price_status": "confirmed"},
-            )
-        )
-        s.flush()
-        s.expunge(bidder)
-        return bidder
-
-
 def set_price_manual(bidder_id: int, price_yuan: Decimal, actor: str, reason: str) -> Bidder:
     """人工录入/纠正报价（抽取失败或抽错时的兜底，直接进入已确认态并留痕）。"""
     if not reason.strip():
@@ -285,6 +259,66 @@ def set_price_manual(bidder_id: int, price_yuan: Decimal, actor: str, reason: st
                 actor=actor, reason=reason,
                 old_value_json=old,
                 new_value_json={"price": str(price_yuan), "price_status": "confirmed"},
+            )
+        )
+        s.flush()
+        s.expunge(bidder)
+        return bidder
+
+
+def apply_extraction(bidder_id: int, extraction, actor: str = "auto") -> Bidder:  # noqa: ANN001
+    """导入抽价结果落库（抽取即生效）。
+
+    extracted/conflict 均为有效报价、无需确认即可评分；missing（抽不到）不参与
+    价格分（评分侧按"无效报价"排除基准并在结果标注）。全程 ReviewRecord 留痕。
+    """
+    from app.pricing.dto import cross_check_json, derive_status
+
+    status = derive_status(extraction)
+    price_str = str(extraction.bid_price) if extraction.bid_price is not None else None
+    breakdown: dict = {
+        "source": extraction.source or None,
+        "source_file": extraction.source_file,
+        "basis": extraction.basis,
+        "unit": extraction.unit,
+        "tax_basis": extraction.tax_basis,
+        "tax_rate": str(extraction.tax_rate) if extraction.tax_rate is not None else None,
+        "items": [
+            {"product": it.product, "price": str(it.price), "unit": it.unit}
+            for it in extraction.items
+        ],
+        "cross_check": cross_check_json(extraction),
+        "warnings": extraction.warnings,
+    }
+    if status == "missing":
+        breakdown = {
+            "error": "no_price_source",
+            "attempts": extraction.cross_check.get("attempts", []),
+            **breakdown,
+        }
+    with session_scope() as s:
+        bidder = s.get(Bidder, bidder_id)
+        if bidder is None:
+            raise NotFound("投标人不存在")
+        old = {"price": str(bidder.bid_price), "price_status": bidder.price_status}
+        bidder.bid_price = extraction.bid_price
+        bidder.bid_price_upper = extraction.upper
+        bidder.price_breakdown_json = breakdown
+        bidder.price_status = status
+        s.add(bidder)
+        s.add(
+            ReviewRecord(
+                subject_type="price",
+                subject_id=str(bidder_id),
+                action="extract",
+                actor=actor,
+                reason=f"导入抽价：{extraction.source or '无来源'}：{extraction.source_file or '-'}",
+                old_value_json=old,
+                new_value_json={
+                    "price": price_str,
+                    "price_status": status,
+                    "cross_check": breakdown["cross_check"],
+                },
             )
         )
         s.flush()

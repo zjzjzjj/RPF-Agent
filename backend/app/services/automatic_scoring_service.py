@@ -959,9 +959,9 @@ def _resolve_prices(run_id: int, manifest: dict, pages_by_bidder: dict, gateway_
             prices[bid_id] = _decimal(resolved[str(bid_id)], "已核验报价")
             continue
         original = bid.get("bid_price")
-        if original is not None and bid.get("price_status") == "confirmed" and _decimal(original, "报价") > 0:
+        if original is not None and bid.get("price_status") != "missing" and _decimal(original, "报价") > 0:
             prices[bid_id] = _decimal(original, "冻结确认报价")
-            source = {"basis": "frozen_confirmed", "reasoning": "采用运行启动时已确认并冻结的投标总价",
+            source = {"basis": "frozen_confirmed", "reasoning": "采用运行启动时已抽取并冻结的投标总价",
                       "evidence": [], "price": str(prices[bid_id])}
         else:
             pages, data_class = pages_by_bidder[bid_id]
@@ -978,11 +978,28 @@ def _resolve_prices(run_id: int, manifest: dict, pages_by_bidder: dict, gateway_
             }
             result = _assess_cell(price_rule, pages, data_class, gateway_factory)
             quote = (result.raw.get("facts") or {}).get("bid_price")
-            if quote is None:
-                raise LLMError(f"投标人 {bid_id} 的总报价经自动补抽仍不可得，未删除该投标人")
+            if quote is None or _decimal(quote, "投标总报价") <= 0:
+                # 2026-11-13：补抽失败不再抛错中断——该公司价格分按引擎
+                # "报价为空或≤0"记 0 并排除基准（跳过该公司继续评的口径），
+                # 投标人保留参评、结果标注。仅留痕，不写 resolved_prices。
+                with session_scope() as s:
+                    run = s.get(EvaluationRun, run_id)
+                    provenance[str(bid_id)] = {
+                        "basis": "missing",
+                        "reasoning": "开标一览表/报价函自动补抽仍不可得，价格分不参与（结果标注）",
+                        "evidence": result.evidence, "facts": result.raw.get("facts"),
+                        "price": None,
+                    }
+                    run.config_json = {**(run.config_json or {}),
+                                       "resolved_prices": dict(resolved),
+                                       "resolved_price_evidence": dict(provenance)}
+                    s.add(ReviewRecord(
+                        subject_type="price", subject_id=str(bid_id), action="extract", actor="auto",
+                        reason=provenance[str(bid_id)]["reasoning"],
+                        new_value_json={"price": None, "price_status": "missing"},
+                    ))
+                continue
             prices[bid_id] = _decimal(quote, "投标总报价")
-            if prices[bid_id] <= 0:
-                raise LLMError(f"投标人 {bid_id} 的投标总报价无效")
             source = {"basis": result.basis, "reasoning": result.reasoning,
                       "evidence": result.evidence, "facts": result.raw.get("facts"),
                       "attempt_history": result.raw.get("attempt_history"), "price": str(prices[bid_id]),
@@ -1003,7 +1020,7 @@ def _resolve_prices(run_id: int, manifest: dict, pages_by_bidder: dict, gateway_
     return prices
 
 
-def _price_stage(run_id: int, manifest: dict, criteria: list[dict], prices: dict[int, Decimal],
+def _price_stage(run_id: int, manifest: dict, criteria: list[dict], prices: dict[int, "Decimal | None"],
                  completed: set[tuple[int, int]], *, only_criterion_id: int | None = None,
                  allow_partial_gate: bool = False) -> None:
     from app.engine.price import compute_price_scores
@@ -1073,7 +1090,9 @@ def _price_stage(run_id: int, manifest: dict, criteria: list[dict], prices: dict
                             sample_results.append(_decimal(record.final_score, "样品得分"))
                         sample_pass = (sum(sample_results, Decimal(0)) > 0
                                        if sample_results else True)
-                bids.append(PriceBid(bid_id, str(bid.get("name") or bid_id), prices[bid_id],
+                # 缺价公司（补抽失败）不在 prices 里：传 None，引擎按
+                # "报价为空或≤0"记 0 并排除基准——与 legacy 无效价语义一致。
+                bids.append(PriceBid(bid_id, str(bid.get("name") or bid_id), prices.get(bid_id),
                                      False, gate_value=value, gate_basis=basis, sample_pass=sample_pass))
             price_evidence = dict((s.get(EvaluationRun, run_id).config_json or {}).get("resolved_price_evidence") or {})
         strict_error: str | None = None

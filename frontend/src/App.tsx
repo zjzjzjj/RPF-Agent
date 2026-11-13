@@ -6,7 +6,6 @@ import ProjectList from "./pages/ProjectList";
 
 const ProjectWorkbench = lazy(() => import("./pages/ProjectWorkbench"));
 const TenderRules = lazy(() => import("./pages/TenderRules"));
-const Bidders = lazy(() => import("./pages/Bidders"));
 const ScoreResults = lazy(() => import("./pages/ScoreResults"));
 const EvidenceWorkbench = lazy(() => import("./pages/EvidenceWorkbench"));
 
@@ -45,7 +44,8 @@ function ProjectShell() {
         <Routes>
           <Route path="/" element={<ProjectWorkbench />} />
           <Route path="rules" element={<TenderRules />} />
-          <Route path="bidders" element={<Bidders />} />
+          {/* 投标人管理已下线（2026-11-13 输入格式重构）：旧书签回工作台 */}
+          <Route path="bidders" element={<Navigate to={`/p/${pid}`} replace />} />
           <Route path="results" element={<ScoreResults />} />
           <Route path="evidence/:sid" element={<EvidenceWorkbench />} />
           <Route path="matrix" element={<LegacyRedirect tab="matrix" />} />

@@ -12,7 +12,7 @@ from decimal import Decimal
 
 import pytest
 
-from .conftest import upload_pdf, wait_job
+from .conftest import add_bidder, extract_price_of, upload_pdf, wait_job
 from app.rules import law_kb as lk
 from app.llm.base import LLMResult
 
@@ -142,12 +142,11 @@ def test_auto_pipeline_full_chain(auto_client, frozen_auto_chain, samples_dir, e
 
     bidder_ids: list[int] = []
     for pdf in sorted((samples_dir / "bids").glob("*_投标文件.pdf")):
-        b = c.post(f"/api/projects/{pid}/bidders",
-                   json={"name": pdf.stem.split("_")[1]}).json()
+        b = add_bidder(pid, pdf.stem.split("_")[1])
         up = upload_pdf(c, pid, pdf, "bid", bidder_id=b["id"])
         job = wait_job(c, up["job_id"])
         assert job["status"] == "succeeded", job.get("error")
-        price = c.get(f"/api/bidders/{b['id']}/price").json()
+        price = extract_price_of(b["id"])
         assert price["bid_price"], price
         bidder_ids.append(b["id"])
 
@@ -186,11 +185,11 @@ def test_auto_mode_confirms_prices_without_manual_step(auto_client, frozen_auto_
     """已抽取报价未经人工确认，也可执行不含价格分的自动资格评审。"""
     c, (pid, package_id) = auto_client, frozen_auto_chain
     pdf = sorted((samples_dir / "bids").glob("*_投标文件.pdf"))[0]
-    b = c.post(f"/api/projects/{pid}/bidders", json={"name": pdf.stem.split("_")[1]}).json()
+    b = add_bidder(pid, pdf.stem.split("_")[1])
     up = upload_pdf(c, pid, pdf, "bid", bidder_id=b["id"])
     job = wait_job(c, up["job_id"])
     assert job["status"] == "succeeded", job.get("error")
-    c.get(f"/api/bidders/{b['id']}/price")  # 触发抽取（不调用 confirm）
+    extract_price_of(b["id"])  # 服务级抽取（报价确认卡点已取消）
 
     # 抽取后仍是 extracted（未人工确认）……
     bidder = c.get(f"/api/projects/{pid}/bidders").json()
@@ -224,11 +223,11 @@ def _import_extra_rule(c, extra):
 
 def _one_bidder(c, pid, samples_dir):
     pdf = sorted((samples_dir / "bids").glob("*_投标文件.pdf"))[0]
-    b = c.post(f"/api/projects/{pid}/bidders", json={"name": pdf.stem.split("_")[1]}).json()
+    b = add_bidder(pid, pdf.stem.split("_")[1])
     up = upload_pdf(c, pid, pdf, "bid", bidder_id=b["id"])
     job = wait_job(c, up["job_id"])
     assert job["status"] == "succeeded", job.get("error")
-    c.get(f"/api/bidders/{b['id']}/price")
+    extract_price_of(b["id"])
     return b["id"]
 
 

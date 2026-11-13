@@ -226,8 +226,9 @@ def parse_document(ctx: JobContext, payload: dict) -> dict:
     from app.services.auto_merge_service import maybe_schedule_auto_match
 
     result.update(maybe_schedule_auto_match(project_id, document_id))
-    # 投标文件解析成功 → 自动分类打标（四类材料索引；tender 侧暂不分类）
-    if doc_kind == "bid" and result.get("rejected") is None:
+    # 投标文件解析成功 → 自动分类打标（四类材料索引；tender 侧暂不分类）。
+    # xlsx（报价表伪页）不走 LLM 分类：报价表结构固定，分类无意义还烧配额。
+    if doc_kind == "bid" and result.get("rejected") is None and extracted.engine != "openpyxl":
         from app.material_index.service import schedule_classify
 
         classify_job = schedule_classify(document_id, project_id=project_id)

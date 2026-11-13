@@ -108,6 +108,29 @@ def client(app_env):  # noqa: ANN001
         yield c
 
 
+def add_bidder(pid: str, name: str) -> dict:  # noqa: ANN001
+    """服务级建档（POST /projects/{pid}/bidders 已随投标人管理下线）。
+
+    返回与 BidderOut 同形的最小 dict（测试只用 id/name）。
+    """
+    from app.services import bidder_service
+
+    b = bidder_service.create_bidder(pid, name)
+    return {"id": b.id, "name": b.name, "price_status": b.price_status, "bid_price": None}
+
+
+def extract_price_of(bidder_id: int) -> dict:  # noqa: ANN001
+    """服务级抽价（GET /bidders/{id}/price 的同步补抽副作用已移除，改为纯读）。"""
+    from app.services import bidder_service
+
+    b = bidder_service.extract_price(bidder_id)
+    return {
+        "bidder_id": b.id,
+        "bid_price": str(b.bid_price) if b.bid_price is not None else None,
+        "price_status": b.price_status,
+    }
+
+
 def wait_job(client, job_id: int, timeout: float = 120.0) -> dict:  # noqa: ANN001
     """轮询任务直至终态。"""
     import time

@@ -1,15 +1,23 @@
-"""投标人 API。"""
+"""投标人 API（只读展示 + 运维纠错兜底）。
+
+2026-11-13 输入格式重构：投标人管理功能下线——投标人由项目包导入自动生成
+（文件夹名 = 投标人名称），报价开标一览表自动抽取即生效。此文件只保留：
+- 只读查询（结果页排名/报价展示依赖）；
+- `POST /bidders/{id}/price/set` 人工纠错（无 UI，运维兜底，留痕）。
+
+写入口（建档/上传/抽取/确认/改名/删除/资格预判）全部随导入链路收敛：
+建档与上传走 bundle_import_service，抽取走 app.pricing.extractor。
+"""
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, File, Form, UploadFile
 from decimal import Decimal
 
+from fastapi import APIRouter, Depends
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.deps import get_actor
-from app.errors import NotFound
-from app.schemas.document import DocumentOut, DocumentUploadOut
-from app.services import audit_service, bidder_service, ingest_service
+from app.schemas.document import DocumentOut
+from app.services import audit_service, bidder_service
 
 router = APIRouter(tags=["bidders"])
 
@@ -29,25 +37,9 @@ class BidderOut(BaseModel):
     status: str
 
 
-class BidderCreate(BaseModel):
-    name: str = Field(min_length=1, max_length=255)
-    unified_code: str | None = None
-
-
-class ConfirmBody(BaseModel):
-    reason: str = Field(min_length=1)
-
-
 class SetPriceBody(BaseModel):
     price_yuan: Decimal = Field(gt=0)
     reason: str = Field(min_length=1)
-
-
-@router.post("/projects/{project_id}/bidders", response_model=BidderOut)
-def create_bidder(project_id: str, body: BidderCreate, actor: str = Depends(get_actor)) -> BidderOut:
-    bidder = bidder_service.create_bidder(project_id, body.name, body.unified_code)
-    audit_service.log(project_id, actor, "bidder.create", "bidder", str(bidder.id), {"name": body.name})
-    return BidderOut.model_validate(bidder)
 
 
 @router.get("/projects/{project_id}/bidders", response_model=list[BidderOut])
@@ -60,32 +52,6 @@ def get_bidder(bidder_id: int) -> BidderOut:
     return BidderOut.model_validate(bidder_service.get_bidder(bidder_id))
 
 
-@router.post("/bidders/{bidder_id}/documents", response_model=DocumentUploadOut)
-def upload_bid_document(
-    bidder_id: int,
-    file: UploadFile = File(...),
-    role: str = Form("main"),
-    actor: str = Depends(get_actor),
-) -> DocumentUploadOut:
-    bidder = bidder_service.get_bidder(bidder_id)
-    content = file.file.read()
-    doc_id, job_id = ingest_service.save_upload(
-        project_id=bidder.project_id,
-        filename=file.filename or "upload",
-        content=content,
-        kind="bid",
-        bidder_id=bidder_id,
-    )
-    from app.db.session import session_scope
-    from app.db.models import BidderDocument
-
-    with session_scope() as s:
-        s.add(BidderDocument(bidder_id=bidder_id, document_id=doc_id, role=role))
-    audit_service.log(bidder.project_id, actor, "bidder.upload_doc", "bidder", str(bidder_id),
-                      {"document_id": doc_id, "role": role})
-    return DocumentUploadOut(document_id=doc_id, parse_status="pending", job_id=job_id)
-
-
 @router.get("/bidders/{bidder_id}/documents", response_model=list[DocumentOut])
 def list_bidder_documents(bidder_id: int) -> list[DocumentOut]:
     return [DocumentOut.model_validate(d) for d in bidder_service.bidder_documents(bidder_id)]
@@ -93,14 +59,8 @@ def list_bidder_documents(bidder_id: int) -> list[DocumentOut]:
 
 @router.get("/bidders/{bidder_id}/price")
 def get_price(bidder_id: int) -> dict:
-    """读取报价；未抽取时**同步**补抽一次。
-
-    legacy 同步路径（多处测试与脚本依赖该副作用）。前端已改用下面的
-    `POST /bidders/{id}/price/extract`（后台任务，带进度与取消）。
-    """
+    """读取报价（纯读；抽取已在导入时完成，不再有同步补抽副作用）。"""
     bidder = bidder_service.get_bidder(bidder_id)
-    if bidder.price_status == "extracted" or bidder.bid_price is None:
-        bidder = bidder_service.extract_price(bidder_id)
     return {
         "bidder_id": bidder.id,
         "bid_price": str(bidder.bid_price) if bidder.bid_price is not None else None,
@@ -111,83 +71,10 @@ def get_price(bidder_id: int) -> dict:
     }
 
 
-@router.post("/bidders/{bidder_id}/price/extract")
-def extract_price_async(bidder_id: int, actor: str = Depends(get_actor)) -> dict:
-    """后台抽取报价（带进度、可取消）：返回 job_id。
-
-    进度用 `GET /jobs/{job_id}` 或 SSE `GET /jobs/{job_id}/events`。
-    """
-    from app.jobs import queue
-
-    bidder = bidder_service.get_bidder(bidder_id)  # 不存在 → 404
-    job_id = queue.submit(
-        "extract_price", {"bidder_id": bidder_id}, project_id=bidder.project_id
-    )
-    audit_service.log(bidder.project_id, actor, "bidder.price.extract", "bidder",
-                      str(bidder_id), {"job_id": job_id})
-    return {"bidder_id": bidder_id, "job_id": job_id}
-
-
-@router.post("/bidders/{bidder_id}/price/confirm", response_model=BidderOut)
-def confirm_price(bidder_id: int, body: ConfirmBody, actor: str = Depends(get_actor)) -> BidderOut:
-    bidder = bidder_service.confirm_price(bidder_id, actor, body.reason)
-    audit_service.log(bidder.project_id, actor, "bidder.price.confirm", "bidder", str(bidder_id),
-                      {"price": str(bidder.bid_price)})
-    return BidderOut.model_validate(bidder)
-
-
 @router.post("/bidders/{bidder_id}/price/set", response_model=BidderOut)
 def set_price_manual(bidder_id: int, body: SetPriceBody, actor: str = Depends(get_actor)) -> BidderOut:
-    """人工录入/纠正报价（抽取失败或抽错时的兜底，直接进入已确认态并留痕）。"""
+    """人工录入/纠正报价（运维兜底，无 UI；直接进入已确认态并留痕）。"""
     bidder = bidder_service.set_price_manual(bidder_id, body.price_yuan, actor, body.reason)
-    audit_service.log(bidder.project_id, actor, "bidder.price.manual", "bidder", str(bidder_id),
-                      {"price": str(bidder.bid_price)})
+    audit_service.log(bidder.project_id, actor, "bidder.price_set", "bidder", str(bidder_id),
+                      {"price": str(body.price_yuan)})
     return BidderOut.model_validate(bidder)
-
-
-class RenameBody(BaseModel):
-    name: str = Field(min_length=1, max_length=255)
-    reason: str = Field(min_length=1)
-
-
-@router.patch("/bidders/{bidder_id}", response_model=BidderOut)
-def rename_bidder(bidder_id: int, body: RenameBody, actor: str = Depends(get_actor)) -> BidderOut:
-    """人工纠正投标人名称（按投标文件封面校准，留痕）。"""
-    bidder = bidder_service.rename_bidder(bidder_id, body.name, actor, body.reason)
-    audit_service.log(bidder.project_id, actor, "bidder.rename", "bidder", str(bidder_id),
-                      {"name": bidder.name})
-    return BidderOut.model_validate(bidder)
-
-
-@router.delete("/bidders/{bidder_id}")
-def delete_bidder(bidder_id: int, actor: str = Depends(get_actor)) -> dict:
-    """删除投标人及其投标文件（已产生评分记录时 409）。审计与复核留痕保留。"""
-    counts = bidder_service.delete_bidder(bidder_id, actor)
-    return {"deleted": bidder_id, **counts}
-
-
-@router.get("/bidders/{bidder_id}/qualification-preview")
-def qualification_preview(bidder_id: int) -> dict:
-    """对当前规则包（冻结或草稿）做一次只读的资格/符合性预判。"""
-    from app.engine.facts import extract_bid_facts
-    from app.services import rule_service, scoring_service
-
-    bidder = bidder_service.get_bidder(bidder_id)
-    pkg = rule_service.current_package(bidder.project_id)
-    if pkg is None:
-        raise NotFound("项目还没有规则包")
-    _snapshot, criteria = scoring_service._snapshot_criteria(pkg.id)
-    from app.rules.scope import split_out_of_scope
-
-    criteria, _out_of_scope = split_out_of_scope(criteria)
-    text, _titles, _docs = bidder_service.bid_text(bidder_id)
-    facts = extract_bid_facts(text)
-    results = []
-    for c in criteria:
-        if c["score_type"] != "veto":
-            continue
-        r = scoring_service._eval_veto(c, facts)  # type: ignore[arg-type]
-        results.append(
-            {"code": c["code"], "name": c["name"], "verdict": r["verdict"], "message": r["message"]}
-        )
-    return {"bidder_id": bidder_id, "package_version": pkg.version, "items": results}

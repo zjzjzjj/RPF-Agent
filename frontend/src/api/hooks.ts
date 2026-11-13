@@ -82,6 +82,41 @@ export function useJob(jobId: number | null) {
   });
 }
 
+/** 按项目列任务（导入进度持久展示用）；运行中 2s 轮询。 */
+export function useProjectJobs(pid: string, kind?: string) {
+  return useQuery({
+    queryKey: ["projectJobs", pid, kind ?? "all"],
+    queryFn: () =>
+      api.get<JobOut[]>(`/projects/${pid}/jobs${kind ? `?kind=${kind}` : ""}`),
+    enabled: !!pid,
+    refetchInterval: (query) => {
+      const data = query.state.data as JobOut[] | undefined;
+      return data?.some((j) => ["queued", "running"].includes(j.status)) ? 1500 : 6000;
+    },
+  });
+}
+
+/** 项目包（zip）重新导入：覆盖输入数据（项目已有评分运行为后端 409）。 */
+export function useImportBundle() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ pid, file }: { pid: string; file: File }) => {
+      const form = new FormData();
+      form.append("file", file);
+      return api.upload<{ project_id: string; job_id: number }>(
+        `/projects/${pid}/import-bundle`,
+        form,
+      );
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["projectJobs"] });
+      qc.invalidateQueries({ queryKey: ["workbench"] });
+      qc.invalidateQueries({ queryKey: ["bidders"] });
+      qc.invalidateQueries({ queryKey: ["documents"] });
+    },
+  });
+}
+
 export function useDocuments(pid: string) {
   return useQuery({
     queryKey: ["documents", pid],

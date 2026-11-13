@@ -68,7 +68,7 @@ log = logging.getLogger("bid_eval.scoring")
 def create_run(
     project_id: str,
     package_id: int,
-    bidder_ids: list[int],
+    bidder_ids: list[int] | None,
     stages: list[str],
     actor: str,
     provider: str | None = None,
@@ -88,31 +88,27 @@ def create_run(
             raise NotFound("规则包不存在")
         if pkg.status != "frozen":
             raise ValidationFailed("规则包尚未冻结，不能发起评分（先完成规则确认与冻结）")
-        if not bidder_ids:
-            raise ValidationFailed("未选择投标人")
-        unconfirmed: list[str] = []
         auto = config.auto_mode()
         if not auto and selected_executor != 1:
             raise ValidationFailed("执行器版本 2 仅支持全自动评审运行")
-        kept: list[int] = []
+        if bidder_ids is None:
+            # 缺省 = 项目全部投标人（输入格式重构：投标人由项目包导入自动生成）
+            bidder_ids = [
+                r[0]
+                for r in s.execute(
+                    select(Bidder.id).where(Bidder.project_id == project_id).order_by(Bidder.id)
+                ).all()
+            ]
+        if not bidder_ids:
+            raise ValidationFailed("未选择投标人（项目尚无投标人，请先导入项目包）")
         for bid_id in bidder_ids:
             bidder = s.get(Bidder, bid_id)
             if bidder is None or bidder.project_id != project_id:
                 raise NotFound(f"投标人 {bid_id} 不存在")
-            if auto:
-                # 报价是自动评审的输入抽取任务，不能因首次抽取失败静默删除参评人。
-                kept.append(bid_id)
-                continue
-            if bidder.price_status == "confirmed":
-                kept.append(bid_id)
-                continue
-            unconfirmed.append(bidder.name)
-        if unconfirmed:
-            raise ValidationFailed(
-                f"以下投标人报价尚未人工确认：{'、'.join(unconfirmed)}（价格分输入必须经人工确认）"
-            )
-        if auto:
-            bidder_ids = kept
+        # 2026-11-13 输入格式重构：报价人工确认卡点取消——导入抽价即生效
+        # （extracted/conflict 均为有效报价）。抽不到价的公司照常参评，
+        # 价格段按引擎既有"报价为空或≤0"语义记 0 并排除基准（结果标注），
+        # 不因缺价把投标人整家剔除。
         run = EvaluationRun(
             project_id=project_id,
             package_id=package_id,

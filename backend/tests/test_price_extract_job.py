@@ -1,26 +1,28 @@
-"""报价抽取的后台任务路径（POST /bidders/{id}/price/extract）。
+"""报价抽取的后台任务（extract_price job）。
 
-同步 legacy 路径（GET /bidders/{id}/price）由其他 e2e 测试覆盖；本文件只验新入口：
-返回 job_id、任务成功、报价落库、进度字段有值、不存在时 404。
+原 `POST /bidders/{id}/price/extract` 端点已随投标人管理下线；job 处理器保留
+（运维/脚本复用），本文件直提任务验证：返回 job、任务成功、报价落库、
+进度字段有值、投标人不存在时任务失败、无文档不崩。
 """
 from __future__ import annotations
 
-from .conftest import upload_pdf, wait_job
+from app.jobs import queue
+
+from .conftest import add_bidder, upload_pdf, wait_job
+
+
+def _submit(bidder_id: int, project_id: str) -> int:
+    return queue.submit("extract_price", {"bidder_id": bidder_id}, project_id=project_id)
 
 
 def test_extract_price_job_succeeds(client, app_env, samples_dir) -> None:  # noqa: ANN001
     pid = client.post("/api/projects", json={"name": "报价后台抽取测试"}).json()["id"]
-    b = client.post(f"/api/projects/{pid}/bidders", json={"name": "甲公司"}).json()
+    b = add_bidder(pid, "甲公司")
     bid_pdf = next((samples_dir / "bids").glob("*.pdf"))
     out = upload_pdf(client, pid, bid_pdf, "bid", bidder_id=b["id"])
     assert wait_job(client, out["job_id"])["status"] == "succeeded"
 
-    r = client.post(f"/api/bidders/{b['id']}/price/extract")
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["bidder_id"] == b["id"]
-    job_id = body["job_id"]
-
+    job_id = _submit(b["id"], pid)
     job = wait_job(client, job_id, timeout=120)
     assert job["status"] == "succeeded", job.get("error")
     assert job["kind"] == "extract_price"
@@ -33,17 +35,17 @@ def test_extract_price_job_succeeds(client, app_env, samples_dir) -> None:  # no
     assert bidder["price_status"] in ("extracted", "conflict")
 
 
-def test_extract_price_job_404(client, app_env) -> None:  # noqa: ANN001
-    assert client.post("/api/bidders/999999/price/extract").status_code == 404
+def test_extract_price_job_unknown_bidder_fails(client, app_env) -> None:  # noqa: ANN001
+    job = wait_job(client, _submit(999999, "PRJ-NOPE"), timeout=60)
+    assert job["status"] == "failed"
+    assert "投标人不存在" in (job["error"] or "")
 
 
 def test_extract_price_job_no_documents(client, app_env) -> None:  # noqa: ANN001
     """无已解析文档也能正常结束（不崩），只是抽不到报价。"""
     pid = client.post("/api/projects", json={"name": "无文档报价抽取"}).json()["id"]
-    b = client.post(f"/api/projects/{pid}/bidders", json={"name": "乙公司"}).json()
+    b = add_bidder(pid, "乙公司")
 
-    r = client.post(f"/api/bidders/{b['id']}/price/extract")
-    assert r.status_code == 200, r.text
-    job = wait_job(client, r.json()["job_id"], timeout=60)
+    job = wait_job(client, _submit(b["id"], pid), timeout=60)
     assert job["status"] == "succeeded", job.get("error")
     assert client.get(f"/api/bidders/{b['id']}").json()["bid_price"] is None

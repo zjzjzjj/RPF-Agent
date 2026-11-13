@@ -87,3 +87,45 @@ class DataClassDenied(AppError):
     code = "DATA_CLASS_DENIED"
     http_status = 403
     default_message = "数据分级策略拒绝了本次模型调用（涉密数据只能发往本地端点）"
+
+
+# ---- 项目包（zip）导入：稳定错误码，前端可分支 ----
+
+
+class ImportBundleError(AppError):
+    """项目包导入失败基类（ZIP_INVALID 等稳定码见各子类）。"""
+
+    code = "ZIP_INVALID"
+    http_status = 422
+    default_message = "项目包无法读取"
+
+
+class ZipTooLarge(ImportBundleError):
+    code = "ZIP_TOO_LARGE"
+    http_status = 413
+    default_message = "项目包超出大小限制"
+
+
+class ZipMissingTenderDir(ImportBundleError):
+    code = "ZIP_MISSING_TENDER_DIR"
+    default_message = "项目包缺少「招标」文件夹"
+
+
+class ZipMissingBidDir(ImportBundleError):
+    code = "ZIP_MISSING_BID_DIR"
+    default_message = "项目包缺少「投标」文件夹"
+
+
+class ZipEmptyTender(ImportBundleError):
+    code = "ZIP_EMPTY_TENDER"
+    default_message = "「招标」文件夹内没有 PDF/Word 文件"
+
+
+class ZipNoBidders(ImportBundleError):
+    code = "ZIP_NO_BIDDERS"
+    default_message = "「投标」文件夹内没有公司文件夹"
+
+
+class ZipDuplicateBidder(ImportBundleError):
+    code = "ZIP_DUPLICATE_BIDDER"
+    default_message = "「投标」文件夹内存在同名公司文件夹"

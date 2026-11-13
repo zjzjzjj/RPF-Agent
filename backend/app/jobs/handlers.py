@@ -47,6 +47,7 @@ def _load_all() -> None:
     from app.rules import compiler  # noqa: F401  (compile_rules)
     from app.services import (  # noqa: F401
         bidder_service,
+        bundle_import_service,  # (import_bundle)
         ingest_service,  # (parse_document)
         rule_service,
         scoring_service,  # (evaluate)

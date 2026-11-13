@@ -70,6 +70,23 @@ def upload_dir() -> Path:
     return Path(os.environ.get("BID_EVAL_UPLOAD_DIR", data_dir() / "uploads"))
 
 
+def import_dir() -> Path:
+    """项目包（zip）导入的解压暂存目录。"""
+    return Path(os.environ.get("BID_EVAL_IMPORT_DIR", data_dir() / "imports"))
+
+
+def import_max_zip_mb() -> int:
+    return int(os.environ.get("BID_EVAL_IMPORT_MAX_ZIP_MB", "500"))
+
+
+def import_max_uncompressed_mb() -> int:
+    return int(os.environ.get("BID_EVAL_IMPORT_MAX_UNCOMPRESSED_MB", "2048"))
+
+
+def import_max_entries() -> int:
+    return int(os.environ.get("BID_EVAL_IMPORT_MAX_ENTRIES", "20000"))
+
+
 def render_dir() -> Path:
     return Path(os.environ.get("BID_EVAL_RENDER_DIR", data_dir() / "renders"))
 

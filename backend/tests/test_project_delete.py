@@ -4,7 +4,7 @@ from __future__ import annotations
 import sqlite3
 from pathlib import Path
 
-from .conftest import upload_pdf, wait_job
+from .conftest import add_bidder, upload_pdf, wait_job
 
 
 def _db_counts(db_path: Path) -> dict[str, int]:
@@ -32,7 +32,7 @@ def test_delete_project_cascades_everything(client, app_env, samples_dir) -> Non
     tender_pdf = next((samples_dir / "tender").glob("*招标文件.pdf"))
     out = upload_pdf(client, pid, tender_pdf, "tender")
     assert wait_job(client, out["job_id"])["status"] == "succeeded"
-    b = client.post(f"/api/projects/{pid}/bidders", json={"name": "测试投标人"}).json()
+    b = add_bidder(pid, "测试投标人")
 
     before = _db_counts(app_env / "test.db")
     assert before["projects"] == 1 and before["criteria"] > 0 and before["documents"] == 1

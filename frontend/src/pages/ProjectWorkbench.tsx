@@ -11,23 +11,26 @@ import {
   Steps,
   Tag,
   Tooltip,
+  Typography,
+  Upload,
 } from "antd";
 import {
   ArrowRightOutlined,
   AuditOutlined,
   CheckCircleOutlined,
   ClockCircleOutlined,
+  CloudUploadOutlined,
   EditOutlined,
   FileProtectOutlined,
   FileTextOutlined,
   SafetyCertificateOutlined,
   TableOutlined,
-  TeamOutlined,
   TrophyOutlined,
   WarningOutlined,
 } from "@ant-design/icons";
-import { useWorkbench } from "../api/hooks";
+import { useImportBundle, useProjectJobs, useWorkbench } from "../api/hooks";
 import DashboardMetrics from "../components/DashboardMetrics";
+import JobProgress from "../components/JobProgress";
 import RenameProjectModal from "../components/RenameProjectModal";
 import { formatPrice, projectStatus } from "../utils/project";
 
@@ -45,14 +48,75 @@ const STATE_COLOR = {
 };
 const STAGE_PATH: Record<string, string> = {
   rules: "/rules",
-  bidders: "/bidders",
+  import: "",
   results: "/results",
 };
 const STAGE_ICON: Record<string, ReactNode> = {
   rules: <FileTextOutlined />,
-  bidders: <TeamOutlined />,
+  import: <CloudUploadOutlined />,
   results: <TrophyOutlined />,
 };
+
+type ImportResult = {
+  counts?: { bidders?: number; priced?: number; unpriced?: number };
+  bidders?: { name: string; price?: { status?: string } }[];
+  warnings?: string[];
+};
+
+/** 「数据导入」阶段卡内嵌控件：上传项目包（zip）+ 任务进度 + 结果摘要。 */
+function ImportStageControls({ pid, locked }: { pid: string; locked: boolean }) {
+  const { data: jobs } = useProjectJobs(pid, "import_bundle");
+  const importJob = jobs?.[0] ?? null;
+  const importing = !!importJob && ["queued", "running"].includes(importJob.status);
+  const importMut = useImportBundle();
+  const result = importJob?.result_json as ImportResult | null;
+  const unpricedNames =
+    result?.bidders
+      ?.filter((b) => b.price?.status === "missing")
+      .map((b) => b.name) ?? [];
+
+  return (
+    <div className="import-controls">
+      <Upload
+        accept=".zip"
+        showUploadList={false}
+        disabled={locked || importing || importMut.isPending}
+        beforeUpload={(file) => {
+          importMut.mutate({ pid, file });
+          return false;
+        }}
+      >
+        <Button
+          type="primary"
+          ghost={!!importJob}
+          icon={<CloudUploadOutlined />}
+          loading={importMut.isPending || importing}
+          disabled={locked}
+        >
+          {importJob ? "重新导入项目包（zip）" : "上传项目包（zip）"}
+        </Button>
+      </Upload>
+      {locked && (
+        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+          已有评分运行，不可重新导入（历史口径不可改写）
+        </Typography.Text>
+      )}
+      <JobProgress job={importJob} width={160} />
+      {result?.counts && (
+        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+          导入结果：{result.counts.bidders ?? 0} 家公司 /
+          {result.counts.priced ?? 0} 家抽价成功
+          {unpricedNames.length > 0 && (
+            <span>
+              ；未抽到报价：
+              {unpricedNames.join("、")}
+            </span>
+          )}
+        </Typography.Text>
+      )}
+    </div>
+  );
+}
 
 export default function ProjectWorkbench() {
   const { pid = "" } = useParams();
@@ -285,9 +349,18 @@ export default function ProjectWorkbench() {
                     ? "阶段已完成"
                     : "按流程推进"}
               </span>
-              <Link to={`/p/${pid}${STAGE_PATH[s.key] ?? ""}`}>
-                进入阶段 <ArrowRightOutlined />
-              </Link>
+              {s.key === "import" ? (
+                <ImportStageControls
+                  pid={pid}
+                  locked={data.stages.some(
+                    (x) => x.key === "results" && x.state !== "pending",
+                  )}
+                />
+              ) : (
+                <Link to={`/p/${pid}${STAGE_PATH[s.key] ?? ""}`}>
+                  进入阶段 <ArrowRightOutlined />
+                </Link>
+              )}
             </div>
           </Card>
         ))}

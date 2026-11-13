@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 
-from .conftest import upload_pdf, wait_job
+from .conftest import add_bidder, extract_price_of, upload_pdf, wait_job
 
 REPO = Path(__file__).resolve().parents[2]
 BIDDER_KEYS = ["jia", "yi", "bing", "ding", "wu"]
@@ -168,16 +168,12 @@ def test_demo_scoring_full_chain(client, samples_dir) -> None:  # noqa: ANN001
     bidder_ids = []
     for key in BIDDER_KEYS:
         pdf = next(p for p in bid_pdfs if p.name.startswith(f"{key}_"))
-        b = client.post(f"/api/projects/{pid}/bidders",
-                        json={"name": pdf.stem.split("_")[1]}).json()
+        b = add_bidder(pid, pdf.stem.split("_")[1])
         out = upload_pdf(client, pid, pdf, "bid", bidder_id=b["id"])
         job = wait_job(client, out["job_id"])
         assert job["status"] == "succeeded", job.get("error")
-        price = client.get(f"/api/bidders/{b['id']}/price").json()
+        price = extract_price_of(b["id"])  # 服务级抽取（报价确认卡点已取消）
         assert price["bid_price"]
-        r = client.post(f"/api/bidders/{b['id']}/price/confirm",
-                        json={"reason": "与开标一览表核对一致"})
-        assert r.status_code == 200, r.text
         bidder_ids.append(b["id"])
 
     resp = client.post(f"/api/projects/{pid}/runs",

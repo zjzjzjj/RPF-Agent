@@ -596,6 +596,8 @@ def test_unexpected_model_transport_failure_automatically_retries(monkeypatch):
 
 
 def test_price_reextraction_ignores_unconfirmed_heuristic_and_saves_sources(managed_run, monkeypatch):
+    """2026-11-13 输入格式重构：抽取即生效——extracted 冻结价直接采纳，
+    不再触发 LLM 补抽；resume 亦不重抽。"""
     with session_scope() as s:
         run = s.get(EvaluationRun, managed_run["id"])
         manifest = dict(run.config_json["automation_manifest"])
@@ -605,19 +607,18 @@ def test_price_reextraction_ignores_unconfirmed_heuristic_and_saves_sources(mana
 
     def assessed(*args):
         calls.append(1)
-        return scoring.CellOutcome("pass", "已核对开标总价，保证金不是总价", evidence=[{
-            "document_id": managed_run["document"], "page_no": 1, "kind": "text", "quote": managed_run["text"],
-        }], pages=pages, basis="evidence", raw={"facts": {"bid_price": "1200000"}})
+        return scoring.CellOutcome("pass", "不应被调用", evidence=[], pages=pages,
+                                   basis="evidence", raw={"facts": {}})
 
     monkeypatch.setattr(scoring, "_assess_cell", assessed)
     mapping = {managed_run["bidder"]: (pages, data_class)}
     assert scoring._resolve_prices(managed_run["id"], manifest, mapping, lambda: None) == {
-        managed_run["bidder"]: Decimal("1200000")}
+        managed_run["bidder"]: Decimal("50000")}
     scoring._resolve_prices(managed_run["id"], manifest, mapping, lambda: None)
-    assert calls == [1], "a verified quote must not be re-extracted on resume"
+    assert calls == [], "冻结的 extracted 报价直接采纳，不触发补抽（含 resume）"
     with session_scope() as s:
         cfg = s.get(EvaluationRun, managed_run["id"]).config_json
-        assert cfg["resolved_price_evidence"][str(managed_run["bidder"])]["evidence"]
+        assert cfg["resolved_price_evidence"][str(managed_run["bidder"])]["basis"] == "frozen_confirmed"
 
 
 def test_scanned_heading_is_not_complete_coverage(managed_run):
@@ -919,30 +920,49 @@ def test_one_valid_case_cannot_hide_another_case_verification_failure():
 
 
 def test_price_conflict_without_frozen_resolution_never_chooses_a_default(managed_run, monkeypatch):
-    from app.engine import auto_review
-
-    monkeypatch.setenv("BID_EVAL_AUTO_REVIEW_ROUNDS", "2")
-    monkeypatch.setattr(scoring, "_supplement_pages", lambda criterion, pages, **kwargs: pages)
+    """2026-11-13 输入格式重构：conflict 是信息性标记（抽价已定取值依据）——
+    冻结价照常生效；补抽仍不可得的 missing 才置空价继续（无效价语义），不抛错。"""
     with session_scope() as s:
         manifest = dict(s.get(EvaluationRun, managed_run["id"]).config_json["automation_manifest"])
+    # ① conflict 冻结价：直接生效，不触发补抽
     manifest["bidders"] = [{"id": managed_run["bidder"], "bid_price": "100", "price_status": "conflict"}]
     pages, data_class = scoring._load_pages(managed_run["bidder"])
     calls = []
 
-    def unresolved(gateway, criterion, material, **kwargs):
-        calls.append(kwargs["round_no"])
-        assert "price_rules" in criterion
-        return AutoReviewDecision(verdict="fail", reasoning="大小写总价冲突，冻结细则未给修正口径",
-                                  facts={"bid_price": "100"}, missing_evidence=["缺少明确冲突修正规则"])
+    def assessed(*args, **kwargs):
+        calls.append(1)
+        return scoring.CellOutcome("fail", "不应被调用", evidence=[], pages=pages,
+                                   basis="none", raw={"facts": {}})
 
-    monkeypatch.setattr(auto_review, "review_criterion", unresolved)
-    with pytest.raises(LLMError, match="冲突修正"):
-        scoring._resolve_prices(managed_run["id"], manifest, {managed_run["bidder"]: (pages, data_class)},
-                                lambda: object())
-    assert calls == [0, 1, 2]
+    monkeypatch.setattr(scoring, "_assess_cell", assessed)
+    prices = scoring._resolve_prices(managed_run["id"], manifest,
+                                     {managed_run["bidder"]: (pages, data_class)}, lambda: object())
+    assert prices == {managed_run["bidder"]: Decimal("100")}
+    assert calls == []
+
+    # ② missing + 补抽失败：置空价继续（价格段按"报价为空或≤0"记 0），
+    #    留痕 basis=missing，投标人不删、任务不崩。
+    with session_scope() as s:  # 清①的 resume 缓存，走补抽分支
+        run = s.get(EvaluationRun, managed_run["id"])
+        run.config_json = {k: v for k, v in (run.config_json or {}).items()
+                           if k not in ("resolved_prices", "resolved_price_evidence")}
+    manifest["bidders"] = [{"id": managed_run["bidder"], "bid_price": None, "price_status": "missing"}]
+
+    def unresolved(*args, **kwargs):
+        calls.append(1)
+        return scoring.CellOutcome("fail", "开标一览表缺失，无法提取报价", evidence=[], pages=pages,
+                                   basis="none", raw={"facts": {}})
+
+    monkeypatch.setattr(scoring, "_assess_cell", unresolved)
+    prices = scoring._resolve_prices(managed_run["id"], manifest,
+                                     {managed_run["bidder"]: (pages, data_class)}, lambda: object())
+    assert prices == {}
+    assert calls == [1]
     with session_scope() as s:
         cfg = s.get(EvaluationRun, managed_run["id"]).config_json
-        assert not cfg.get("resolved_prices") and not cfg.get("resolved_price_evidence")
+        prov = cfg["resolved_price_evidence"][str(managed_run["bidder"])]
+        assert prov["basis"] == "missing"
+        assert str(managed_run["bidder"]) not in (cfg.get("resolved_prices") or {})
 
 
 def test_resume_rejects_changed_page_readability_warnings(managed_run):

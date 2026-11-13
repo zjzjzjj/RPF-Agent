@@ -19,7 +19,7 @@ router = APIRouter(tags=["runs"])
 
 class RunCreate(BaseModel):
     package_id: int | None = None  # 缺省用当前冻结包
-    bidder_ids: list[int]
+    bidder_ids: list[int] | None = None  # 缺省 = 项目全部投标人（导入自动生成）
     stages: list[Literal["objective", "price", "subjective"]] | None = None
     provider: str | None = None
     model: str | None = None  # 前端可选模型（模型目录内的 id）

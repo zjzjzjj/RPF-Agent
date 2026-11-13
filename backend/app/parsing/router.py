@@ -32,6 +32,10 @@ def extract_document(path: str) -> ExtractedDocument:
         from app.parsing.docx_extractor import extract_docx
 
         return extract_docx(path)
+    if suffix == ".xlsx":
+        from app.parsing.xlsx_text import extract_xlsx
+
+        return extract_xlsx(path)
     if suffix == ".doc":
         raise DocumentRejectedError(
             config.REJECT_NOT_SUPPORTED, "旧版 .doc 暂不支持，请另存为 .docx 或 PDF 后上传"

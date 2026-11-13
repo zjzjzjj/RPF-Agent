@@ -133,7 +133,7 @@ export default function ScoreResults() {
     mutationFn: () =>
       api.post<{ run_id: number; job_id: number }>(`/projects/${pid}/runs`, {
         package_id: rules?.id,
-        bidder_ids: (bidders ?? []).map((b) => b.id),
+        // 2026-11-13 输入格式重构：不传 bidder_ids = 项目全部投标人（导入自动生成）
         stages: ["objective", "price", "subjective"],
         model: selectedModel ?? null,
         failure_policy: "continue",

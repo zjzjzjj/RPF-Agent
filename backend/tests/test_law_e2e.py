@@ -16,7 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from .conftest import upload_pdf, wait_job
+from .conftest import add_bidder, extract_price_of, upload_pdf, wait_job
 from .test_law_import import _doc  # 合成 5 条法律包（与导入测试同源）
 from app.rules import law_kb as lk
 from app.rules.library.law_pack_loader import load_law_pack, reset_law_pack_cache
@@ -62,16 +62,12 @@ def law_chain(client, law_kb, samples_dir):  # noqa: ANN001
     assert len(bid_pdfs) == 5
     bidder_ids: list[int] = []
     for pdf in bid_pdfs:
-        b = client.post(f"/api/projects/{pid}/bidders",
-                        json={"name": pdf.stem.split("_")[1]}).json()
+        b = add_bidder(pid, pdf.stem.split("_")[1])
         up = upload_pdf(client, pid, pdf, "bid", bidder_id=b["id"])
         job = wait_job(client, up["job_id"])
         assert job["status"] == "succeeded", job.get("error")
-        price = client.get(f"/api/bidders/{b['id']}/price").json()  # GET 触发报价抽取
+        price = extract_price_of(b["id"])  # 服务级抽取（报价确认卡点已取消）
         assert price["bid_price"], price
-        r = client.post(f"/api/bidders/{b['id']}/price/confirm",
-                        json={"reason": "与开标一览表核对一致"})
-        assert r.status_code == 200, r.text
         bidder_ids.append(b["id"])
     return pid, package_id, bidder_ids
 

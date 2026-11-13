@@ -32,6 +32,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO / "backend"))
+sys.path.insert(0, str(REPO / "scripts"))
+from build_import_zip import build_zip  # noqa: E402  项目包打包（与导入端同构）
 
 
 def _wait(client, job_id: int, timeout: float = 300.0) -> dict:  # noqa: ANN001
@@ -44,17 +46,15 @@ def _wait(client, job_id: int, timeout: float = 300.0) -> dict:  # noqa: ANN001
     raise TimeoutError(f"任务 {job_id} 超时")
 
 
-def _upload(client, pid: str, path: Path, kind: str, bidder_id: int | None = None) -> dict:  # noqa: ANN001
-    data = {"kind": kind}
-    if bidder_id is not None:
-        data["bidder_id"] = str(bidder_id)
-    resp = client.post(
-        f"/api/projects/{pid}/documents",
-        files={"file": (path.name, path.read_bytes(), "application/pdf")},
-        data=data,
-    )
-    assert resp.status_code == 200, resp.text
-    return resp.json()
+def _wait_project_jobs(client, pid: str, timeout: float = 600.0) -> None:  # noqa: ANN001
+    """等项目全部任务终态（导入把解析任务异步排队，后续步骤前必须等完）。"""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        jobs = client.get(f"/api/projects/{pid}/jobs").json()
+        if not any(j["status"] in ("queued", "running") for j in jobs):
+            return
+        time.sleep(0.5)
+    raise TimeoutError(f"项目 {pid} 任务未在 {timeout}s 内完成")
 
 
 def main() -> int:
@@ -104,11 +104,21 @@ def main() -> int:
                           json={"name": "全自动验收", "max_price": "8000000"}).json()["id"]
         print(f"[1/6] 新建项目 {pid}")
 
-        out = _upload(client, pid, tender_pdf, "tender")
-        job = _wait(client, out["job_id"])
-        assert job["status"] == "succeeded", job.get("error")
+        # ---- 项目包导入（招标 + 5 家投标）：报价开标一览表自动抽取即生效 ----
+        pdfs = sorted((samples / "bids").glob("*_投标文件.pdf"))
+        zip_path = build_zip([tender_pdf],
+                             {p.stem.split("_")[1]: [p] for p in pdfs},
+                             Path(tempfile.mkdtemp(prefix="bid-eval-import-")) / "项目包.zip")
+        with open(zip_path, "rb") as fh:
+            imp = client.post(f"/api/projects/{pid}/import-bundle",
+                              files={"file": (zip_path.name, fh.read(), "application/zip")})
+        assert imp.status_code == 202, imp.text
+        imp_job = _wait(client, imp.json()["job_id"], timeout=600)
+        assert imp_job["status"] == "succeeded", imp_job.get("error")
+        tender_doc_id = imp_job["result_json"]["tender_documents"][0]["document_id"]
+        _wait_project_jobs(client, pid)
         resp = client.post(f"/api/projects/{pid}/rules/compile",
-                           json={"document_id": out["document_id"]})
+                           json={"document_id": tender_doc_id})
         job = _wait(client, resp.json()["job_id"], timeout=900)  # 真实模型 + 契约修复重试，可能超 5 分钟
         assert job["status"] == "succeeded", job.get("error")
         doc_pkg = job["result_json"]["package_id"]
@@ -140,21 +150,12 @@ def main() -> int:
         frozen_pkg = client.get(f"/api/rules/packages/{doc_pkg}").json()
         criterion_ids = {int(c["id"]) for c in frozen_pkg["criteria"] if c.get("status") != "retired"}
 
-        bidder_ids: list[int] = []
-        pdfs = sorted((samples / "bids").glob("*_投标文件.pdf"))
-        for pdf in pdfs:
-            b = client.post(f"/api/projects/{pid}/bidders",
-                            json={"name": pdf.stem.split("_")[1]}).json()
-            bo = _upload(client, pid, pdf, "bid", bidder_id=b["id"])
-            jb = _wait(client, bo["job_id"])
-            assert jb["status"] == "succeeded", jb.get("error")
-            client.get(f"/api/bidders/{b['id']}/price")  # GET 触发报价抽取
-            bidder_ids.append(b["id"])
-        print(f"[4/6] {len(bidder_ids)} 家投标人解析完成（报价核验与补抽由评分运行处理）")
+        bidder_ids = [b["id"] for b in client.get(f"/api/projects/{pid}/bidders").json()]
+        print(f"[4/6] {len(bidder_ids)} 家投标人已由项目包导入建档"
+              f"（报价开标一览表自动抽取，冲突由评分运行核验）")
 
         resp = client.post(f"/api/projects/{pid}/runs", json={
-            "package_id": doc_pkg,
-            "bidder_ids": bidder_ids,
+            "package_id": doc_pkg,  # 不传 bidder_ids = 项目全部投标人（导入自动生成）
             "stages": ["objective", "price", "subjective"],
         })
         assert resp.status_code == 200, resp.text

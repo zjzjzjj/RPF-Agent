@@ -194,25 +194,28 @@ def get_workbench(project_id: str) -> WorkbenchOut:
             if unverified:
                 blockers.append(f"评分规则有 {unverified} 项待确认（未确认不能冻结）")
 
-        # ② 投标人
+        # ② 数据导入（2026-11-13 输入格式重构：投标人由项目包导入自动生成，
+        #    报价开标一览表自动抽取即生效——不再有"报价已确认"卡点）
         bidder_count = s.execute(
             select(func.count(Bidder.id)).where(Bidder.project_id == project_id)
         ).scalar_one()
-        price_confirmed = s.execute(
+        priced_count = s.execute(
             select(func.count(Bidder.id)).where(
-                Bidder.project_id == project_id, Bidder.price_status == "confirmed"
+                Bidder.project_id == project_id, Bidder.price_status != "missing"
             )
         ).scalar_one()
+        unpriced = int(bidder_count - priced_count)
         if bidder_count == 0:
-            stages.append(StageState(key="bidders", label="投标人", state="pending",
-                                     detail="尚未添加投标人"))
-        elif price_confirmed < bidder_count:
-            stages.append(StageState(key="bidders", label="投标人", state="active",
-                                     detail=f"报价已确认 {price_confirmed}/{bidder_count}",
-                                     todo_count=int(bidder_count - price_confirmed)))
+            stages.append(StageState(key="import", label="数据导入", state="pending",
+                                     detail="尚未导入项目包（zip：招标文件 + 各公司投标文件夹）"))
+        elif unpriced > 0:
+            stages.append(StageState(key="import", label="数据导入", state="active",
+                                     detail=f"{bidder_count} 家公司 / {priced_count} 家抽价成功，"
+                                            f"{unpriced} 家未抽到报价（不参与价格分）",
+                                     todo_count=unpriced))
         else:
-            stages.append(StageState(key="bidders", label="投标人", state="done",
-                                     detail=f"{bidder_count} 家，报价全部已确认"))
+            stages.append(StageState(key="import", label="数据导入", state="done",
+                                     detail=f"{bidder_count} 家公司，报价抽取全部成功"))
 
         # ③ 评分结果：评分运行、复核与报告都在评分结果页，合成一个阶段。
         # 状态优先级：无运行 > 运行中 > 运行失败 > 人工复核待办（仅人工模式）> 报告定稿 > 可查看/可生成。

@@ -16,7 +16,7 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import select
 
-from .conftest import wait_job
+from .conftest import add_bidder, wait_job
 
 SUBJECTIVE_CODE = "T4.1"  # comprehensive-goods 模板里的主观分项
 
@@ -39,7 +39,7 @@ def summary_chain(client):  # noqa: ANN001
 
     bidder_ids: list[int] = []
     for name, price in (("甲公司", "1000000"), ("乙公司", "1100000"), ("丙公司", "1200000")):
-        b = client.post(f"/api/projects/{pid}/bidders", json={"name": name}).json()
+        b = add_bidder(pid, name)
         rr = client.post(f"/api/bidders/{b['id']}/price/set",
                          json={"price_yuan": price, "reason": "测试录入报价"})
         assert rr.status_code == 200, rr.text
