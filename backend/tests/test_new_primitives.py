@@ -113,6 +113,131 @@ def test_deviation_missing_params_field_missing() -> None:
     assert r.score == Decimal("20")
 
 
+# --- run 119 回归：真实偏离表形态（目录中毒 / 多行抽取 / 规则引文排除） -----------
+
+TOC_QUOTE_THEN_TABLE = """投标文件目录
+2.1 投标保证金汇款凭证 ................................... 10
+2.4 技术偏离表 ........................................... 25
+2.5 投标产品附加功能说明表 ............................... 48
+
+评标办法响应表：技术指标符合性——根据用户需求书中条款，按照所选投标设备的
+技术性能一一填写《2.4 技术偏离表》中技术参数，每缺失一条扣两分，每负偏离
+一条扣一分，正偏离不加分。见投标文件（63）页
+
+2.4 商务技术偏离表
+项目名称：测试项目
+序号 | 招标文件要求 | 投标文件的响应 | 偏离说明
+1 | 过滤精度≤5μm | 过滤精度≤5μm | 无偏离
+2 | 流量≥100L/min | 流量 80L/min | 负偏离
+3 | 材质 316L | 材质 316L | 无偏离
+4 | 接口 DN50 | 接口 DN40 | 负偏离
+5 | 转速 14000rpm | 转速 14000rpm | 无偏离
+注：投标人应根据招标文件要求详细填写本表，如果未填写，将作无效标处理
+"""
+
+
+def test_deviation_toc_and_rule_quote_do_not_poison_counting() -> None:
+    """run 119 形态：目录/规则引文里的"偏离表"命中不得抢走真实表的行计数。"""
+    c = {"max_score": Decimal("20")}
+    params = {"engine": "deviation_deduct_table", "per_missing": "2", "per_negative": "1"}
+    r = score_deviation_deduct_table(c, params, _facts(TOC_QUOTE_THEN_TABLE))
+    # 真实表 5 行：负偏离 2（行2/4）→ 扣 2×1=2 → 18；目录/引文/注脚不计
+    assert r.score == Decimal("18")
+    assert r.unresolved is None
+
+
+MULTILINE_TOKEN_TABLE = """2.4 商务技术偏离表
+序
+号
+招标文
+件条目
+号
+招标文件要求
+投标文件的响应
+偏离
+说明
+1
+第三部分用户需求书
+功能与用途：快速研磨破碎
+功能与用途：快速研磨破碎
+无偏离
+2
+第三部分用户需求书
+速度：至少包含4-10 m/s
+速度：包含0.8-10 m/s
+正偏离
+3
+第三部分用户需求书
+最大离心力：25,155
+最大离心力：22132
+负偏离
+4
+第三部分用户需求书
+精度达±1 rpm
+精度达±1 rpm
+无偏离
+5
+第三部分用户需求书
+升速：<2 s
+升速：<3 s
+负偏离
+注：针对以上表格填写内容提供相关证明材料
+"""
+
+
+def test_deviation_multiline_token_rows_counted() -> None:
+    """PyMuPDF 多行抽取形态：状态词独占行，每词恰一行 → 行数=词数。"""
+    c = {"max_score": Decimal("20")}
+    params = {"engine": "deviation_deduct_table", "per_missing": "2", "per_negative": "1"}
+    r = score_deviation_deduct_table(c, params, _facts(MULTILINE_TOKEN_TABLE))
+    # 5 行状态词：负偏离 2 → 扣 2 → 18
+    assert r.score == Decimal("18")
+    assert r.unresolved is None
+
+
+def test_deviation_missing_rows_without_status_token() -> None:
+    """响应列写"未提供"且无状态词的行按缺失计（每条扣缺失率）。"""
+    text = """2.4 技术偏离表
+序号 | 招标文件要求 | 投标文件的响应 | 偏离说明
+1 | 过滤精度≤5μm | 未提供 |
+2 | 流量≥100L/min | 流量 80L/min | 负偏离
+3 | 材质 316L | 材质 316L | 无偏离
+"""
+    c = {"max_score": Decimal("20")}
+    params = {"engine": "deviation_deduct_table", "per_missing": "2", "per_negative": "1"}
+    r = score_deviation_deduct_table(c, params, _facts(text))
+    # 缺失 1（行1）×2 + 负偏离 1（行2）×1 = 扣 3 → 17
+    assert r.score == Decimal("17")
+
+
+def test_deviation_certificates_field_counts_certs_not_rows() -> None:
+    """c31 形态（缺一个扣0.5分）：按有效证书份数计分，不数偏离行。"""
+
+    class _F:
+        certificates = [{"name": "计量检校证书1"}, {"name": "计量检校证书2"}, {"name": "计量检校证书3"}]
+        text = ""
+
+    c = {"max_score": Decimal("4")}
+    params = {"engine": "deviation_deduct_table", "per_missing": "0.5", "field": "certificates"}
+    r = score_deviation_deduct_table(c, params, _F())
+    # 3 份 ×0.5 = 1.5（人工口径一致）
+    assert r.score == Decimal("1.5")
+
+
+def test_deviation_certificates_unseen_gives_unresolved_zero() -> None:
+    """证书为扫描件/未检出：不冒充满分，unresolved 显式暂定 0 待人工核对。"""
+
+    class _F:
+        certificates = []
+        text = "投标文件正文"
+
+    c = {"max_score": Decimal("4")}
+    params = {"engine": "deviation_deduct_table", "per_missing": "0.5", "field": "certificates"}
+    r = score_deviation_deduct_table(c, params, _F())
+    assert r.score == Decimal("0")
+    assert r.unresolved == "no_facts"
+
+
 # --- score_value_tier / score_value_linear ------------------------------------
 
 HOURS_TEXT = "我方承诺：故障响应时间 2 小时内到现场，4 小时内恢复运行。"

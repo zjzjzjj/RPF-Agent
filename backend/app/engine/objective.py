@@ -1509,6 +1509,10 @@ _RE_WARRANTY = re.compile(
 _RE_DEV_SECTION = re.compile(r"技术偏离表|技术响应偏离表|偏离表")
 _RE_DEV_NEG = re.compile(r"负偏离|低于(?:要求|招标)|不满足")
 _RE_DEV_MISSING = re.compile(r"未提供|无响应|未响应|未填写")
+# 行状态列词（真实偏离表每行"偏离说明"列恰好一个词）与说明/规则行判定
+_RE_DEV_STATUS_TOKEN = re.compile(r"无偏离|正偏离|负偏离")
+_RE_DEV_INSTRUCTION = re.compile(r"每.{0,8}扣|视为|即为|不得分|无效标|填写本表|注\s*[:：]|不加分")
+_RE_DEV_STOP_NOTE = re.compile(r"^\s*注\s*[:：]")
 
 
 def _units_to_months(value: Decimal, unit: str) -> Decimal:
@@ -1627,23 +1631,110 @@ def _extract_warranty_months(text: str, window: str | None = None) -> tuple[Deci
     return _pick_value(cands)
 
 
+def _deviation_table_region(text: str) -> tuple[str, str] | None:
+    """定位真实技术偏离表区间（表标题之后到注脚/下一章节），防目录页中毒。
+
+    2026-11-16 run 119 实证：旧实现取"偏离表"**首个**标题命中（常落在目录
+    "2.4 …… 25"或规则引文《2.4 技术偏离表》）+ 4000 字数字行启发式，窗口里
+    全是目录/引文行 → 缺失0/负偏离0 → 满分误判（人工对纳德实扣 11 条负偏离）。
+    现按**状态词密度**选区间：真实表的行状态列每行恰有一个
+    无偏离/正偏离/负偏离，目录与规则引文区域密度为 0。
+    """
+    best: tuple[tuple[int, int], str, str] | None = None
+    for m in _RE_DEV_SECTION.finditer(text):
+        region = _bounded_deviation_region(text, m.end())
+        if not region.strip():
+            continue
+        tokens = len(_RE_DEV_STATUS_TOKEN.findall(
+            "\n".join(ln for ln in region.splitlines() if not _RE_DEV_INSTRUCTION.search(ln))
+        ))
+        # 标题带"技术"的候选优先（规则原文指向《技术偏离表》，不是商务偏离表）；
+        # 同级按状态词密度取最大——目录/规则引文候选密度为 0。注意不要按
+        # "下一标题"截断：真实表每页页眉重复"2.4 商务技术偏离表"，会把区域
+        # 砍到首页（run 119 实证 24 行/0 负偏离的假象）。
+        rank = (2 if "技术偏离表" in m.group() else 1, tokens)
+        if best is None or rank > best[0]:
+            best = (rank, region, region[:160])
+    if best is None or best[0][1] <= 0:
+        return None
+    return best[1], best[2]
+
+
+def _bounded_deviation_region(text: str, start: int) -> str:
+    """表标题之后到"注："表尾脚注为止（上限 120000 字符）。
+
+    只认"注："脚注为边界——表格单元格的换行文本会伪装成章节标题（"3.1 验收前
+    需要获得…"、"2.3 性能指标"），行形/节号启发式都会被撞（run 119 实证）；
+    真实偏离表以"注：…填写本表…"类脚注收尾，后段逐产品响应表靠该边界排除。
+    无注脚的表退化为截到上限，由多候选取最大密度与说明行过滤兜底。
+    """
+    out: list[str] = []
+    used = 0
+    for ln in text[start:].splitlines(keepends=True):
+        if used > 120_000:
+            break
+        if ln.strip() and _RE_DEV_STOP_NOTE.match(ln):
+            break
+        out.append(ln)
+        used += len(ln)
+    return "".join(out)
+
+
 def _extract_deviation_counts(text: str) -> tuple[dict | None, str]:
-    """技术偏离表行状态计数。定位不到该表 → (None, "")。"""
-    m = _RE_DEV_SECTION.search(text)
-    if not m:
+    """技术偏离表行状态计数（G9 扣分制）。定位不到可判读的表 → (None, "")。
+
+    行状态按"偏离说明"列词判读（无偏离/正偏离/负偏离，每行恰一词）；
+    说明/规则行（"每缺失一条扣两分"、"注：…"、"…视为负偏离"）不计；
+    响应列写明未提供/未响应/未填写且无状态词的行按缺失计（每条扣缺失率）。
+    同行同时命中缺失词与负偏离按负偏离计（扣率取小者，与人工口径一致）。
+    """
+    located = _deviation_table_region(text)
+    if located is None:
         return None, ""
-    # 从表标题向后取窗口：到下一个明显章节标题/表题为止（最多 4000 字符）
-    tail = text[m.end(): m.end() + 4000]
-    stop = re.search(r"\n\s*(?:表\s*\d|[一二三四五六]、|第[一二三四五六][章节部分])", tail)
-    window = tail[: stop.start()] if stop else tail
-    rows = [ln for ln in window.splitlines() if re.search(r"\d", ln) and len(ln.strip()) >= 6]
-    if not rows:
+    region, snippet = located
+    kept = [ln for ln in region.splitlines() if not _RE_DEV_INSTRUCTION.search(ln)]
+    status_lines = [ln for ln in kept if _RE_DEV_STATUS_TOKEN.search(ln)]
+    # 形态分流：状态词带管道符=单行表格（一行一格）；否则=多行抽取（一格一行）
+    pipe_mode = any(re.search(r"[|｜]", ln) for ln in status_lines)
+    total = neg = missing = 0
+    if pipe_mode:
+        for ln in kept:
+            if _RE_DEV_STATUS_TOKEN.search(ln):
+                total += 1
+                if "负偏离" in ln:
+                    neg += 1
+            elif _RE_DEV_MISSING.search(ln):
+                total += 1
+                missing += 1
+    else:
+        # 多行抽取：以"序号独行"与"状态词行"双锚点切行块，防止缺失行并入下一块；
+        # 行块分类仍以状态词行为主导（同一行块的缺失词按状态词行的口径不重复计）
+        chunks: list[str] = []
+        cur: list[str] = []
+        for ln in kept:
+            if re.match(r"^\s*\d+\s*$", ln) and cur:
+                chunks.append("\n".join(cur))
+                cur = []
+            cur.append(ln)
+            if _RE_DEV_STATUS_TOKEN.search(ln):
+                chunks.append("\n".join(cur))
+                cur = []
+        if cur:
+            chunks.append("\n".join(cur))
+        for chunk in chunks:
+            if _RE_DEV_STATUS_TOKEN.search(chunk):
+                total += 1
+                if "负偏离" in chunk:
+                    neg += 1
+            elif _RE_DEV_MISSING.search(chunk):
+                total += 1
+                missing += 1
+    if total == 0:
         return None, ""
-    neg = sum(1 for ln in rows if _RE_DEV_NEG.search(ln))
-    missing = sum(
-        1 for ln in rows if _RE_DEV_MISSING.search(ln) and not _RE_DEV_NEG.search(ln)
-    )
-    return {"total": len(rows), "negative": neg, "missing": missing}, window[:160]
+    return {"total": total, "negative": neg, "missing": missing}, snippet
+    if total == 0:
+        return None, ""
+    return {"total": total, "negative": neg, "missing": missing}, snippet
 
 
 def _q2(v: Decimal) -> Decimal:
@@ -1663,6 +1754,28 @@ def score_deviation_deduct_table(
         )
     max_score = criterion.get("max_score")
     verified = criterion.get("verified_facts") or {}
+    if str(params.get("field") or "") == "certificates":
+        # "缺一个扣 N 分，最高 M 分"（第三方计量检校证书等）：按**有效证书份数**
+        # 计分 = min(满分, N × 份数)，与偏离表行数无关。证书为扫描件/未检出时
+        # 不冒充满分也不冒充 0 结论——unresolved 显式暂定 0 待人工核对
+        # （run 119 c31 实证：旧口径套偏离表行数全员满分误判，人工 0/4/1.5/0）。
+        supplied_certs = verified.get("certificates") if isinstance(verified, dict) else None
+        cert_count = (len(supplied_certs) if supplied_certs is not None
+                      else len(getattr(facts, "certificates", None) or []))
+        if cert_count <= 0:
+            return CountResult(
+                Decimal(0),
+                f"未检出有效证书（可能为扫描件），按暂定 0 分待人工核对证书份数"
+                f"（缺一个扣 {per_missing} 分，最高 {max_score} 分）",
+                True, unresolved="no_facts",
+            )
+        score = min(Decimal(str(max_score or 0)), per_missing * cert_count)
+        return CountResult(
+            score,
+            f"有效证书 {cert_count} 份 × 每份 {_q2(per_missing)} 分 = {_q2(score)}"
+            f"（缺一个扣 {_q2(per_missing)} 分口径，最高 {max_score} 分）",
+            conflict=True,
+        )
     supplied = verified.get("deviation_counts") if isinstance(verified, dict) else None
     if isinstance(supplied, dict):
         # LLM 逐页核验的偏离表事实优先（托管路径）。
