@@ -117,7 +117,21 @@ export default function EvidencePanel({
       </Card>
 
       {showViewer && documentId != null && (
-        <Card size="small" title="原件定位（高亮为证据所在位置）" style={{ marginTop: 12 }}>
+        <Card size="small" title="投标书原文（高亮为证据所在位置）" style={{ marginTop: 12 }}>
+          {selectedCitation && (
+            <div style={{
+              background: "#fffbe6",
+              border: "1px solid #f0e0a0",
+              borderRadius: 4,
+              padding: "6px 10px",
+              marginBottom: 8,
+              fontSize: 13,
+              lineHeight: 1.6,
+            }}>
+              <Tag color="orange" style={{ marginBottom: 4 }}>原文引文</Tag>
+              {selectedCitation.quote}
+            </div>
+          )}
           <PdfPageViewer
             documentId={documentId}
             focusPage={focusPage}

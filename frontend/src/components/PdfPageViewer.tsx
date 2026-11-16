@@ -125,15 +125,27 @@ export default function PdfPageViewer({
                       top: `${(y0 / denom.h) * 100}%`,
                       width: `${((x1 - x0) / denom.w) * 100}%`,
                       height: `${((y1 - y0) / denom.h) * 100}%`,
-                      background: h.color ?? "rgba(250, 204, 21, 0.38)",
-                      border: "1px solid rgba(217, 119, 6, 0.9)",
-                      borderRadius: 2,
+                      background: h.color ?? "rgba(250, 204, 21, 0.45)",
+                      border: "2px solid rgba(217, 119, 6, 1)",
+                      borderRadius: 3,
+                      boxShadow: "0 0 8px rgba(217, 119, 6, 0.5)",
                       pointerEvents: "none",
+                      // 脉冲动画：首次渲染时短暂闪烁吸引注意
+                      animation: "evidence-pulse 1.2s ease-out 2",
                     }}
                   />
                 );
               })
             )}
+          {/* 高亮动画 keyframes（全局注入一次） */}
+          <style>{`
+            @keyframes evidence-pulse {
+              0% { opacity: 0; transform: scale(0.97); }
+              30% { opacity: 1; transform: scale(1); }
+              50% { opacity: 0.7; }
+              100% { opacity: 1; transform: scale(1); }
+            }
+          `}</style>
         </div>
       </div>
     </div>
