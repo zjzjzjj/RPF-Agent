@@ -1062,6 +1062,7 @@ def _price_stage(run_id: int, manifest: dict, criteria: list[dict], prices: dict
         gate = (formula.get("params_json") or {}).get("benchmark_gate")
         bids = []
         gate_missing_by_bidder: dict[int, list[str]] = {}
+        gate_fallback_by_bidder: dict[int, list[str]] = {}
         with session_scope() as s:
             for bid in manifest["bidders"]:
                 bid_id = int(bid["id"])
@@ -1085,11 +1086,21 @@ def _price_stage(run_id: int, manifest: dict, criteria: list[dict], prices: dict
                             ScoreRecord.run_id == run_id, ScoreRecord.bidder_id == bid_id,
                             ScoreRecord.criterion_id == c["id"],
                         )).scalar_one_or_none()
-                        if record is None or (bid_id, c["id"]) not in completed:
+                        # 门槛读**已定格**的上游分数（含收尾暂定兜底分）——收尾闭合
+                        # 保证价格段之前每格都有定格记录（见 _evaluate_run 收尾注释）；
+                        # 只有真正没有分数（未评/读取故障未定分）才算缺失。旧实现按
+                        # worker 完成集判断，收尾兜底格被误判"分数未完成"→ 整体放弃
+                        # 门槛（如 70% 技术门槛）按"未剔除"处理——run 119 实证门槛被
+                        # 静默跳过、基准价算错。
+                        if record is None or record.final_score is None:
                             if allow_partial_gate:
                                 missing_gate.append(str(c.get("code") or c["id"]))
                                 continue
                             raise LLMError("价格分所依赖的上游评分尚未完成")
+                        if (((record.ai_raw_json or {}).get("auto_review") or {}).get("basis")
+                                == "fallback"):
+                            gate_fallback_by_bidder.setdefault(bid_id, []).append(
+                                str(c.get("code") or c["id"]))
                         values.append(_decimal(record.final_score, "门槛得分"))
                     if needed:
                         value = sum(values, Decimal(0))
@@ -1157,11 +1168,17 @@ def _price_stage(run_id: int, manifest: dict, criteria: list[dict], prices: dict
                             page["unreadable"] = True
                     pages = _supplement_pages(criterion, pages, visual=True)
                 missing_gate = gate_missing_by_bidder.get(result.bidder_id) or []
-                provisional = bool(missing_gate) or strict_error is not None
+                gate_fallback_codes = sorted({code for codes in gate_fallback_by_bidder.values()
+                                              for code in codes})
+                provisional = (bool(missing_gate) or strict_error is not None
+                               or bool(gate_fallback_codes))
                 reason = result.explanation
                 if missing_gate:
                     reason += (f"；暂定价格：门槛所需评分尚未完成（{', '.join(missing_gate)}），"
                                "按未剔除处理")
+                if gate_fallback_codes:
+                    reason += (f"；暂定价格：门槛输入含暂定分（{', '.join(gate_fallback_codes)}），"
+                               "定分后应复核门槛与基准价")
                 if strict_error:
                     reason += f"；严格门槛无法形成基准价（{strict_error}），按门槛前口径暂定计算"
                 _persist_cell(run_id, result.bidder_id, criterion, CellOutcome(
@@ -1173,6 +1190,7 @@ def _price_stage(run_id: int, manifest: dict, criteria: list[dict], prices: dict
                          "price_provisional": provisional,
                          "price_strict_error": strict_error,
                          "gate_missing_criteria": missing_gate,
+                         "gate_fallback_criteria": gate_fallback_codes,
                          "price_source": source,
                          "benchmark_inputs": [{"bidder_id": b.bidder_id, "price": str(b.price),
                                                "gate_value": str(b.gate_value) if b.gate_value is not None else None,

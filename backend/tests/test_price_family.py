@@ -536,3 +536,68 @@ def test_real_yie5_commercial_formula_forces_price_and_enriches(app_env) -> None
     assert c.deduct_rate_up == Decimal("0.5")
     assert (c.params or {}).get("benchmark_gate", {}).get("min_ratio") == "70"
     assert (c.params or {}).get("outlier_policy", {}).get("max_mult") == "2"
+
+
+# --- 规则原文逐字口径回归（2025 实验室设备第一批，run 119 诊断锚） ---------------
+
+def _lab_first_batch_formula() -> dict:
+    """招标文件报价评分办法（原文）：≥6 家截 1 高 1 低后首均，对低于首均者二次均；
+    等于最佳报价值 50 分、每低 1% 扣 0.4、每高 1% 扣 0.6（直线插入）；
+    技术≥70%（32.2 分）才进最佳报价值计算；超 2 倍/半价记 0 剔除重算。"""
+    return {
+        "formula_type": "deviation_deduct", "benchmark_method": "average_trimmed_then_below",
+        "k": D(1), "max_score": D(50), "rounding": 2,
+        "params_json": {
+            "deduct_rate_down": "0.4", "deduct_rate_up": "0.6",
+            "trim_count": "1", "trim_threshold": "6", "trim_threshold_op": "ge",
+            "benchmark_gate": {
+                "source_text": "技术得分需达到技术部分总分的70%即32.2分及以上，未达到的不进入最佳报价值的计算",
+                "gate_on": "tech", "min_ratio": "70", "ratio_kind": "percent",
+                "stated_min_score": "32.2", "on_fail": "exclude",
+            },
+            "outlier_policy": {
+                "source_text": "有效投标价格＞最佳报价*2或＜最佳报价/2，其商务报价得分为0分，剔除该报价后重新计算得出最佳报价值",
+                "on_hit": "zero_and_recompute", "max_mult": "2", "min_mult": "0.5",
+            },
+        },
+    }
+
+
+def test_lab_first_batch_rule_text_reproduces_committee_scores() -> None:
+    """门槛结果代入后，引擎须按规则原文逐分复现（数值由规则+报价确定性推出，回归锚）。
+
+    门槛池 = 技术≥32.2 的两家（成尚/仪衡）→ 首均 8186477.10 → 低于首均者仅仪衡
+    → 最佳报价值 8170465.00；四家均按 0.4/0.6 不对称扣率对最佳报价值计分。"""
+    bids = [
+        PriceBid(95, "成尚", D("8202489.20"), gate_value=D("36.36"), gate_basis=D(46)),
+        PriceBid(96, "仪衡", D("8170465.00"), gate_value=D("43.14"), gate_basis=D(46)),
+        PriceBid(97, "玖皇", D("8026700.02"), gate_value=D("32.04"), gate_basis=D(46)),  # 差 0.16
+        PriceBid(98, "纳德", D("7107700.00"), gate_value=D("26.92"), gate_basis=D(46)),
+    ]
+    comp = compute_price_scores(bids, _lab_first_batch_formula(), strict=True)
+    assert comp.benchmark == D("8170465.00")
+    by_id = {r.bidder_id: r for r in comp.results}
+    assert by_id[96].price_score == D("50.00")
+    assert by_id[95].price_score == D("49.76")
+    assert by_id[98].price_score == D("44.80")
+    assert by_id[97].price_score == D("49.30")
+    assert by_id[97].excluded_from_benchmark and by_id[98].excluded_from_benchmark
+    assert not by_id[95].excluded_from_benchmark and not by_id[96].excluded_from_benchmark
+    # 门槛失败者仍按扣分率计分（未达门槛≠不得分），且说明标注
+    assert "未达基准价门槛" in (by_id[98].explanation or "")
+
+
+def test_lab_first_batch_no_gate_would_pick_cheapest_as_benchmark() -> None:
+    """反向锚：门槛缺席时最佳报价值会落到最低价（run 119 的错误形态）——
+    同一组报价必须因门槛结果不同而得出不同基准价，证明门槛是价格分的决定性输入。"""
+    no_gate = _lab_first_batch_formula()
+    no_gate = {**no_gate, "params_json": {**no_gate["params_json"]}}
+    no_gate["params_json"].pop("benchmark_gate")
+    bids = [
+        PriceBid(95, "成尚", D("8202489.20")),
+        PriceBid(96, "仪衡", D("8170465.00")),
+        PriceBid(97, "玖皇", D("8026700.02")),
+        PriceBid(98, "纳德", D("7107700.00")),
+    ]
+    comp = compute_price_scores(bids, no_gate, strict=True)
+    assert comp.benchmark == D("7107700.00")  # 无门槛 → 最低价成基准（错误形态）
