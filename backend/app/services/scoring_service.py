@@ -2810,67 +2810,9 @@ def _upsert_score(
         return row
 
 
-def _persist_verdict_citations(
-    score_row,  # ScoreRecord（_upsert_score 返回的 expunged 行）
-    result: dict,
-    *,
-    main_doc_id: int | None,
-    role: str,
-    stats: dict,
-) -> None:
-    """veto/match 的 LLM 裁决逐字引文落库（2026-11-05，补上被丢弃的 evidence 死字段）。
-
-    口径镜像 _persist_subjective 证据段：quote <8 字符跳过、每格最多 5 条、
-    create_citation 立即核验（verified 仍只由 verifier.py 写）、evidence_status
-    三态回写。与主观分路径的差异：重跑**先删后建**（限本 role + created_by='llm'，
-    保留人工补录与其它角色引文），引文与裁决结论同步替换；人工已处置
-    （human_confirmed/overridden）的行不动。纯机器判定（run_check）不产引文，
-    evidence_items 为空 → 只把 evidence_status 归 none。
-    """
-    if score_row.review_status in ("human_confirmed", "human_overridden"):
-        return
-    items = result.get("evidence_items") or []
-    from app.evidence.verifier import create_citation
-
-    with session_scope() as s:
-        s.execute(
-            delete(EvidenceCitation).where(
-                EvidenceCitation.score_record_id == score_row.id,
-                EvidenceCitation.citation_role == role,
-                EvidenceCitation.created_by == "llm",
-            )
-        )
-    evidence_status = "none"
-    verified_any = False
-    found_any = False
-    for ev in items[:5]:
-        quote = str(ev.get("quote") or "")
-        if len(quote.strip()) < 8:
-            continue
-        cit_id = create_citation(
-            main_doc_id,
-            quote,
-            page_hint=ev.get("page_hint"),
-            role=role,
-            score_record_id=score_row.id,
-            created_by="llm",
-        )
-        stats["citations_total"] += 1
-        with session_scope() as s:
-            cit = s.get(EvidenceCitation, cit_id)
-            if cit.verified:
-                verified_any = True
-            if cit.verify_method is not None:
-                found_any = True
-    if verified_any:
-        evidence_status = "verified"
-    elif found_any:
-        evidence_status = "unverified"
-    stats["citations_verified"] += int(verified_any)
-    with session_scope() as s:
-        row = s.get(ScoreRecord, score_row.id)
-        row.evidence_status = evidence_status
-        s.add(row)
+from app.evidence.verdict_citations import (  # noqa: E402
+    persist_verdict_citations as _persist_verdict_citations,
+)
 
 
 def _criterion_pk(s, criterion: dict) -> int:  # noqa: ANN001

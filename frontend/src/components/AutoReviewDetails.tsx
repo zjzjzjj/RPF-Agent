@@ -9,6 +9,7 @@ const BASIS_LABEL: Record<string, string> = {
   external: "外部事实证据边界",
   deterministic: "程序计算",
   absence: "完整材料检索确认缺失",
+  lightweight: "资格轻量预检（确定性预检+快审）",
 };
 
 export default function AutoReviewDetails({ metadata }: { metadata?: AutoReviewMetadata | null }) {
@@ -16,6 +17,7 @@ export default function AutoReviewDetails({ metadata }: { metadata?: AutoReviewM
   if (!metadata) return null;
   const visuals = metadata.visual_evidence ?? [];
   const visual = visuals[selectedVisual] ?? visuals[0];
+  const rejectQuotes = metadata.lightweight?.reject_quotes ?? [];
 
   return (
     <Card size="small" title="自动评审记录" style={{ marginBottom: 12 }}>
@@ -37,6 +39,27 @@ export default function AutoReviewDetails({ metadata }: { metadata?: AutoReviewM
             <Typography.Paragraph style={{ whiteSpace: "pre-wrap", marginBottom: 0 }}>
               {metadata.calculation}
             </Typography.Paragraph>
+          </div>
+        )}
+        {rejectQuotes.length > 0 && (
+          <div>
+            <Typography.Text strong>反面引文（逐字核验）</Typography.Text>
+            <List
+              size="small"
+              dataSource={rejectQuotes}
+              renderItem={(q, index) => (
+                <List.Item>
+                  <Space direction="vertical" size={2} style={{ width: "100%" }}>
+                    <Typography.Text>
+                      {index + 1}. {q.quote}
+                    </Typography.Text>
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                      文件 #{q.document_id} · 第 {q.page_no} 页
+                    </Typography.Text>
+                  </Space>
+                </List.Item>
+              )}
+            />
           </div>
         )}
         {(metadata.attempt_history?.length ?? 0) > 0 && (

@@ -459,6 +459,19 @@ export default function ScoreResults() {
                           <Tag color={selected.veto_flag ? "red" : "green"}>
                             {managed ? selected.veto_flag ? "存在不符合项，继续参评" : "AI 自动评审" : selected.veto_flag ? "存在否决建议" : "无否决建议"}
                           </Tag>
+                          {selected.qualification_suggestion && (
+                            <Tag
+                              color={
+                                selected.qualification_suggestion.code === "reject"
+                                  ? "red"
+                                  : selected.qualification_suggestion.code === "concern"
+                                    ? "orange"
+                                    : "green"
+                              }
+                            >
+                              资格建议：{selected.qualification_suggestion.label}
+                            </Tag>
+                          )}
                           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                             报价 {selected.bid_price ? Number(selected.bid_price).toLocaleString() : "未录入"} 元
                             {selected.bid_price_is_run_snapshot ? "（本次运行快照）" : "（当前值）"}
@@ -491,9 +504,25 @@ export default function ScoreResults() {
                                   {bucket.missing_count > 0 ? `（${bucket.missing_count} 项未定分）` : ""}
                                 </Typography.Text>
                               ) : (
-                                <Typography.Text type="secondary">
-                                  {bucket.item_count} 项，不计分
-                                </Typography.Text>
+                                <Space size={6}>
+                                  <Typography.Text type="secondary">
+                                    {bucket.item_count} 项，不计分
+                                  </Typography.Text>
+                                  {selected.qualification_suggestion && (
+                                    <Tag
+                                      color={
+                                        selected.qualification_suggestion.code === "reject"
+                                          ? "red"
+                                          : selected.qualification_suggestion.code === "concern"
+                                            ? "orange"
+                                            : "green"
+                                      }
+                                      style={{ marginRight: 0 }}
+                                    >
+                                      总评价：{selected.qualification_suggestion.label}
+                                    </Tag>
+                                  )}
+                                </Space>
                               )}
                             </Space>
                           }

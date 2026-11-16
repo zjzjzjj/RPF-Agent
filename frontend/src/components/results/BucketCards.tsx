@@ -1,4 +1,4 @@
-import { Card, Col, Row, Tooltip, Typography } from "antd";
+import { Card, Col, Row, Tag, Tooltip, Typography } from "antd";
 import type { BidderSummary } from "../../types";
 
 interface Props {
@@ -12,6 +12,7 @@ const VERDICT_META: Record<string, { label: string; color: string }> = {
   recommend_reject: { label: "建议否决", color: "#cf1322" },
   need_human: { label: "待人工", color: "#d46b08" },
   fail: { label: "不通过", color: "#cf1322" },
+  concern: { label: "存疑", color: "#d46b08" },
   unverifiable: { label: "现有材料无法证实", color: "#ad8b00" },
   execution_failed: { label: "执行失败", color: "#cf1322" },
 };
@@ -84,6 +85,15 @@ export default function BucketCards({ bidder, managed = false, provisional = fal
   ];
 
   const verdictBucket = bidder.buckets.find((b) => b.key === "qualification_compliance");
+  // 轻量 fail（建议否决）与深评 fail（不通过）语义不同，后端合并进同一个
+  // verdicts["fail"] 键——这里按条目拆回两个计数，避免混跑时互相冒充。
+  const verdictItems = verdictBucket?.items ?? [];
+  const lightFailCount = verdictItems.filter((it) => it.machine_status === "fail" && it.lightweight).length;
+  const deepFailCount = verdictItems.filter((it) => it.machine_status === "fail" && !it.lightweight).length;
+  const verdictLabel = (k: string) => {
+    if (managed && k === "need_human") return "待自动完成"; // deep/fallback 行特例
+    return VERDICT_META[k]?.label ?? k;
+  };
 
   return (
     <Row gutter={12}>
@@ -132,18 +142,43 @@ export default function BucketCards({ bidder, managed = false, provisional = fal
             <Typography.Text type="secondary" style={{ fontSize: 12, marginRight: 8 }}>
               资格与符合性（{verdictBucket.item_count} 项，不计分）
             </Typography.Text>
+            {bidder.qualification_suggestion && (
+              <Tag
+                color={
+                  bidder.qualification_suggestion.code === "reject"
+                    ? "red"
+                    : bidder.qualification_suggestion.code === "concern"
+                      ? "orange"
+                      : "green"
+                }
+                style={{ marginRight: 8 }}
+              >
+                总评价：{bidder.qualification_suggestion.label}
+              </Tag>
+            )}
             <SideTag side="verdict" />
-            {Object.entries(verdictBucket.verdicts).map(([k, v]) =>
-              v > 0 ? (
-                <Tooltip key={k} title={managed && k === "need_human" ? "待自动完成" : VERDICT_META[k]?.label ?? k}>
-                  <Typography.Text
-                    style={{ color: VERDICT_META[k]?.color, fontSize: 13, marginRight: 12 }}
-                  >
-                    {managed && k === "need_human" ? "待自动完成" : VERDICT_META[k]?.label ?? k} {v}
+            {Object.entries(verdictBucket.verdicts)
+              .flatMap(([k, v]) => {
+                if (k === "fail") {
+                  // 合并计数还原：轻量 fail=建议否决、深评 fail=不通过
+                  return [
+                    ...(lightFailCount > 0
+                      ? [{ key: "light_fail", v: lightFailCount, label: "建议否决", color: "#cf1322" }]
+                      : []),
+                    ...(deepFailCount > 0
+                      ? [{ key: "fail", v: deepFailCount, label: "不通过", color: "#cf1322" }]
+                      : []),
+                  ];
+                }
+                return v > 0 ? [{ key: k, v, label: verdictLabel(k), color: VERDICT_META[k]?.color }] : [];
+              })
+              .map(({ key, v, label, color }) => (
+                <Tooltip key={key} title={label}>
+                  <Typography.Text style={{ color, fontSize: 13, marginRight: 12 }}>
+                    {label} {v}
                   </Typography.Text>
                 </Tooltip>
-              ) : null,
-            )}
+              ))}
           </Card>
         </Col>
       )}

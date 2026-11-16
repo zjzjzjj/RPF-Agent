@@ -59,8 +59,10 @@ export default function ReportPanel({ report, error, managed = false }: Props) {
         {report.qualification_mode === "light" ? (
           <Card size="small" title="资格与符合性审核口径">
             <Space direction="vertical" size={4}>
-              <div>资格与符合性采用确定性预检 + 每家投标人一次轻量快审，不构成完整资格审查。</div>
-              <div>预检结果仅作报告提示，不阻断计分、排名与价格基准价。</div>
+              <div>
+                资格与符合性采用确定性预检 + 每家一次轻量快审，每条给出通过/建议否决/存疑三态结论并汇总每家资格建议；建议否决仅来自确定性硬性不符或带逐字反面引文的快审结论，材料缺失/不可读一律存疑。
+              </div>
+              <div>结论仅作报告提示，不阻断计分、排名与价格基准价。</div>
             </Space>
           </Card>
         ) : null}

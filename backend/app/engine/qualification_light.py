@@ -3,12 +3,21 @@
 Qualification/eligibility is deliberately *not* a deep review here:
 - deterministic primitives (run_check / extract_bid_facts) run first, no LLM;
 - unresolved clauses are sent to exactly one consolidated LLM screen per bidder;
-- no OCR, no images, no per-criterion review loop, no evidence citations;
+- no OCR, no images, no per-criterion review loop;
 - conclusions are advisory only and never block scoring, ranking or price.
 
-Statuses are intentionally distinct from the scoring vocabulary:
-``pass`` / ``fail`` / ``concern`` / ``not_deeply_reviewed``.  A clause that was
-not actually reviewed is never reported as a pass.
+Statuses are intentionally distinct from the scoring vocabulary and are
+**tristate since schema v2** (2026-11-16): every clause settles as
+``pass`` / ``fail`` / ``concern`` — a deterministic suggestion is always
+produced and ``not_deeply_reviewed`` is gone from the producing side
+(legacy rows keep the status for display only).
+
+Reject discipline ("AI 尽量不否决，宁存疑不错杀"):
+- a deterministic hard fail (date out of window, threshold unmet, ...) → ``fail``;
+- an LLM screen may reject **only** with verbatim counter-evidence that is
+  re-verified locally against the reviewed pages; missing / unreadable /
+  unextractable material is always ``concern``, never ``fail``;
+- an unverifiable or absent counter-quote degrades the reject to ``concern``.
 """
 from __future__ import annotations
 
@@ -21,21 +30,36 @@ from app import config
 from app.engine.facts import BidFacts, extract_bid_facts
 from app.engine.objective import run_check
 
-SCHEMA_VERSION = 1
-PROMPT_VERSION = "2026-11-10.qual-light.1"
+SCHEMA_VERSION = 2
+PROMPT_VERSION = "2026-11-16.qual-light.2"
 RULE_TEXT_LIMIT = 300
+MAX_REJECT_QUOTES = 5
 
 SYSTEM_PROMPT = """你是招标评审的资格/符合性轻量预检助手。这不是完整资格审查，只做一次合并快审。
 输入包含：投标人结构化事实、已解析的投标文件页面文本（可能是节选）、待审条款列表。
 对每个条款 code 输出且只输出一个 status：
 - pass：材料/事实初步支持符合；
-- concern：存在疑点、信息不足或需要人工核对；
-- unknown：无法判断。
-禁止输出 fail。禁止编造原文、材料或页码；目录、模板、投标人自述不能当作证明材料。
-若 input_complete=false（输入为节选），任何“材料缺失”结论只能给 unknown 或 concern，不得给 pass。
-签章、盖章、签字、照片、现场密封、递交时间、平台记录等需要原件/视觉/外部记录的事项，一律给 unknown。
-严格输出 JSON：{"items":[{"code":"条款code","status":"pass|concern|unknown","reason":"简短理由"}]}
-每个待审条款都必须出现一次；没有把握就写 unknown。"""
+- concern：存在疑点、信息不足、材料缺失、无法读取或需要人工核对；
+- reject：材料中存在明确反面事实、可逐字引用原文证明不符合（如资质等级低于要求、承诺明确不满足条款原文）。
+否决必须极度克制、宁存疑不错杀：只有反面事实清晰无歧义、且能给出逐字反面原文时才可 reject；
+材料缺失、抽取不到、扫描件不可读、仅有推断或无法确定，一律 concern，绝不 reject。
+reject 必须附 evidence 数组：反面原文逐字摘录（≥10 字，不得改写、不得编造、不得省略号截断关键断言），
+每条含 quote、document_id、page_no（照抄输入 pages 中的值）；引文必须能在输入页面文本中逐字找到。
+禁止编造原文、材料或页码；目录、模板、投标人自述不能当作证明材料。
+若 input_complete=false（输入为节选），任何“材料缺失”结论只能给 concern，不得给 pass；
+但已有逐字反面原文的 reject 不受此限（引文本身即证明）。
+签章、盖章、签字、照片、现场密封、递交时间、平台记录等需要原件/视觉/外部记录的事项，一律给 concern。
+严格输出 JSON：{"items":[{"code":"条款code","status":"pass|concern|reject","reason":"简短理由",
+"evidence":[{"quote":"逐字原文","document_id":1,"page_no":3}]}]}
+每个待审条款都必须出现一次；没有把握就写 concern。"""
+
+
+class _QuickEvidence(BaseModel):
+    model_config = ConfigDict(extra="ignore", str_strip_whitespace=True)
+
+    quote: str = ""
+    document_id: int = 0
+    page_no: int = 0
 
 
 class _QuickItem(BaseModel):
@@ -44,6 +68,7 @@ class _QuickItem(BaseModel):
     code: str = ""
     status: str = ""
     reason: str = ""
+    evidence: list[_QuickEvidence] = []
 
 
 class _QuickReview(BaseModel):
@@ -54,12 +79,14 @@ class _QuickReview(BaseModel):
 
 @dataclass
 class LightResult:
-    status: str                    # pass|fail|concern|not_deeply_reviewed
+    status: str                    # pass|fail|concern（三态；not_deeply_reviewed 仅历史数据）
     reason: str
     deterministic: str = "unknown"  # pass|fail|concern|unknown
-    quick: str = "skipped"          # pass|concern|unknown|skipped|failed
+    quick: str = "skipped"          # pass|concern|reject|unknown|skipped|failed
     quick_state: str = "skipped"    # completed|skipped|failed
     input_complete: bool = True
+    reject_source: str = ""         # ""|deterministic|llm
+    evidence_items: list = field(default_factory=list)  # llm 否决的已逐字核验反面引文
 
 
 _DETERMINISTIC_CHECKS = ("document_present", "contains_phrase", "value_in_range",
@@ -162,6 +189,50 @@ def _build_pages_digest(criteria: list[dict], pages: list[dict], budget: int) ->
     return digest, complete
 
 
+def _verified_counter_quotes(evidence, pages: list[dict]) -> list[dict]:
+    """LLM reject 反面引文的本地逐字核验闸门。
+
+    不信任 LLM 给的页码（只作 hint）：引文必须在送审页文本中逐字命中
+    （归一化空白后子串），命中处的 document_id/page_no 才是落库位置；
+    找不到即视为编造/改写，整条作废。返回 ≤MAX_REJECT_QUOTES 条
+    ``{quote, document_id, page_no}``。
+    """
+    from app.parsing.normalize import normalize_no_ws
+
+    page_index = [
+        (int(p.get("document_id") or 0), int(p.get("page_no") or 0),
+         normalize_no_ws(str(p.get("text") or "")))
+        for p in pages
+    ]
+    verified: list[dict] = []
+    seen: set[str] = set()
+    for ev in evidence or []:
+        if len(verified) >= MAX_REJECT_QUOTES:
+            break
+        quote = str((ev or {}).get("quote") or "").strip()
+        if len(quote) < 8:
+            continue
+        needle = normalize_no_ws(quote)
+        if not needle or needle in seen:
+            continue
+        claimed = (int((ev or {}).get("document_id") or 0), int((ev or {}).get("page_no") or 0))
+        hit = None
+        for doc, page, text in page_index:
+            if needle in text and (doc, page) == claimed:
+                hit = (doc, page)
+                break
+        if hit is None:
+            for doc, page, text in page_index:
+                if needle in text:
+                    hit = (doc, page)
+                    break
+        if hit is None:
+            continue
+        seen.add(needle)
+        verified.append({"quote": quote, "document_id": hit[0], "page_no": hit[1]})
+    return verified
+
+
 def _call_quick_review(gateway, payload: dict, data_class: str) -> _QuickReview | None:
     from app.llm.request_sizing import ReviewContextExceeded, assert_request_fits
 
@@ -209,7 +280,7 @@ def review_bidder_qualification(criteria: list[dict], pages: list[dict], data_cl
         visual = _is_visual_requirement(criterion)
         external = is_external_requirement(criterion)
         results[code] = LightResult(
-            status="not_deeply_reviewed",
+            status="concern",
             reason="",
             deterministic=det,
             quick="skipped",
@@ -217,12 +288,11 @@ def review_bidder_qualification(criteria: list[dict], pages: list[dict], data_cl
         )
         if det == "unknown" and not visual and not external:
             pending.append(criterion)
-        # Visual/external clauses never receive an LLM "pass" here; they remain advisory.
         results[code].reason = ("确定性预检：" + (primitive.message if primitive else "预检异常"))[:500]
 
     quick_state = "skipped"
     input_complete = True
-    quick_map: dict[str, tuple[str, str]] = {}
+    quick_map: dict[str, tuple[str, str, list]] = {}
     if pending and gateway is not None:
         budget = config.qualification_quick_chars()
         digest, input_complete = _build_pages_digest(pending, pages, budget)
@@ -244,13 +314,24 @@ def review_bidder_qualification(criteria: list[dict], pages: list[dict], data_cl
             quick_state = "completed" if review is not None else "skipped"
         if review is not None:
             for item in review.items:
-                status = item.status if item.status in ("pass", "concern", "unknown") else "unknown"
-                quick_map[str(item.code or "")] = (status, item.reason or "")
+                raw = str(item.status or "").strip().lower()
+                if raw == "pass":
+                    status = "pass"
+                elif raw == "reject":
+                    status = "reject"
+                else:
+                    # unknown / 乱码 / 旧词一律安全侧存疑（绝不放行成 pass 或 reject）
+                    status = "concern"
+                evidence = [
+                    {"quote": e.quote, "document_id": e.document_id, "page_no": e.page_no}
+                    for e in (item.evidence or [])
+                ]
+                quick_map[str(item.code or "")] = (status, item.reason or "", evidence)
 
     for criterion in criteria:
         code = str(criterion.get("code") or "")
         result = results[code]
-        quick_status, quick_reason = quick_map.get(code, ("unknown", ""))
+        quick_status, quick_reason, quick_evidence = quick_map.get(code, ("", "", []))
         result.quick_state = quick_state
         result.input_complete = input_complete
         if quick_state == "failed":
@@ -263,40 +344,54 @@ def review_bidder_qualification(criteria: list[dict], pages: list[dict], data_cl
         visual = _is_visual_requirement(criterion)
         external = is_external_requirement(criterion)
         if result.deterministic == "fail":
+            # 确定性硬性不符 → 建议否决（仅报告，不阻断计分/排名）
             result.status = "fail"
-            result.reason = "确定性预检不符合（仅报告，不阻断计分/排名）：" + result.reason
+            result.reject_source = "deterministic"
+            result.reason = "确定性预检不符合（建议否决，仅报告，不阻断计分/排名）：" + result.reason
         elif result.deterministic == "concern":
             result.status = "concern"
             result.reason = "确定性预检存在冲突，建议人工核对：" + result.reason
         elif visual or external:
-            result.status = "not_deeply_reviewed"
-            result.reason = ("未深评（需原件/视觉/外部记录）：" + result.reason)[:500]
+            # 需要原件/视觉/外部记录的事项 AI 不下结论 → 存疑（不是“未深评”）
+            result.status = "concern"
+            result.reason = ("存疑（需人工核对原件/视觉/外部记录）：" + result.reason)[:500]
         elif result.deterministic == "pass":
-            if quick_status == "concern":
-                result.status = "concern"
-                result.reason = "预检通过但快审存疑：" + quick_reason[:400]
+            result.status = "pass"
+            result.reason = "确定性预检通过（轻量预检，未做完整资格审查）"
+        elif quick_status == "reject":
+            verified = _verified_counter_quotes(quick_evidence, pages)
+            if verified:
+                result.status = "fail"
+                result.reject_source = "llm"
+                result.evidence_items = verified
+                result.reason = ("快审发现明确反面事实（建议否决，仅报告，不阻断计分/排名）："
+                                 + quick_reason[:400])
             else:
-                result.status = "pass"
-                result.reason = "确定性预检通过（轻量预检，未做完整资格审查）"
+                # 反面引文缺失/无法逐字核验（可能编造）→ 降级存疑，绝不放行成否决
+                result.status = "concern"
+                result.reason = "快审拟判不符合但反面引文未能逐字核验，降级存疑：" + quick_reason[:400]
         elif quick_status == "pass":
             if input_complete:
                 result.status = "pass"
                 result.reason = "轻量快审通过（仅基于已解析材料，不构成完整审查）：" + quick_reason[:400]
             else:
                 result.status = "concern"
-                result.reason = "仅节选材料快审通过，未深评：" + quick_reason[:400]
+                result.reason = "仅节选材料快审通过，存疑待人工核对：" + quick_reason[:400]
         elif quick_status == "concern":
             result.status = "concern"
             result.reason = "轻量快审存疑：" + quick_reason[:400]
         else:
-            result.status = "not_deeply_reviewed"
+            # 兜底：快审失败/未给出结论/未覆盖 → 一律存疑，不再产生“未深评”
+            result.status = "concern"
             if quick_state == "failed":
                 detail = "快审调用失败"
+            elif quick_state == "skipped":
+                detail = "快审未执行"
             elif not input_complete:
                 detail = "材料为节选"
             else:
                 detail = "快审未给出结论"
-            result.reason = f"未深评（{detail}）：" + result.reason
+            result.reason = f"存疑（{detail}）：" + result.reason
 
     return results
 
@@ -311,4 +406,6 @@ def cell_payload(result: LightResult) -> dict:
         "quick_state": result.quick_state,
         "input_complete": result.input_complete,
         "method": "deterministic+quick",
+        "reject_source": result.reject_source or None,
+        "reject_quotes": result.evidence_items,
     }

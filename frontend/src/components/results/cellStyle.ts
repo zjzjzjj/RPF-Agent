@@ -4,14 +4,15 @@ import type { MatrixCell } from "../../types";
 export function cellStyle(cell: MatrixCell | undefined, managed = false): { bg: string; label: string; tip: string } {
   if (!cell) return { bg: "#f0f0f0", label: "—", tip: "未评分" };
   if (managed && cell.auto_review_basis === "lightweight") {
-    const tip = "资格轻量预检 + 每家一次快审，不构成完整资格审查；不阻断计分、排名与价格基准价";
+    const tip =
+      "资格轻量预检 + 每家一次快审，不构成完整资格审查；建议否决仅作报告提示，不阻断计分、排名与价格基准价";
     if (cell.machine_status === "fail")
-      return { bg: "#fff1f0", label: "预检不符合", tip };
+      return { bg: "#fff1f0", label: "建议否决", tip };
     if (cell.machine_status === "concern")
-      return { bg: "#fff7e6", label: "预检存疑", tip };
+      return { bg: "#fff7e6", label: "存疑", tip };
     if (cell.machine_status === "not_deeply_reviewed")
       return { bg: "#fafafa", label: "未深评", tip };
-    return { bg: "#f6ffed", label: "预检通过", tip };
+    return { bg: "#f6ffed", label: "通过", tip };
   }
   if (managed && cell.auto_review_basis === "fallback") {
     if (cell.score_type === "match" || cell.machine_status === "not_deeply_reviewed")

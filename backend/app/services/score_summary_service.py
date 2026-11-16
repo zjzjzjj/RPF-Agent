@@ -92,9 +92,31 @@ MACHINE_VERDICT_LABELS = {
 }
 
 LIGHTWEIGHT_VERDICT_LABELS = {
-    "pass": "预检通过", "fail": "预检不符合",
-    "concern": "预检存疑（未深评）", "not_deeply_reviewed": "未深评",
+    "pass": "通过", "fail": "建议否决", "concern": "存疑",
+    "not_deeply_reviewed": "未深评",  # legacy：仅历史 v1 行显示
 }
+
+# 每家资格建议（纯投影，2026-11-16 三态化）：任一否决→建议否决；有存疑无否决→存疑；
+# 全过→通过；无轻量资格判定条目（full 模式/未评）→ None。
+QUALIFICATION_SUGGESTION_LABELS = {"pass": "通过", "concern": "存疑", "reject": "建议否决"}
+
+
+def derive_qualification_suggestion(items: list[dict]) -> dict | None:
+    """每家资格建议（纯投影）。仅对轻量运行（存在 lightweight 格）产出。
+
+    范围=该家**全部** veto/match 条目：深评残留、故障兜底（basis=fallback）、
+    execution_failed 与未评格绝不能被过滤掉——否则个别格故障/未评时会误报
+    "通过"（2026-11-16 复核实证）。任一 fail/recommend_reject→建议否决；
+    其余任一非 pass（含 None/未评）→存疑；全 pass→通过。
+    """
+    verdict_items = [i for i in items if i.get("score_type") in ("veto", "match")]
+    if not any(i.get("lightweight") for i in verdict_items):
+        return None  # full 模式不出轻量建议
+    if any(i.get("machine_status") in ("fail", "recommend_reject") for i in verdict_items):
+        return {"code": "reject", "label": QUALIFICATION_SUGGESTION_LABELS["reject"]}
+    if any(i.get("machine_status") != "pass" for i in verdict_items):
+        return {"code": "concern", "label": QUALIFICATION_SUGGESTION_LABELS["concern"]}
+    return {"code": "pass", "label": QUALIFICATION_SUGGESTION_LABELS["pass"]}
 
 REASON_LIMIT_DEFAULT = 1200
 QUOTE_MAX_CHARS = 300
@@ -357,6 +379,7 @@ def _build_item(
         "scoring_method": (SCORE_TYPE_LABELS.get(score_type or "", score_type or "—")
                            + ("（轻量）" if lightweight else "")),
         "is_veto": is_veto,
+        "lightweight": lightweight,
         "bucket": BUCKET_BY_CATEGORY.get(crit.category, "qualification_compliance"),
         "state": state,
         "max_score": _s(max_dec),
@@ -583,6 +606,7 @@ def build_score_summary(
                     "veto_flag": False,
                     "tie_break_level": None,
                     "tie_explanations": [],
+                    "qualification_suggestion": None,
                     "summary": None,
                     "buckets": [],
                 }
@@ -619,10 +643,14 @@ def build_score_summary(
             verdicts = None
             if bdef["kind"] == "verdict":
                 verdicts = {"pass": 0, "recommend_reject": 0, "need_human": 0, "fail": 0,
-                            "unverifiable": 0, "execution_failed": 0}
+                            "concern": 0, "unverifiable": 0, "execution_failed": 0}
                 for i in items:
                     ms = i["machine_status"] or "need_human"
-                    if ms in verdicts:
+                    if i.get("lightweight"):
+                        # 轻量三态计桶：通过/建议否决/存疑（legacy not_deeply_reviewed 归存疑桶）
+                        verdicts[ms if ms in ("pass", "fail") else "concern"] += 1
+                    elif ms in ("pass", "fail", "recommend_reject", "need_human",
+                                "unverifiable", "execution_failed"):
                         verdicts[ms] += 1
                     elif i["state"] != "not_run":
                         verdicts["need_human"] += 1
@@ -707,6 +735,9 @@ def build_score_summary(
                 "veto_flag": bool(rank_row.get("veto_flag")) if rank_row else False,
                 "tie_break_level": rank_row.get("tie_break_level") if rank_row else None,
                 "tie_explanations": list(rank_row.get("tie_explanations") or []) if rank_row else [],
+                "qualification_suggestion": derive_qualification_suggestion(
+                    [i for b in buckets_out for i in b["items"]]
+                ),
                 "summary": summary,
                 "buckets": buckets_out,
             }

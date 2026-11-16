@@ -364,6 +364,19 @@ export interface AutoReviewMetadata {
     sha256?: string | null;
     image_sha256?: string | null;
   }[];
+  /** basis === "lightweight" 时的资格轻量预检负载（qualification_light.cell_payload） */
+  lightweight?: {
+    status?: string;
+    reason?: string;
+    deterministic?: string | null;
+    quick?: string | null;
+    quick_state?: string | null;
+    input_complete?: boolean;
+    method?: string;
+    reject_source?: string | null;
+    /** 快审带逐字核验的反面引文（仅 fail 且 reject_source === "llm" 时非空） */
+    reject_quotes?: { quote: string; document_id: number; page_no: number }[];
+  } | null;
 }
 
 export interface Citation {
@@ -568,6 +581,8 @@ export interface SummaryItem {
   committee: CommitteeMember[];
   sub_scores: SummarySubScore[];
   artifacts_check: SummaryArtifact[];
+  /** 资格轻量预检条目（lightweight 运行）；legacy 四态运行无此字段 */
+  lightweight?: boolean;
   evidence: {
     status: string;
     verified_count: number;
@@ -609,6 +624,8 @@ export interface BidderSummary {
   bidder_status_is_run_snapshot: boolean;
   rank: number | null;
   veto_flag: boolean;
+  /** 每家资格建议汇总（lightweight 运行；full 模式为 null）：任一资格格 fail→reject，有非 pass→concern，全 pass→pass */
+  qualification_suggestion?: { code: "pass" | "concern" | "reject"; label: string } | null;
   tie_break_level: number | null;
   tie_explanations: string[];
   summary: {
@@ -778,6 +795,8 @@ export const REVIEW_STATUS_LABELS: Record<string, string> = {
 export const MACHINE_STATUS_LABELS: Record<string, string> = {
   pass: "通过",
   fail: "不通过",
+  concern: "存疑",
+  not_deeply_reviewed: "未深评",
   recommend_reject: "建议否决",
   need_human: "待人工",
   conflict_flagged: "冲突",

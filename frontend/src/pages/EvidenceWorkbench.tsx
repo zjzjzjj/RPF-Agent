@@ -84,6 +84,28 @@ export default function EvidenceWorkbench() {
   const isMatch = score.score_type === "match";
   const isSubjective = score.score_type === "subjective";
   const verdictSource = verdictSourceFromWarnings(score.warnings_json);
+  // 轻量预检三态（pass/fail/concern + legacy not_deeply_reviewed）：
+  // 旧逻辑把 auto_confirmed 的 concern 显示成"符合"，这里按 basis 分流修正。
+  const isLightweight = score.auto_review?.basis === "lightweight";
+  const managedMessage = score.machine_status === "execution_failed"
+    ? "自动评审遇到技术故障，已保留进度"
+    : isLightweight
+      ? score.machine_status === "pass"
+        ? "预检通过（轻量预检）"
+        : score.machine_status === "fail"
+          ? "建议否决（轻量预检，仅报告，投标人继续参与计分和排名）"
+          : score.machine_status === "not_deeply_reviewed"
+            ? "未深评（v1 旧数据，未做完整资格审查）"
+            : "存疑（轻量预检，待人工核对原件）"
+      : isVeto || isMatch
+        ? score.machine_status === "unverifiable"
+          ? "现有材料无法证实（已评审的外部事实风险结论）"
+          : score.machine_status === "fail"
+            ? "不符合，投标人继续参与计分和排名"
+            : score.review_status === "auto_confirmed"
+              ? "符合"
+              : "待自动完成"
+        : `最终得分：${score.final_score ?? "尚未完成"}${score.final_score == null ? "" : ` / ${score.max_score ?? "—"}`}`;
 
   return (
     <div>
@@ -156,7 +178,7 @@ export default function EvidenceWorkbench() {
                 <Alert
                   type={score.machine_status === "execution_failed" ? "error" : "info"}
                   showIcon
-                  message={score.machine_status === "execution_failed" ? "自动评审遇到技术故障，已保留进度" : isVeto || isMatch ? score.machine_status === "unverifiable" ? "现有材料无法证实（已评审的外部事实风险结论）" : score.machine_status === "fail" ? "不符合，投标人继续参与计分和排名" : score.review_status === "auto_confirmed" ? "符合" : "待自动完成" : `最终得分：${score.final_score ?? "尚未完成"}${score.final_score == null ? "" : ` / ${score.max_score ?? "—"}`}`}
+                  message={managedMessage}
                   description={score.ai_reasoning}
                 />
                 {score.warnings_json?.map((w, i) => (w.message || w.formula_explanation) ? (

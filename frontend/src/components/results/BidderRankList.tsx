@@ -109,6 +109,19 @@ export default function BidderRankList({ bidders, selectedId, onSelect, managed 
                 <Tag color={b.veto_flag ? "red" : "green"}>
                   {managed ? b.veto_flag ? "存在不符合项" : "评审结果" : b.veto_flag ? "存在否决建议" : "无否决建议"}
                 </Tag>
+                {b.qualification_suggestion && (
+                  <Tag
+                    color={
+                      b.qualification_suggestion.code === "reject"
+                        ? "red"
+                        : b.qualification_suggestion.code === "concern"
+                          ? "orange"
+                          : "green"
+                    }
+                  >
+                    资格建议：{b.qualification_suggestion.label}
+                  </Tag>
+                )}
                 {(b.summary?.missing_count ?? 0) > 0 && (
                   <Tooltip title={`${managed ? "以下项目尚未自动完成" : "未定分项不计入总分"}：${(b.summary?.missing_criteria ?? []).join("、")}`}>
                     <Tag color="orange">{b.summary?.missing_count} 项{managed ? "待自动完成" : "未定分"}</Tag>

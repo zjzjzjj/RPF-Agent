@@ -47,7 +47,7 @@ PDF 会检查实际嵌入图像，文字层较长也不能跳过扫描图核验�
 
 ## 资格轻量化与全量出分（2026-11-10）
 
-**资格只报告，不阻断**（[决策记录 0011](docs/decisions/0011-qualification-light.md)）：新运行默认 `qualification_mode=light`——每家投标人一次确定性预检 + 一次合并 LLM 快审（不 OCR、不逐条款深评），结论为"符合 / 不符合 / 现有材料无法证实 / 未深度复核"，**只写进报告，不参与计分、排名与价格基准价**；未知一律记"未深度复核"，不伪造通过。旧运行保留 full 模式；`BID_EVAL_QUALIFICATION_MODE_DEFAULT=full` 可切回。
+**资格只报告，不阻断**（[决策记录 0011](docs/decisions/0011-qualification-light.md) + [0013 三态化](docs/decisions/0013-qualification-tristate.md)）：新运行默认 `qualification_mode=light`——每家投标人一次确定性预检 + 一次合并 LLM 快审（不 OCR、不逐条款深评），每条给出**通过 / 建议否决 / 存疑**三态结论并按项汇总每家资格建议，**只写进报告，不参与计分、排名与价格基准价**。建议否决仅来自确定性硬性不符或附逐字反面引文的快审结论；材料缺失/不可读一律存疑，绝不因此否决。旧运行保留 full 模式；`BID_EVAL_QUALIFICATION_MODE_DEFAULT=full` 可切回。
 
 **每个评分格都必须落终态**（[决策记录 0012](docs/decisions/0012-always-score-deterministic-objective.md)）：
 
@@ -98,7 +98,7 @@ PDF 会检查实际嵌入图像，文字层较长也不能跳过扫描图核验�
 |---|---|---|
 | count | 计数分（最先执行） | 确定性快路径在 OCR/LLM 前出分（material_inventory + objective_fastpath）；未覆盖格再走 AI 逐件核验；故障按闭合写显式暂定分 |
 | subjective | 主观分 | 默认直评：选页后单轮 AI 出分，缺引文/子项不挡；`BID_EVAL_SUBJECTIVE_DIRECT=0` 回退分层证据簇 + 引文闸门路径 |
-| veto / match | 资格与符合性（收尾执行） | 默认轻量快审、只报告不阻断（见「资格轻量化」节）；全量模式 AI 输出“符合 / 不符合 / 现有材料无法证实”，投标人继续参与评分和排名 |
+| veto / match | 资格与符合性（收尾执行） | 默认轻量快审三态结论（通过 / 建议否决 / 存疑）+ 每家资格建议，只报告不阻断（见「资格轻量化」节）；全量模式 AI 输出“符合 / 不符合 / 现有材料无法证实”，投标人继续参与评分和排名 |
 | price | 价格分（最后执行） | 报价缺失或冲突先自动补抽；全部计分格完成后由纯 Decimal 引擎执行门槛、基准价与冻结公式；无法形成基准价时暂定出分 |
 
 ```

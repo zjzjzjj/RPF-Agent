@@ -36,7 +36,7 @@
     <th>最终得分</th><th>名次</th></tr>
   {% for r in summary_rows | sort(attribute="rank") %}
   <tr>
-    <td class="left">{{ r.bidder }}{% if run.automation %}{% if r.has_noncompliance %} <span class="veto">〔存在不符合结论〕</span>{% endif %}{% if r.has_external_boundary %} <span class="note">〔外部事实无法证实〕</span>{% endif %}{% elif r.veto_flag %} <span class="veto">〔有否决建议〕</span>{% endif %}</td>
+    <td class="left">{{ r.bidder }}{% if run.automation %}{% if r.has_noncompliance %} <span class="veto">〔存在不符合结论〕</span>{% endif %}{% if r.has_external_boundary %} <span class="note">〔外部事实无法证实〕</span>{% endif %}{% if r.qualification_suggestion %} <span class="{% if r.qualification_suggestion.code == 'reject' %}veto{% else %}note{% endif %}">〔资格建议：{{ r.qualification_suggestion.label }}〕</span>{% endif %}{% elif r.veto_flag %} <span class="veto">〔有否决建议〕</span>{% endif %}</td>
     <td>{{ r.bid_price or "-" }}</td><td>{{ r.price_no_tax or "-" }}</td>
     {% for j in r.judge_totals %}<td>{{ j.total }}{% if j.missing %}*</td>{% else %}</td>{% endif %}{% endfor %}
     <td><strong>{{ r.final or "-" }}</strong>{% if r.incomplete and r.provisional_total %} <span class="note">（不完整；含暂定 {{ r.provisional_total }}）</span>{% endif %}</td><td>{{ r.rank or "-" }}</td>
@@ -77,6 +77,7 @@
 {% else %}<p>暂无可排序的评分结果。</p>{% endif %}
 
 <h2>附表 A1 资格性审查表</h2>
+{% if qualification_mode == "light" %}<p class="note">本表为轻量预检三态结论（通过/建议否决/存疑），仅作报告提示，不阻断计分、排名与价格基准价；按项汇总的每家资格建议见汇总表〔资格建议〕标注。</p>{% endif %}
 {% for row in qualification_table.rows %}
 <h3>{{ row.code }} {{ row.name }}</h3>
 {% if row.factor %}<p class="factor">评审因素（招标文件原文）：{{ row.factor[:400] }}</p>{% endif %}
@@ -86,6 +87,7 @@
 {% endfor %}
 
 <h2>附表 A2 符合性审查表</h2>
+{% if qualification_mode == "light" %}<p class="note">本表为轻量预检三态结论（通过/建议否决/存疑），仅作报告提示，不阻断计分、排名与价格基准价。</p>{% endif %}
 {% for row in compliance_table.rows %}
 <h3>{{ row.code }} {{ row.name }}</h3>
 {% if row.factor %}<p class="factor">评审因素（招标文件原文）：{{ row.factor[:400] }}</p>{% endif %}

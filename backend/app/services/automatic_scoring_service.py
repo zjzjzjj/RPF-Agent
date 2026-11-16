@@ -834,6 +834,32 @@ def _write_closure_fallback(s, row: ScoreRecord, criterion: dict, error: BaseExc
     ))
 
 
+def _persist_light_reject_citations(run_id: int, bidder_id: int, criterion: dict, outcome) -> None:
+    """qualification-light 的 LLM 否决逐字反面引文落库（role 按 score_type，与 deep 路径同构）。
+
+    引文已在引擎侧逐字核验（_verified_counter_quotes），此处只负责落库与
+    evidence_status 回写；确定性否决（reject_source=deterministic）不产引文。"""
+    payload = (outcome.raw or {}).get("qualification_light") or {}
+    if payload.get("reject_source") != "llm" or not payload.get("reject_quotes"):
+        return
+    from app.evidence.verdict_citations import persist_verdict_citations
+
+    with session_scope() as s:
+        row = s.execute(select(ScoreRecord).where(
+            ScoreRecord.run_id == run_id, ScoreRecord.bidder_id == bidder_id,
+            ScoreRecord.criterion_id == criterion["id"],
+        )).scalar_one_or_none()
+        if row is None:
+            return
+        s.expunge(row)
+    persist_verdict_citations(
+        row, {"evidence_items": payload["reject_quotes"]},
+        main_doc_id=None,
+        role="veto" if criterion["score_type"] == "veto" else "match",
+        stats=None,
+    )
+
+
 def _persist_cell(run_id: int, bidder_id: int, criterion: dict, outcome: CellOutcome | None,
                   error: BaseException | None = None) -> None:
     from app.evidence.verifier import verify_automatic_citation
@@ -945,6 +971,9 @@ def _persist_cell(run_id: int, bidder_id: int, criterion: dict, outcome: CellOut
                                 "score": str(outcome.score) if outcome.score is not None else None,
                                 "auto_review": metadata},
             ))
+    # 轻量三态的 LLM 否决反面引文落库：主写事务之外（SQLite WAL 单写者，避免嵌套写连接）
+    if error is None and outcome is not None and outcome.basis == "lightweight":
+        _persist_light_reject_citations(run_id, bidder_id, criterion, outcome)
 
 
 def _resolve_prices(run_id: int, manifest: dict, pages_by_bidder: dict, gateway_factory) -> dict[int, Decimal]:
@@ -1385,12 +1414,13 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
         from app.engine.qualification_light import LightResult, cell_payload
 
         if result is None:
-            result = LightResult(status="not_deeply_reviewed", reason="轻量预检未覆盖该条款")
+            result = LightResult(status="concern", reason="轻量预检未覆盖该条款，存疑待人工核对")
         payload = cell_payload(result)
+        verdict_source = "llm" if payload["quick"] in ("pass", "concern", "reject") else "machine"
         return CellOutcome(
             payload["status"], payload["reason"], None, [], pages,
             "lightweight", 1, {"qualification_light": payload},
-            [{"message": payload["reason"], "verdict_source": "lightweight"}],
+            [{"message": payload["reason"], "verdict_source": verdict_source}],
         )
 
     def merge_prepared_pages(bid_id, updated_pages):
@@ -1523,9 +1553,12 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
                             cached = review_bidder_qualification(
                                 light_criteria_by_bidder.get(bid_id, []), pages, data_class, gateway_obj)
                         except Exception as exc:  # noqa: BLE001
-                            cached = {str(criterion.get("code") or ""): LightResult(
-                                status="not_deeply_reviewed",
-                                reason=f"轻量预检异常（{type(exc).__name__}），未深评")}
+                            cached = {
+                                str(c.get("code") or ""): LightResult(
+                                    status="concern",
+                                    reason=f"轻量预检异常（{type(exc).__name__}），存疑待人工核对")
+                                for c in light_criteria_by_bidder.get(bid_id, [])
+                            }
                         light_reviews[bid_id] = cached
                 return light_cell_outcome(criterion, cached.get(str(criterion.get("code") or "")), pages)
             if executor_version == 1 and is_external_requirement(criterion):

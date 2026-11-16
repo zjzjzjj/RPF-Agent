@@ -31,7 +31,7 @@ from app.services.automation_service import (
     public_auto_review,
 )
 from app.services.ranking_service import compute_ranking
-from app.services.score_summary_service import SCORE_TYPE_LABELS
+from app.services.score_summary_service import SCORE_TYPE_LABELS, derive_qualification_suggestion
 
 TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "report" / "templates"
 
@@ -55,19 +55,26 @@ REVIEW_LABELS = {
 
 SETTLED_STATUSES = ("human_confirmed", "human_overridden", "auto_confirmed")
 
-AUTOMATIC_REVIEW_METHOD = (
+_METHOD_HEAD = (
     "AI 按冻结细则核验资格与符合性事实，并按评分细则评定主观分值；"
     "未解决项按需执行定向检索、补充 OCR、视觉核验与 AI 复评，"
     "计数、客观分和价格分由程序按冻结规则确定性重算。"
+)
+_METHOD_QUAL_DEEP = (
     "资格与符合性给出“符合”“不符合”或仅针对缺失外部事实的“现有材料无法证实”最终结论；"
     "不符合的投标人仍参与评分和排名。"
-    "文件读取与模型故障不得替代材料缺失结论或生成兜底分。"
 )
+_METHOD_TAIL = "文件读取与模型故障不得替代材料缺失结论或生成兜底分。"
+
+AUTOMATIC_REVIEW_METHOD = _METHOD_HEAD + _METHOD_QUAL_DEEP + _METHOD_TAIL
 
 
 QUALIFICATION_LIGHT_METHOD = (
     "资格与符合性采用确定性预检与每家投标人一次轻量快审，"
-    "仅作报告提示，不构成完整资格审查，不阻断计分、排名与价格基准价。"
+    "每条给出通过/建议否决/存疑三态结论，并按项汇总每家资格建议；"
+    "建议否决仅来自确定性硬性不符或附逐字反面引文的快审结论，"
+    "材料缺失/不可读一律存疑。"
+    "结论仅作报告提示，不构成完整资格审查，不阻断计分、排名与价格基准价。"
 )
 
 
@@ -75,10 +82,10 @@ def _report_verdict(status: str | None, automated: bool, lightweight: bool = Fal
     if automated:
         if lightweight:
             return {
-                "pass": "预检通过", "fail": "预检不符合",
-                "concern": "预检存疑（未深评）", "not_deeply_reviewed": "未深评",
+                "pass": "通过", "fail": "建议否决",
+                "concern": "存疑", "not_deeply_reviewed": "未深评",  # legacy v1 行
                 "execution_failed": "评审执行失败",
-            }.get(status or "", "未深评")
+            }.get(status or "", "存疑")
         return {
             "pass": "符合", "fail": "不符合", "unverifiable": "现有材料无法证实",
             "execution_failed": "评审执行失败",
@@ -89,7 +96,7 @@ def _report_verdict(status: str | None, automated: bool, lightweight: bool = Fal
 def _report_method(score_type: str, automated: bool, lightweight: bool = False) -> str:
     if automated:
         if lightweight and score_type in ("veto", "match"):
-            return "确定性预检 + 单次轻量快审（不构成完整审查）"
+            return "确定性预检 + 单次轻量快审（三态结论，不构成完整审查）"
         return {
             "subjective": "AI 按细则评分",
             "count": "AI 核验事实，程序确定性计数",
@@ -941,12 +948,13 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
                 for crit in criteria if crit.score_type in ("veto", "match")
                 and (entry := score_by_key.get((bidder.id, crit.id))) is not None
             ),
-            "has_precheck_alert": automated and any(
-                _is_lightweight(entry[0])
-                and entry[0].machine_status in ("fail", "concern", "not_deeply_reviewed")
+            "qualification_suggestion": derive_qualification_suggestion([
+                {"score_type": crit.score_type,
+                 "lightweight": _is_lightweight(e[0]) if e is not None else False,
+                 "machine_status": e[0].machine_status if e is not None else None}
                 for crit in criteria if crit.score_type in ("veto", "match")
-                and (entry := score_by_key.get((bidder.id, crit.id))) is not None
-            ),
+                for e in [score_by_key.get((bidder.id, crit.id))]
+            ]),
             "status": bidder.status,
         })
 
@@ -1130,7 +1138,14 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
 
     return {
         "report_title": "评审报告（全自动评审）" if automated else "评审报告（AI 辅助评审）",
-        "method_note": AUTOMATIC_REVIEW_METHOD if automated else None,
+        "method_note": (
+            (_METHOD_HEAD + QUALIFICATION_LIGHT_METHOD + _METHOD_TAIL
+             if (run.config_json or {}).get("qualification_mode") == "light"
+             else AUTOMATIC_REVIEW_METHOD) if automated else None
+        ),
+        "qualification_mode": (
+            (run.config_json or {}).get("qualification_mode", "full") if automated else None
+        ),
         "score_table_title": "分项得分表（自动评审结果）" if automated else
                              "分项得分表（证据簇明细）" if cluster_mode else "分项得分表（AI 评委矩阵）",
         "final_score_label": "最终得分" if automated else "最终得分(去尾)",
@@ -1233,14 +1248,19 @@ def render_docx(report: dict) -> bytes:
         # P0-1：含故障兜底暂定格时标注不完整，并给含暂定合计双分值。
         if r.get("incomplete") and r.get("provisional_total"):
             final_cell += f"（不完整；含暂定 {r['provisional_total']}）"
+        marks = ""
+        if automated and r.get("has_noncompliance"):
+            marks += "（存在不符合结论）"
+        if automated and r.get("has_external_boundary"):
+            marks += "（外部事实无法证实）"
+        if automated and r.get("qualification_suggestion"):
+            marks += f"（资格建议：{r['qualification_suggestion']['label']}）"
+        if not automated and r["veto_flag"]:
+            marks += "（有否决建议）"
         rows.append(
             [r["bidder"], r["bid_price"] or "-", r["price_no_tax"] or "-"]
             + [j["total"] for j in r["judge_totals"]]
-            + [final_cell, str(r["rank"] or "-") + (
-                "（存在不符合结论）" if automated and r.get("has_noncompliance") else
-                "（外部事实无法证实）" if automated and r.get("has_external_boundary") else
-                "（有否决建议）" if not automated and r["veto_flag"] else ""
-            )]
+            + [final_cell, str(r["rank"] or "-") + marks]
         )
     table(headers, rows)
     if any(r.get("incomplete") for r in report["summary_rows"]):
@@ -1290,6 +1310,9 @@ def render_docx(report: dict) -> bytes:
          ("A2 符合性审查表", report["compliance_table"])], start=1
     ):
         heading(f"附表 {tname}", 1)
+        if report.get("qualification_mode") == "light":
+            para("本表为轻量预检三态结论（通过/建议否决/存疑），仅作报告提示，不阻断计分、排名与价格基准价；"
+                 "按项汇总的每家资格建议见汇总表标注。")
         for row in tab["rows"]:
             heading(f"{row['code']} {row['name']}", 3)
             if row["factor"]:

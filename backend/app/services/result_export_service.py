@@ -51,8 +51,8 @@ def export_results_csv(run_id: int) -> str:
         writer.writerow([])
         writer.writerow(["投标人", "条款编号", "评审条款", "满分", "有效得分", "业务结论", "执行结果", "理由或故障原因"])
         verdicts = {"pass": "符合", "fail": "不符合", "unverifiable": "现有材料无法证实"}
-        light_verdicts = {"pass": "预检通过", "fail": "预检不符合",
-                          "concern": "预检存疑（未深评）", "not_deeply_reviewed": "未深评"}
+        light_verdicts = {"pass": "通过", "fail": "建议否决",
+                          "concern": "存疑", "not_deeply_reviewed": "未深评"}
         for bidder in manifest["bidders"]:
             for criterion in manifest["criteria"]:
                 key = (int(bidder["id"]), int(criterion["id"]))

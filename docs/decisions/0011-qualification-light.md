@@ -1,7 +1,7 @@
 # 决策记录 0011：资格/符合性轻量审核
 
 - 日期：2026-11-10
-- 状态：已采纳
+- 状态：已采纳（2026-11-16 部分被决策 0013 修订：四态→三态，见文末）
 - 关联：决策 0007/0010、围串标留空
 
 ## 背景
@@ -30,3 +30,14 @@
 
 - `backend/tests/test_qualification_light.py`：每家一次调用、硬 fail 不被覆盖、快审失败不产 pass、视觉条款未深评、执行器不 OCR/不建 collection、`_valid_cell` 四状态、计分项拒绝 lightweight。
 - 全量回归（基线 1346 passed）与真实项目小样验证；报告中资格 fail/concern 不进入 `has_noncompliance`。
+
+## 2026-11-16 修订（决策 0013：三态化）
+
+用户反馈"未深评"大面积出现不可接受，本决策的第 2/3 条与"未知→not_deeply_reviewed"不变量被 **[决策 0013](0013-qualification-tristate.md)** 修订：
+
+- 状态收敛为 `pass/fail/concern` 三态必给（通过/建议否决/存疑），`not_deeply_reviewed` 不再产生（v1 旧数据显示保留）；
+- 快审 schema 改 `pass/concern/reject`：reject 必带逐字反面引文，本地核验不过降级存疑；引文落库（role 按 score_type）；
+- 视觉/外部事项、快审失败、节选未给结论一律 `concern`；
+- 每家汇总资格建议（纯投影 `derive_qualification_suggestion`）。
+
+本决策其余部分（轻量架构、每家一次快审、只报告不阻断、执行顺序、模式配置）不变。
