@@ -130,7 +130,11 @@ export default function TenderRules() {
         merge_target_id: isMerge ? rules!.id : null,
       });
     },
-    onSuccess: (r) => setJobId(r.job_id),
+    onSuccess: (r) => {
+      setJobId(r.job_id);
+      setMatchJobId(r.job_id);
+      setFlow("matching");
+    },
     onError: (e: Error) => message.error(e.message),
   });
 

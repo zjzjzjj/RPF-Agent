@@ -1,4 +1,4 @@
-import { Alert, Button, Card, Collapse, Empty, List, Space, Spin, Tag, Tooltip, Typography } from "antd";
+import { Alert, Button, Card, Collapse, Empty, List, Progress, Space, Spin, Tag, Tooltip, Typography } from "antd";
 import { ReloadOutlined, SyncOutlined } from "@ant-design/icons";
 import type { DocumentOut, JobOut, MergeRecord } from "../../types";
 
@@ -129,9 +129,19 @@ export default function AutoMatchBanner({
               </Tag>
             )}
             {flow === "matching" && (
-              <Tag color="purple">
-                <Spin size="small" /> 自动匹配规则中 {matchJob?.message ?? ""}
-              </Tag>
+              <Space size={6}>
+                <Tag color="purple">
+                  <Spin size="small" /> 自动匹配规则中 {matchJob?.message ?? ""}
+                </Tag>
+                {matchJob && matchJob.total_steps > 0 && (
+                  <Progress
+                    percent={Math.min(100, Math.round((matchJob.done_steps / matchJob.total_steps) * 100))}
+                    size="small"
+                    style={{ width: 160 }}
+                    status="active"
+                  />
+                )}
+              </Space>
             )}
             {flow === "idle" && matchJob?.status === "succeeded" && (
               <Tag color="green">自动匹配已完成</Tag>
