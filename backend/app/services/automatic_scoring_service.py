@@ -79,7 +79,16 @@ def _score_in_range(value: Any, criterion: dict) -> Decimal:
     return score.quantize(Decimal("0.01"))
 
 
-def _load_pages(bidder_id: int) -> tuple[list[dict], str]:
+def _load_pages(bidder_id: int) -> tuple[list[dict], str, list[dict]]:
+    """读取一家投标人的全部送审页面。
+
+    **逐文档降级**（2026-11-17 run 125 实证）：单个附件不可读（解析失败 / DOCX
+    嵌入图片无法映射页码 / 页数不完整）只把**该文档**记入 unreadable_docs，
+    其余可读文档照常送审——旧实现一家有一个坏附件就整家抬走，天兴（.xls
+    解析失败）、青云（.docx 嵌入图片）400 页主标书明明可读，技术/商务分却
+    全部被兜底清零。只有**全部**文档不可读时才抛错，且按读取故障（
+    reading_incomplete，未定分待补读）定性，不按材料缺失计 0。
+    """
     from app.services.automatic_document_service import annotate_page_readability
 
     with session_scope() as s:
@@ -88,10 +97,18 @@ def _load_pages(bidder_id: int) -> tuple[list[dict], str]:
         if not docs:
             raise LLMError("未找到投标文件，无法执行自动评审")
         pages: list[dict] = []
+        unreadable_docs: list[dict] = []
         data_class = "synthetic"
+
+        def _drop(doc, reason: str) -> None:
+            unreadable_docs.append({"document_id": doc.id,
+                                    "filename": doc.original_filename,
+                                    "reason": reason})
+
         for doc in docs:
             if doc.parse_status not in ("parsed", "degraded", "ocr_required"):
-                raise LLMError(f"投标文件 {doc.id} 尚未成功解析")
+                _drop(doc, f"文件 {doc.id} 尚未成功解析")
+                continue
             if doc.data_class == "confidential":
                 data_class = "confidential"
             elif doc.data_class == "redacted_sample" and data_class != "confidential":
@@ -99,9 +116,11 @@ def _load_pages(bidder_id: int) -> tuple[list[dict], str]:
             rows = s.execute(select(DocumentPage).where(DocumentPage.document_id == doc.id)
                              .order_by(DocumentPage.page_no)).scalars().all()
             if not rows:
-                raise LLMError(f"投标文件 {doc.id} 没有可评审页面")
+                _drop(doc, f"文件 {doc.id} 没有可评审页面")
+                continue
             if doc.page_count and len(rows) != doc.page_count:
-                raise LLMError(f"投标文件 {doc.id} 的解析页数不完整，不能判定材料缺失")
+                _drop(doc, f"文件 {doc.id} 的解析页数不完整")
+                continue
             unreadable_pages = set()
             for warning in doc.warnings_json or []:
                 text = str(warning)
@@ -127,8 +146,17 @@ def _load_pages(bidder_id: int) -> tuple[list[dict], str]:
                     "known_blank": known_blank, "unreadable": unreadable,
                     "requires_vision": unreadable,
                 })
-            pages.extend(annotate_page_readability(document_pages, doc.stored_path, doc.warnings_json))
-        return pages, data_class
+            try:
+                pages.extend(annotate_page_readability(document_pages, doc.stored_path, doc.warnings_json))
+            except LLMError as exc:
+                # DOCX 嵌入图像/图像可读性核验拒绝等：只降级该文档，不抬走整家
+                _drop(doc, str(exc)[:200])
+        if not pages:
+            detail = "；".join(f"{d['filename']}（{d['reason']}）" for d in unreadable_docs)
+            err = LLMError(f"全部投标文件均未能读取，无法执行自动评审：{detail}")
+            err.reading_incomplete = True
+            raise err
+        return pages, data_class, unreadable_docs
 
 
 def _page_text(pages: list[dict]) -> str:
@@ -1156,7 +1184,7 @@ def _price_stage(run_id: int, manifest: dict, criteria: list[dict], prices: dict
                 source = price_evidence.get(str(result.bidder_id)) or {}
                 evidence_warning = None
                 try:
-                    pages, _ = _load_pages(result.bidder_id)
+                    pages = _load_pages(result.bidder_id)[0]
                     for extra in source.get("supplemented_pages") or []:
                         for page in pages:
                             if (page["document_id"], page["page_no"]) == (extra["document_id"], extra["page_no"]):
@@ -1323,12 +1351,29 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
             return gateway
 
     pages_by_bidder: dict[int, tuple[list[dict], str]] = {}
+    unreadable_by_bidder: dict[int, list[dict]] = {}
     preparation_errors: dict[int, BaseException] = {}
     for bid_id in bidder_ids:
         try:
-            pages_by_bidder[bid_id] = _load_pages(bid_id)
+            pages, data_class, unreadable_docs = _load_pages(bid_id)
+            pages_by_bidder[bid_id] = pages, data_class
+            unreadable_by_bidder[bid_id] = unreadable_docs
         except Exception as exc:
             preparation_errors[bid_id] = exc
+
+    def reading_caveat_for(bid_id: int) -> str | None:
+        """存在不可读附件时的送审范围限制说明（注入评审提示词）。"""
+        docs = unreadable_by_bidder.get(bid_id) or []
+        if not docs:
+            return None
+        listed = "、".join(f"{d['filename']}（{d['reason']}）" for d in docs)
+        return (
+            f"该投标人存在未能读取的附件文档：{listed}。材料完整性判断受限："
+            "凡未能在送审页面定位到证据的条款，不得断定『未提供/不存在』——"
+            "confirmed_absent 一律为 false，reasoning 注明『未能读取的附件中可能存在该材料』；"
+            "资格/符合性条款不得因未能定位而否决，按存疑结项；主观分按较低档给分并注明存疑。"
+            "已定位到证据的条款照常评审，不受此限制影响。"
+        )
     inventory_by_bidder: dict[int, Any] = {}
     inventory_locks = {bid: threading.Lock() for bid in bidder_ids}
 
@@ -1366,6 +1411,10 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
                 [{"message": reason, "verdict_source": "deterministic"}],
             )
         if score_type == "match":
+            return None
+        if unreadable_by_bidder.get(bid_id):
+            # 存在不可读附件时材料完整性不可判定，确定性计 0 不安全：
+            # 放行到带「送审范围限制」的 LLM 评审路径，缺证按存疑不硬判。
             return None
         try:
             from app.engine.objective_fastpath import build_objective_plan, score_objective
@@ -1563,7 +1612,8 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
                 if loaded is None:
                     raise LLMError("投标文件页尚未加载")
                 pages, data_class = loaded
-                review_rule = {**criterion, "_frozen_bidder": frozen_bidders[bid_id]}
+                review_rule = {**criterion, "_frozen_bidder": frozen_bidders[bid_id],
+                               "_reading_caveat": reading_caveat_for(bid_id)}
                 outcome = _assess_cell(review_rule, pages, data_class, gateway_factory)
                 merge_prepared_pages(bid_id, outcome.pages)
                 return outcome
@@ -1607,7 +1657,8 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
                 pages, data_class = loaded
             else:
                 pages, data_class = prepare_bidder(bid_id)
-            review_rule = {**criterion, "_frozen_bidder": frozen_bidders[bid_id]}
+            review_rule = {**criterion, "_frozen_bidder": frozen_bidders[bid_id],
+                           "_reading_caveat": reading_caveat_for(bid_id)}
             if is_cross_bidder_requirement(criterion):
                 report("汇集全部所选投标人的关联材料进行横向核验")
                 pages = []

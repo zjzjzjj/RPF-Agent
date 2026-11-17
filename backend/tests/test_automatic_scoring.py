@@ -295,7 +295,7 @@ def test_continue_does_not_repeat_failed_assessment_or_full_ocr(managed_run, mon
     with session_scope() as s:
         manifest = s.get(EvaluationRun, managed_run["id"]).config_json["automation_manifest"]
     manifest["scoring_config"]["auto_review_rounds"] = 2
-    pages, classification = scoring._load_pages(managed_run["bidder"])
+    pages, classification, _ = scoring._load_pages(managed_run["bidder"])
     calls = []
 
     def fail(*args, **kwargs):
@@ -323,8 +323,8 @@ def test_document_ocr_is_shared_across_clauses_and_activity_preserves_real_count
     from app.jobs.queue import JobContext
     from app.services.review_activity import report
 
-    pages, classification = scoring._load_pages(managed_run["bidder"])
-    monkeypatch.setattr(scoring, "_load_pages", lambda bid: ([{**p, "unreadable": True} for p in pages], classification))
+    pages, classification, _ = scoring._load_pages(managed_run["bidder"])
+    monkeypatch.setattr(scoring, "_load_pages", lambda bid: ([{**p, "unreadable": True} for p in pages], classification, []))
     ocr_calls = []
 
     def supplement(criterion, original, **kwargs):
@@ -367,7 +367,7 @@ def test_invalid_completed_marker_can_be_repaired(managed_run):
                           machine_status="pass", review_status="auto_confirmed", final_score=Decimal("7"),
                           ai_raw_json={"auto_review": {"state": "completed", "basis": "evidence"}})
         s.add(row)
-    pages, _ = scoring._load_pages(managed_run["bidder"])
+    pages, _, _ = scoring._load_pages(managed_run["bidder"])
     outcome = scoring.CellOutcome("pass", "证据补齐后形成8分结论", Decimal("8"),
                                   [{"document_id": managed_run["document"], "page_no": 1,
                                     "quote": managed_run["text"], "kind": "text"}], pages, basis="evidence")
@@ -380,7 +380,7 @@ def test_invalid_completed_marker_can_be_repaired(managed_run):
 
 
 def test_bad_quote_rolls_back_score_and_completion_marker(managed_run):
-    pages, _ = scoring._load_pages(managed_run["bidder"])
+    pages, _, _ = scoring._load_pages(managed_run["bidder"])
     outcome = scoring.CellOutcome("pass", "模型生成了不存在的证据", Decimal("8"),
                                   [{"document_id": managed_run["document"], "page_no": 1,
                                     "quote": "这段很长的引文并不真实存在于本次投标原文中", "kind": "text"}], pages,
@@ -602,7 +602,7 @@ def test_price_reextraction_ignores_unconfirmed_heuristic_and_saves_sources(mana
         run = s.get(EvaluationRun, managed_run["id"])
         manifest = dict(run.config_json["automation_manifest"])
     manifest["bidders"] = [{"id": managed_run["bidder"], "bid_price": "50000", "price_status": "extracted"}]
-    pages, data_class = scoring._load_pages(managed_run["bidder"])
+    pages, data_class, _ = scoring._load_pages(managed_run["bidder"])
     calls = []
 
     def assessed(*args):
@@ -628,7 +628,7 @@ def test_scanned_heading_is_not_complete_coverage(managed_run):
         doc.warnings_json = ["第 1 页疑似扫描件，已超出 OCR 页数上限，跳过"]
         page = s.execute(select(DocumentPage)).scalar_one()
         page.text = "附件 证书 第1页"
-    pages, _ = scoring._load_pages(managed_run["bidder"])
+    pages, _, _ = scoring._load_pages(managed_run["bidder"])
     assert pages[0]["unreadable"] and pages[0]["requires_vision"]
 
 
@@ -638,7 +638,7 @@ def test_blank_separator_is_known_readable(managed_run):
         page.text = ""
         page.source = "skipped"
         page.has_text_layer = False
-    pages, _ = scoring._load_pages(managed_run["bidder"])
+    pages, _, _ = scoring._load_pages(managed_run["bidder"])
     assert pages[0]["known_blank"] and not pages[0]["unreadable"]
 
 
@@ -839,8 +839,8 @@ def test_preparation_never_retries_exhausted_ocr_or_budget(managed_run, monkeypa
     from app.parsing.pdf_runtime import OCRProcessingError
     from app.services import execution_version
 
-    pages, classification = scoring._load_pages(managed_run["bidder"])
-    monkeypatch.setattr(scoring, "_load_pages", lambda bid: ([{**p, "unreadable": True} for p in pages], classification))
+    pages, classification, _ = scoring._load_pages(managed_run["bidder"])
+    monkeypatch.setattr(scoring, "_load_pages", lambda bid: ([{**p, "unreadable": True} for p in pages], classification, []))
     original_config = execution_version.execution_config_value
     monkeypatch.setattr(execution_version, "execution_config_value",
         lambda name: 2 if name == "auto_review_rounds" else original_config(name))
@@ -926,7 +926,7 @@ def test_price_conflict_without_frozen_resolution_never_chooses_a_default(manage
         manifest = dict(s.get(EvaluationRun, managed_run["id"]).config_json["automation_manifest"])
     # ① conflict 冻结价：直接生效，不触发补抽
     manifest["bidders"] = [{"id": managed_run["bidder"], "bid_price": "100", "price_status": "conflict"}]
-    pages, data_class = scoring._load_pages(managed_run["bidder"])
+    pages, data_class, _ = scoring._load_pages(managed_run["bidder"])
     calls = []
 
     def assessed(*args, **kwargs):

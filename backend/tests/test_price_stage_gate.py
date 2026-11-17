@@ -172,11 +172,11 @@ def test_evidence_load_failure_does_not_zero_other_bidders(app_env):
     尚未落库的 5 家确定性报价分（各 40~50 分）被同一个异常批量打成「暂定 0 分」。
     """
     run_id, ids, tech_crit, formula_crit = _seed(app_env, mode="real")
-    # 给乙挂一个解析失败的文档 → 乙的 _load_pages 抛"尚未成功解析"
+    # 乙的全部文档解析失败 → 乙的 _load_pages 整家抛错（读取故障），
+    # 触发价格证据循环的逐家隔离路径
     with session_scope() as s:
-        s.add(Document(project_id="price-gate", bidder_id=ids["乙"], kind="bid",
-                       parse_status="failed", original_filename="broken.xls",
-                       stored_path="", sha256="x", page_count=None))
+        for d in s.execute(select(Document).where(Document.bidder_id == ids["乙"])).scalars():
+            d.parse_status = "failed"
     scoring._price_stage(
         run_id,
         {"bidders": [{"id": ids["甲"], "name": "甲"}, {"id": ids["乙"], "name": "乙"}],

@@ -1092,6 +1092,10 @@ def _call(gateway: Gateway, criterion: dict, pages: list[dict], *, data_class: s
             "子项缺失或部分页面不可读而拒绝给分。材料不足时按较低档位给分并说明。"
             "不得因模型或读取故障给满分或最低分。"
         )
+    if criterion.get("_reading_caveat"):
+        # 送审范围限制（存在未能读取的附件）：缺证存疑不硬判，见
+        # automatic_scoring_service.reading_caveat_for（2026-11-17 run 125）。
+        payload["reading_caveat"] = str(criterion["_reading_caveat"])
     if summaries is not None and not collection_only and material_state is not None:
         payload["current_material_state"] = material_state
     if summaries is not None and not collection_only and criterion.get("score_type") in ("veto", "match"):
