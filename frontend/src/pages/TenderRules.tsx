@@ -37,6 +37,7 @@ import {
   useMatchProposal,
   useMergeRecords,
   useModels,
+  useProjectJobs,
   useRestoreCriterion,
   useRetireCriterion,
   useRules,
@@ -60,6 +61,9 @@ export default function TenderRules() {
   const { data: coverage } = useCoverage(rules?.id ?? null);
   const { data: lawPacks } = useLawPacks();
   const { data: templates, isLoading: templatesLoading } = useTemplates();
+  // 最近一次规则编译任务（项目包导入触发的自动匹配也在其中，服务端真相）
+  const compileJobs = useProjectJobs(pid, "compile_rules").data;
+  const serverMatchJob = compileJobs?.[0];
   const [jobId, setJobId] = useState<number | null>(null);
   const [parseJobId, setParseJobId] = useState<number | null>(null);
   const [matchJobId, setMatchJobId] = useState<number | null>(null);
@@ -68,6 +72,8 @@ export default function TenderRules() {
   const job = useJobProgress(jobId);
   const parseJob = useJobProgress(parseJobId);
   const matchJob = useJobProgress(matchJobId);
+  // 空态/横幅状态源统一：matchJob（SSE 尚未回包的窗口）回落到服务端轮询结果
+  const shownMatchJob = matchJob ?? serverMatchJob ?? null;
   const [detail, setDetail] = useState<CriterionOut | null>(null);
   const [signoffTarget, setSignoffTarget] = useState<CriterionOut | null>(null);
   const [toggleTarget, setToggleTarget] = useState<CriterionOut | null>(null);
@@ -205,6 +211,10 @@ export default function TenderRules() {
       qc.invalidateQueries({ queryKey: ["workbench", pid] });
       qc.invalidateQueries({ queryKey: ["mergeRecords"] });
       const r = (matchJob.result_json ?? {}) as Record<string, unknown>;
+      // 自动采纳失败时会留下匹配提案包——认领的任务也要能打开提案审核抽屉
+      if (typeof r.package_id === "number") {
+        setMergePackageId(r.package_id as number);
+      }
       const post = r.post_merge as { errors?: unknown[] } | undefined;
       if (post?.errors?.length) {
         message.warning("自动匹配完成，但规则总分/价格公式不完整，请修正后再确认冻结");
@@ -219,6 +229,38 @@ export default function TenderRules() {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [matchJob?.status, matchJob?.id, pid]);
+
+  // 项目包导入触发的自动匹配任务不在本页 state 里——认领进 matchJobId，
+  // 否则用户在规则库页只看到「尚无评分规则」，无从判断是排队、编译中还是失败
+  // （2026-11-17 测试11 实证：编译任务在队列里排了半小时，页面毫无提示）。
+  useEffect(() => {
+    const j = serverMatchJob;
+    if (!j || (j.status !== "queued" && j.status !== "running")) return;
+    const currentTerminal =
+      matchJobId != null &&
+      matchJob != null &&
+      ["succeeded", "failed", "cancelled"].includes(matchJob.status);
+    if (matchJobId == null || (currentTerminal && j.id > matchJobId)) {
+      setMatchJobId(j.id);
+      setFlow("matching");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [serverMatchJob?.id, serverMatchJob?.status, matchJobId, matchJob?.status]);
+
+  // 任意编译任务成功都要刷新规则表：堆叠多编译（自动+手动重复触发）时，
+  // 只盯认领的那一个会让更早任务的成功对页面不可见（对抗复查实证）。
+  const invalidatedJobsRef = useRef<Set<number>>(new Set());
+  useEffect(() => {
+    for (const j of compileJobs ?? []) {
+      if (j.status === "succeeded" && !invalidatedJobsRef.current.has(j.id)) {
+        invalidatedJobsRef.current.add(j.id);
+        qc.invalidateQueries({ queryKey: ["rules", pid] });
+        qc.invalidateQueries({ queryKey: ["coverage"] });
+        qc.invalidateQueries({ queryKey: ["workbench", pid] });
+        qc.invalidateQueries({ queryKey: ["mergeRecords"] });
+      }
+    }
+  }, [compileJobs, pid, qc]);
 
   const handleUseDefault = (templateId: string, reason: string) => {
     useDefault.mutate(
@@ -800,7 +842,15 @@ export default function TenderRules() {
       {(!rules || rules.id === 0) && !isLoading && (
         <Empty
           style={{ marginTop: 40 }}
-          description="尚无评分规则：上传项目包后自动匹配，或点「使用默认规则」选择内置模板直接评分"
+          description={
+            shownMatchJob?.status === "running"
+              ? "规则编译进行中，完成后自动显示评分规则"
+              : shownMatchJob?.status === "queued"
+                ? `规则编译排队中${matchJob?.queue_position ? `（前面还有 ${matchJob.queue_position} 个任务）` : ""}，完成后自动显示评分规则`
+                : serverMatchJob?.status === "failed" || serverMatchJob?.status === "cancelled"
+                  ? "上次规则编译未成功，可点「重新匹配」重试，或「使用默认规则」直接评分"
+                  : "尚无评分规则：上传项目包后自动匹配，或点「使用默认规则」选择内置模板直接评分"
+          }
         />
       )}
 

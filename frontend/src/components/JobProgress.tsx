@@ -41,7 +41,7 @@ export function JobProgress({
         <Typography.Text type="warning" style={{ fontSize: 12 }}>
           排队等待中
           {job.queue_position != null && job.queue_position > 0
-            ? `（前面还有 ${job.queue_position} 个任务，单 worker 串行执行）`
+            ? `（前面还有 ${job.queue_position} 个任务）`
             : "（即将开始）"}
         </Typography.Text>
       )}

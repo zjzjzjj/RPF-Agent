@@ -21,7 +21,7 @@ from contextlib import suppress
 from datetime import timedelta
 from typing import Any
 
-from sqlalchemy import func, or_, select, update
+from sqlalchemy import and_, case, func, or_, select, update
 from sqlalchemy.exc import OperationalError
 
 from app import config
@@ -33,6 +33,31 @@ log = logging.getLogger("bid_eval.jobs")
 
 _worker_task: asyncio.Task | None = None
 _stop_event: asyncio.Event | None = None
+
+# 用户关键路径任务优先领取（2026-11-17 测试11 实证：项目包 zip 一次灌进 40 个
+# parse_document（扫描件 OCR 每个 10+ 分钟），纯 FIFO 把 compile_rules 饿了半小时
+# 以上——规则库一直显示"尚无评分规则"，实际是排在批量文档解析后面根本没轮到跑）。
+_PRIORITY_KINDS = frozenset({"compile_rules", "evaluate", "extract_price", "import_bundle"})
+
+
+def _critical_bool():  # noqa: ANN202 —— SQLAlchemy 表达式，返回类型无公开契约
+    """关键路径任务判定：优先级 kind，或提交时显式 critical 的任务。
+
+    critical 标志存 payload（不加列、不动 schema）：招标文件解析也走 parse_document，
+    但它触发自动匹配，压在批量投标解析后会以同样的方式饿死规则匹配——提交方
+    （ingest_service）知道 document.kind，对 tender 显式标 critical。
+    """
+    return or_(
+        Job.kind.in_(tuple(_PRIORITY_KINDS)),
+        # JSON 路径索引（非 json_extract）：与 config.database_url() 的 Postgres
+        # 升级接缝兼容，方言翻译交给 SQLAlchemy
+        Job.payload_json["critical"].as_boolean() == True,  # noqa: E712
+    )
+
+
+def _priority_expr():  # noqa: ANN202 —— SQLAlchemy 表达式，返回类型无公开契约
+    """领取优先级排序键：0=优先，1=普通（同类内仍按提交序 FIFO）。"""
+    return case((_critical_bool(), 0), else_=1)
 
 
 class JobCancelled(Exception):
@@ -144,8 +169,16 @@ class JobContext:
 # ---------------------------------------------------------------------------
 # 提交与查询（同步，供 API/服务层调用）
 # ---------------------------------------------------------------------------
-def submit(kind: str, payload: dict[str, Any], project_id: str | None = None) -> int:
-    """入队一个任务，返回 job id。"""
+def submit(
+    kind: str,
+    payload: dict[str, Any],
+    project_id: str | None = None,
+    *,
+    critical: bool = False,
+) -> int:
+    """入队一个任务，返回 job id。critical=True 跳到队列前头（关键路径，见 _critical_expr）。"""
+    if critical:
+        payload = {**payload, "critical": True}
     with session_scope() as s:
         job = Job(kind=kind, payload_json=payload, project_id=project_id, status="queued")
         s.add(job)
@@ -185,18 +218,31 @@ def get_job(job_id: int) -> Job | None:
 def queue_position(job_id: int) -> int:
     """该任务前面还有几个未完成任务（running 的算 1 个）。0 = 正在跑或已终态。
 
-    供 UI 显示「排队中，前面还有 N 个任务」——单 worker 下这是用户判断
-    「任务没反应」到底是排队还是卡死的唯一线索。
+    供 UI 显示「排队中，前面还有 N 个任务」——这是用户判断「任务没反应」
+    到底是排队还是卡死的唯一线索。"前面"与 _claim_next_job **同口径**：
+    先按优先级（关键路径优先）再按提交序，而非单纯 id 大小。
     """
     with session_scope() as s:
         job = s.get(Job, job_id)
         if job is None or job.status != "queued":
             return 0
-        ahead = s.execute(
-            select(func.count(Job.id)).where(
-                Job.status.in_(("queued", "running")),
-                Job.id < job_id,
+        mine_critical = job.kind in _PRIORITY_KINDS or bool(
+            (job.payload_json or {}).get("critical")
+        )
+        # running（无论关键与否）占着执行槽，一律计入"前面"——否则关键任务
+        # 排在一个正在跑的扫描件 OCR 后面会被报成 0「即将开始」（对抗复查实证）。
+        running = Job.status == "running"
+        if mine_critical:
+            queued_before = and_(
+                Job.status == "queued", _critical_bool(), Job.id < job_id
             )
+        else:
+            # 关键路径任务不论 id 大小都会先跑，一律计入"前面"
+            queued_before = and_(
+                Job.status == "queued", or_(_critical_bool(), Job.id < job_id)
+            )
+        ahead = s.execute(
+            select(func.count(Job.id)).where(or_(running, queued_before))
         ).scalar_one()
         return int(ahead or 0)
 
@@ -238,7 +284,7 @@ def _claim_next_job() -> int | None:
             candidate = s.execute(
                 select(Job.id)
                 .where(or_(Job.status == "queued", reclaimable))
-                .order_by(Job.id)
+                .order_by(_priority_expr(), Job.id)
                 .limit(1)
             ).scalar_one_or_none()
         if candidate is None:

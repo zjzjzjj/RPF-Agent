@@ -80,7 +80,14 @@ def save_upload(
 
     from app.jobs.queue import submit
 
-    job_id = submit("parse_document", {"document_id": doc_id}, project_id=project_id)
+    # 招标文件/补遗解析是规则匹配的关键路径（解析完即触发自动匹配编译），
+    # 不能压在同批几十个投标文档解析后面排队（2026-11-17 测试11 实证）。
+    job_id = submit(
+        "parse_document",
+        {"document_id": doc_id},
+        project_id=project_id,
+        critical=(kind in ("tender", "addendum")),
+    )
     return doc_id, job_id
 
 

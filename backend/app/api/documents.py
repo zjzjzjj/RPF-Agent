@@ -79,6 +79,11 @@ def reparse_document(document_id: int, actor: str = Depends(get_actor)) -> Docum
         raise NotFound("文档不存在")
     from app.jobs.queue import submit
 
-    job_id = submit("parse_document", {"document_id": document_id}, project_id=doc.project_id)
+    job_id = submit(
+        "parse_document",
+        {"document_id": document_id},
+        project_id=doc.project_id,
+        critical=(doc.kind in ("tender", "addendum")),
+    )
     audit_service.log(doc.project_id, actor, "document.reparse", "document", str(document_id), {})
     return DocumentUploadOut(document_id=document_id, parse_status=doc.parse_status, job_id=job_id)

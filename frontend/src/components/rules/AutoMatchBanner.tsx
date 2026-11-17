@@ -130,9 +130,18 @@ export default function AutoMatchBanner({
             )}
             {flow === "matching" && (
               <Space size={6}>
-                <Tag color="purple">
-                  <Spin size="small" /> 自动匹配规则中 {matchJob?.message ?? ""}
-                </Tag>
+                {matchJob?.status === "queued" ? (
+                  <Tag color="purple">
+                    <Spin size="small" /> 规则编译排队中
+                    {matchJob.queue_position
+                      ? `（前面还有 ${matchJob.queue_position} 个任务）`
+                      : "，即将开始"}
+                  </Tag>
+                ) : (
+                  <Tag color="purple">
+                    <Spin size="small" /> 自动匹配规则中 {matchJob?.message ?? ""}
+                  </Tag>
+                )}
                 {matchJob && matchJob.total_steps > 0 && (
                   <Progress
                     percent={Math.min(100, Math.round((matchJob.done_steps / matchJob.total_steps) * 100))}
