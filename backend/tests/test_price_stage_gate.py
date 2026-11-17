@@ -163,3 +163,43 @@ def test_gate_missing_record_keeps_partial_run_safety(app_env):
     assert "门槛所需评分尚未完成" in reason_a and "按未剔除处理" in reason_a
     # 门槛未执行 → 两家全量进基准：(100+120)/2=110
     assert raw_a.get("benchmark") == "110.00"
+
+
+def test_evidence_load_failure_does_not_zero_other_bidders(app_env):
+    """单家证据页加载失败不得连坐他家的确定性价格分（2026-11-17 run 124 实证）。
+
+    价格证据循环曾把 10 家串在一个 try 里：青云一家 DOCX 嵌入图片报错中断整环，
+    尚未落库的 5 家确定性报价分（各 40~50 分）被同一个异常批量打成「暂定 0 分」。
+    """
+    run_id, ids, tech_crit, formula_crit = _seed(app_env, mode="real")
+    # 给乙挂一个解析失败的文档 → 乙的 _load_pages 抛"尚未成功解析"
+    with session_scope() as s:
+        s.add(Document(project_id="price-gate", bidder_id=ids["乙"], kind="bid",
+                       parse_status="failed", original_filename="broken.xls",
+                       stored_path="", sha256="x", page_count=None))
+    scoring._price_stage(
+        run_id,
+        {"bidders": [{"id": ids["甲"], "name": "甲"}, {"id": ids["乙"], "name": "乙"}],
+         "criteria": [tech_crit, formula_crit]},
+        [tech_crit, formula_crit],
+        {ids["甲"]: Decimal("100"), ids["乙"]: Decimal("120")},
+        completed=set(),
+    )
+    with session_scope() as s:
+        rows = {r.bidder_id: r for r in s.execute(select(ScoreRecord).where(
+            ScoreRecord.run_id == run_id, ScoreRecord.criterion_id.in_(
+                select(Criterion.id).where(Criterion.score_type == "formula")))).scalars()}
+    row_a, row_b = rows[ids["甲"]], rows[ids["乙"]]
+    # 两家确定性价格分都照常落库，不因乙的证据故障清零
+    assert row_a.final_score is not None and row_a.final_score > 0
+    assert row_b.final_score is not None and row_b.final_score > 0
+    assert "暂定 0 分兜底" not in (row_a.ai_reasoning or "")
+    assert "暂定 0 分兜底" not in (row_b.ai_reasoning or "")
+    # 甲的证据正常：无降级标记；乙的证据页故障：降级为暂定并留痕
+    raw_a = row_a.ai_raw_json or {}
+    raw_b = row_b.ai_raw_json or {}
+    assert raw_a.get("price_provisional") is False
+    assert raw_b.get("price_provisional") is True
+    warns_b = row_b.warnings_json or []
+    assert any("evidence_pages_unavailable" in w for w in warns_b)
+    assert not any("evidence_pages_unavailable" in w for w in (row_a.warnings_json or []))

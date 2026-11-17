@@ -1154,25 +1154,42 @@ def _price_stage(run_id: int, manifest: dict, criteria: list[dict], prices: dict
             # Compute all bidders against the same complete frozen quote set before writes.
             for result in computation.results:
                 source = price_evidence.get(str(result.bidder_id)) or {}
-                pages, _ = _load_pages(result.bidder_id)
-                for extra in source.get("supplemented_pages") or []:
-                    for page in pages:
-                        if (page["document_id"], page["page_no"]) == (extra["document_id"], extra["page_no"]):
-                            page.update(extra)
-                            page["supplemented"] = True
-                visual_keys = {(e["document_id"], e["page_no"]) for e in source.get("evidence", [])
-                               if e.get("kind") == "visual"}
-                if visual_keys:
-                    for page in pages:
-                        if (page["document_id"], page["page_no"]) in visual_keys:
-                            page["unreadable"] = True
-                    pages = _supplement_pages(criterion, pages, visual=True)
+                evidence_warning = None
+                try:
+                    pages, _ = _load_pages(result.bidder_id)
+                    for extra in source.get("supplemented_pages") or []:
+                        for page in pages:
+                            if (page["document_id"], page["page_no"]) == (extra["document_id"], extra["page_no"]):
+                                page.update(extra)
+                                page["supplemented"] = True
+                    visual_keys = {(e["document_id"], e["page_no"]) for e in source.get("evidence", [])
+                                   if e.get("kind") == "visual"}
+                    if visual_keys:
+                        for page in pages:
+                            if (page["document_id"], page["page_no"]) in visual_keys:
+                                page["unreadable"] = True
+                        pages = _supplement_pages(criterion, pages, visual=True)
+                except JobCancelled:
+                    raise
+                except Exception as exc:  # noqa: BLE001 —— 单家证据故障不得连坐他家
+                    # 确定性价格分已由引擎算出（源自开标一览表报价抽取，不依赖
+                    # 证据页判读）：证据页加载失败只降级该家证据展示与核验，不能
+                    # 中断共享循环把尚未落库的公司全部打成「暂定 0 分」——2026-11-17
+                    # run 124 实证：青云一家的 DOCX 嵌入图片报错把 5 家确定性报价分
+                    # （各有 40~50 分）连坐清零，7 家错误信息一字不差同源。
+                    pages = []
+                    evidence_warning = {
+                        "evidence_pages_unavailable": f"{type(exc).__name__}: {exc}"[:500]
+                    }
                 missing_gate = gate_missing_by_bidder.get(result.bidder_id) or []
                 gate_fallback_codes = sorted({code for codes in gate_fallback_by_bidder.values()
                                               for code in codes})
                 provisional = (bool(missing_gate) or strict_error is not None
-                               or bool(gate_fallback_codes))
+                               or bool(gate_fallback_codes) or evidence_warning is not None)
                 reason = result.explanation
+                if evidence_warning:
+                    reason += ("；暂定价格：证据页未能加载（报价为开标一览表确定性抽取，"
+                               "证据展示降级），复核报价后应定分")
                 if missing_gate:
                     reason += (f"；暂定价格：门槛所需评分尚未完成（{', '.join(missing_gate)}），"
                                "按未剔除处理")
@@ -1199,7 +1216,8 @@ def _price_stage(run_id: int, manifest: dict, criteria: list[dict], prices: dict
                     warnings=[{"formula_explanation": result.explanation,
                                "price_provisional": provisional,
                                "price_strict_error": strict_error,
-                               "gate_missing_criteria": missing_gate}],
+                               "gate_missing_criteria": missing_gate}]
+                              + ([evidence_warning] if evidence_warning else []),
                 ))
                 completed.add((result.bidder_id, criterion["id"]))
         except Exception as exc:
