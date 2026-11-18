@@ -689,8 +689,10 @@ def llm_prompt_version() -> str:
     以作废既有磁盘缓存键（新旧 prompt 不得共享缓存命中）。
     2026-11-05：围串标功能下线，<facts> 摘要删除 cross_bidder 两键（提示词内容
     变更），升版作废旧缓存。
+    2026-11-18：规则抽取 prompt 修 match 措辞（"满足条件得分"误导计分行标 match，
+    利群 7 条实证）+ 权重表禁抽 + 主/客观列最终依据声明，升版作废旧缓存。
     """
-    return os.environ.get("BID_EVAL_PROMPT_VERSION", "2026-11-06.1")
+    return os.environ.get("BID_EVAL_PROMPT_VERSION", "2026-11-18.1")
 
 
 def veto_batch_size() -> int:

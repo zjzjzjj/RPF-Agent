@@ -154,7 +154,10 @@ def run_validators(
         if c.get("origin") != "template" and not (c.get("source_quote") or "").strip():
             findings.append(Finding("QUOTE_REQUIRED", "error",
                                     f"评分项「{c['name']}」缺少招标文件原文引用（无证据的标准不得作为评分依据）",
-                                    "criterion", code))
+                                    "criterion", code,
+                                    "请补充该评分项的招标文件原文逐字引用。若该条来自权重表/加权表/表头/目录"
+                                    "等非评分细则处（如「标段|产品名称|所占样品分」数据行），它不是评分项，"
+                                    "请停用（退役）该条目"))
 
         # 模板兜底签批（设计稿 §6.1）：模板条目未经签批不得执行
         if c.get("origin") == "template" and c.get("status") != "retired" and not c.get("signoff"):
@@ -336,6 +339,39 @@ def run_validators(
                                     "但评分类型是 match（满足即得分）——请人工确认是否应为 count/formula",
                                     "criterion", code,
                                     "核对评标细则原文的主/客观分列与计分方式"))
+
+        # match 带分值硬不变式（2026-11-18 利群 7 条实证：match 不计分语义下
+        # 分值永远兑现不了，Σ 恒缺此分）——数据侧由 normalize_package 自愈，
+        # 形态判不出的由本检查阻断转人工，不猜
+        if (
+            c.get("score_type") == "match"
+            and not c.get("is_veto")
+            and c.get("max_score") not in (None, ZERO)
+        ):
+            findings.append(Finding(
+                "MATCH_WITH_SCORE", "error",
+                f"判断项「{c['name']}」不得携带分值（max_score={c['max_score']}）："
+                "match 是不计分的符合性判断，该分值永远无法兑现（总分核算恒缺此分）",
+                "criterion", code,
+                "若细则是「…得N分/扣N分」的计分行，请改为 count/subjective 并给计分参数；"
+                "若确是判断项请清空分值；若来自权重表/表头，请停用该条目"))
+
+        # 客观列落 subjective 代判的诚实披露（全有全无/形态不可判：如样品评审
+        # "任一不符得0分、全部符合得满分"——判定对象是实体样品，文本无计数对象）
+        _form = (c.get("params") or {}).get("_objective_form")
+        if (
+            (c.get("params") or {}).get("_subjectivity_hint") == "objective"
+            and c.get("score_type") == "subjective"
+            and _form
+        ):
+            _form_label = {"all_or_nothing": "全有全无",
+                           "unparsed_objective": "形态不可判"}.get(_form, "计分形态")
+            findings.append(Finding(
+                "OBJECTIVE_AS_SUBJECTIVE", "warn",
+                f"评分项「{c['name']}」的评标细则标注为客观分，但因「{_form_label}」"
+                "无文本计数对象，暂由主观通道代判——请人工复核客观分一致性",
+                "criterion", code,
+                "客观性以细则原文为准；如需确定性计数，请补充可计数的证明材料要求"))
 
         # ⑦ 否决项必须有后果
         if c.get("is_veto") and not c.get("veto_consequence"):

@@ -857,6 +857,8 @@ def normalize_package(package_id: int, actor: str = "auto") -> dict[str, int]:
         "count_repaired": 0,
         "veto_normalized": 0,
         "veto_consequence_filled": 0,
+        "match_scored_fixed": 0,
+        "weight_rows_retired": 0,
     }
     summary_names = {
         "资格审查不通过",
@@ -932,6 +934,85 @@ def normalize_package(package_id: int, actor: str = "auto") -> dict[str, int]:
                 record(c, "自动修复：表头/结论行不是独立条款，已退役")
                 stats["summary_retired"] += 1
                 active.remove(c)
+
+        # ②b match 带分值归正（"match 不带分值"硬不变式的数据侧，2026-11-18
+        # 利群 7 条实证：match 不计分语义下分值永远兑现不了，Σ 恒缺此分）。
+        # 明示形态可判 → 归正 score_type + 计分参数（缺 check 补建）；
+        # 形态判不出不猜——MATCH_WITH_SCORE 校验阻断交人工。
+        from app.rules.check_infer import classify_scoring_form
+
+        for c in list(active):
+            if (
+                c.origin not in ("template", "document")
+                or c.score_type != "match"
+                or c.is_veto
+                or c.max_score is None
+                or c.max_score <= 0
+            ):
+                continue
+            form = classify_scoring_form(
+                f"{c.name}\n{c.description or ''}\n{c.source_quote or ''}")
+            if form is None:
+                continue
+            kind, params = form
+            if kind == "all_or_nothing":
+                new_type, params = "subjective", {
+                    "_subjectivity_hint": "objective",
+                    "_objective_form": "all_or_nothing",
+                }
+            else:
+                new_type, params = "count", {**params, "_objective_form": kind}
+            c.score_type = new_type
+            s.add(c)
+            check = s.execute(
+                select(CriterionCheck).where(CriterionCheck.criterion_id == c.id)
+            ).scalar_one_or_none()
+            merged = dict(check.params_json or {}) if check is not None else {}
+            for k, v in params.items():
+                merged.setdefault(k, v)  # 既有显式参数优先
+            if check is None:
+                check = CriterionCheck(
+                    criterion_id=c.id,
+                    check_type="human_only" if new_type == "subjective" else "count_at_least",
+                    field=merged.get("field") if isinstance(merged.get("field"), str) else None,
+                    params_json=merged,
+                    on_fail="need_human",
+                    source_quote=c.source_quote,
+                )
+            else:
+                check.params_json = merged
+                if check.field is None and isinstance(merged.get("field"), str):
+                    check.field = merged["field"]
+            s.add(check)
+            record(c, "自动修复：判断项不得带分值，已按细则形态归正为计分项")
+            stats["match_scored_fixed"] += 1
+
+        # ②c 权重表假项退役（利群 p125「产品名 10分」实证）：quote 空 + 权重表
+        # 上下文 + 无计分语言 → 权重声明行不是评分项。与 compiler 抽取期剪枝
+        # 同源判定（is_weight_table_item）；页文本按需加载（有候选才读）。
+        from app.rules.check_infer import is_weight_table_item
+
+        candidates = [
+            c for c in list(active)
+            if c.origin in ("template", "document") and not (c.source_quote or "").strip()
+        ]
+        if candidates and pkg.source_document_id:
+            from app.db.models import DocumentPage
+
+            pages_by_no = {
+                p.page_no: (p.text or "")
+                for p in s.execute(
+                    select(DocumentPage).where(
+                        DocumentPage.document_id == pkg.source_document_id)
+                ).scalars()
+            }
+            for c in candidates:
+                if is_weight_table_item(c.name, c.description or "", c.source_quote, pages_by_no):
+                    c.status = "retired"
+                    s.add(c)
+                    record(c, "自动修复：权重表/加权表数据行不是评分项，已退役")
+                    stats["weight_rows_retired"] += 1
+                    active.remove(c)
 
         # ③ 不闭合档位
         from app.rules.validators import _check_level_closure

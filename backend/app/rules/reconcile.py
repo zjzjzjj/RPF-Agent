@@ -183,14 +183,16 @@ def _category_for_group(group: str, pages_by_no: dict[int, str]) -> str:
 
 
 def _score_type_for_row(row: SkeletonRow) -> tuple[str, dict]:
-    """骨架行 → (score_type, params 补充)。count 仅在有明确按件计分语言时。
+    """骨架行 → (score_type, params 补充)。「主/客观分」列是 ground truth
+    （2026-11-18 用户拍板全面覆盖：列值决定 score_type 族，不信 LLM 自报）。
 
-    2026-10-27 修复：资质/证书**存在性即得分**行（"投标人具有 ISO9001…得 2 分"，
-    无"每…得"语言）此前落到 subjective——证书复印件是确定性材料，应按 count/
-    certificates 计数（有证书复印件就计 1 项），交 LLM 主观评必然偏低且不可复算。
+    客观行按 check_infer.classify_scoring_form 的明示形态落 count 族
+    （多档 tiers / 扣分式 deviation_deduct_table / per_item / 二值存在）；
+    形态不明与全有全无 → subjective + _subjectivity_hint=objective 留痕
+    （不猜、不硬映射 count——count 事实层无计数对象会悬置不进总分）。
     """
     if row.subjectivity == "subjective":
-        return "subjective", {}
+        return "subjective", {"_subjectivity_hint": "subjective"}
     text = row.text or ""
     # CMMI 认证独立计分项（"具有有效期内CMMI 认证二级及以上得 N 分"）：
     # 存在性即得分、单一证书。LLM 编译曾把此行标 match（判断项不计分）→
@@ -199,37 +201,36 @@ def _score_type_for_row(row: SkeletonRow) -> tuple[str, dict]:
     _m_cmmi = re.search(r"(?:具有|具备|通过|获得|拥有|提供)[^。；]{0,30}?(?:得|计)\s*(\d+(?:\.\d+)?)\s*分", text)
     if "CMMI" in text and _m_cmmi:
         return "count", {"field": "cmmi", "per_item": str(Decimal(_m_cmmi.group(1)))}
-    m = _RE_PER_ITEM.search(text)
-    if m:
-        if _RE_CERT_KW.search(text):
-            field = "certificates"
-        elif _RE_PERF_KW.search(text):
-            field = "performance"
-        else:
-            return "subjective", {}  # 计数对象不明 → 交 LLM 主观评，不猜
-        params: dict[str, Any] = {"field": field, "per_item": m.group(1)}
-        cap = re.search(r"最高(?:不超过|得)?\s*(\d+(?:\.\d+)?)\s*分", text)
-        if cap:
-            per = Decimal(m.group(1))
-            if per > 0:
-                params["max_items"] = str(int(Decimal(cap.group(1)) / per))
-        return "count", params
-    # 存在性即得分："具有/具备/通过 ISO9001…得 N 分"或"提供证书…得 N 分"——
-    # 按 evidence/ 证书清单计数（1 项 = 该项得分，per_item 用满分 1:1）。
-    # 只认客观类 + 细则点名硬材料 + 得分语言，杜绝误判主观行。
-    if (
-        _RE_CERT_KW.search(text)
-        and re.search(r"(?:具有|具备|通过|获得|拥有|提供)[^。；]{0,12}?(?:得|计)\s*(\d+(?:\.\d+)?)\s*分", text)
-    ):
-        return "count", {"field": "certificates", "per_item": "1"}
+    from app.rules.check_infer import classify_scoring_form
+
+    form = classify_scoring_form(text)
+    if form is not None:
+        kind, params = form
+        col_hint = {"_subjectivity_hint": "objective"} if row.subjectivity == "objective" else {}
+        if kind == "all_or_nothing":
+            # 客观全有全无（"任一不能满足得0分、全部符合得满分"，如样品评审）：
+            # 判定对象是实体样品/整体符合性，文本无计数对象 → subjective 引擎
+            # 代判 + 客观标注留痕（OBJECTIVE_AS_SUBJECTIVE warn 披露）。
+            return "subjective", {"_subjectivity_hint": "objective",
+                                  "_objective_form": "all_or_nothing"}
+        return "count", {**col_hint, **params, "_objective_form": kind}
+    if row.subjectivity == "objective":
+        # 客观列但形态不可判 → subjective 代判 + 客观标注留痕（不猜计数口径）
+        return "subjective", {"_subjectivity_hint": "objective",
+                              "_objective_form": "unparsed_objective"}
     return "subjective", {}
 
 
 def _generate_for_row(row: SkeletonRow, pages_by_no: dict[int, str],
                       category: str) -> ExtractedCriterion:
-    label = f"{row.group}"
-    if row.sub_idx is not None:
-        label += f"（{row.sub_idx}）"
+    # 三级表分值 cell 里的子项名是权威条目名（"技术研发（0-2 分）"→技术研发）；
+    # 无子项名退组名+子序号（浙江多媒体既有命名口径）
+    if row.sub_name:
+        label = row.sub_name
+    else:
+        label = f"{row.group}"
+        if row.sub_idx is not None:
+            label += f"（{row.sub_idx}）"
     first = re.split(r"[。；;]", row.text or "")
     hint = (first[0] if first else "")[:24]
     # 去 hint 开头的序号（细则文本常见「（1）投标人具有…」→ 与 label 的
@@ -330,7 +331,7 @@ def reconcile_with_skeleton(
               "target_total": float(skeleton.target_total()),
               "generated": [], "score_fixed": [], "price_generated": False,
               "score_type_fixed": [], "category_fixed": [],
-              "overcoverage_pruned": []}
+              "overcoverage_pruned": [], "objective_as_subjective": []}
 
     texts = [(c, _crit_text(c)) for c in criteria]
     # 行 → 覆盖它的 criteria（前缀/子串命中）
@@ -353,30 +354,44 @@ def reconcile_with_skeleton(
                     if ci not in covered_by[i]:
                         covered_by[i].append(ci)
 
-    # score_type 校正：骨架是计分行（分值列有值），被 match（判断项，不计分）覆盖时
-    # 分值永远兑现不了——按骨架映射改写为计分类型（prompt 里"match（满足条件得分）"
-    # 误导 LLM 把"承诺X得2分"型计分行分给了 match，实测 Σ 96≠100 的 4 分缺口即此）。
-    # veto（一票否决）不动；非 1:1 的 match 覆盖走缺口补齐。
+    # score_type 校正（2026-11-18 列覆盖全面归正，用户拍板「主/客观分列=ground truth」）：
+    # ① 骨架行有主/客观列标注、被 1:1 覆盖 → 按列+形态决策树归正（不信 LLM 自报；
+    #    利群实证：财务制度/样品评审列标客观分却成 subjective）；
+    # ② match（判断项，不计分）覆盖计分行 → 必然改写——match 带分值自相矛盾，
+    #    分值永远兑现不了（利群 7 条实证 Σ 恒缺 15；prompt"match（满足条件得分）"
+    #    误导是历史病根）。
+    # veto/formula 不动；非 1:1 覆盖走缺口补齐（多行覆盖的合并项留原样）。
     retyped: set[int] = set()
     for ri, row in enumerate(skeleton.rows):
         cis = covered_by[ri]
-        if any(criteria[ci].score_type in SCORING_TYPES for ci in cis):
+        if len(cis) != 1:
             continue
-        match_cis = [ci for ci in cis
-                     if criteria[ci].score_type == "match" and not criteria[ci].is_veto]
-        if len(match_cis) != 1 or len(cis) != 1:
-            continue  # 多覆盖/含 veto → 不动，走缺口补齐
-        ci = match_cis[0]
+        ci = cis[0]
         if ci in retyped:
             continue
-        # 只改写 1:1 的 match（多行覆盖的 match 留作判断项，逐行走缺口）
+        c = criteria[ci]
+        if c.is_veto or c.score_type == "formula":
+            continue
         others = [j for j, lst in covered_by.items() if j != ri and ci in lst]
         if others:
+            continue  # 多行覆盖（父项/合并项）不动
+        is_match = c.score_type == "match"
+        has_column = row.subjectivity is not None
+        if not (is_match or has_column):
             continue
-        c = criteria[ci]
         new_type, params = _score_type_for_row(row)
+        if not is_match and new_type == c.score_type:
+            # 与列一致：只补参数缺口（既有显式参数优先，不覆盖）
+            if params:
+                merged = dict(c.params or {})
+                for k, v in params.items():
+                    merged.setdefault(k, v)
+                c.params = merged
+            retyped.add(ci)
+            continue
         report["score_type_fixed"].append(
-            {"name": c.name, "from": "match", "to": new_type})
+            {"name": c.name, "from": c.score_type, "to": new_type,
+             "by": "subj_column" if has_column else "form"})
         c.score_type = new_type  # type: ignore[assignment]
         if params:
             c.params = {**(c.params or {}), **params}
@@ -470,6 +485,12 @@ def reconcile_with_skeleton(
                 if gen is not None:
                     out.append(gen)
                     report["price_generated"] = True
+
+    # 客观列但落 subjective 代判的条目（全有全无/形态不可判）——诚实披露通道
+    for c in out:
+        of = (c.params or {}).get("_objective_form")
+        if of in ("all_or_nothing", "unparsed_objective"):
+            report["objective_as_subjective"].append(c.name)
 
     total = sum((c.max_score or Decimal(0) for c in out
                  if c.score_type in ("formula", "count", "subjective")), Decimal(0))

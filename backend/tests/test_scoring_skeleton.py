@@ -315,3 +315,83 @@ def test_level_table_header_rejected() -> None:
         ["差", "0-5分", "技术方案不完整或存在明显缺陷"],
     ]]}
     assert parse_skeleton(tables, {4: ""}) is None
+
+
+# --- 利群商标条盒 2026：三级表命名分值 cell / 权重表跳过 / 空细则行过滤 ----------
+
+LIQUN_FX = Path(__file__).parent / "fixtures" / "scoring_skeleton" / "liqun_2026"
+
+
+def _load_liqun_fixture() -> tuple[dict[int, list], dict[int, str]]:
+    tables = json.loads((LIQUN_FX / "tables_p123_125.json").read_text(encoding="utf-8"))
+    pages = json.loads((LIQUN_FX / "pages_p123_125.json").read_text(encoding="utf-8"))
+    return {int(k): v for k, v in tables.items()}, {int(k): v for k, v in pages.items()}
+
+
+def test_liqun_named_score_cell_parses_subitem_and_max() -> None:
+    """三级表分值 cell「子项名（0-N 分）」→ (sub_name, 上界)。
+
+    变异强度：回退旧 _RE_SCORE_CELL（只认裸分值）→ 技术 14 行整体蒸发
+    （rows 19→5、row_sum 50→18），本断言必红（2026-11-18 实证：该形态
+    解析不了正是 14 个技术子项行丢失、Σ=28 的根因）。
+    """
+    tables, pages = _load_liqun_fixture()
+    sk = parse_skeleton(tables, pages)
+    assert sk is not None
+    named = {r.sub_name: r for r in sk.rows if r.sub_name}
+    assert named["技术研发"].max_score == Decimal("2")
+    assert named["生产设备配置"].max_score == Decimal("3")
+    assert named["追溯方案"].max_score == Decimal("4")
+    assert len(sk.rows) == 19
+
+
+def test_liqun_rows_sum50_no_phantom_no_empty_text() -> None:
+    """行合计 Σ=50 与细则账本相符；无权重表假项、无空细则文本行。"""
+    tables, pages = _load_liqun_fixture()
+    sk = parse_skeleton(tables, pages)
+    assert sk is not None
+    assert sk.row_sum() == Decimal("50")
+    assert not any("商标条盒" in r.group for r in sk.rows)
+    assert not any(not (r.text or "").strip() for r in sk.rows)
+
+
+def test_liqun_weight_tables_skipped_with_marker() -> None:
+    """p125 两张权重表整表跳过；warning 层指纹与 normalize 的 stats 键不同。"""
+    tables, pages = _load_liqun_fixture()
+    sk = parse_skeleton(tables, pages)
+    assert sk is not None
+    assert sum(1 for w in sk.warnings if w.startswith("weight_table_skipped")) == 2
+
+
+def test_liqun_expected_fixture_matches() -> None:
+    """fixture 快照：行/台账形态与 expected.json 一致（防意外漂移）。"""
+    tables, pages = _load_liqun_fixture()
+    sk = parse_skeleton(tables, pages)
+    exp = json.loads((LIQUN_FX / "expected.json").read_text(encoding="utf-8"))
+    assert sk is not None
+    assert len(sk.rows) == len(exp["rows"]) == 19
+    for want, got in zip(exp["rows"], sk.rows):
+        assert (got.group, got.sub_name, got.subjectivity,
+                str(got.max_score), got.page_no) == (
+            want["group"], want["sub_name"], want["subjectivity"],
+            want["max_score"], want["page_no"])
+    assert str(sk.row_sum()) == exp["row_sum"] == "50"
+    assert str(sk.target_total()) == exp["target_total"] == "100"
+    assert sk.closed() == exp["closed"] is True
+    ledgers = {(e.label, str(e.max_score)) for e in sk.ledger}
+    for want in exp["ledger"]:
+        assert (want["label"], want["max_score"]) in ledgers
+
+
+def test_empty_text_row_dropped_with_marker() -> None:
+    """无细则文本行（分值有值）→ 丢弃并留层指纹 warning（假项防线一）。
+
+    变异强度：摘除过滤 → 幽灵行进 rows → 断言必红。
+    """
+    tables = {1: [[["序号", "评审项目", "分值", "主/客观分", "评审细则"],
+                   ["1", "真实项", "0-2 分", "客观分", "提供有效合同得2分。"],
+                   ["2", "幽灵项", "5 分", "客观分", ""]]]}
+    sk = parse_skeleton(tables, {1: "1、技术部分（7 分）"})
+    assert sk is not None
+    assert [r.group for r in sk.rows] == ["真实项"]
+    assert any(w.startswith("empty_text_row_dropped") for w in sk.warnings)

@@ -34,6 +34,7 @@ class SkeletonRow:
     text: str                        # 细则全文（含续行合并）
     required_evidence: str | None = None
     page_no: int = 0
+    sub_name: str | None = None      # 三级表分值 cell 里的子项名（"技术研发（0-2 分）"→技术研发）
 
 
 @dataclass
@@ -119,12 +120,15 @@ _RE_GROUP_TOTAL = re.compile(r"[（(]\s*(\d+(?:\.\d+)?)\s*分?\s*[）)]")
 _RE_SUB_IDX = re.compile(r"^[（(](\d{1,2})[）)]")
 _RE_MATERIAL = re.compile(r"^【\s*证明材料\s*】")
 # 部分组名：长前缀优先（「商务报价部分（55 分）」先于「商务部分」——
-# 二维码项目 p94 实证，旧交替 (商务|技术|价格|报价)部分 漏配复合组名）
-_PART_GROUP = r"(商务报价|商务技术|商务|技术|价格|报价)"
-# 表外分值声明："3、报价部分（50 分）" / "（一）商务部分（9 分）"
+# 二维码项目 p94 实证，旧交替 (商务|技术|价格|报价)部分 漏配复合组名）。
+# 资信/样品 变体（利群 p123/p125「1、资信部分（8 分）」「4、样品评审（10 分）」）
+_PART_GROUP = r"(商务报价|商务技术|商务|技术|价格|报价|资信|样品)"
+# 表外分值声明："3、报价部分（50 分）" / "（一）商务部分（9 分）" /
+# "4、样品评审（10 分）"（"评审"后缀变体）/ "3、商务报价部分（0-50 分）"（区间取上界，
+# 利群 p124 实证：旧正则只认「（N 分）」漏掉区间形态 → 报价 50 进不了台账、target≠100）
 _RE_LEDGER = re.compile(
     r"(?:^|\n)\s*[(（]?[一二三四五六七八九十\d]+[)）、.．]\s*"
-    + _PART_GROUP + r"部分\s*[（(]\s*(\d+(?:\.\d+)?)\s*分\s*[）)]"
+    + _PART_GROUP + r"((?:部分|评审))\s*[（(]\s*(?:0\s*[-–—~～至]\s*)?(\d+(?:\.\d+)?)\s*分\s*[）)]"
 )
 # 章节标题关键词
 _RE_SECTION_TITLE = re.compile(r"评标细则|评分细则|评审细则")
@@ -152,6 +156,33 @@ def _parse_score_cell(text: str) -> Decimal | None:
     if m:
         return Decimal(m.group(1))
     return None
+
+
+# 三级表命名分值 cell（利群商标条盒 p123 实证）：分值列挤着「子项名（0-N 分）」，
+# 如"技术研发\n（0-2 分）"（_cell 去空白后=技术研发（0-2分））。旧 _RE_SCORE_CELL
+# 只认裸分值 → 该形态 14 个技术子项行全部蒸发（骨架只出 6 行、Σ=28≠50）。
+_RE_SCORE_CELL_NAMED = re.compile(
+    r"^(?P<name>[^（(]{0,40}?)\s*[（(]\s*(?:0\s*[-–—~～至]\s*)?"
+    r"(?P<val>\d+(?:\.\d+)?)\s*分?\s*[）)]\s*$"
+)
+
+
+def _parse_score_cell_named(text: str) -> tuple[Decimal | None, str | None]:
+    """分值 cell → (上界, 子项名)：先裸分值，再「子项名（0-N 分）」命名形态。
+
+    区间取上界（0-2 → 2），与裸分值口径一致；纯「（0-2 分）」→ (2, None)。
+    """
+    t = _cell(text)
+    if not t:
+        return None, None
+    m = _RE_SCORE_CELL.match(t)
+    if m:
+        return Decimal(m.group(1)), None
+    m = _RE_SCORE_CELL_NAMED.match(t)
+    if m:
+        name = m.group("name").strip() or None
+        return Decimal(m.group("val")), name
+    return None, None
 
 
 def _parse_group_total(text: str) -> Decimal | None:
@@ -205,6 +236,26 @@ def _is_material_row(row: list[str]) -> bool:
     return len(texts) == 1 and bool(_RE_MATERIAL.match(texts[0]))
 
 
+# 权重表（利群 p125「标段|产品名称|分值计算权重/所占样品分」实证）：其数据行
+# 会按继承列映射被误收成计分行（"1|产品名|10分"→假项，text=""），整表跳过。
+_RE_WEIGHT_HEADER = re.compile(r"产品名称|所占.{0,6}分|分值计算权重|评审权重")
+
+
+def _is_weight_table(rows: list[list[str | None]]) -> bool:
+    """前 2 行任一行是权重表列头/声明行，且不含评分表列头词 → 权重表。"""
+    if not rows:
+        return False
+    for raw in rows[:2]:
+        joined = _cell("".join(c or "" for c in raw))
+        if not joined:
+            continue
+        if _RE_WEIGHT_HEADER.search(joined) and not (
+            _RE_HEADER_FACTOR.search(joined) or _RE_HEADER_DETAIL.search(joined)
+        ):
+            return True
+    return False
+
+
 def _row_cell(row: list[str], idx: int | None) -> str:
     if idx is None or idx >= len(row):
         return ""
@@ -246,6 +297,10 @@ def _split_pending_family(st: _ParseState, factor: str) -> bool:
 
 def _feed_table(rows: list[list[str | None]], page_no: int, st: _ParseState) -> None:
     """把一张表的 rows 喂进解析状态（状态跨表/跨页共享以支持续表与跨页续行）。"""
+    if _is_weight_table(rows):
+        # 权重表整表跳过：不产行、不改 st.cols（后续真续表仍继承细则表列映射）
+        st.warnings.append(f"weight_table_skipped：p{page_no} 权重表（产品名称/所占分值/权重）不是评分项表，已跳过")
+        return
     for raw in rows:
         row = [("" if c is None else c) for c in raw]
         mapped = _map_columns(row)
@@ -276,7 +331,7 @@ def _feed_table(rows: list[list[str | None]], page_no: int, st: _ParseState) -> 
         factor = _cell_soft(_row_cell(row, cols.get("factor")))
         subj_raw = _cell(_row_cell(row, cols.get("subj")))
         score_raw = _row_cell(row, cols.get("score"))
-        score = _parse_score_cell(score_raw)
+        score, sub_name = _parse_score_cell_named(score_raw)
         detail = _cell_soft(_row_cell(row, cols.get("detail")))
 
         # P0-B 占位符/空条款行防护（"前*名"未填、"未达到__%"空条款）——跳过防误启用
@@ -324,7 +379,7 @@ def _feed_table(rows: list[list[str | None]], page_no: int, st: _ParseState) -> 
                 group=st.group, group_total=st.group_total,
                 sub_idx=int(m_idx.group(1)) if m_idx else None,
                 subjectivity=subj, max_score=score,
-                text=detail, page_no=page_no,
+                text=detail, page_no=page_no, sub_name=sub_name,
             ))
         elif detail:
             # 续行：分值 cell 空 + 细则非空 → 直接并入上一计分行（同 cell 断片）
@@ -342,14 +397,15 @@ def _feed_ledger(pages_by_no: dict[int, str], ledger: list[LedgerEntry]) -> None
     for pno in sorted(pages_by_no):
         text = pages_by_no[pno]
         for m in _RE_LEDGER.finditer(text):
-            label, num = m.group(1), m.group(2)
+            label, suffix, num = m.group(1), m.group(2), m.group(3)
             start = m.start()
             nxt = re.search(
-                r"\n\s*[(（]?[一二三四五六七八九十\d]+[)）、.．]\s*(?:" + _PART_GROUP + r")部分",
+                r"\n\s*[(（]?[一二三四五六七八九十\d]+[)）、.．]\s*"
+                r"(?:" + _PART_GROUP + r")(?:部分|评审)",
                 text[m.end():])
             seg = text[start: m.end() + (nxt.start() if nxt else 0)]
             entry = LedgerEntry(
-                label=f"{label}部分", max_score=Decimal(num),
+                label=f"{label}{suffix}", max_score=Decimal(num),
                 text=_cell_soft(seg), page_no=pno,
             )
             # 同声明多页出现（目录/前文摘要 vs 评标细则正文）→ 留正文（更长者）
@@ -442,6 +498,23 @@ def parse_skeleton(tables_by_page: dict[int, list],
         return None
     rows_alt: list[SkeletonRow] = [r for seg in segments[1:] for r in seg]
     warnings = list(st.warnings)
+
+    # 空细则行过滤（假项防线一）：text 为空的行无法引文核验、也无法计分判定，
+    # 多为权重表数据行/表头误收（利群「产品名 10分」假项实证）——丢弃并留痕。
+    # 续行回接（_feed_table 已把跨页断片并入上一行）之后再滤，不伤续行。
+    def _drop_empty(rows: list[SkeletonRow]) -> tuple[list[SkeletonRow], int]:
+        kept = [r for r in rows if (r.text or "").strip()]
+        return kept, len(rows) - len(kept)
+
+    primary, dropped1 = _drop_empty(primary)
+    rows_alt, dropped2 = _drop_empty(rows_alt)
+    if dropped1 + dropped2:
+        warnings.append(
+            f"empty_text_row_dropped：{dropped1 + dropped2} 个无细则文本行被丢弃"
+            "（疑似权重表/表头数据行误收，非评分项）"
+        )
+    if not primary:
+        return None
     if rows_alt:
         warnings.append(
             f"ambiguous_dual_scoring：检测到 {len(segments)} 套评分表家族"

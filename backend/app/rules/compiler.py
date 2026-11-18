@@ -857,6 +857,31 @@ def fold_material_blocks(
     return out
 
 
+def prune_weight_table_items(
+    criteria: list[ExtractedCriterion],
+    pages: list[tuple[int, str]],
+) -> tuple[list[ExtractedCriterion], list[str]]:
+    """抽取期剪枝：权重表数据行误抽的评分项（假项）。
+
+    利群 p125「标段|产品名称|所占样品分 → 1|利群(休闲细支)商标条盒|10分」实证：
+    权重声明行被抽成 criterion（quote=null、与样品分重复计分）。
+    判定走 check_infer.is_weight_table_item（quote 空 + 权重表上下文 + 无计分
+    语言，零项目专名）；返回 (保留项, 剪除名清单)。normalize_package 的退役
+    规则是第二道网（骨架失效时兜底），此处剪掉的还没落库、不产 ReviewRecord。
+    """
+    from app.rules.check_infer import is_weight_table_item
+
+    pages_by_no = dict(pages or [])
+    kept: list[ExtractedCriterion] = []
+    pruned: list[str] = []
+    for c in criteria:
+        if is_weight_table_item(c.name, c.description or "", c.quote, pages_by_no):
+            pruned.append(c.name)
+            continue
+        kept.append(c)
+    return kept, pruned
+
+
 def _triage(c: ExtractedCriterion, quote_verified: bool, has_node: bool) -> str:
     """六态分诊。"""
     if c.score_type == "subjective" and c.levels and any(
@@ -1179,6 +1204,14 @@ def _persist_criterion(
     # veto/match/count 一律建 check：缺 check 会让评分端落入「缺少可执行的检查
     # 定义」死项或「未知计数字段」恒 0（2026-10-26 run 54 c51/c57/c63、c64 实证）。
     wants_check = bool(c.check_type) or c.score_type in ("veto", "match", "count")
+    # 客观列落 subjective 代判的条目（全有全无/形态不可判）也建 check 以落
+    # _subjectivity_hint/_objective_form 进快照（OBJECTIVE_AS_SUBJECTIVE warn
+    # 的数据源）。仅这一小类，不波及其他主观项（避免 auto 裁决队列膨胀）。
+    subj_objective_form = (
+        c.score_type == "subjective" and (c.params or {}).get("_objective_form")
+    )
+    if subj_objective_form:
+        wants_check = True
     if wants_check:
         from app.rules.check_infer import infer_check, infer_count_params
         from app.rules.freeze import _jsonable
@@ -1198,7 +1231,8 @@ def _persist_criterion(
             )
             check_type = check_type or "count_at_least"
         if not check_type:
-            gen = infer_check(
+            # 主观代判条目的 check 只为落参留痕（不参与判定），固定 human_only
+            gen = None if subj_objective_form else infer_check(
                 {"name": c.name, "description": c.description, "source_quote": c.quote}
             )
             if gen is not None:
@@ -1390,6 +1424,11 @@ def compile_rules(
     criteria_acc = dedupe_extracted(criteria_acc)
     # 确定性补全：先把【证明材料】块折叠进 count 项，再补公式/计数参数
     criteria_acc = fold_material_blocks(criteria_acc)
+    # 权重表数据行剪枝（利群 p125「产品名 10分」假项实证）：quote 空 + 权重表
+    # 上下文 + 无计分语言 → 不是评分项，抽取期即剔除（normalize 退役是第二道网）
+    criteria_acc, weight_pruned = prune_weight_table_items(criteria_acc, tender_pages)
+    if selection_meta_out is not None and weight_pruned:
+        selection_meta_out["weight_pruned"] = weight_pruned
     # 类别确定性校正（落库前）：category=="price" 是价格公式落盘的门槛，
     # LLM 把商务/价格项标错类别会让对应链路整体失效（2026-10-21 实证）。
     from app.rules.category_map import apply_category_to_extracted
@@ -1634,8 +1673,10 @@ def compile_rules_job(ctx: JobContext, payload: dict) -> dict:
         ctx.advance(message="校验与分诊完成")
 
     result: dict = {"package_id": package_id}
-    if selection_meta.get("truncated"):
-        result["selection_meta"] = selection_meta
+    # selection_meta 恒写（2026-11-18）：未截断文档也要带 skeleton_reconcile 对账
+    # 报告 / weight_pruned 剪枝记录——否则"骨架跑没跑、跑了什么"无从排查
+    # （旧实现只在 truncated 时写，利群排障时 Job 结果里什么都没有）
+    result["selection_meta"] = selection_meta
     # 校验摘要（2026-10-27 错配护栏）：编译结果即时带出 error/warn（Σ 满分核对、
     # 价格参数缺参等），前端编译完成即可见红字——不让"Σ≠100/无法执行"静默上线
     try:

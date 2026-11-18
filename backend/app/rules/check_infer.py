@@ -188,8 +188,10 @@ def _num_value(raw: str) -> str:
     return _CN_NUM_MAP.get(raw, raw)
 
 
+# 「缺(失|少)?」容忍"缺少一项扣0.5分"（利群 p123 检测仪器配置实证：旧
+# 缺(?:失)? 匹配不了"缺少"→ 扣分式整条漏判）
 _RE_DEV_PER_MISSING = re.compile(
-    r"每?\s*缺(?:失)?(?:一)?\s*(?:条|个|本|张|项)\s*扣\s*" + _NUM_TOKEN + r"\s*分"
+    r"每?\s*缺(?:失|少)?(?:一)?\s*(?:条|个|本|张|项)\s*扣\s*" + _NUM_TOKEN + r"\s*分"
 )
 _RE_DEV_PER_NEG = re.compile(
     r"每?\s*负偏离\s*(?:一)?\s*(?:条|个|张|项)?\s*扣\s*" + _NUM_TOKEN + r"\s*分"
@@ -409,7 +411,7 @@ _CERT_LEVEL_ORDER = {"一级": 1, "二级": 2, "三级": 3, "四级": 4, "五级
 # 分档计数（带量词后名词捕获，判计数源用）："2个及以上…经验，得1分" / "提供两项得1分"
 # 得(得)* 容忍双得断行（与 objective._RE_COUNT_TIER 同口径）
 _RE_COUNT_TIER_NOUN = re.compile(
-    r"(一|二|两|三|四|五|六|七|八|九|十|\d+)\s*(?:项|个|本|张|类)"
+    r"(一|二|两|三|四|五|六|七|八|九|十|\d+)\s*(?:项|个|本|张|类|条|台|套|人|份|种)"
     r"([^得。；]{0,14})得(?:\s*得)*\s*(\d+(?:\.\d+)?)\s*分"
 )
 _EXP_KW = re.compile(r"经验|业绩|案例")
@@ -550,3 +552,146 @@ def infer_objective_route(criterion: dict[str, Any]) -> tuple[str, dict[str, Any
             return "count", out
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# 评分形态共享决策树（reconcile 与 normalize_package 共用，口径唯一）
+# ---------------------------------------------------------------------------
+# 只认细则明示形态（不猜）：全有全无 / 分档计数 / 扣分式 / per_item 线性 / 二值存在。
+# 利群商标条盒 7 条 match 误标实证：多档"一条…得2分、两条…得3分"（无「每」）、
+# 扣分式"缺少一项扣0.5分"（旧正则匹配不了"缺少"）、二值"提供…得1分"（无证书词）
+# 三形态全走旧兜底 → 撞上 match（不计分）→ Σ 恒缺 15。
+
+_RE_ALL_OR_NOTHING_FAIL = re.compile(
+    r"任(?:何|意)?\s*(?:一)?\s*(?:项|个|条|处|样品)[^。；]{0,24}?"
+    r"(?:不能|不符合|未)(?:满足|符合)[^。；]{0,30}?得\s*0\s*分"
+)
+_RE_ALL_OR_NOTHING_PASS = re.compile(
+    r"全部(?:符合|满足)[^。；]{0,24}?(?:得\s*(?:满分|\d+(?:\.\d+)?\s*分))"
+)
+# 二值存在性："提供检测人员配置方案的得1分，未提供的得0分"（无「每」的单件得分）
+_RE_EXIST_SCORE = re.compile(
+    r"(?:提供|具有|配备|提交|出具)[^。；]{0,40}?(?:得|计)\s*(\d+(?:\.\d+)?)\s*分"
+)
+
+
+def classify_scoring_form(text: str) -> tuple[str, dict[str, Any]] | None:
+    """细则文本 → (form, params)；明示形态都判不出 → None（调用方维持现状，不猜）。
+
+    form ∈ {all_or_nothing, tier_count, deduct, per_item, existence}：
+    - all_or_nothing（"任一不能满足得0分、全部符合得满分"）：文本无计数对象
+      （样品符合性是实体判定）——调用方应落 subjective + _subjectivity_hint=objective
+      留痕，不得硬映射 count（count 事实层无案例会悬置不进总分，更糟）；
+    - 其余形态 → count 族，params 供确定性引擎执行（tiers 走 score_count 案例档表
+      （objective.score_count 的 _use_tiers）/ deviation_deduct_table 扣分封顶 /
+      per_item 线性）。
+    """
+    text = text or ""
+    # ① 全有全无（双侧判据：0 分侧与满分侧都在才算明示）
+    if _RE_ALL_OR_NOTHING_FAIL.search(text) and _RE_ALL_OR_NOTHING_PASS.search(text):
+        return "all_or_nothing", {}
+    # ② 扣分式："缺少一项扣0.5分（扣完为止）"——封顶由引擎 deduct=min(deduct,max) 天然满足
+    m = _RE_DEV_PER_MISSING.search(text)
+    if m:
+        return "deduct", {"engine": "deviation_deduct_table",
+                          "per_missing": _num_value(m.group(1))}
+    # ③ 分档计数（≥2 档明示 + 子句闭合守卫，不猜阈值）
+    from app.engine.objective import _CN_NUM, _RE_COUNT_TIER
+
+    count_m = list(_RE_COUNT_TIER.finditer(text))
+    if len(count_m) >= 2 and _tier_scores_closed(text, [m.span() for m in count_m]):
+        tiers: list[dict[str, Any]] = []
+        seen_min: set[int] = set()
+        for raw_n, raw_score in ((mm.group(1), mm.group(2)) for mm in count_m):
+            min_c = _CN_NUM.get(raw_n)
+            if min_c is None:
+                try:
+                    min_c = int(raw_n)
+                except ValueError:
+                    continue
+            if min_c in seen_min:
+                continue
+            seen_min.add(min_c)
+            tiers.append({"min_count": min_c, "score": raw_score})
+        if len(tiers) >= 2:
+            tiers.sort(key=lambda t: int(t["min_count"]))
+            if CERT_KW.search(text):
+                # 证书档计数：count_tier 引擎按证书清单计数
+                return "tier_count", {"engine": "count_tier",
+                                      "field": "certificates", "tiers": tiers}
+            if PERF_KW.search(text):
+                # 业绩档计数：score_count 案例档表（tiers 形状、不带 engine）
+                return "tier_count", {"field": "performance", "tiers": tiers}
+            # 其他计数对象（设备/生产线/条目）：LLM 逐条核验 + 案例档表
+            return "tier_count", {"field": "items", "tiers": tiers}
+    # ④ per_item 线性："每提供1个案例得1分，最高2分"
+    m = _RE_PER_ITEM.search(text)
+    if m:
+        field = ("certificates" if CERT_KW.search(text)
+                 else "performance" if PERF_KW.search(text) else "items")
+        params: dict[str, Any] = {"field": field, "per_item": m.group(1)}
+        cap = _RE_CAP.search(text)
+        if cap:
+            try:
+                per = Decimal(m.group(1))
+            except Exception:  # noqa: BLE001
+                per = Decimal(0)
+            if per > 0:
+                params["max_items"] = str(int(Decimal(cap.group(1)) / per))
+        return "per_item", params
+    # ⑤ 二值存在性："提供…得N分，未提供得0分"——单件存在即得 N 分（per_item=N，max_items=1）
+    m = _RE_EXIST_SCORE.search(text)
+    if m:
+        field = "certificates" if CERT_KW.search(text) else "items"
+        return "existence", {"field": field, "per_item": m.group(1), "max_items": "1"}
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 权重表数据行判定（compiler 抽取期剪枝与 normalize_package 退役共用）
+# ---------------------------------------------------------------------------
+# 利群 p125「标段|产品名称|所占样品分 → 1|利群(休闲细支)商标条盒|10分」实证：
+# 权重声明行被 LLM 误抽成评分项（quote=null、与样品分重复计 10 分）。
+# 判据全部来自文本形态，零项目专名；调用方另要求 source_quote 为空（有原文
+# 引用的真评分项不动）。
+
+_RE_WEIGHT_CTX = re.compile(r"产品名称|所占.{0,6}分|分值计算权重|评审权重|标段")
+_RE_SCORING_LANG = re.compile(r"得\s*\d|扣\s*\d|评分|评审细则|评标细则|符合|满足")
+_RE_BARE_VALUE = re.compile(r"[\d.]+\s*(?:分|%)\s*$")
+
+
+def is_weight_table_item(name: str, text: str, quote: str | None,
+                         pages_by_no: dict[int, str] | None) -> bool:
+    """权重表数据行 → True。全部满足才判（宁放过不误杀）：
+    1. source_quote 为空（有原文引用的真评分项不动）；
+    2. name/text 无任何计分/评审语言，且 text 为空或仅形如「N分/N%」；
+    3. name 在招标文件页文本中命中权重表上下文：邻近 80 字符内出现
+       产品名称/所占分值/分值计算权重/评审权重/标段，或同行呈
+       「数字 | name | 数字分|%」表格行形态且上下文带权重列头词。
+    """
+    if (quote or "").strip():
+        return False
+    name = (name or "").strip()
+    if not name:
+        return False
+    text = (text or "").strip()
+    if _RE_SCORING_LANG.search(name) or _RE_SCORING_LANG.search(text):
+        return False
+    if text and not _RE_BARE_VALUE.search(text):
+        return False
+    for ptext in (pages_by_no or {}).values():
+        if not ptext or name not in ptext:
+            continue
+        for m in re.finditer(re.escape(name), ptext):
+            window = ptext[max(0, m.start() - 80): m.end() + 80]
+            if _RE_WEIGHT_CTX.search(window):
+                return True
+            line_start = ptext.rfind("\n", 0, m.start()) + 1
+            line_end = ptext.find("\n", m.end())
+            line = ptext[line_start: line_end if line_end != -1 else len(ptext)]
+            compact = re.sub(r"\s+", "", line)
+            if re.search(
+                r"\d+[|｜]%s[|｜][\d.]+(?:分|%%)" % re.escape(name), compact
+            ) and _RE_WEIGHT_CTX.search(compact):
+                return True
+    return False

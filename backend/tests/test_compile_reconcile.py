@@ -386,3 +386,267 @@ def test_non_sample_criterion_no_total_scope_flag() -> None:
     )
     enrich_extracted([c], "综合得分为以上三部分得分的总和。")
     assert "in_total" not in (c.params or {})
+
+
+# --- 利群商标条盒 2026：主/客观列全面归正 + 形态决策树（match 带分值实证） ---
+
+LIQUN_FX = Path(__file__).parent / "fixtures" / "scoring_skeleton" / "liqun_2026"
+
+
+def _liqun_skeleton_and_pages():
+    tables = {int(k): v for k, v in json.loads(
+        (LIQUN_FX / "tables_p123_125.json").read_text(encoding="utf-8")).items()}
+    pages = {int(k): v for k, v in json.loads(
+        (LIQUN_FX / "pages_p123_125.json").read_text(encoding="utf-8")).items()}
+    sk = parse_skeleton(tables, pages)
+    assert sk is not None
+    return sk, sorted(pages.items())
+
+
+def _liqun_row(sk, sub_name: str):
+    return next(r for r in sk.rows if r.sub_name == sub_name)
+
+
+def _match_item_on(row, name: str) -> ExtractedCriterion:
+    return ExtractedCriterion(
+        name=name, category="technical", score_type="match",
+        max_score=row.max_score, description=row.text, page_hint=row.page_no,
+    )
+
+
+def test_reconcile_objective_column_overrides_match_rows() -> None:
+    """客观列计分行被 LLM 标 match → 列覆盖归正为 count（by=subj_column 层指纹）。
+
+    利群实证：7 条 match 带分值（Σ 恒缺 15）——match 不计分语义下分值永远兑现不了。
+    变异强度：摘除列覆盖 pass → 停在 match → 断言必红。
+    """
+    sk, pages = _liqun_skeleton_and_pages()
+    row = _liqun_row(sk, "生产设备配置")
+    item = _match_item_on(row, "生产设备配置")
+    out, report = reconcile_with_skeleton([item], document_id=1, pages=pages, skeleton=sk)
+    assert item.score_type == "count"
+    fixed = [f for f in report["score_type_fixed"] if f["name"] == "生产设备配置"]
+    assert fixed and fixed[0]["by"] == "subj_column"
+    # 改写后分值计入总分（列=objective 的行留标注）
+    assert (item.params or {}).get("_subjectivity_hint") == "objective"
+
+
+def test_reconcile_tier_form_maps_case_tiers() -> None:
+    """多档「一条…得2分、两条…得3分」→ count + tiers（案例档表，不带 engine 键）。
+
+    变异强度：_RE_COUNT_TIER 量词删「条」→ 档位解析失败落 existence（带 per_item）
+    或兜底 → tiers 断言必红（2026-11-18 实证该形态旧正则全漏）。
+    """
+    sk, pages = _liqun_skeleton_and_pages()
+    row = _liqun_row(sk, "生产设备配置")
+    item = _match_item_on(row, "生产设备配置")
+    out, report = reconcile_with_skeleton([item], document_id=1, pages=pages, skeleton=sk)
+    params = item.params or {}
+    assert item.score_type == "count"
+    assert params["tiers"] == [{"min_count": 1, "score": "2"}, {"min_count": 2, "score": "3"}]
+    assert "per_item" not in params
+    assert params.get("engine") in (None, "count_tier")
+
+
+def test_reconcile_deduct_form_maps_deviation_engine() -> None:
+    """扣分式「缺少一项扣0.5分扣完为止」→ count + deviation_deduct_table。
+
+    变异强度：还原 _RE_DEV_PER_MISSING（缺(?:失)? 匹配不了"缺少"）→ 形态不认
+    → 非 count → 断言必红。
+    """
+    sk, pages = _liqun_skeleton_and_pages()
+    row = _liqun_row(sk, "检测仪器配置")
+    item = _match_item_on(row, "检测仪器配置")
+    out, report = reconcile_with_skeleton([item], document_id=1, pages=pages, skeleton=sk)
+    params = item.params or {}
+    assert item.score_type == "count"
+    assert params.get("engine") == "deviation_deduct_table"
+    assert params.get("per_missing") == "0.5"
+
+
+def test_reconcile_binary_existence_maps_count_one() -> None:
+    """二值存在「提供…得1分，未提供得0分」→ count（per_item=1，max_items=1）。"""
+    sk, pages = _liqun_skeleton_and_pages()
+    row = _liqun_row(sk, "检测人员")
+    item = _match_item_on(row, "检测人员")
+    out, report = reconcile_with_skeleton([item], document_id=1, pages=pages, skeleton=sk)
+    params = item.params or {}
+    assert item.score_type == "count"
+    assert params.get("per_item") == "1"
+    assert params.get("max_items") == "1"
+
+
+def test_reconcile_all_or_nothing_subjective_with_hint() -> None:
+    """全有全无（样品评审「任一不符得0分、全部符合得满分」）→ subjective 代判
+    + _subjectivity_hint=objective 留痕 + 报告披露（count 事实层无计数对象，
+    硬映射 count 会悬置不进总分——设计决策见 ADR 0014）。"""
+    sk, pages = _liqun_skeleton_and_pages()
+    row = _liqun_row(sk, "样品评审") if any(
+        r.sub_name == "样品评审" for r in sk.rows) else next(
+        r for r in sk.rows if r.group == "样品评审")
+    item = ExtractedCriterion(
+        name="样品评审", category="technical", score_type="match",
+        max_score=Decimal("10"), description=row.text, page_hint=row.page_no)
+    out, report = reconcile_with_skeleton([item], document_id=1, pages=pages, skeleton=sk)
+    params = item.params or {}
+    assert item.score_type == "subjective"
+    assert params.get("_subjectivity_hint") == "objective"
+    assert params.get("_objective_form") == "all_or_nothing"
+    assert "样品评审" in report["objective_as_subjective"]
+
+
+def test_reconcile_gap_gen_keeps_subjectivity_hint() -> None:
+    """缺口生成条目保留主/客观列标注（旧实现把 row.subjectivity 丢弃）。"""
+    sk, pages = _liqun_skeleton_and_pages()
+    out, report = reconcile_with_skeleton([], document_id=1, pages=pages, skeleton=sk)
+    assert report["generated"]
+    subj_gen = [c for c in out if (c.params or {}).get("_subjectivity_hint") == "subjective"]
+    assert subj_gen, "主观列的缺口生成条目应带 _subjectivity_hint=subjective"
+    assert all(c.score_type == "subjective" for c in subj_gen)
+
+
+def test_liqun_reconcile_end_to_end_sum_100() -> None:
+    """利群形态模拟抽取（7 条 match 带分 + 其余计分行）→ 对账后 Σ=100 零 match 带分。
+
+    模拟实测 41 条的病灶形态：多档/扣分式/二值三类被标 match（Σ=95 实证），
+    对账归正后 formula50+资信8+技术32+样品10 = 100。"""
+    sk, pages = _liqun_skeleton_and_pages()
+    mislabeled = {"生产设备配置", "检测仪器配置", "检测人员", "控制手段",
+                  "追溯方案", "二维码管控", "绿色低碳成果"}
+    out = []
+    for r in sk.rows:
+        name = r.sub_name or r.group
+        is_bad = (name in mislabeled or r.group in mislabeled) and r.group != "样品评审"
+        out.append(ExtractedCriterion(
+            name=name, category="technical",
+            score_type="match" if is_bad else ("subjective" if r.subjectivity == "subjective" else "count"),
+            max_score=r.max_score, description=r.text, page_hint=r.page_no,
+        ))
+    out.append(ExtractedCriterion(
+        name="商务报价部分", category="price", score_type="formula",
+        max_score=Decimal("50"), description="偏离扣分",
+        formula_type="deviation_deduct", benchmark_method="average",
+    ))
+    result, report = reconcile_with_skeleton(out, document_id=1, pages=pages, skeleton=sk)
+    bad_left = [c.name for c in result if c.score_type == "match" and c.max_score]
+    assert not bad_left, f"match 带分值残留：{bad_left}"
+    total = sum((c.max_score or Decimal(0) for c in result
+                 if c.score_type in ("formula", "count", "subjective")), Decimal(0))
+    assert total == Decimal("100")
+    assert report["final_sum"] == 100.0
+
+
+def _liqun_ill_extraction(sk) -> "RuleExtraction":  # noqa: ANN002
+    """模拟利群实测 41 条的病灶形态：7 条 match 带分 + 权重假项 + 其余照抄列。"""
+    from app.rules.model import RuleExtraction
+
+    mislabeled = {"生产设备配置", "检测仪器配置", "检测人员", "控制手段",
+                  "追溯方案", "二维码管控", "绿色低碳成果"}
+    items = []
+    for r in sk.rows:
+        name = r.sub_name or r.group
+        is_bad = name in mislabeled
+        items.append(ExtractedCriterion(
+            name=name, category="technical",
+            score_type="match" if is_bad else (
+                "subjective" if r.subjectivity == "subjective" else "count"),
+            max_score=r.max_score, description=r.text,
+            quote=(r.text or "")[:20] or None, page_hint=r.page_no,
+        ))
+    # 权重表假项（p125「产品名 10分」误抽形态：无引文、无细则文本）
+    items.append(ExtractedCriterion(
+        name="利群(休闲细支)商标条盒", category="technical", score_type="subjective",
+        max_score=Decimal("10"), description="", quote=None))
+    items.append(ExtractedCriterion(
+        name="商务报价部分", category="price", score_type="formula",
+        max_score=Decimal("50"), description="偏离扣分",
+        formula_type="deviation_deduct", benchmark_method="average"))
+    return RuleExtraction(criteria=items)
+
+
+def test_liqun_compile_wiring_prunes_phantom_and_fixes_match(app_env, monkeypatch) -> None:
+    """compile_rules 全链端到端（利群病灶形态）：抽取期剪假项 + 对账归正 match
+    → 落库 Σ=100、零「商标条盒」条目、7 条误标全计分。
+
+    变异强度：摘除 prune_weight_table_items → 假项落库 → 断言必红；
+    摘除列覆盖 pass → match 残留 → 断言必红。
+    """
+    from sqlalchemy import select
+
+    from app.db.models import Criterion, Document, DocumentPage, Project
+    from app.db.session import session_scope
+    from app.rules import compiler as compiler_mod
+
+    sk, pages = _liqun_skeleton_and_pages()
+    with session_scope() as s:
+        s.add(Project(id="PRJ-TEST-LIQUN", name="利群接线测试"))
+        s.flush()
+        doc = Document(project_id="PRJ-TEST-LIQUN", kind="tender",
+                       original_filename="t.pdf", stored_path="t.pdf",
+                       sha256="2" * 64, parse_status="parsed")
+        s.add(doc)
+        s.flush()
+        doc_id = doc.id
+        for pno, text in pages:
+            s.add(DocumentPage(document_id=doc_id, page_no=pno, text=text))
+
+    fake_extraction = _liqun_ill_extraction(sk)
+    monkeypatch.setattr(
+        compiler_mod, "_extract_chunk",
+        lambda *a, **k: (fake_extraction, type("R", (), {"model": "mock"})()))
+    monkeypatch.setattr(
+        "app.rules.reconcile.extract_score_skeleton", lambda *a, **k: sk)
+
+    package_id = compiler_mod.compile_rules("PRJ-TEST-LIQUN", doc_id, actor="tester")
+
+    with session_scope() as s:
+        crits = s.execute(
+            select(Criterion).where(Criterion.package_id == package_id)
+        ).scalars().all()
+        assert not any("商标条盒" in c.name for c in crits), "权重表假项必须被剪除"
+        total = sum((c.max_score or Decimal(0) for c in crits
+                     if c.score_type in ("formula", "count", "subjective")), Decimal(0))
+        assert total == Decimal("100"), f"落库合计 {total} != 100"
+        bad = [c.name for c in crits if c.score_type == "match" and c.max_score]
+        assert not bad, f"match 带分值残留：{bad}"
+
+
+def test_compile_job_result_carries_reconcile_report_untruncated(app_env, monkeypatch) -> None:
+    """Job 结果恒带 skeleton_reconcile 对账报告（旧实现只在 truncated 时写，
+    未截断文档"骨架跑没跑"无从排查——利群排障实证）。"""
+    from app.db.models import Document, DocumentPage, Project
+    from app.db.session import session_scope
+    from app.rules import compiler as compiler_mod
+
+    sk, pages = _liqun_skeleton_and_pages()
+    with session_scope() as s:
+        s.add(Project(id="PRJ-TEST-JOBRPT", name="job报告测试"))
+        s.flush()
+        doc = Document(project_id="PRJ-TEST-JOBRPT", kind="tender",
+                       original_filename="t.pdf", stored_path="t.pdf",
+                       sha256="3" * 64, parse_status="parsed")
+        s.add(doc)
+        s.flush()
+        doc_id = doc.id
+        for pno, text in pages:
+            s.add(DocumentPage(document_id=doc_id, page_no=pno, text=text))
+
+    fake_extraction = _liqun_ill_extraction(sk)
+    monkeypatch.setattr(
+        compiler_mod, "_extract_chunk",
+        lambda *a, **k: (fake_extraction, type("R", (), {"model": "mock"})()))
+    monkeypatch.setattr(
+        "app.rules.reconcile.extract_score_skeleton", lambda *a, **k: sk)
+
+    class _Ctx:
+        def start(self, **kw):  # noqa: ANN002, ANN202
+            return None
+
+        def advance(self, **kw):  # noqa: ANN002, ANN202
+            return None
+
+    result = compiler_mod.compile_rules_job(_Ctx(), {
+        "project_id": "PRJ-TEST-JOBRPT", "document_id": doc_id, "actor": "tester"})
+    assert "selection_meta" in result, "未截断文档也必须带 selection_meta（恒写）"
+    assert result["selection_meta"].get("skeleton_reconcile"), "对账报告必须可见"
+    assert result["selection_meta"].get("weight_pruned") == ["利群(休闲细支)商标条盒"]

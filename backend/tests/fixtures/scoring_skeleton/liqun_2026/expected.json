@@ -1,0 +1,33 @@
+{
+  "rows": [
+    {"group": "供货业绩", "sub_name": null, "sub_idx": null, "subjectivity": "objective", "max_score": "2", "page_no": 123},
+    {"group": "体系认证", "sub_name": null, "sub_idx": null, "subjectivity": "objective", "max_score": "3", "page_no": 123},
+    {"group": "财务制度", "sub_name": null, "sub_idx": null, "subjectivity": "objective", "max_score": "2", "page_no": 123},
+    {"group": "银行资信", "sub_name": null, "sub_idx": null, "subjectivity": "objective", "max_score": "1", "page_no": 123},
+    {"group": "创新能力", "sub_name": "技术研发", "sub_idx": null, "subjectivity": "objective", "max_score": "2", "page_no": 123},
+    {"group": "创新能力", "sub_name": "产品设计", "sub_idx": null, "subjectivity": "objective", "max_score": "2", "page_no": 123},
+    {"group": "生产设备能力", "sub_name": "生产设备配置", "sub_idx": null, "subjectivity": "objective", "max_score": "3", "page_no": 123},
+    {"group": "工艺技术能力", "sub_name": "产品工艺", "sub_idx": null, "subjectivity": "subjective", "max_score": "3", "page_no": 123},
+    {"group": "工艺技术能力", "sub_name": "上机适应能力", "sub_idx": null, "subjectivity": "subjective", "max_score": "3", "page_no": 123},
+    {"group": "质量控制能力", "sub_name": "检测仪器配置", "sub_idx": null, "subjectivity": "objective", "max_score": "2", "page_no": 123},
+    {"group": "质量控制能力", "sub_name": "检测人员", "sub_idx": null, "subjectivity": "objective", "max_score": "1", "page_no": 123},
+    {"group": "质量控制能力", "sub_name": "控制手段", "sub_idx": null, "subjectivity": "objective", "max_score": "2", "page_no": 124},
+    {"group": "质量控制能力", "sub_name": "追溯方案", "sub_idx": null, "subjectivity": "objective", "max_score": "4", "page_no": 124},
+    {"group": "质量控制能力", "sub_name": "追溯案例", "sub_idx": null, "subjectivity": "subjective", "max_score": "3", "page_no": 124},
+    {"group": "服务能力及承诺", "sub_name": "保障能力", "sub_idx": null, "subjectivity": "subjective", "max_score": "2", "page_no": 124},
+    {"group": "服务能力及承诺", "sub_name": "应急响应能力", "sub_idx": null, "subjectivity": "subjective", "max_score": "2", "page_no": 124},
+    {"group": "二维码管控能力", "sub_name": "二维码管控", "sub_idx": null, "subjectivity": "objective", "max_score": "2", "page_no": 124},
+    {"group": "绿色低碳能力", "sub_name": "绿色低碳成果", "sub_idx": null, "subjectivity": "objective", "max_score": "1", "page_no": 124},
+    {"group": "样品评审", "sub_name": null, "sub_idx": null, "subjectivity": "objective", "max_score": "10", "page_no": 125}
+  ],
+  "row_sum": "50",
+  "ledger": [
+    {"label": "资信部分", "max_score": "8"},
+    {"label": "技术部分", "max_score": "32"},
+    {"label": "商务报价部分", "max_score": "50"},
+    {"label": "样品评审", "max_score": "10"}
+  ],
+  "ledger_sum": "100",
+  "target_total": "100",
+  "closed": true
+}
