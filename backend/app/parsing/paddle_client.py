@@ -187,16 +187,30 @@ def _try_read_segment(img, prompt: str | None) -> str | None:
 
 
 def _ocr_split_and_read(img, prompt: str | None, depth: int) -> str:
-    """已知该图整读会截断：竖切两半（5% 重叠）递归读全。"""
+    """已知该图整读会截断：竖切两半（5% 重叠）递归读全。
+
+    竖切到底（高 <32px）仍截断时改**横切**——点检/签到类宽表一行几百个
+    "✓ |" 列（run128 p508 实证：1/32 段装不下一行），按列对半降到 ~1k token。
+    """
     w, h = img.size
-    if h < 32 or depth >= _MAX_SEGMENT_DEPTH:
+    if depth >= _MAX_SEGMENT_DEPTH:
         raise RuntimeError("PaddleOCR-VL 分段输出仍被 max_tokens 截断，原页尚未完整读取")
-    overlap = max(4, int(h * 0.05))
-    mid = h // 2
-    crops = [
-        img.crop((0, 0, w, min(h, mid + overlap))),
-        img.crop((0, max(0, mid - overlap), w, h)),
-    ]
+    if h >= 64:
+        overlap = max(4, int(h * 0.05))
+        mid = h // 2
+        crops = [
+            img.crop((0, 0, w, min(h, mid + overlap))),
+            img.crop((0, max(0, mid - overlap), w, h)),
+        ]
+    elif w >= 240:
+        overlap = max(4, int(w * 0.05))
+        mid = w // 2
+        crops = [
+            img.crop((0, 0, min(w, mid + overlap), h)),
+            img.crop((max(0, mid - overlap), 0, w, h)),
+        ]
+    else:
+        raise RuntimeError("PaddleOCR-VL 分段输出仍被 max_tokens 截断，原页尚未完整读取")
     parts: list[str] = []
     for crop in crops:
         text = _try_read_segment(crop, prompt)

@@ -44,6 +44,21 @@ def test_dense_page_recurses_until_segments_fit(monkeypatch) -> None:  # noqa: A
     assert max(calls) <= 220, "首轮应从对半开始（整页截断已由调用方确认，不重发整页）"
 
 
+def test_wide_row_table_splits_horizontally(monkeypatch) -> None:  # noqa: ANN001
+    """点检宽表：一行几百个 ✓ 列，竖切到底仍截断 → 横切按列读全（run128 p508）。"""
+
+    def fake_post(png_bytes, prompt, max_tokens):  # noqa: ANN001, ANN202
+        img = Image.open(io.BytesIO(png_bytes))
+        if img.size[0] > 400:
+            return _reply("（截断）", truncated=True)
+        return _reply(f"[宽{img.size[0]}]")
+
+    monkeypatch.setattr(paddle_client, "_post", fake_post)
+    out = paddle_client._ocr_segmented(_png(800, 20), "OCR:")
+    # 800×20 → 横切两段各 440 宽（仍截断）→ 再横切各 242 宽 → 读全，共 4 段
+    assert out.count("[宽") == 4 and "[宽242]" in out, out
+
+
 def test_depth_limit_still_fails_loudly(monkeypatch) -> None:  # noqa: ANN001
     """任何深度都截断 → 明确失败（绝不输出部分文本冒充完整读取）。"""
     monkeypatch.setattr(paddle_client, "_post",
