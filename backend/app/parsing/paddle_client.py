@@ -138,7 +138,10 @@ def remote_ocr_page(
     return text.strip()
 
 
-_MAX_SEGMENT_DEPTH = 3  # 最多八分（1→2→4→8 段）；深度内仍截断才判"密集页读不全"
+# 最多 32 分（1→2→…→32 段）。设备点检/保养记录大表（一行几十个 ✓ 列，
+# 一页 1.8 万字符 ≈ 上万 token，run128 p254/p508 实证）连 1/8 段都装不下；
+# 1/32 ≈ 一两行表格 ≈ 2k token 必装得下。只有病态段才深挖（每层只在截断时细分）。
+_MAX_SEGMENT_DEPTH = 5
 
 
 def _ocr_segmented(png_bytes: bytes, prompt: str | None) -> str:
