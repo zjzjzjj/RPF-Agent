@@ -1183,7 +1183,7 @@ def execute_run(
         # 缺失）。旧二态把"没扫到"当"确认没有"→ 清零误杀。正则补 简历|职称证|
         # 人员情况表|履历（c48 实证：p121-122"简历+职称证书"旧正则匹配不到），
         # 并消费 material_tags 页级标签作存在性信号（目录式页被跳过条件误跳时的补救）。
-        person_stats: dict[int, dict[str, bool | None]] = {}
+        person_stats: dict[int, dict] = {}
         with session_scope() as s:
             from app.db.models import DocumentPage, MaterialTag
 
@@ -1191,11 +1191,13 @@ def execute_run(
                 doc_id = main_doc_by_bidder.get(bid_id)
                 exp_mat: bool | None = None
                 social_mat: bool | None = None
+                exp_pages: list[int] = []
+                social_pages: list[int] = []
                 if doc_id is not None:
                     exp_hit = social_hit = False
                     has_scan = False
-                    for ptext, psrc in s.execute(
-                        select(DocumentPage.text, DocumentPage.source)
+                    for ptext, psrc, pno in s.execute(
+                        select(DocumentPage.text, DocumentPage.source, DocumentPage.page_no)
                         .where(DocumentPage.document_id == doc_id)
                     ):
                         t = ptext or ""
@@ -1209,12 +1211,14 @@ def execute_run(
                             t,
                         ):
                             exp_hit = True
+                            exp_pages.append(int(pno or 0))
                         if re.search(r"社会保险|社保|参保缴费|参保人员|参保证明|缴费证明", t):
                             social_hit = True
+                            social_pages.append(int(pno or 0))
                     if not (exp_hit and social_hit):
                         # material_tags 页级标签存在性信号（补救目录式页误跳）
-                        for (tags_json,) in s.execute(
-                            select(MaterialTag.tags_json).where(
+                        for tags_json, tpage in s.execute(
+                            select(MaterialTag.tags_json, MaterialTag.page_no).where(
                                 MaterialTag.document_id == doc_id,
                                 MaterialTag.seg_kind == "page",
                             )
@@ -1222,13 +1226,20 @@ def execute_run(
                             joined = "、".join(str(x) for x in (tags_json or []))
                             if re.search(r"工作|经验证明|简历|职称|人员", joined):
                                 exp_hit = True
+                                exp_pages.append(int(tpage or 0))
                             if re.search(r"社保|参保", joined):
                                 social_hit = True
+                                social_pages.append(int(tpage or 0))
                     # 三态归位：命中→True；未命中且文本层可读（无扫描页）→False；
                     # 未命中但有扫描页 → None（机器看不见，不确认缺失）
                     exp_mat = True if exp_hit else (False if not has_scan else None)
                     social_mat = True if social_hit else (False if not has_scan else None)
-                person_stats[bid_id] = {"exp_material": exp_mat, "social_material": social_mat}
+                # exp_pages/social_pages：命中页锚（2026-11-18 ADR 0015——供确定性
+                # 事实供给/人员锚优先源；阈值不复活，纯存在性口径不变）
+                person_stats[bid_id] = {
+                    "exp_material": exp_mat, "social_material": social_mat,
+                    "exp_pages": sorted(set(exp_pages)), "social_pages": sorted(set(social_pages)),
+                }
 
         use_hierarchical = config.review_mode() == "hierarchical"
         subj_done = 0

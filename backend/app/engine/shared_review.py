@@ -579,6 +579,11 @@ class SharedReviewCollector:
             raise error
         review._validate_synthesis_sources(decision, [approved])
         review._validate_evidence(decision, collected.pages, use_vision=any(p.get("image_url") for p in collected.pages))
+        supplies = review._supplies_for(criterion, collected.pages)
+        if supplies:
+            # 确定性事实注入（ADR 0015）：与 review_criterion 同口径——证据校验
+            # 之后、finish_decision 复核之前
+            review._inject_supplied_facts(decision, supplies, collected.pages)
         decision = review.finish_decision(decision, criterion, collected.pages,
             selected=collected.pages, batches=[collected.pages], full=True,
             use_vision=any(p.get("image_url") for p in collected.pages))

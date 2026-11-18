@@ -22,7 +22,7 @@ from app.llm.base import LLMError
 _RUNTIME: ContextVar[dict | None] = ContextVar("review_work_runtime", default=None)
 _FLIGHTS_LOCK = threading.Lock()
 _FLIGHTS: dict[tuple, threading.Lock] = {}
-VALIDATOR_VERSION = "2026-11-06.sources-v2.1"
+VALIDATOR_VERSION = "2026-11-18.sources-v2.2"
 
 
 def stable_hash(value) -> str:

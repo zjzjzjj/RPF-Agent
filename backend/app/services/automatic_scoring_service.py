@@ -389,6 +389,9 @@ def _inject_deterministic_cert_backing(criterion: dict, decision, pages: list[di
     certificates = decision.facts.get("certificates") or []
     if not certificates:
         return
+    if (decision.facts.get("_fact_provenance") or {}).get("cert_section_present"):
+        # 已由确定性事实供给注入（ADR 0015）：同源检测结果，不重算不覆盖 provenance
+        return
     from app.engine.facts import extract_bid_facts
     from app.engine.objective import cert_evidence_present, classify_cert_backing
 
@@ -425,6 +428,20 @@ def _verified_count(criterion: dict, decision, pages: list[dict]) -> tuple[Decim
               for p in facts.person_attributes if isinstance(p, dict)]
     if len(people) != len(set(people)):
         raise LLMError("人员清单存在重复，须合并同一人员的证明材料后重算")
+    # 确定性 overlay 移植入自动路（ADR 0015，2026-11-18）：SC 深评路既有语义
+    # （scoring_service._overlay_* 同源：只升不降/严口径）——补齐"AS 不经 overlay"
+    # 缺口，与确定性事实供给互为表里。run48/49 社保来回摆、run64 经验证明误杀
+    # 等实证口径不变。
+    cases = values.get("verified_cases")
+    if isinstance(cases, list) and cases and params.get("person_scope"):
+        from app.services import scoring_service as _ss
+
+        _ss._overlay_social_security(cases, pages)
+        if str(params.get("person_scope")) == "member":
+            _ss._overlay_work_proof(cases, pages)
+        else:
+            _ss._overlay_experience_proof(cases, pages)
+            _ss._overlay_leader_table_proof(cases, pages)
     for name in ("response_hours", "warranty_months"):
         if name in values:
             number = _decimal(values[name], name)
@@ -937,6 +954,10 @@ def _persist_cell(run_id: int, bidder_id: int, criterion: dict, outcome: CellOut
                 if page is None:
                     raise LLMError("证据引用了本次送审范围以外的页")
                 if item.get("kind") == "visual":
+                    if item.get("engine_supplied") and not page.get("image_url"):
+                        # 确定性供给的 visual 锚（图片/短文本页，ADR 0015）：留痕
+                        # 于 _fact_provenance，无页图时不落图证也不判失败
+                        continue
                     if not page.get("image_url") or not item.get("observation"):
                         raise LLMError("视觉证据没有对应的原页图像或观察记录")
                     visual_evidence.append({
@@ -949,7 +970,10 @@ def _persist_cell(run_id: int, bidder_id: int, criterion: dict, outcome: CellOut
                     score_record_id=row.id, criterion_id=criterion["id"],
                     document_id=key[0], page_no=key[1], quote=str(item.get("quote") or ""),
                     citation_role="veto" if criterion["score_type"] == "veto" else "score",
-                    created_by="llm", page_size_json=[page.get("width", 0), page.get("height", 0)],
+                    # 确定性供给证据按 engine 留痕（ADR 0015；created_by="engine" 先例
+                    # 见 bidder_service 价格引文），模型证据仍标 llm
+                    created_by="engine" if item.get("engine_supplied") else "llm",
+                    page_size_json=[page.get("width", 0), page.get("height", 0)],
                 )
                 if not verify_automatic_citation(cit, page["text"]):
                     if outcome.basis == "model":

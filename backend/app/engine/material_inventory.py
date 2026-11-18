@@ -839,12 +839,17 @@ def build_inventory(bidder_id: int, pages: list[dict]) -> MaterialInventory:
     cert_names = [c.normalized or c.name for c in certs]
     facts.certificates = list(dict.fromkeys(cert_names))
     try:
-        from app.engine.objective import cert_evidence_present, classify_cert_backing
+        from app.engine.objective import classify_cert_backing, detect_cert_section
         page_pairs = [(str(p.get("source") or "text"), str(p.get("text") or "")) for p in pages]
-        cert_section = cert_evidence_present(page_pairs)
+        detection = detect_cert_section(pages)
+        cert_section = (detection.state is True, detection.basis)
+        cert_section_state = detection.state  # 三态进 audit（None=盲态不猜）
+        cert_section_hits = len(detection.hits)
         backing = classify_cert_backing(facts, page_pairs, cert_section)
     except Exception:  # noqa: BLE001
         cert_section = (False, "")
+        cert_section_state = None
+        cert_section_hits = 0
         backing = {}
     for cert in certs:
         key = cert.normalized or cert.name
@@ -903,5 +908,9 @@ def build_inventory(bidder_id: int, pages: list[dict]) -> MaterialInventory:
             ),
             "value_items": len(value_items),
             "cert_section_present": bool(cert_section[0]),
+            # 三态与命中数（2026-11-18 ADR 0015：bool 字段保持兼容 fastpath，
+            # None 盲态语义留痕不猜）
+            "cert_section_state": cert_section_state,
+            "cert_section_hits": cert_section_hits,
         },
     )

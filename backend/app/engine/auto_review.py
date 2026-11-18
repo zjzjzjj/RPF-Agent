@@ -494,7 +494,7 @@ def _anchor_person_sources(decision: AutoReviewDecision, pages: list[dict]) -> N
 
 _FACT_FIELDS_BY_PARAM = {
     "performance": ("verified_cases", "performance_amounts"),
-    "certificates": ("certificates", "cert_section_present"),
+    "certificates": ("certificates", "certificate_evidence", "cert_backing", "cert_section_present"),
 }
 
 
@@ -519,6 +519,234 @@ def _consumed_fact_fields(criterion: dict | None) -> set[str] | None:
     if params.get("person_scope"):
         consumed.update(("person_attributes", "verified_cases"))
     return consumed
+
+
+# ---------------------------------------------------------------------------
+# 确定性事实供给（2026-11-18，ADR 0015）：检测器结论作为有据事实，免模型口供。
+#
+# manifest（criterion["_supplied_facts"]，发 prompt 前剥离）：
+#   {field: {"value", "detector", "mode": "evidence"|"provenance_only",
+#            "exclusive": bool, "identity": "normalize_cert"|"name"|None,
+#            "anchors": [{"key"?, "document_id", "page_no", "quote", "kind"?}]}}
+# 红线：正向供给（检出才供）；未检出不供给不否定；锚 quote 只由宿主从送审页
+# 文本逐字切片并复核，复核不过丢锚（anchor_verify_failed）绝不放行。
+# ---------------------------------------------------------------------------
+
+
+def _supplies_for(criterion: dict, pages: list[dict]) -> dict:
+    """供给 manifest：预挂（criterion["_supplied_facts"]）优先，否则惰性构建。
+
+    检测器异常绝不打挂评审——fail-open 回模型通道（supplies={}）。
+    """
+    supplies = criterion.get("_supplied_facts")
+    if supplies is not None:
+        return supplies
+    try:
+        from app.engine.deterministic_facts import build_supplied_facts
+
+        return build_supplied_facts(criterion, pages or [])
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _identity_key(value: Any, identity: str | None) -> str | None:
+    from app.engine.objective import normalize_cert
+    from app.parsing.normalize import normalize_no_ws
+
+    if not identity:
+        return None
+    raw = value.get("name") if isinstance(value, dict) else value
+    raw = str(raw or "")
+    if identity == "normalize_cert":
+        return normalize_no_ws(normalize_cert(raw))
+    return normalize_no_ws(raw)
+
+
+def _supplied_anchor_to_evidence(pages: list[dict], anchor: dict) -> dict | None:
+    """锚 → 合法证据条目。text 逐字窗口（≥12 归一化字）；页文本过短退 visual。
+
+    quote 只认宿主从送审页切出的连续原文（_original_quote 同源复核）；
+    复核不过 → None（调用方记 anchor_verify_failed，绝不放行）。
+    """
+    from app.parsing.normalize import normalize_no_ws
+
+    try:
+        key = (int(anchor.get("document_id") or 0), int(anchor.get("page_no") or 0))
+    except (TypeError, ValueError):
+        return None
+    page = next((p for p in pages or [] if _page_key(p) == key), None)
+    if page is None:
+        return None
+    text = str(page.get("text") or "")
+    quote = str(anchor.get("quote") or "").strip()
+    verified = _original_quote(quote, text) if quote else None
+    if verified:
+        return {"document_id": key[0], "page_no": key[1], "kind": "text",
+                "quote": verified, "engine_supplied": True}
+    # 纯图页/OCR 仅标题（归一化全文 <12 字）→ visual 锚：截图类证据本体就是页图。
+    # 注入点在 _validate_evidence 之后（_finish_decision 不复验），不走 image_url 门槛；
+    # 事实引用侧同配 kind="visual"（_has_fact_source 的 visual-visual 通道）。
+    if len(normalize_no_ws(text)) < config.MIN_QUOTE_CHARS:
+        return {"document_id": key[0], "page_no": key[1], "kind": "visual", "quote": "",
+                "observation": str(anchor.get("observation") or anchor.get("kind") or "确定性检测命中该页（图片/短文本页）"),
+                "engine_supplied": True}
+    return None
+
+
+def _pop_repeated_supplies(decision: AutoReviewDecision, supplies: dict) -> None:
+    """模型重复报已供给事实 → 弹出（冻结价 "Repeated confirmed inputs" 同款）。
+
+    检测器是标定过的真值源：冲突**不抛错**（截图节在图片页上模型本来就看不见，
+    逼模型改口只会制造假引文），冲突值记 _fact_provenance[field].conflict。
+    """
+    if decision.facts is None:
+        decision.facts = {}
+    facts = decision.facts  # 注意：空 dict 是 falsy，禁用 `or {}`（会写进游离字典）
+    refs = facts.get("fact_evidence")
+    refs = refs if isinstance(refs, dict) else None
+    prov = facts.setdefault("_fact_provenance", {})
+    for field, spec in (supplies or {}).items():
+        if field.startswith("_"):
+            continue
+        entry = prov.setdefault(field, {})
+        identity = spec.get("identity")
+        if field not in facts:
+            continue
+        if identity and isinstance(facts.get(field), list):
+            supplied_ids = {_identity_key(v, identity) for v in (spec.get("value") or [])}
+            kept = []
+            for item in facts[field]:
+                if _identity_key(item, identity) in supplied_ids:
+                    entry["repeated_input_popped"] = True
+                    continue
+                kept.append(item)
+            facts[field] = kept
+            continue
+        if identity is None and isinstance(spec.get("value"), dict) and isinstance(facts.get(field), dict):
+            # dict 型（certificate_evidence/cert_backing）：只弹已供给键
+            for k in spec["value"]:
+                hit = next((kk for kk in facts[field]
+                            if _identity_key(kk, identity) == _identity_key(k, identity)), None)
+                if hit is not None:
+                    facts[field].pop(hit, None)
+                    entry["repeated_input_popped"] = True
+            continue
+        model_value = facts.pop(field)
+        if refs is not None:
+            refs.pop(field, None)
+        entry["repeated_input_popped"] = True
+        if str(model_value) != str(spec.get("value")):
+            entry["conflict"] = {"model_value": model_value}
+
+
+def _inject_supplied_facts(decision: AutoReviewDecision, supplies: dict,
+                           pages: list[dict]) -> None:
+    """把确定性检测结论注入为有据事实（宿主合成证据，构造期逐字复核）。
+
+    幂等：_fact_provenance 已标记的字段跳过。三种值形态：
+    - 标量：写值 + 事实引用（evidence 态）/ 仅留痕（provenance_only，无锚否定态）；
+    - 列表（identity）：与模型条目合并去重；**案例布尔只升不降**（检测 True 升
+      None/False，检测 False/None 不降模型 True）；缺证据条目补合成引用；
+    - dict（identity）：按键合并，值为 "auto" 时由锚物化引用替换。
+    锚复核不过 → 丢锚留痕 anchor_verify_failed，绝不放行未核验引文。
+    """
+    from app.parsing.normalize import normalize_no_ws
+    from app.services.review_activity import report
+
+    if decision.facts is None:
+        decision.facts = {}
+    facts = decision.facts  # 注意：空 dict 是 falsy，禁用 `or {}`（会写进游离字典）
+    if not isinstance(facts.get("fact_evidence"), dict):
+        facts["fact_evidence"] = {}
+    refs = facts["fact_evidence"]
+    prov = facts.setdefault("_fact_provenance", {})
+
+    def _ref_list(evs: list[dict]) -> list[dict]:
+        # text 引用必须带 quote（_has_fact_source 的 quote⊆证据 quote 通道）；
+        # visual 引用凭 (document_id,page_no,kind=visual) 配对
+        return [{"document_id": e["document_id"], "page_no": e["page_no"], "kind": e["kind"],
+                 **({"quote": e["quote"]} if e.get("quote") else {})}
+                for e in evs]
+
+    for field, spec in (supplies or {}).items():
+        if field.startswith("_"):
+            continue
+        prior = prov.get(field) or {}
+        if prior.get("injected"):
+            continue  # 幂等（注意：pop 阶段写入的 provenance 不算已注入）
+        mode = str(spec.get("mode") or "evidence")
+        detector = str(spec.get("detector") or "")
+        prov_entry: dict[str, Any] = {**prior, "detector": detector, "mode": mode,
+                                      "injected": True}
+        prov[field] = prov_entry
+        value = spec.get("value")
+        identity = spec.get("identity")
+        # ---- 锚物化（逐字复核；不过即丢锚留痕） ----
+        evidence_by_key: dict[Any, list[dict]] = {}
+        failed = 0
+        for a in (spec.get("anchors") or []):
+            ev = _supplied_anchor_to_evidence(pages, a)
+            if ev is None:
+                failed += 1
+                continue
+            evidence_by_key.setdefault(a.get("key"), []).append(ev)
+        if failed:
+            prov_entry["anchor_verify_failed"] = failed
+        if mode == "evidence" and not evidence_by_key:
+            # 无一锚可物化：退回仅留痕（未核验引文绝不放行）。列表/dict 合并型
+            # 仍落值（只升不降的 overlay 语义：模型条目自担引文，升级布尔的依据
+            # 记 provenance）；标量丢锚不放行（值不注入）。
+            prov_entry["mode"] = "provenance_only"
+            prov_entry["anchors_unverified"] = True
+            if not (identity and isinstance(value, (list, dict))):
+                continue
+        for evs in evidence_by_key.values():
+            decision.evidence.extend(evs)
+        # ---- 写值/合并 ----
+        if identity and isinstance(value, list):
+            existing = facts.get(field)
+            existing = existing if isinstance(existing, list) else []
+            have = {_identity_key(x, identity) for x in existing}
+            for item in value:
+                key = _identity_key(item, identity)
+                if key in have:
+                    tgt = next(x for x in existing if _identity_key(x, identity) == key)
+                    # 只升不降：检测 True 升模型 None/False；检测 False/None 不降模型 True
+                    if isinstance(item, dict) and isinstance(tgt, dict):
+                        for flag in ("social_security", "work_proof", "experience_proof",
+                                     "contract", "invoice", "acceptance"):
+                            if item.get(flag) is True and tgt.get(flag) is not True:
+                                tgt[flag] = True
+                                prov_entry.setdefault("upgraded", []).append(
+                                    f"{normalize_no_ws(str(tgt.get('name') or key))}.{flag}")
+                    continue
+                item = dict(item) if isinstance(item, dict) else item
+                if isinstance(item, dict) and not item.get("quote"):
+                    evs = evidence_by_key.get(key) or evidence_by_key.get(None) or []
+                    if evs:
+                        item["evidence"] = _ref_list(evs)
+                existing.append(item)
+                have.add(key)
+            facts[field] = existing
+            continue
+        if identity and isinstance(value, dict):
+            merged = dict(facts.get(field)) if isinstance(facts.get(field), dict) else {}
+            for k, v in value.items():
+                ikey = _identity_key(k, identity)
+                if v == "auto":
+                    evs = evidence_by_key.get(ikey) or evidence_by_key.get(None) or []
+                    if evs:
+                        merged[k] = _ref_list(evs)
+                else:
+                    merged[k] = v
+            facts[field] = merged
+            continue
+        # 标量 / 整字段
+        facts[field] = value
+        evs = evidence_by_key.get(None) or [e for evs in evidence_by_key.values() for e in evs]
+        if evs:
+            refs[field] = _ref_list(evs)
+        report(f"程序供给 {field}（{detector}）")
 
 
 def _validate_fact_sources(decision: AutoReviewDecision, criterion: dict | None = None) -> None:
@@ -557,6 +785,11 @@ def _validate_fact_sources(decision: AutoReviewDecision, criterion: dict | None 
             raise LLMError("业绩金额列表缺少逐案例证明材料核验")
 
     def check_scalar(field: str, fact_refs, is_yearly: bool) -> None:
+        prov = (decision.facts.get("_fact_provenance") or {}).get(field) or {}
+        if prov.get("mode") == "provenance_only":
+            # 确定性供给的无锚否定态（如 cert_section_present=False，引擎闸门标定
+            # 输入）——只写值不留引文，豁免口供校验（has_qualification_cert 同款先例）
+            return
         references = fact_refs.get(field) if isinstance(fact_refs, dict) else None
         if isinstance(references, list):
             references = {"evidence": references}
@@ -1072,6 +1305,19 @@ def _call(gateway: Gateway, criterion: dict, pages: list[dict], *, data_class: s
                        "fact_evidence": FACT_SCHEMA["fact_evidence"],
                        **{item["field"]: f"第{i}年度实际含税投标报价元字符串，必须有该年度原页证据，未找到填null"
                           for i, item in enumerate(price_components, 1)}}
+    # 确定性事实供给（ADR 0015）：整字段供给的标量从 schema 删除（冻结价同款——
+    # "不填也不为冻结输入寻找或编造原页引文"），其余由 supplied_fact_policy 声明。
+    supplies = _supplies_for(criterion, pages)
+    supplied_fact_policy = None
+    if fact_required and supplies:
+        fact_schema = dict(fact_schema)
+        for f, sp in supplies.items():
+            if sp.get("exclusive") and f in fact_schema:
+                fact_schema.pop(f, None)
+        supplied_fact_policy = (
+            "以下计分事实已由程序按确定性检测供给，不要重复抽取，也不要为其寻找或编造原页引文："
+            + "、".join(sorted(f for f in supplies if not f.startswith("_")))
+        )
     from app.services.review_collections import semantic_value
 
     payload = {"rule": criterion, "fact_schema": fact_schema,
@@ -1085,6 +1331,8 @@ def _call(gateway: Gateway, criterion: dict, pages: list[dict], *, data_class: s
                "allowed_source_ids": [p["source_id"] for p in material],
                "allowed_evidence_ids": evidence_ids,
                "response_schema": response_model.model_json_schema()}
+    if supplied_fact_policy:
+        payload["supplied_fact_policy"] = supplied_fact_policy
     if criterion.get("_subjective_direct"):
         payload["direct_subjective_policy"] = (
             "本项按直接评审模式执行：必须给出 0 到满分的确定分数；"
@@ -1255,6 +1503,9 @@ def _call(gateway: Gateway, criterion: dict, pages: list[dict], *, data_class: s
                 refs = decision.facts.get("fact_evidence")
                 if isinstance(refs, dict):
                     refs.pop("bid_price", None)
+            if supplies:
+                # 供给事实的模型重复报 → 弹出（schema 抑制失效时的第二道保险）
+                _pop_repeated_supplies(decision, supplies)
             _validate_fact_sources(decision, criterion)
         except (LLMError, ValidationError) as exc:
             invalidate()
@@ -2008,6 +2259,12 @@ def review_criterion(gateway: Gateway, criterion: dict, pages: list[dict], *,
                          material_state=_material_review_state(pages, selected, full=full, use_vision=use_vision))
         _validate_synthesis_sources(decision, decisions)
         _validate_evidence(decision, selected, use_vision=use_vision)
+    supplies = _supplies_for(criterion, pages)
+    if supplies:
+        # 确定性事实注入（ADR 0015）：单批/综合汇流的唯一出口前统一注入——
+        # 在 _validate_evidence 之后（合成证据不越权批次契约）、_finish_decision
+        # 的 _validate_fact_sources 复核之前（免费二次核验）
+        _inject_supplied_facts(decision, supplies, selected)
     return finish_decision(decision, criterion, pages, selected=selected, batches=batches,
                            full=full, use_vision=use_vision)
 
@@ -2068,6 +2325,11 @@ def _finish_decision(decision: AutoReviewDecision, criterion: dict, pages: list[
             raise LLMError("材料缺失结论未覆盖全部可读原页，需补做 OCR 或视觉核验")
         if not decision.confirmed_absent and not decision.evidence:
             raise LLMError("自动评审结论没有可核验的原页证据")
+        if not decision.confirmed_absent and not [
+            e for e in decision.evidence if not e.get("engine_supplied")
+        ]:
+            # 确定性供给证据只服务事实计分，不能给空口结论洗白（ADR 0015）
+            raise LLMError("自动评审结论没有可核验的原页证据（程序供给证据不作为结论依据）")
     if criterion.get("score_type") != "subjective" or criterion.get("_objective_route"):
         # Objective scores are owned by the deterministic engine.  A score
         # without facts cannot replace the fact contract (reject); a score

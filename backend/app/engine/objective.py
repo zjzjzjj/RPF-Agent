@@ -13,7 +13,7 @@
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
 
 from app import config
@@ -461,58 +461,128 @@ _CERT_WEAK_FINGERPRINTS = (
 )
 
 
-def cert_evidence_present(pages: list[tuple[str, str]]) -> tuple[bool, str]:
-    """认证"查询截图"证据双通道判定 → (是否存在, 命中依据)。
+@dataclass
+class CertSectionDetection:
+    """认证"查询截图"节三态检测（2026-11-18 确定性事实源接入）。
 
-    `pages` 是 [(document_pages.source, 页文本)]。通道 A 对全部页的文本层生效；
-    通道 B 只对 OCR 页生效（防止证书扫描件的"证书编号"误触发）。
-    实证校准（浙江中烟 4 家）：龙即/致成有文本标题 → 真；诚道证书页图片就是
-    认证平台查询截图（OCR 正文含平台名）→ 真；先数只有证书扫描件 → 假（真实
-    评审也是只给先数按"无截图"计 1 分）。
+    state: True=命中；False=文本层可读确认未见；None=存在不可读/空文本页（盲态，
+    机器看不见≠不存在，不猜）。hits 带命中页锚（供事实供给层合成原页证据）。
     """
-    for _source, text in pages:
-        for line in (text or "").split("\n"):
+    state: bool | None
+    basis: str
+    hits: list[dict] = field(default_factory=list)
+
+
+def _cert_line_basis(s: str) -> str | None:
+    """单行命中判定 → 依据前缀（None=不命中）。行过滤口径与历史逐条一致。"""
+    if not s or s.count("....") >= 2:
+        return None
+    # 平台 URL 强信号（在行长度检查之前——URL 行可能很长）。
+    # 但要求文本也含 cx.cnca.cn（"查询结果截图并加盖公章，未按要求提供不得分"），
+    # 需排除要求特征词，只匹配投标人自己的标签/标题行。
+    if _CERT_PLATFORM_URL.search(s) and not any(
+        k in s for k in ("不得分", "加盖公章", "未按要求", "须提供", "应提供")
+    ):
+        return f"平台 URL：{s[:40]}"
+    if len(s) > 60:
+        return None
+    # 要求复述行（招标文件索引表常整页复述"须提供…截图，未提供不得分"）
+    # 不算投标人提供了截图：同时出现"须/应/需"与"提供/不得分"即视为要求句。
+    if any(k in s for k in ("须", "应", "需", "加盖公章", "未按要求")) and (
+        "提供" in s or "不得分" in s or "公章" in s or "要求" in s
+    ):
+        return None
+    # 纯要求句（无"须/应/需"但含"不得分"——如"…并加盖公章，未按要求提供不得分"）
+    if "不得分" in s or "加盖公章" in s:
+        return None
+    # 证书上的免责声明（"可在官方网站查询"）不是截图证据
+    if _CERT_DISCLAIMER.search(s):
+        return None
+    # 排除非认证查询截图（行贿犯罪记录/信用中国等——这些是其他资质要求）
+    if _CERT_EXCLUDE.search(s):
+        return None
+    if _CERT_TITLE_RE.search(s):
+        return f"文本标题：{s[:40]}"
+    return None
+
+
+def _anchor_window(text: str, pos: int, width: int = 60) -> dict:
+    """命中位置 → 页文本逐字窗口（quote 供原页证据合成；宿主侧再逐字复核）。"""
+    t = text or ""
+    start = max(0, pos - width // 3)
+    end = min(len(t), pos + width)
+    return {"quote": t[start:end].strip()}
+
+
+def detect_cert_section(pages: list[dict]) -> CertSectionDetection:
+    """认证"查询截图"证据双通道三态判定（带命中页锚）。
+
+    pages 是 [{document_id, page_no, source, text, ...}]。通道 A 对全部页文本层
+    生效；通道 B 只对 OCR 页生效（防证书扫描件"证书编号"误触发）。
+    实证校准（浙江中烟 4 家）：龙即/致成文本标题→真；诚道 OCR 平台指纹→真；
+    先数只有证书扫描件（OCR 可读、无截图信号）→假（真实评审按"无截图"计 1 分）。
+    盲态（None）仅当**无命中且存在零文本页**（纯图无 OCR 结果——截图可能在上面）。
+    """
+    hits: list[dict] = []
+    for p in pages or []:
+        text = p.get("text") or ""
+        for line in text.split("\n"):
             s = line.strip()
-            if not s or s.count("....") >= 2:
+            basis = _cert_line_basis(s)
+            if basis is None:
                 continue
-            # 平台 URL 强信号（在行长度检查之前——URL 行可能很长）。
-            # 但要求文本也含 cx.cnca.cn（"查询结果截图并加盖公章，未按要求提供不得分"），
-            # 需排除要求特征词，只匹配投标人自己的标签/标题行。
-            if _CERT_PLATFORM_URL.search(s) and not any(
-                k in s for k in ("不得分", "加盖公章", "未按要求", "须提供", "应提供")
-            ):
-                return True, f"平台 URL：{s[:40]}"
-            if len(s) > 60:
+            pos = text.find(s) if s else -1
+            win = _anchor_window(text, pos if pos >= 0 else 0)
+            hits.append({"document_id": p.get("document_id"), "page_no": p.get("page_no"),
+                         "quote": win["quote"], "basis": basis, "source": p.get("source")})
+            break  # 每页取首个命中即可
+    if not hits:
+        for p in pages or []:
+            if p.get("source") not in ("ocr", "ocr_img"):
                 continue
-            # 要求复述行（招标文件索引表常整页复述"须提供…截图，未提供不得分"）
-            # 不算投标人提供了截图：同时出现"须/应/需"与"提供/不得分"即视为要求句。
-            # 2026-10-22 扩展：要求文本也含"加盖公章/未按要求"等特征词，一并排除。
-            if any(k in s for k in ("须", "应", "需", "加盖公章", "未按要求")) and (
-                "提供" in s or "不得分" in s or "公章" in s or "要求" in s
-            ):
-                continue
-            # 纯要求句（无"须/应/需"但含"不得分"——如"…并加盖公章，未按要求提供不得分"）
-            if "不得分" in s or "加盖公章" in s:
-                continue
-            # 证书上的免责声明（"可在官方网站查询"）不是截图证据
-            if _CERT_DISCLAIMER.search(s):
-                continue
-            # 排除非认证查询截图（行贿犯罪记录/信用中国等——这些是其他资质要求）
-            if _CERT_EXCLUDE.search(s):
-                continue
-            if _CERT_TITLE_RE.search(s):
-                return True, f"文本标题：{s[:40]}"
-    for source, text in pages:
-        if source not in ("ocr", "ocr_img"):
-            continue
-        t = text or ""
-        for fp in _CERT_STRONG_FINGERPRINTS:
-            if fp in t:
-                return True, f"OCR 正文命中平台指纹：{fp}"
-        weak = [k for k in _CERT_WEAK_FINGERPRINTS if k in t]
-        if len(weak) >= 2:
-            return True, f"OCR 正文命中平台特征：{'、'.join(weak)}"
-    return False, "未见查询截图标题或认证平台指纹"
+            t = p.get("text") or ""
+            for fp in _CERT_STRONG_FINGERPRINTS:
+                if fp in t:
+                    pos = t.find(fp)
+                    win = _anchor_window(t, pos)
+                    hits.append({"document_id": p.get("document_id"), "page_no": p.get("page_no"),
+                                 "quote": win["quote"],
+                                 "basis": f"OCR 正文命中平台指纹：{fp}", "source": p.get("source")})
+                    break
+            else:
+                weak = [k for k in _CERT_WEAK_FINGERPRINTS if k in t]
+                if len(weak) >= 2:
+                    pos = t.find(weak[0])
+                    win = _anchor_window(t, pos)
+                    hits.append({"document_id": p.get("document_id"), "page_no": p.get("page_no"),
+                                 "quote": win["quote"],
+                                 "basis": f"OCR 正文命中平台特征：{'、'.join(weak)}",
+                                 "source": p.get("source")})
+            if hits:
+                break
+    if hits:
+        return CertSectionDetection(state=True, basis=hits[0]["basis"], hits=hits)
+    # 无命中：存在零文本页（纯图无 OCR 结果/不可读）→ 盲态不猜
+    blind = any(
+        not (p.get("text") or "").strip()
+        and not p.get("known_blank")
+        for p in (pages or [])
+    )
+    if blind:
+        return CertSectionDetection(state=None, basis="存在不可读页，截图节不可确认（盲态）")
+    return CertSectionDetection(state=False, basis="未见查询截图标题或认证平台指纹")
+
+
+def cert_evidence_present(pages: list[tuple[str, str]]) -> tuple[bool, str]:
+    """兼容包装（历史 2 元组契约）：[(source, 页文本)] → (是否存在, 命中依据)。
+
+    三态映射：True→True；None/False→False（历史调用点只消费布尔，盲态语义
+    由 detect_cert_section 供给层使用）。
+    """
+    dicts = [{"document_id": 0, "page_no": i + 1, "source": src, "text": text}
+             for i, (src, text) in enumerate(pages or [])]
+    det = detect_cert_section(dicts)
+    return (det.state is True), det.basis
 
 
 
@@ -557,6 +627,46 @@ def find_cert_copy_pages(
             out.append(("copy", idx))
         else:
             out.append(("claim", idx))
+    return out
+
+
+def find_cert_copy_pages_anchored(
+    pages: list[dict], cert_name: str
+) -> list[tuple[str, dict]]:
+    """逐本证书复印件页定位（带页锚，2026-11-18 确定性事实源）。
+
+    pages 是 [{document_id, page_no, source, text}]；返回 [(kind, anchor)]，
+    anchor={document_id, page_no, quote}（命中名附近的页文本逐字窗口）。
+    kind 语义同 find_cert_copy_pages（copy/low/claim）。
+    """
+    from app.parsing.normalize import normalize_no_ws as _nnw
+
+    name_raw = str(cert_name or "").strip()
+    if not name_raw:
+        return []
+    norm_name = _nnw(normalize_cert(name_raw))
+    tail = norm_name[-6:] if len(norm_name) >= 6 else norm_name
+    if not tail:
+        return []
+    out: list[tuple[str, dict]] = []
+    for p in pages or []:
+        t = p.get("text") or ""
+        nt = _nnw(t)
+        if tail not in nt and norm_name not in nt:
+            continue
+        pos = t.find(name_raw.strip())
+        if pos < 0:
+            # 归一化命中：退化取页首窗口（宿主合成期会再逐字复核）
+            pos = 0
+        quote = t[max(0, pos - 20): pos + 60].strip()
+        anchor = {"document_id": p.get("document_id"), "page_no": p.get("page_no"),
+                  "quote": quote}
+        if len(t.strip()) < 30:
+            out.append(("low", anchor))
+        elif _RE_CERT_COPY_FP.search(t) or p.get("source") in ("ocr", "ocr_img"):
+            out.append(("copy", anchor))
+        else:
+            out.append(("claim", anchor))
     return out
 
 
@@ -1732,9 +1842,36 @@ def _extract_deviation_counts(text: str) -> tuple[dict | None, str]:
     if total == 0:
         return None, ""
     return {"total": total, "negative": neg, "missing": missing}, snippet
-    if total == 0:
-        return None, ""
-    return {"total": total, "negative": neg, "missing": missing}, snippet
+
+
+def _extract_deviation_counts_from_pages(
+    pages: list[tuple[int, str]],
+) -> tuple[dict | None, str, list[int]]:
+    """按页版偏离计数（2026-11-18 确定性事实源）：(counts|None, snippet, 区间页码)。
+
+    页码锚 = snippet 跨越的页（供事实供给层合成原页证据）；定位不到表时页码为空。
+    """
+    offsets: list[tuple[int, int, int]] = []
+    segs: list[str] = []
+    pos = 0
+    for pno, text in pages or []:
+        t = text or ""
+        offsets.append((pos, pos + len(t), int(pno)))
+        segs.append(t)
+        pos += len(t) + 1
+    full = "\n".join(segs)
+    counts, snippet = _extract_deviation_counts(full)
+    if counts is None:
+        return None, "", []
+    region_pages: list[int] = []
+    if snippet:
+        start = full.find(snippet)
+        end = start + len(snippet) if start >= 0 else -1
+        if start >= 0:
+            for lo, hi, pno in offsets:
+                if hi > start and lo < end:
+                    region_pages.append(pno)
+    return counts, snippet, region_pages
 
 
 def _q2(v: Decimal) -> Decimal:
