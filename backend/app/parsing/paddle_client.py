@@ -15,6 +15,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import re
 import threading
 import time
 import urllib.error
@@ -135,9 +136,6 @@ def remote_ocr_page(
         # 下游「未见/缺证→0」误判的温床）。
         if not allow_truncated:
             return _ocr_segmented(png_bytes, prompt)
-    if not allow_truncated and _looks_looped(text):
-        # 复读循环的"完整"输出同样是垃圾（幻觉续行+尾巴重复）——明确失败转本地
-        raise RuntimeError("PaddleOCR-VL 输出疑似复读循环，原页尚未完整读取")
     return text.strip()
 
 
@@ -168,18 +166,19 @@ def _ocr_segmented(png_bytes: bytes, prompt: str | None) -> str:
 
 
 def _looks_looped(text: str) -> bool:
-    """VL 解码器复读循环判定：结尾短语在输出中高频重复。
+    """VL 解码器复读循环判定（**仅用于截断输出**）：结尾短语高频重复且含文字/数字。
 
-    run128 p508 实证：数值表/勾选行/单证行布局上模型循环到 max_tokens
-    （尾巴全是"0.006 0.006…"/"☐ ☐ ☐…"/"型号 | 港水号：2401139"×N，且带
-    幻觉续行）——任何裁剪尺寸都会复发，继续细分纯烧时间。判循环 → 快速
-    失败转本地引擎。误报的代价只是多走一次本地 OCR，不会错收文本。
+    run128 p508 实证：数值表/单证行布局上模型循环到 max_tokens（尾巴全是
+    "0.006 0.006…"/"型号 | 港水号：2401139"×N + 幻觉续行）——任何裁剪尺寸都
+    复发，继续细分纯烧时间。两个精确判据缺一不可：
+    - **只判截断输出**：真循环必然跑满 max_tokens；完整输出的重复是真实数据
+      （勾选表"✓ | "×数百是合法内容——p254 误杀实证）；
+    - **尾巴必含文字/数字**：纯字形重复（✓/☐ + 分隔符）是表格内容不是循环。
     """
     t = (text or "").strip()
-    if len(t) < 60:
+    if len(t) < 60 or not re.search(r"[A-Za-z0-9一-鿿]", t[-20:]):
         return False
-    # 多尺度尾部检测（循环单元长度不定："0.006 " 6 字符/"☐ " 2 字符/单证行 20+ 字符，
-    # 固定单一窗口会与单元错位漏检——2026-11-18 测试实证）
+    # 多尺度尾部检测（循环单元长度不定，固定单一窗口会与单元错位漏检）
     for k in (6, 8, 20):
         if t.count(t[-k:]) >= 5:
             return True
@@ -202,11 +201,13 @@ def _try_read_segment(img, prompt: str | None) -> str | None:
     except (KeyError, IndexError, TypeError) as exc:
         raise RuntimeError(f"PaddleOCR-VL 响应缺少内容：{str(answer)[:200]}") from exc
     if choice.get("finish_reason") == "length":
+        if _looks_looped(text):
+            # 截断且复读循环：任何裁剪尺寸都会复发（p508 八条带实证），继续
+            # 细分纯烧时间——明确失败转本地引擎
+            raise RuntimeError("PaddleOCR-VL 输出疑似复读循环，原页尚未完整读取")
         return None
     if not text.strip():
         raise RuntimeError("PaddleOCR-VL 分段未产生内容，原页尚未完整读取")
-    if _looks_looped(text):
-        raise RuntimeError("PaddleOCR-VL 输出疑似复读循环，原页尚未完整读取")
     return text.strip()
 
 

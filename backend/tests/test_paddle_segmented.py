@@ -77,16 +77,35 @@ def test_empty_segment_fails_loudly(monkeypatch) -> None:  # noqa: ANN001
         paddle_client._ocr_segmented(_png(300, 400), "OCR:")
 
 
-def test_loop_detection_fails_fast(monkeypatch) -> None:  # noqa: ANN001
-    """VL 复读循环（run128 p508：数值表/勾选行解码器循环到 max_tokens）：
-    判循环即明确失败转本地，不再递归细分烧时间；循环文本绝不当读取结果。"""
+def test_loop_detection_fails_fast_on_truncated(monkeypatch) -> None:  # noqa: ANN001
+    """VL 复读循环（run128 p508）：截断输出+含文字尾巴重复 → 快速失败转本地，
+    不再递归细分烧时间；循环文本绝不当读取结果。"""
     import pytest
 
     looped = "真实开头两行内容\n" + "型号 | 港水号：2401139\n" * 40
-    monkeypatch.setattr(paddle_client, "_post", lambda *a, **k: _reply(looped))
+    monkeypatch.setattr(paddle_client, "_post",
+                        lambda *a, **k: _reply(looped, truncated=True))
     with pytest.raises(RuntimeError, match="复读循环"):
         paddle_client.remote_ocr_page(_png(300, 400), prompt="OCR:")
-    # 正常文本不受影响
+
+
+def test_glyph_run_repetition_is_not_loop(monkeypatch) -> None:  # noqa: ANN001
+    """勾选表「✓ | 」×数百是合法表格内容（p254 误杀实证）：不判循环——
+    截断时照常递归细分读全，完整时直接返回。"""
+    glyph_run = "设备点检表\n" + "✓ | " * 200
+    # 截断 → 递归 → 子段完整 → 读全
+    calls = []
+
+    def fake(png_bytes, prompt, max_tokens):  # noqa: ANN001, ANN202
+        img = Image.open(io.BytesIO(png_bytes))
+        calls.append(img.size[1])
+        return _reply("✓ | ✓ | ✓", truncated=img.size[1] > 150)
+
+    monkeypatch.setattr(paddle_client, "_post", fake)
+    out = paddle_client.remote_ocr_page(_png(300, 400), prompt="OCR:")
+    assert out and "✓" in out
+    assert len(calls) > 1, "字形重复不得触发快速失败，应递归细分"
+    # 完整输出的重复直接返回
     monkeypatch.setattr(paddle_client, "_post",
-                        lambda *a, **k: _reply("正常的一行识别结果，没有任何重复尾巴。"))
-    assert paddle_client.remote_ocr_page(_png(300, 400), prompt="OCR:")
+                        lambda *a, **k: _reply(glyph_run))
+    assert "✓" in paddle_client.remote_ocr_page(_png(300, 400), prompt="OCR:")
