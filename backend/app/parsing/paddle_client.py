@@ -138,10 +138,17 @@ def remote_ocr_page(
     return text.strip()
 
 
-def _ocr_segmented(png_bytes: bytes, prompt: str | None) -> str:
-    """截断页的分段识别：竖切上下两半（5% 重叠）各识别一次后拼接。
+_MAX_SEGMENT_DEPTH = 3  # 最多八分（1→2→4→8 段）；深度内仍截断才判"密集页读不全"
 
-    只切一层。任何分段仍截断或没有内容均明确失败，部分文本不冒充完整读取。
+
+def _ocr_segmented(png_bytes: bytes, prompt: str | None) -> str:
+    """截断页的分段识别：竖切两半（5% 重叠），仍截断则**递归细分**后拼接。
+
+    只出完整读取：任何最终分段仍截断或没有内容均明确失败，部分文本不冒充
+    完整读取。整页截断已由调用方确认（不再重发整页），从对半开始递归。
+    2026-11-18 run128 实证：密集文字页（6000+ 字）单层对半仍截断 → 硬失败
+    回退本地 CPU OCR（149 页把 675 格评分拖成 30+ 小时）——递归细分让密集页
+    走完远程快通道（4-8 段 ×1-2s，远快于本地 OCR 数十秒/页）。
     """
     import io
 
@@ -151,9 +158,36 @@ def _ocr_segmented(png_bytes: bytes, prompt: str | None) -> str:
         img = Image.open(io.BytesIO(png_bytes)).convert("RGB")
     except Exception as exc:  # noqa: BLE001
         raise RuntimeError(f"PaddleOCR-VL 输出被 max_tokens 截断（分段重试失败：{exc}）") from exc
+    return _ocr_split_and_read(img, prompt, depth=0)
+
+
+def _try_read_segment(img, prompt: str | None) -> str | None:
+    """识别一段：完整 → 文本；截断 → None（调用方细分）；空内容 → 明确失败。"""
+    import io
+
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    try:
+        answer = _post(buf.getvalue(), prompt, config.paddle_ocr_max_tokens())
+    except (OSError, ValueError, urllib.error.URLError) as exc:
+        raise RuntimeError(f"PaddleOCR-VL 调用失败：{exc}") from exc
+    try:
+        choice = answer["choices"][0]
+        text = str(choice["message"]["content"] or "")
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError(f"PaddleOCR-VL 响应缺少内容：{str(answer)[:200]}") from exc
+    if choice.get("finish_reason") == "length":
+        return None
+    if not text.strip():
+        raise RuntimeError("PaddleOCR-VL 分段未产生内容，原页尚未完整读取")
+    return text.strip()
+
+
+def _ocr_split_and_read(img, prompt: str | None, depth: int) -> str:
+    """已知该图整读会截断：竖切两半（5% 重叠）递归读全。"""
     w, h = img.size
-    if h < 32:
-        raise RuntimeError("PaddleOCR-VL 输出被 max_tokens 截断")
+    if h < 32 or depth >= _MAX_SEGMENT_DEPTH:
+        raise RuntimeError("PaddleOCR-VL 分段输出仍被 max_tokens 截断，原页尚未完整读取")
     overlap = max(4, int(h * 0.05))
     mid = h // 2
     crops = [
@@ -162,22 +196,10 @@ def _ocr_segmented(png_bytes: bytes, prompt: str | None) -> str:
     ]
     parts: list[str] = []
     for crop in crops:
-        buf = io.BytesIO()
-        crop.save(buf, format="PNG")
-        try:
-            answer = _post(buf.getvalue(), prompt, config.paddle_ocr_max_tokens())
-        except (OSError, ValueError, urllib.error.URLError) as exc:
-            raise RuntimeError(f"PaddleOCR-VL 调用失败：{exc}") from exc
-        try:
-            choice = answer["choices"][0]
-            text = str(choice["message"]["content"] or "")
-        except (KeyError, IndexError, TypeError) as exc:
-            raise RuntimeError(f"PaddleOCR-VL 响应缺少内容：{str(answer)[:200]}") from exc
-        if choice.get("finish_reason") == "length":
-            raise RuntimeError("PaddleOCR-VL 分段输出仍被 max_tokens 截断，原页尚未完整读取")
-        if not text.strip():
-            raise RuntimeError("PaddleOCR-VL 分段未产生内容，原页尚未完整读取")
-        parts.append(text.strip())
+        text = _try_read_segment(crop, prompt)
+        if text is None:
+            text = _ocr_split_and_read(crop, prompt, depth + 1)
+        parts.append(text)
     return "\n".join(parts)
 
 
