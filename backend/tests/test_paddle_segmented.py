@@ -78,15 +78,29 @@ def test_empty_segment_fails_loudly(monkeypatch) -> None:  # noqa: ANN001
 
 
 def test_loop_detection_fails_fast_on_truncated(monkeypatch) -> None:  # noqa: ANN001
-    """VL 复读循环（run128 p508）：截断输出+含文字尾巴重复 → 快速失败转本地，
-    不再递归细分烧时间；循环文本绝不当读取结果。"""
+    """VL token 循环铁证（run128 p508 y=330 "0.006 0.006…"）：截断输出结尾
+    连续 15+ 次同一含数字单元 → 快速失败转本地，循环文本绝不当读取结果。"""
     import pytest
 
-    looped = "真实开头两行内容\n" + "型号 | 港水号：2401139\n" * 40
+    looped = "真实开头两行内容\n" + "0.006 " * 200
     monkeypatch.setattr(paddle_client, "_post",
                         lambda *a, **k: _reply(looped, truncated=True))
     with pytest.raises(RuntimeError, match="复读循环"):
         paddle_client.remote_ocr_page(_png(300, 400), prompt="OCR:")
+
+
+def test_alternating_repetition_not_flagged(monkeypatch) -> None:  # noqa: ANN001
+    """交替值重复（p508 y=220 "港水号：A/B 交替"）不是铁证——交递归细分，
+    子段正常即读全（宁可漏不误杀）。"""
+    alt = ("型号 | 港水号：2401139\n型号 | 港水号：0116-12\n" * 30)
+
+    def fake(png_bytes, prompt, max_tokens):  # noqa: ANN001, ANN202
+        img = Image.open(io.BytesIO(png_bytes))
+        return _reply(alt, truncated=True) if img.size[1] > 150 else _reply("子段正常读全")
+
+    monkeypatch.setattr(paddle_client, "_post", fake)
+    out = paddle_client.remote_ocr_page(_png(300, 400), prompt="OCR:")
+    assert out.count("子段正常读全") == 4
 
 
 def test_header_repetition_at_one_level_resolves_by_splitting(monkeypatch) -> None:  # noqa: ANN001
