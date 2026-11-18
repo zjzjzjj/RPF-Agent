@@ -135,6 +135,9 @@ def remote_ocr_page(
         # 下游「未见/缺证→0」误判的温床）。
         if not allow_truncated:
             return _ocr_segmented(png_bytes, prompt)
+    if not allow_truncated and _looks_looped(text):
+        # 复读循环的"完整"输出同样是垃圾（幻觉续行+尾巴重复）——明确失败转本地
+        raise RuntimeError("PaddleOCR-VL 输出疑似复读循环，原页尚未完整读取")
     return text.strip()
 
 
@@ -164,8 +167,27 @@ def _ocr_segmented(png_bytes: bytes, prompt: str | None) -> str:
     return _ocr_split_and_read(img, prompt, depth=0)
 
 
+def _looks_looped(text: str) -> bool:
+    """VL 解码器复读循环判定：结尾短语在输出中高频重复。
+
+    run128 p508 实证：数值表/勾选行/单证行布局上模型循环到 max_tokens
+    （尾巴全是"0.006 0.006…"/"☐ ☐ ☐…"/"型号 | 港水号：2401139"×N，且带
+    幻觉续行）——任何裁剪尺寸都会复发，继续细分纯烧时间。判循环 → 快速
+    失败转本地引擎。误报的代价只是多走一次本地 OCR，不会错收文本。
+    """
+    t = (text or "").strip()
+    if len(t) < 60:
+        return False
+    # 多尺度尾部检测（循环单元长度不定："0.006 " 6 字符/"☐ " 2 字符/单证行 20+ 字符，
+    # 固定单一窗口会与单元错位漏检——2026-11-18 测试实证）
+    for k in (6, 8, 20):
+        if t.count(t[-k:]) >= 5:
+            return True
+    return False
+
+
 def _try_read_segment(img, prompt: str | None) -> str | None:
-    """识别一段：完整 → 文本；截断 → None（调用方细分）；空内容 → 明确失败。"""
+    """识别一段：完整 → 文本；截断 → None（调用方细分）；空内容/复读循环 → 明确失败。"""
     import io
 
     buf = io.BytesIO()
@@ -183,6 +205,8 @@ def _try_read_segment(img, prompt: str | None) -> str | None:
         return None
     if not text.strip():
         raise RuntimeError("PaddleOCR-VL 分段未产生内容，原页尚未完整读取")
+    if _looks_looped(text):
+        raise RuntimeError("PaddleOCR-VL 输出疑似复读循环，原页尚未完整读取")
     return text.strip()
 
 

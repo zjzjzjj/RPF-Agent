@@ -75,3 +75,18 @@ def test_empty_segment_fails_loudly(monkeypatch) -> None:  # noqa: ANN001
 
     with pytest.raises(RuntimeError, match="未产生内容"):
         paddle_client._ocr_segmented(_png(300, 400), "OCR:")
+
+
+def test_loop_detection_fails_fast(monkeypatch) -> None:  # noqa: ANN001
+    """VL 复读循环（run128 p508：数值表/勾选行解码器循环到 max_tokens）：
+    判循环即明确失败转本地，不再递归细分烧时间；循环文本绝不当读取结果。"""
+    import pytest
+
+    looped = "真实开头两行内容\n" + "型号 | 港水号：2401139\n" * 40
+    monkeypatch.setattr(paddle_client, "_post", lambda *a, **k: _reply(looped))
+    with pytest.raises(RuntimeError, match="复读循环"):
+        paddle_client.remote_ocr_page(_png(300, 400), prompt="OCR:")
+    # 正常文本不受影响
+    monkeypatch.setattr(paddle_client, "_post",
+                        lambda *a, **k: _reply("正常的一行识别结果，没有任何重复尾巴。"))
+    assert paddle_client.remote_ocr_page(_png(300, 400), prompt="OCR:")
