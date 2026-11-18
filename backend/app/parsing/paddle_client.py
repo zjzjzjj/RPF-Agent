@@ -165,21 +165,19 @@ def _ocr_segmented(png_bytes: bytes, prompt: str | None) -> str:
     return _ocr_split_and_read(img, prompt, depth=0)
 
 
-def _looks_looped(text: str) -> bool:
-    """VL 解码器复读循环判定（**仅用于截断输出**）：结尾短语高频重复且含文字/数字。
+_LOOPED = object()  # _try_read_segment 哨兵：截断且疑似复读循环
 
-    run128 p508 实证：数值表/单证行布局上模型循环到 max_tokens（尾巴全是
-    "0.006 0.006…"/"型号 | 港水号：2401139"×N + 幻觉续行）——任何裁剪尺寸都
-    复发，继续细分纯烧时间。两个精确判据缺一不可：
-    - **只判截断输出**：真循环必然跑满 max_tokens；完整输出的重复是真实数据
-      （勾选表"✓ | "×数百是合法内容——p254 误杀实证）；
-    - **尾巴必含文字/数字**：纯字形重复（✓/☐ + 分隔符）是表格内容不是循环。
+
+def _looks_looped(text: str) -> bool:
+    """截断输出的结尾短语高频重复（复读循环疑似信号）。
+
+    只作**疑似**信号——单独一次不判死（✓/☐ 字形重复、"安装位置: 胶印车间"
+    表头重复、"PR #" 带拉丁的表头重复都是合法表格内容，p254 三次误杀实证）。
+    真循环的本质特征是**任何裁剪尺寸都复发**（p508 八条带全循环），真内容
+    切细即正常——由 _ocr_split_and_read 的"连续两层疑似"判死。
     """
     t = (text or "").strip()
-    # 尾巴必含数字/拉丁字母：p508 全部真循环都是编号/数值（2401139、0.006、
-    # 1.2.22×8）；纯中文表头重复（"安装位置: 胶印车间"×N）与 ✓/☐ 字形重复
-    # 都是合法表格内容（p254 两次误杀实证），交递归细分读全
-    if len(t) < 60 or not re.search(r"[A-Za-z0-9]", t[-20:]):
+    if len(t) < 60:
         return False
     # 多尺度尾部检测（循环单元长度不定，固定单一窗口会与单元错位漏检）
     for k in (6, 8, 20):
@@ -188,8 +186,9 @@ def _looks_looped(text: str) -> bool:
     return False
 
 
-def _try_read_segment(img, prompt: str | None) -> str | None:
-    """识别一段：完整 → 文本；截断 → None（调用方细分）；空内容/复读循环 → 明确失败。"""
+def _try_read_segment(img, prompt: str | None) -> "str | None | object":
+    """识别一段：完整 → 文本；截断 → None；截断且疑似循环 → _LOOPED；
+    空内容 → 明确失败。"""
     import io
 
     buf = io.BytesIO()
@@ -204,21 +203,21 @@ def _try_read_segment(img, prompt: str | None) -> str | None:
     except (KeyError, IndexError, TypeError) as exc:
         raise RuntimeError(f"PaddleOCR-VL 响应缺少内容：{str(answer)[:200]}") from exc
     if choice.get("finish_reason") == "length":
-        if _looks_looped(text):
-            # 截断且复读循环：任何裁剪尺寸都会复发（p508 八条带实证），继续
-            # 细分纯烧时间——明确失败转本地引擎
-            raise RuntimeError("PaddleOCR-VL 输出疑似复读循环，原页尚未完整读取")
-        return None
+        return _LOOPED if _looks_looped(text) else None
     if not text.strip():
         raise RuntimeError("PaddleOCR-VL 分段未产生内容，原页尚未完整读取")
     return text.strip()
 
 
-def _ocr_split_and_read(img, prompt: str | None, depth: int) -> str:
-    """已知该图整读会截断：竖切两半（5% 重叠）递归读全。
+def _ocr_split_and_read(img, prompt: str | None, depth: int,
+                        looped_parent: bool = False) -> str:
+    """已知该图整读会截断：竖切两半（5% 重叠）递归读全，高<64px 转横切。
 
-    竖切到底（高 <32px）仍截断时改**横切**——点检/签到类宽表一行几百个
+    竖切到底（高 <64px）仍截断时改**横切**——点检/签到类宽表一行几百个
     "✓ |" 列（run128 p508 实证：1/32 段装不下一行），按列对半降到 ~1k token。
+    复读循环判死 = **连续两层疑似**：第一层疑似可能是表头/字形重复（真内容，
+    p254 三次误杀实证），继续细分；子段又疑似（真循环任何裁剪尺寸都复发，
+    p508 八条带实证）→ 快速失败转本地引擎，不空烧递归。
     """
     w, h = img.size
     if depth >= _MAX_SEGMENT_DEPTH:
@@ -241,9 +240,15 @@ def _ocr_split_and_read(img, prompt: str | None, depth: int) -> str:
         raise RuntimeError("PaddleOCR-VL 分段输出仍被 max_tokens 截断，原页尚未完整读取")
     parts: list[str] = []
     for crop in crops:
-        text = _try_read_segment(crop, prompt)
-        if text is None:
+        result = _try_read_segment(crop, prompt)
+        if result is _LOOPED:
+            if looped_parent:
+                raise RuntimeError("PaddleOCR-VL 输出疑似复读循环，原页尚未完整读取")
+            text = _ocr_split_and_read(crop, prompt, depth + 1, looped_parent=True)
+        elif result is None:
             text = _ocr_split_and_read(crop, prompt, depth + 1)
+        else:
+            text = result
         parts.append(text)
     return "\n".join(parts)
 

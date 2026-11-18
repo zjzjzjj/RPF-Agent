@@ -89,6 +89,23 @@ def test_loop_detection_fails_fast_on_truncated(monkeypatch) -> None:  # noqa: A
         paddle_client.remote_ocr_page(_png(300, 400), prompt="OCR:")
 
 
+def test_header_repetition_at_one_level_resolves_by_splitting(monkeypatch) -> None:  # noqa: ANN001
+    """p254 场景：表头重复（含 'PR #' 拉丁）只在粗段疑似循环，子段正常
+    → 必须递归读全，不得判死（两击判据的第一击只续切不放弃）。"""
+    header_looped = ("机器编号: PR # | 安装位置: 胶印车间 | 机器编号: PR # | "
+                     "安装位置: 胶印车间\n") * 12  # 尾部高频重复 → 疑似循环
+
+    def fake(png_bytes, prompt, max_tokens):  # noqa: ANN001, ANN202
+        img = Image.open(io.BytesIO(png_bytes))
+        if img.size[1] > 150:
+            return _reply(header_looped, truncated=True)
+        return _reply(f"[{img.size[1]}行]正常读全的表格行内容")
+
+    monkeypatch.setattr(paddle_client, "_post", fake)
+    out = paddle_client.remote_ocr_page(_png(300, 400), prompt="OCR:")
+    assert "正常读全" in out and out.count("正常读全") == 4, out
+
+
 def test_glyph_run_repetition_is_not_loop(monkeypatch) -> None:  # noqa: ANN001
     """勾选表「✓ | 」×数百是合法表格内容（p254 误杀实证）：不判循环——
     截断时照常递归细分读全，完整时直接返回。"""
