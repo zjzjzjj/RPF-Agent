@@ -45,6 +45,23 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    @app.middleware("http")
+    async def _upload_limit_middleware(request: Request, call_next):  # noqa: ANN001
+        """项目包上传 Content-Length 预检：超限在收 body 前 413（见 upload_guard）。"""
+        from app.api.upload_guard import oversized_upload_response
+
+        cl = request.headers.get("content-length")
+        content_length = int(cl) if cl and cl.isdigit() else None
+        rejected = oversized_upload_response(
+            request.method,
+            request.url.path,
+            content_length,
+            config.import_max_zip_mb() * 1024 * 1024,
+        )
+        if rejected is not None:
+            return rejected
+        return await call_next(request)
+
     @app.exception_handler(AppError)
     async def _app_error_handler(_req: Request, exc: AppError):
         return JSONResponse(
@@ -67,6 +84,7 @@ def create_app() -> FastAPI:
             "llm_model": config.llm_model(),
             "allow_remote_confidential": config.allow_remote_confidential(),
             "prompt_version": config.llm_prompt_version(),
+            "import_max_zip_mb": config.import_max_zip_mb(),
         }
 
     from app.api.router import api_router

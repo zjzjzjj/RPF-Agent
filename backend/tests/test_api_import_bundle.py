@@ -102,6 +102,36 @@ def test_zip_too_large(client, app_env, monkeypatch) -> None:  # noqa: ANN001
     assert r.json()["code"] == "ZIP_TOO_LARGE"
 
 
+def test_stream_over_limit_cleans_staging(client, app_env, monkeypatch) -> None:  # noqa: ANN001
+    """流式落盘中途超限：413 且暂存目录清干净（不留半截 zip）。"""
+    from app import config
+
+    monkeypatch.setenv("BID_EVAL_IMPORT_MAX_ZIP_MB", "1")  # 1MB
+    r = _post(client, b"x" * (3 * 1024 * 1024))  # 3MB，越过流式精确限额
+    assert r.status_code == 413
+    assert r.json()["code"] == "ZIP_TOO_LARGE"
+    staging = config.import_dir()
+    assert not staging.exists() or not any(staging.iterdir())
+
+
+def test_content_length_precheck_before_body(client, app_env, monkeypatch) -> None:  # noqa: ANN001
+    """upload_guard 中间件：Content-Length 超限直接 413（multipart 开销余量置 0）。
+
+    message 必须含"本次约"、detail 必须含 size_mb——两者都是中间件信封专属
+    （_save_zip 的同码 413：message 只有"上限 X MB"、detail 只有 limit_mb）。
+    若中间件被禁用，响应来自流式兜底，本测试必须变红。
+    （2026-11-17 变异测试实证：只断言 code/detail.limit_mb 时禁用中间件的变异体存活。）
+    """
+    monkeypatch.setenv("BID_EVAL_IMPORT_MAX_ZIP_MB", "0")
+    monkeypatch.setattr("app.api.upload_guard.SLACK_BYTES", 0)
+    r = _post(client, _zip_bytes(OK_ENTRIES))
+    assert r.status_code == 413
+    assert r.json()["code"] == "ZIP_TOO_LARGE"
+    assert "limit_mb" in r.json()["detail"]
+    assert "size_mb" in r.json()["detail"]  # 中间件信封专属；流式兜底不产出
+    assert "本次约" in r.json()["message"]
+
+
 def test_reimport_conflicts_with_runs(client, app_env) -> None:  # noqa: ANN001
     pid = client.post("/api/projects", json={"name": "重导409"}).json()["id"]
     with session_scope() as s:

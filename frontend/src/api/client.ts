@@ -60,6 +60,47 @@ export const api = {
   upload: <T,>(path: string, form: FormData) => request<T>(path, { method: "POST", body: form }),
 };
 
+/** 带上传进度的文件上传（fetch 无法观测上传进度，走 XHR）。
+ * 大项目包（数 GB）上传耗时数分钟，进度可见是"有反应"的关键。 */
+export function uploadWithProgress<T>(
+  path: string,
+  form: FormData,
+  onProgress?: (loaded: number, total: number) => void,
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open("POST", `/api${path}`);
+    xhr.setRequestHeader("X-Actor", getActor());
+    xhr.upload.onprogress = (e: ProgressEvent) => {
+      if (e.lengthComputable) onProgress?.(e.loaded, e.total);
+    };
+    xhr.onload = () => {
+      let body: unknown = null;
+      try {
+        body = JSON.parse(xhr.responseText);
+      } catch {
+        /* 非 JSON 响应体 */
+      }
+      if (xhr.status >= 200 && xhr.status < 300) {
+        resolve(body as T);
+        return;
+      }
+      const b = (body ?? {}) as { code?: string; message?: string; detail?: unknown };
+      reject(
+        new ApiError(
+          xhr.status,
+          b.code ?? `HTTP_${xhr.status}`,
+          b.message ?? xhr.statusText ?? "上传失败",
+          b.detail ?? null,
+        ),
+      );
+    };
+    xhr.onerror = () => reject(new Error("网络错误：上传中断，请重试"));
+    xhr.onabort = () => reject(new Error("上传已取消"));
+    xhr.send(form);
+  });
+}
+
 export function pageImageUrl(documentId: number, pageNo: number, scale = 2): string {
   return `/api/documents/${documentId}/pages/${pageNo}/image?scale=${scale}`;
 }

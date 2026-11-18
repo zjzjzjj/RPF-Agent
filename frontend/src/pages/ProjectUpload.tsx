@@ -5,6 +5,7 @@ import {
   App,
   Button,
   Card,
+  Progress,
   Space,
   Typography,
   Upload,
@@ -15,7 +16,7 @@ import {
   CloudUploadOutlined,
   FileZipOutlined,
 } from "@ant-design/icons";
-import { useBidders, useImportBundle, useJob, useProjectJobs } from "../api/hooks";
+import { useBidders, useHealth, useImportBundle, useJob, useProjectJobs } from "../api/hooks";
 import JobProgress from "../components/JobProgress";
 
 interface ImportResult {
@@ -23,6 +24,8 @@ interface ImportResult {
   bidders?: { name: string; price?: { status?: string } }[];
   warnings?: string[];
 }
+
+const fmtMb = (bytes: number) => (bytes / 1048576).toFixed(1);
 
 export default function ProjectUpload() {
   const { pid = "" } = useParams();
@@ -34,6 +37,9 @@ export default function ProjectUpload() {
   const importing = !!importJob && ["queued", "running"].includes(importJob.status);
   const importMut = useImportBundle();
   const [uploading, setUploading] = useState(false);
+  const [progress, setProgress] = useState<{ loaded: number; total: number } | null>(null);
+  const [localError, setLocalError] = useState<string | null>(null);
+  const { data: health } = useHealth();
 
   const { data: bidders } = useBidders(pid);
   const hasData = !!bidders && bidders.length > 0;
@@ -79,13 +85,31 @@ export default function ProjectUpload() {
           showUploadList={false}
           disabled={importing || importMut.isPending}
           beforeUpload={(file) => {
+            const limitMb = health?.import_max_zip_mb;
+            if (limitMb && file.size > limitMb * 1024 * 1024) {
+              const msg = `项目包 ${fmtMb(file.size)} MB，超出大小限制（上限 ${limitMb} MB）`;
+              setLocalError(msg);
+              message.error(msg);
+              return false;
+            }
+            setLocalError(null);
             setUploading(true);
+            setProgress({ loaded: 0, total: file.size });
             importMut.mutate(
-              { pid, file },
+              {
+                pid,
+                file,
+                onProgress: (loaded, total) => setProgress({ loaded, total }),
+              },
               {
                 onError: (e: Error) => {
                   setUploading(false);
+                  setProgress(null);
                   message.error(e.message || "导入失败，请检查 zip 文件结构");
+                },
+                onSuccess: () => {
+                  setUploading(false);
+                  setProgress(null);
                 },
               },
             );
@@ -107,8 +131,45 @@ export default function ProjectUpload() {
 
         {(importing || importMut.isPending || uploading) && (
           <div style={{ marginTop: 16 }}>
-            <JobProgress job={importJob} width={240} />
+            {importMut.isPending && progress ? (
+              <Space direction="vertical" style={{ width: "100%" }} size={4}>
+                <Progress
+                  percent={
+                    progress.total
+                      ? Math.min(100, Math.round((progress.loaded / progress.total) * 1000) / 10)
+                      : 0
+                  }
+                  status="active"
+                />
+                <Typography.Text type="secondary">
+                  正在上传 {fmtMb(progress.loaded)} / {fmtMb(progress.total)} MB（大文件上传需要几分钟，请勿关闭页面）
+                </Typography.Text>
+              </Space>
+            ) : (
+              <JobProgress job={importJob} width={240} />
+            )}
           </div>
+        )}
+
+        {localError && (
+          <Alert
+            type="error"
+            showIcon
+            closable
+            style={{ marginTop: 16 }}
+            message={localError}
+            onClose={() => setLocalError(null)}
+          />
+        )}
+
+        {importMut.isError && !importMut.isPending && (
+          <Alert
+            type="error"
+            showIcon
+            style={{ marginTop: 16 }}
+            message="导入失败"
+            description={(importMut.error as Error)?.message || "上传失败，请重试"}
+          />
         )}
 
         {importJob?.status === "failed" && (

@@ -76,11 +76,14 @@ def import_dir() -> Path:
 
 
 def import_max_zip_mb() -> int:
-    return int(os.environ.get("BID_EVAL_IMPORT_MAX_ZIP_MB", "500"))
+    """项目包（zip）大小上限 MB。真实标书包（含数十份扫描件 PDF）可达数 GB，
+    默认 8GB（2026-11-17 从 500MB 上调；3.5GB 利群商标条盒项目包实证）。"""
+    return int(os.environ.get("BID_EVAL_IMPORT_MAX_ZIP_MB", "8192"))
 
 
 def import_max_uncompressed_mb() -> int:
-    return int(os.environ.get("BID_EVAL_IMPORT_MAX_UNCOMPRESSED_MB", "2048"))
+    """解压总量上限 MB（zip 炸弹护栏）。与 import_max_zip_mb 同步上调至 16GB。"""
+    return int(os.environ.get("BID_EVAL_IMPORT_MAX_UNCOMPRESSED_MB", "16384"))
 
 
 def import_max_entries() -> int:

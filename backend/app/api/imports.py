@@ -26,22 +26,41 @@ from app.services import audit_service, ingest_service
 router = APIRouter(tags=["imports"])
 
 
-def _save_zip(content: bytes, filename: str | None) -> Path:
+_CHUNK = 8 * 1024 * 1024
+
+
+def _save_zip(upload: UploadFile, filename: str | None) -> Path:
+    """流式落盘 + 精确限额：不把整个包读进内存（真实项目包可达数 GB）。
+
+    Content-Length 预检（upload_guard）拦不住的 chunked 请求在这里按
+    实际字节数兜底；超限清理暂存目录后抛 ZipTooLarge。
+    """
     max_zip = config.import_max_zip_mb() * 1024 * 1024
-    if len(content) > max_zip:
-        raise ZipTooLarge(
-            f"项目包超出大小限制（{config.import_max_zip_mb()} MB）",
-            detail={"limit_mb": config.import_max_zip_mb()},
-        )
-    if not content:
-        raise ImportBundleError("项目包为空")
     run_dir = config.import_dir() / f"imp_{uuid.uuid4().hex[:12]}"
     run_dir.mkdir(parents=True, exist_ok=True)
     safe = ingest_service.sanitize_filename(filename or "bundle.zip")
     if not safe.lower().endswith(".zip"):
         safe += ".zip"
     zip_path = run_dir / safe
-    zip_path.write_bytes(content)
+
+    total = 0
+    try:
+        with zip_path.open("wb") as out:
+            upload.file.seek(0)
+            while chunk := upload.file.read(_CHUNK):
+                total += len(chunk)
+                if total > max_zip:
+                    raise ZipTooLarge(
+                        f"项目包超出大小限制（上限 {config.import_max_zip_mb()} MB）",
+                        detail={"limit_mb": config.import_max_zip_mb()},
+                    )
+                out.write(chunk)
+    except Exception:
+        shutil.rmtree(run_dir, ignore_errors=True)
+        raise
+    if total == 0:
+        shutil.rmtree(run_dir, ignore_errors=True)
+        raise ImportBundleError("项目包为空")
     return zip_path
 
 
@@ -66,8 +85,7 @@ def import_bundle_create(
     actor: str = Depends(get_actor),
 ) -> JSONResponse:
     """新建项目并导入项目包。202 → {project_id, job_id}。"""
-    content = file.file.read()
-    zip_path = _save_zip(content, file.filename)
+    zip_path = _save_zip(file, file.filename)
     _precheck(zip_path)  # 结构预检：失败抛 ImportBundleError 子类（4xx），并清掉暂存
 
     project_name = (name or Path(file.filename or "").stem or "导入项目").strip() or "导入项目"
@@ -120,8 +138,7 @@ def import_bundle_reimport(
                 f"项目已有 {n_runs} 个评分运行，重新导入会改写历史口径；请先删除评分运行或新建项目"
             )
 
-    content = file.file.read()
-    zip_path = _save_zip(content, file.filename)
+    zip_path = _save_zip(file, file.filename)
     _precheck(zip_path)
 
     from app.jobs.queue import submit

@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useSearchParams } from "react-router-dom";
-import { api } from "../api/client";
+import { api, uploadWithProgress } from "../api/client";
 import { pickDefaultRun } from "../utils/runs";
 import type {
   Bidder,
@@ -96,16 +96,35 @@ export function useProjectJobs(pid: string, kind?: string) {
   });
 }
 
-/** 项目包（zip）重新导入：覆盖输入数据（项目已有评分运行为后端 409）。 */
+/** 服务端配置（上传限额等）；供上传前预检给出即时反馈。 */
+export function useHealth() {
+  return useQuery({
+    queryKey: ["health"],
+    queryFn: () => api.get<{ import_max_zip_mb?: number }>("/health"),
+    staleTime: 60_000,
+  });
+}
+
+/** 项目包（zip）重新导入：覆盖输入数据（项目已有评分运行为后端 409）。
+ * onProgress 上报上传字节进度（大项目包上传耗时数分钟，必须可见）。 */
 export function useImportBundle() {
   const qc = useQueryClient();
   return useMutation({
-    mutationFn: ({ pid, file }: { pid: string; file: File }) => {
+    mutationFn: ({
+      pid,
+      file,
+      onProgress,
+    }: {
+      pid: string;
+      file: File;
+      onProgress?: (loaded: number, total: number) => void;
+    }) => {
       const form = new FormData();
       form.append("file", file);
-      return api.upload<{ project_id: string; job_id: number }>(
+      return uploadWithProgress<{ project_id: string; job_id: number }>(
         `/projects/${pid}/import-bundle`,
         form,
+        onProgress,
       );
     },
     onSuccess: () => {
