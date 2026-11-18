@@ -288,6 +288,204 @@ def _generate_for_price(entry: LedgerEntry, pages_by_no: dict[int, str],
 
 
 # ---------------------------------------------------------------------------
+# 片段覆盖对账（P0，2026-11-18 测试7-1 实证）
+# ---------------------------------------------------------------------------
+# 形态：LLM 把一个骨架计分行拆成多条子项（"ISO27001 得1分""ISO20000 得1分"
+# "ISO9000 得1分"），每条引文只是该行原文的一个分句。`_covers` 要求 40 字符
+# 切片命中，三条都太短 → 该行被判「未覆盖」→ 缺口补齐又生成一条整行父项，
+# 同一行计两次（103≠100）。这里只在**片段集合恰好闭合该行满分**时把片段登记
+# 为覆盖；其余情况（分值不符/覆盖不足/重复引文/跨行歧义）一律只披露不改数，
+# 由 TOTAL_SCORE 阻断人工处理——绝不静默删条目或猜分值。
+_RE_MATERIAL_HEAD = re.compile(r"【\s*证明材料\s*】")
+_RE_SCORE_ANCHOR = re.compile(r"得\s*\d|扣\s*\d|计\s*\d|满分|不得分")
+_FRAGMENT_MIN_LEN = 8            # 归一化引文下限（与 _row_cores 的 8 字符同口径）
+_FRAGMENT_LONG_LEN = 16          # 超过此长度不再要求计分锚点
+_FRAGMENT_COVER_RATIO = 0.6      # 片段并集须覆盖评分正文的比例
+_FRAGMENT_TYPES = ("count", "subjective")  # formula 不参与：价格 ledger 语义独立
+
+
+def _row_label(row: SkeletonRow) -> str:
+    name = row.group or ""
+    return f"{name}｜{(row.text or '')[:24]}"
+
+
+def _row_scoring_body(row: SkeletonRow) -> str:
+    """行正文（去掉【证明材料】段与序号前缀）——片段必须命中计分正文。"""
+    text = row.text or ""
+    m = _RE_MATERIAL_HEAD.search(text)
+    if m:
+        text = text[: m.start()]
+    text = re.sub(r"^\s*[（(]\d{1,2}[）)]\s*", "", text)
+    return _norm(text)
+
+
+def _fragment_probes(c: ExtractedCriterion) -> list[str]:
+    """候选引文（quote → description → name）；短引文必须带计分锚点。"""
+    probes: list[str] = []
+    for raw in (c.quote, c.description, c.name):
+        p = _norm(raw or "")
+        if not p or len(p) < _FRAGMENT_MIN_LEN:
+            continue
+        if len(p) < _FRAGMENT_LONG_LEN and not _RE_SCORE_ANCHOR.search(p):
+            continue
+        probes.append(p)
+    return probes
+
+
+def _fragment_page_ok(c: ExtractedCriterion, row: SkeletonRow) -> bool:
+    try:
+        ph = int(c.page_hint) if c.page_hint is not None else 0
+    except (TypeError, ValueError):
+        ph = 0
+    try:
+        rp = int(row.page_no or 0)
+    except (TypeError, ValueError):
+        rp = 0
+    if ph <= 0 or rp <= 0:
+        return True
+    return abs(ph - rp) <= 1
+
+
+def _union_coverage(body_n: str, probes: list[str]) -> float:
+    """片段并集（首次出现区间合并）覆盖评分正文的比例。"""
+    if not body_n:
+        return 0.0
+    spans: list[tuple[int, int]] = []
+    for p in probes:
+        pos = body_n.find(p)
+        if pos >= 0:
+            spans.append((pos, pos + len(p)))
+    if not spans:
+        return 0.0
+    spans.sort()
+    merged = 0
+    cur_s, cur_e = spans[0]
+    for s, e in spans[1:]:
+        if s <= cur_e:
+            cur_e = max(cur_e, e)
+        else:
+            merged += cur_e - cur_s
+            cur_s, cur_e = s, e
+    merged += cur_e - cur_s
+    return merged / len(body_n)
+
+
+def _reconcile_fragments(
+    criteria: list[ExtractedCriterion],
+    rows: list[SkeletonRow],
+    *,
+    covered_by: dict[int, list[int]],
+    scoring_idx: list[int],
+    rows_of: dict[int, set[int]],
+    dropped_idx: set[int],
+    index: "_PageIndex | None",
+    report: dict[str, Any],
+) -> None:
+    """片段覆盖 pass：只原地登记 covered_by，其余只写 report（不改分值/不删条目）。"""
+    def scoring_covered(ri: int) -> bool:
+        return any(criteria[ci].score_type in SCORING_TYPES for ci in covered_by[ri])
+
+    bodies = {ri: _row_scoring_body(row) for ri, row in enumerate(rows)}
+
+    # 诊断：同一行被 ≥2 条计分条目完整覆盖——只披露，不自动去重
+    for ri, row in enumerate(rows):
+        cis = [ci for ci in covered_by[ri]
+               if ci not in dropped_idx and criteria[ci].score_type in SCORING_TYPES]
+        if len(cis) >= 2:
+            report["multi_covered_rows"].append({
+                "row_index": ri, "row": _row_label(row),
+                "criteria": [criteria[ci].name for ci in cis],
+                "sum": float(sum((criteria[ci].max_score or Decimal(0)) for ci in cis)),
+            })
+
+    uncovered = {ri for ri in range(len(rows)) if not scoring_covered(ri)}
+
+    # 片段识别：未完整覆盖任何行 + 引文唯一命中某行评分正文
+    groups: dict[int, list[tuple[int, list[str]]]] = {}
+    for ci in scoring_idx:
+        c = criteria[ci]
+        if (ci in dropped_idx or rows_of.get(ci) or c.is_veto
+                or c.score_type not in _FRAGMENT_TYPES
+                or c.category == "price" or c.max_score is None):
+            continue
+        probes = _fragment_probes(c)
+        if not probes:
+            continue
+        hit: int | None = None
+        ambiguous: list[int] = []
+        for p in probes:
+            hits = [ri for ri, body in bodies.items()
+                    if p in body and _fragment_page_ok(c, rows[ri])]
+            if len(hits) == 1:
+                hit = hits[0]
+                break
+            if len(hits) > 1:
+                ambiguous = hits
+                break
+        if hit is None:
+            if ambiguous:
+                report["fragment_ambiguous"].append({
+                    "name": c.name, "max_score": float(c.max_score),
+                    "rows": [_row_label(rows[ri]) for ri in ambiguous]})
+                continue
+            shadow = [ri for ri in range(len(rows))
+                      if ri not in uncovered
+                      and any(p in bodies[ri] for p in probes)
+                      and _fragment_page_ok(c, rows[ri])]
+            if shadow:
+                report["fragment_shadowed"].append({
+                    "name": c.name, "max_score": float(c.max_score),
+                    "rows": [_row_label(rows[ri]) for ri in shadow]})
+            continue
+        if hit not in uncovered:
+            report["fragment_shadowed"].append({
+                "name": c.name, "max_score": float(c.max_score),
+                "rows": [_row_label(rows[hit])]})
+            continue
+        matched = [p for p in probes if p in bodies[hit]]
+        groups.setdefault(hit, []).append((ci, matched))
+
+    # 逐行裁决：只有片段分值严格闭合行满分且并集覆盖足够才登记
+    for ri in sorted(groups):
+        row = rows[ri]
+        if row.max_score is None or row.max_score <= 0:
+            continue
+        pairs = groups[ri]
+        cis = [ci for ci, _ in pairs]
+        probes = [p for _, ps in pairs for p in ps]
+        primary = [ps[0] for _, ps in pairs if ps]
+        total = sum((criteria[ci].max_score or Decimal(0)) for ci in cis)
+        coverage = _union_coverage(bodies[ri], probes)
+        base = {"row_index": ri, "row": _row_label(row),
+                "fragments": [criteria[ci].name for ci in cis]}
+        duplicate = len(set(primary)) < len(primary)
+        if not duplicate and total == row.max_score and coverage >= _FRAGMENT_COVER_RATIO:
+            for ci in cis:
+                if ci not in covered_by[ri]:
+                    covered_by[ri].append(ci)
+            report["fragment_covered"].append(
+                {**base, "sum": float(total), "coverage": round(coverage, 3)})
+            # 与既有 category 校正同口径（该 pass 已跑过，此处补登记片段）
+            if index is not None:
+                cat = _category_for_row(row, index)
+                if cat is not None:
+                    for ci in cis:
+                        c = criteria[ci]
+                        if c.category != cat:
+                            report["category_fixed"].append(
+                                {"name": c.name, "from": c.category, "to": cat})
+                            c.category = cat
+        else:
+            reason = ("duplicate_probe" if duplicate
+                      else "sum_mismatch" if total != row.max_score
+                      else "low_coverage")
+            report["fragment_unmatched"].append(
+                {**base, "fragment_sum": float(total),
+                 "row_max": float(row.max_score),
+                 "coverage": round(coverage, 3), "reason": reason})
+
+
+# ---------------------------------------------------------------------------
 # 主入口
 # ---------------------------------------------------------------------------
 
@@ -331,7 +529,10 @@ def reconcile_with_skeleton(
               "target_total": float(skeleton.target_total()),
               "generated": [], "score_fixed": [], "price_generated": False,
               "score_type_fixed": [], "category_fixed": [],
-              "overcoverage_pruned": [], "objective_as_subjective": []}
+              "overcoverage_pruned": [], "objective_as_subjective": [],
+              "fragment_covered": [], "fragment_unmatched": [],
+              "fragment_ambiguous": [], "fragment_shadowed": [],
+              "multi_covered_rows": []}
 
     texts = [(c, _crit_text(c)) for c in criteria]
     # 行 → 覆盖它的 criteria（前缀/子串命中）
@@ -464,6 +665,14 @@ def reconcile_with_skeleton(
     # 缺口补齐（match/veto 覆盖不计分——重写后仍无计分覆盖的行才算缺口）
     def _scoring_covered(ri: int) -> bool:
         return any(criteria[ci].score_type in SCORING_TYPES for ci in covered_by[ri])
+
+    # 片段覆盖对账（必须在生成循环之前：片段已足额闭合的行不再生成整行父项）
+    _reconcile_fragments(
+        criteria, skeleton.rows,
+        covered_by=covered_by, scoring_idx=scoring_idx,
+        rows_of=rows_of, dropped_idx=dropped_idx,
+        index=index, report=report,
+    )
 
     out = [c for i, c in enumerate(criteria) if i not in dropped_idx]
     for ri, row in enumerate(skeleton.rows):

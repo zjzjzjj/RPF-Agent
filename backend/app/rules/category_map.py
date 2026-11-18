@@ -13,6 +13,7 @@ commercial 项在合并时被整条弃用。
 from __future__ import annotations
 
 import logging
+import re
 from typing import Iterable
 
 from sqlalchemy import select
@@ -131,14 +132,39 @@ def load_page_texts(document_id: int, around: set[int] | None = None) -> list[tu
     return [(int(p), text or "") for p, text in rows]
 
 
+# 多分部节点判定：节点正文含 ≥2 个不同「X部分（N分）」章节标记时，节点标题只
+# 描述了首个分部（真实文档节点切分会把商务表与技术表并在同一节点）——该节点
+# 不再作 category 权威，退回引文位置通道；引文通道也给不出类别时保持 LLM 原值。
+_RE_SECTION_PART = re.compile(r"(商务|技术|价格|报价)部分\s*[（(]\s*\d+(?:\.\d+)?\s*分")
+_SECTION_PART_CAT = {"商务": "commercial", "技术": "technical",
+                     "价格": "price", "报价": "price"}
+
+
+def node_part_categories(text: str | None) -> set[str]:
+    """节点正文里出现的分部类别集合（用于识别多分部节点）。"""
+    return {_SECTION_PART_CAT[m.group(1)]
+            for m in _RE_SECTION_PART.finditer(text or "")}
+
+
+def load_node_texts(document_id: int) -> dict[str, str]:
+    """document 全部节点的 {node_id: text}（仅用于多分部判定）。"""
+    with session_scope() as s:
+        rows = s.execute(
+            select(DocNode.node_id, DocNode.text).where(DocNode.document_id == document_id)
+        ).all()
+    return {nid: (text or "") for nid, text in rows}
+
+
 def plan_category_fixes(
     criteria: list[Criterion],
     document_id: int,
     node_titles: dict[str, str] | None = None,
     page_texts: list[tuple[int, str]] | None = None,
+    multi_part_nodes: set[str] | None = None,
 ) -> list[tuple[int, str, str, str]]:
     """计算应改的类别 → [(criterion_id, 旧, 新, 依据)]。只读，不动库。"""
     out: list[tuple[int, str, str, str]] = []
+    multi = multi_part_nodes or set()
     for c in criteria:
         if c.origin not in ("document", "template"):
             continue  # 法规/人工条目不自动改
@@ -155,7 +181,10 @@ def plan_category_fixes(
             continue
         cat = None
         basis = ""
-        if c.source_node_id:
+        # 多分部节点（正文含 ≥2 个「X部分（N分）」标记）的标题只描述了首个
+        # 分部，不能当类别权威（2026-11-18 测试7-1 实证：商务节点正文含技术表，
+        # 按标题强改会把技术 30 分全部归商务）。撤权后走引文位置通道。
+        if c.source_node_id and c.source_node_id not in multi:
             cat = category_from_node_chain(node_titles or {}, c.source_node_id)
             if cat:
                 basis = f"节点标题（{c.source_node_id}）"
@@ -211,10 +240,14 @@ def apply_category_from_nodes(package_id: int, actor: str = "auto") -> int:
         return 0
 
     node_titles = load_node_titles(doc_id)
+    node_texts = load_node_texts(doc_id)
+    multi_part = {nid for nid, text in node_texts.items()
+                  if len(node_part_categories(text)) >= 2}
     pages = load_page_texts(doc_id, around={c.source_page for c in crit_list if c.source_page})
     manual = manual_edited_criterion_ids(package_id)
     fixes = [
-        f for f in plan_category_fixes(crit_list, doc_id, node_titles, pages)
+        f for f in plan_category_fixes(
+            crit_list, doc_id, node_titles, pages, multi_part_nodes=multi_part)
         if f[0] not in manual
     ]
     if not fixes:
@@ -253,13 +286,16 @@ def in_memory_category_fixes(entries: list[dict], document_id: int) -> dict[int,
     if not entries or document_id <= 0:
         return {}
     node_titles = load_node_titles(document_id)
+    node_texts = load_node_texts(document_id)
+    multi_part = {nid for nid, text in node_texts.items()
+                  if len(node_part_categories(text)) >= 2}
     pages = load_page_texts(
         document_id, around={e.get("source_page") for e in entries if e.get("source_page")}
     )
     out: dict[int, str] = {}
     for e in entries:
         cat = None
-        if e.get("source_node_id"):
+        if e.get("source_node_id") and e["source_node_id"] not in multi_part:
             cat = category_from_node_chain(node_titles, e["source_node_id"])
         if cat is None and e.get("source_quote"):
             cat = category_from_quote_position(pages, e["source_quote"], e.get("source_page"))

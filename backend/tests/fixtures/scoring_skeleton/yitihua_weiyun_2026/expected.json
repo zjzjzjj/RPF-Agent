@@ -1,0 +1,25 @@
+{
+ "rows": [
+  {"group": "投标人实力", "sub_name": null, "sub_idx": null, "subjectivity": "objective", "max_score": "3", "page_no": 88},
+  {"group": "投标人实力", "sub_name": null, "sub_idx": null, "subjectivity": "objective", "max_score": "1", "page_no": 88},
+  {"group": "投标人业绩", "sub_name": null, "sub_idx": null, "subjectivity": "objective", "max_score": "6", "page_no": 88},
+  {"group": "项目重点、难点分析", "sub_name": null, "sub_idx": null, "subjectivity": "subjective", "max_score": "6", "page_no": 88},
+  {"group": "项目主要技术方案", "sub_name": null, "sub_idx": null, "subjectivity": "objective", "max_score": "8", "page_no": 89},
+  {"group": "项目主要技术方案", "sub_name": null, "sub_idx": null, "subjectivity": "objective", "max_score": "2", "page_no": 89},
+  {"group": "项目主要技术方案", "sub_name": null, "sub_idx": null, "subjectivity": "subjective", "max_score": "5", "page_no": 89},
+  {"group": "服务团队技术力量", "sub_name": null, "sub_idx": null, "subjectivity": "objective", "max_score": "2", "page_no": 89},
+  {"group": "服务团队技术力量", "sub_name": null, "sub_idx": null, "subjectivity": "objective", "max_score": "2", "page_no": 89},
+  {"group": "服务团队技术力量", "sub_name": null, "sub_idx": null, "subjectivity": "objective", "max_score": "2", "page_no": 89},
+  {"group": "项目响应能力", "sub_name": null, "sub_idx": null, "subjectivity": "objective", "max_score": "3", "page_no": 89}
+ ],
+ "row_sum": "40",
+ "ledger": [
+  {"label": "商务部分", "max_score": "10", "page_no": 88},
+  {"label": "技术部分", "max_score": "30", "page_no": 88},
+  {"label": "报价部分", "max_score": "60", "page_no": 90}
+ ],
+ "ledger_sum": "100",
+ "target_total": "100",
+ "closed": true,
+ "warnings": []
+}

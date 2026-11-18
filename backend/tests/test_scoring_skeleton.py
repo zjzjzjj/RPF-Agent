@@ -395,3 +395,62 @@ def test_empty_text_row_dropped_with_marker() -> None:
     assert sk is not None
     assert [r.group for r in sk.rows] == ["真实项"]
     assert any(w.startswith("empty_text_row_dropped") for w in sk.warnings)
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-18 测试7-1 一体化运维平台维保：商务10+技术30+报价60
+# ---------------------------------------------------------------------------
+YITIHUA_FX = Path(__file__).parent / "fixtures" / "scoring_skeleton" / "yitihua_weiyun_2026"
+
+
+def _load_yitihua_fixture() -> tuple[dict[int, list], dict[int, str]]:
+    tables = json.loads((YITIHUA_FX / "tables_p88_90.json").read_text(encoding="utf-8"))
+    pages = json.loads((YITIHUA_FX / "pages_p88_90.json").read_text(encoding="utf-8"))
+    return {int(k): v for k, v in tables.items()}, {int(k): v for k, v in pages.items()}
+
+
+def test_yitihua_skeleton_11_rows_sum40_closes_100() -> None:
+    """真实形态：11 计分行 Σ=40 + 表外商务10/技术30/报价60 → 目标 100。
+
+    第 0 行「投标人实力 0-3 分」的细则 cell 含三个 ISO 分句 + 【证明材料】，
+    是片段覆盖对账 bug 的原始场景（行级 group_total 为空）。
+    """
+    tables, pages = _load_yitihua_fixture()
+    sk = parse_skeleton(tables, pages)
+    assert sk is not None
+    assert len(sk.rows) == 11
+    assert sk.row_sum() == Decimal("40")
+    assert sk.target_total() == Decimal("100")
+    assert sk.closed() is True
+    assert sk.warnings == []
+    first = sk.rows[0]
+    assert first.group == "投标人实力"
+    assert first.group_total is None
+    assert first.max_score == Decimal("3")
+    assert first.subjectivity == "objective"
+    for token in ("ISO27001", "ISO20000", "ISO9000", "【证明材料】"):
+        assert token in first.text
+
+    span = locate_scoring_section(sorted(pages.items()), tables)
+    assert span == (88, 90)
+
+
+def test_yitihua_expected_fixture_matches() -> None:
+    """fixture 快照：行/台账形态与 expected.json 逐行一致（防意外漂移）。"""
+    tables, pages = _load_yitihua_fixture()
+    sk = parse_skeleton(tables, pages)
+    exp = json.loads((YITIHUA_FX / "expected.json").read_text(encoding="utf-8"))
+    assert sk is not None
+    assert len(sk.rows) == len(exp["rows"]) == 11
+    for want, got in zip(exp["rows"], sk.rows):
+        assert (got.group, got.sub_name, got.subjectivity,
+                str(got.max_score), got.page_no) == (
+            want["group"], want["sub_name"], want["subjectivity"],
+            want["max_score"], want["page_no"])
+    assert str(sk.row_sum()) == exp["row_sum"] == "40"
+    assert str(sk.target_total()) == exp["target_total"] == "100"
+    assert sk.closed() == exp["closed"] is True
+    assert sk.warnings == exp["warnings"]
+    ledgers = {(e.label, str(e.max_score)) for e in sk.ledger}
+    for want in exp["ledger"]:
+        assert (want["label"], want["max_score"]) in ledgers

@@ -246,3 +246,77 @@ def test_plan_fixes_formula_forces_price_and_blocks_downgrade() -> None:
 
     ok = Criterion(category="price", **{**base, "code": "c31"})
     assert category_map.plan_category_fixes([ok], 1, titles, []) == []
+
+
+# ---------------------------------------------------------------------------
+# 多分部节点不作类别权威（2026-11-18 测试7-1 实证）
+# ---------------------------------------------------------------------------
+def test_node_part_categories_variants() -> None:
+    assert category_map.node_part_categories(
+        "1、商务部分（10 分）……2、技术部分（30 分）……") == {"commercial", "technical"}
+    assert category_map.node_part_categories("1、商务部分（10 分）") == {"commercial"}
+    assert category_map.node_part_categories("3、报价部分（60分）") == {"price"}
+    assert category_map.node_part_categories("没有分部分值声明") == set()
+
+
+def test_plan_fixes_skips_multi_part_node() -> None:
+    """节点正文含多分部标记 → 标题不可作权威，保持 LLM 原类别。"""
+    node_id = "t:root:C12:SEC6:I5:N1"
+    crit = Criterion(
+        package_id=0, code="c23", category="technical", name="项目重点、难点分析",
+        description="技术评审", score_type="subjective", max_score=Decimal("6"),
+        is_veto=False, source_node_id=node_id, source_page=89,
+        source_quote="对本次招标项目运维服务工作的重点、难点进行分析",
+        origin="document", status="verified", sort_order=1,
+    )
+    titles = {node_id: "1、商务部分（10 分）"}
+
+    # 对照：不传 multi_part_nodes → 旧行为会按标题强改成 commercial
+    fixes = category_map.plan_category_fixes([crit], 1, titles, [])
+    assert [(f[1], f[2]) for f in fixes] == [("technical", "commercial")]
+
+    # 修复后：多分部节点撤权，B 通道无页文本 → 不改
+    assert category_map.plan_category_fixes(
+        [crit], 1, titles, [], multi_part_nodes={node_id}) == []
+
+
+def test_normalize_multi_part_node_keeps_llm_category(client) -> None:  # noqa: ANN001
+    """落库路径：多分部节点下的技术条目在 normalize 后仍为 technical。"""
+    from sqlalchemy import select
+
+    from app.db.models import Criterion, DocNode, Document, RulePackage
+    from app.db.session import session_scope
+    from app.services import rule_service
+
+    pid = client.post("/api/projects", json={"name": "多分部类别"}).json()["id"]
+    node_id = "t:root:C12:SEC6:I5:N1"
+    with session_scope() as s:
+        s.add(Document(project_id=pid, kind="tender", original_filename="t.pdf",
+                       stored_path="t.pdf", sha256="9" * 64, parse_status="parsed"))
+        s.flush()
+        doc_id = s.execute(
+            select(Document.id).where(Document.project_id == pid)
+        ).scalar_one()
+        s.add(DocNode(
+            document_id=doc_id, node_id=node_id, kind="item", page=88, depth=4,
+            title="1、商务部分（10 分）",
+            text="1、商务部分（10 分）……2、技术部分（30 分）……3、报价部分（60 分）"))
+        pkg = RulePackage(project_id=pid, version=1, status="draft", origin="document",
+                          source_document_id=doc_id, created_by="tester")
+        s.add(pkg)
+        s.flush()
+        pkg_id = pkg.id
+        c = Criterion(
+            package_id=pkg_id, code="c23", category="technical", name="项目重点、难点分析",
+            description="技术评审", score_type="subjective", max_score=Decimal("6"),
+            is_veto=False, source_node_id=node_id, source_page=89,
+            source_quote="对本次招标项目运维服务工作的重点、难点进行分析",
+            origin="document", status="verified", sort_order=1)
+        s.add(c)
+        s.flush()
+        crit_id = c.id
+
+    stats = rule_service.normalize_package(pkg_id, "auto")
+    assert stats["category_corrected"] == 0
+    with session_scope() as s:
+        assert s.get(Criterion, crit_id).category == "technical"
