@@ -156,11 +156,37 @@ def _load_pages(bidder_id: int) -> tuple[list[dict], str, list[dict]]:
             err = LLMError(f"全部投标文件均未能读取，无法执行自动评审：{detail}")
             err.reading_incomplete = True
             raise err
+        # 页级 material_tags（解析期已分类）附到页 dict——评分读页阶段据此跳过
+        # 结构性噪声页（2026-11-18 用户指令：解析期标签应被评分复用，无用页不重读）
+        from app.db.models import MaterialTag
+
+        tag_rows = s.execute(
+            select(MaterialTag.document_id, MaterialTag.page_no, MaterialTag.tags_json)
+            .where(MaterialTag.document_id.in_([d.id for d in docs]),
+                   MaterialTag.seg_kind == "page")
+        ).all()
+        tags_by_page = {
+            (int(r[0]), int(r[1])): [str(x) for x in (r[2] or [])] for r in tag_rows
+        }
+        for p in pages:
+            p["material_tags"] = tags_by_page.get(
+                (int(p["document_id"]), int(p["page_no"])), [])
         return pages, data_class, unreadable_docs
 
 
 def _page_text(pages: list[dict]) -> str:
     return "\n".join(str(p.get("text") or "") for p in pages)
+
+
+# 结构性噪声页标签（永远不可能是文本证据）：目录/空白/分隔页。只在标签
+# **明确命中**时跳过——未打标/拿不准的照读（正向判定，不猜）。
+# 注意：封面类不入列（可能带公章/投标人标识，签章与身份核验要用）。
+_NOISE_PAGE_TAGS = {"toc", "目录", "空白", "空白页", "分隔页", "隔页"}
+
+
+def _is_noise_page(page: dict) -> bool:
+    tags = [str(t).strip().lower() for t in (page.get("material_tags") or [])]
+    return any(t in _NOISE_PAGE_TAGS for t in tags)
 
 
 def _is_visual_requirement(criterion: dict) -> bool:
@@ -244,7 +270,7 @@ def _supplement_pages(criterion: dict, pages: list[dict], *, visual: bool, exhau
             continue
         if page.get("supplemented") and not page.get("unreadable") and not page.get("requires_vision"):
             continue
-        if (page["document_id"], page["page_no"]) in targets and (
+        if (page["document_id"], page["page_no"]) in targets and not _is_noise_page(page) and (
             page.get("source") != "text" or not page.get("has_text_layer", True)
             or page.get("unreadable") or page.get("requires_vision")
             or len(str(page.get("text") or "")) < config.OCR_MIXED_PAGE_MAX_CHARS
