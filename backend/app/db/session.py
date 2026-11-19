@@ -24,6 +24,10 @@ def _make_engine() -> Engine:
     kwargs: dict = {"future": True}
     if url.startswith("sqlite"):
         kwargs["connect_args"] = {"check_same_thread": False}
+        # 2026-11-19：评分并发提到 24 后，默认 QueuePool(5+10) 会出现
+        # "QueuePool limit ... connection timed out"，格直接落暂定兜底
+        # （run143 实证）。SQLite 连接本身很廉价，放大池并给足等待时间。
+        kwargs.update(pool_size=20, max_overflow=40, pool_timeout=60)
     engine = create_engine(url, **kwargs)
     if url.startswith("sqlite"):
         _install_sqlite_pragmas(engine)

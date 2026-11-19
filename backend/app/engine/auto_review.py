@@ -1320,7 +1320,8 @@ def _call(gateway: Gateway, criterion: dict, pages: list[dict], *, data_class: s
         )
     from app.services.review_collections import semantic_value
 
-    payload = {"rule": criterion, "fact_schema": fact_schema,
+    payload = {"rule": {k: v for k, v in criterion.items() if k != "_supplied_facts"},
+               "fact_schema": fact_schema,
                "required_price_components": price_components,
                "frozen_subitems": [{"name": name, "max_score": str(cap)}
                                    for name, cap in parse_subitems(criterion.get("description"), criterion.get("max_score"))],
@@ -2156,6 +2157,12 @@ def review_criterion(gateway: Gateway, criterion: dict, pages: list[dict], *,
             raise LLMError("横向评审尚未提供全部所选投标人的完整关联材料及归属，不能形成结论")
     if not pages and not is_external_requirement(criterion):
         raise LLMError("没有可供自动评审的投标文件页")
+    # 确定性事实供给必须按**投标人全部送审页**算一次并预挂：逐批 _call 只拿一页
+    # 子集时，截图节/证书清单在别的批里 → 检测成"不存在"、schema 抑制失效、模型
+    # 重复报无据事实 → 补抽耗尽整格暂定 0（run132 证书格实证）。
+    supplies = _supplies_for(criterion, pages)
+    if supplies:
+        criterion = {**criterion, "_supplied_facts": supplies}
     if use_vision and not any(p.get("image_url") for p in pages):
         raise LLMError("需要视觉核验但未提供可读取原页图像")
     if use_vision:
@@ -2264,7 +2271,11 @@ def review_criterion(gateway: Gateway, criterion: dict, pages: list[dict], *,
         # 确定性事实注入（ADR 0015）：单批/综合汇流的唯一出口前统一注入——
         # 在 _validate_evidence 之后（合成证据不越权批次契约）、_finish_decision
         # 的 _validate_fact_sources 复核之前（免费二次核验）
-        _inject_supplied_facts(decision, supplies, selected)
+        # 锚复核用**全部送审页**：检测器锚（如 cert_section_present 的截图节页）
+        # 常落在本批 selected 之外（视觉批次只选图证页），用 selected 会把供给
+        # 降级成 provenance_only、标量值不注入 → 模型口供又被证据闸门拦下
+        # （run130 c18 143 实证）。落库仍按投标人全页校验，引文来自真实页文本。
+        _inject_supplied_facts(decision, supplies, pages)
     return finish_decision(decision, criterion, pages, selected=selected, batches=batches,
                            full=full, use_vision=use_vision)
 

@@ -102,7 +102,7 @@ def _lock_slot(descriptor: int) -> None:
 
 @contextmanager
 def _slot() -> Iterator[None]:
-    limit = min(8, max(1, config.llm_max_concurrency()))
+    limit = min(config.llm_concurrency_ceiling(), max(1, config.llm_max_concurrency()))
     directory = config.data_dir() / "llm_request_slots"
     directory.mkdir(parents=True, exist_ok=True)
     flags = os.O_CREAT | os.O_RDWR | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0)

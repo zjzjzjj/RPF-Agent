@@ -20,8 +20,9 @@ import hashlib
 import json
 import logging
 import math
+import threading
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import copy_context
 from pathlib import Path
 from typing import Callable
@@ -39,7 +40,7 @@ def _check_file(path: str) -> None:
     p = Path(path)
     if not p.exists() or p.stat().st_size == 0:
         raise DocumentRejectedError(config.REJECT_EMPTY_FILE, "文件为空或不存在")
-    if p.stat().st_size > config.max_upload_bytes():
+    if p.stat().st_size > config.max_parse_file_bytes():
         raise DocumentRejectedError(config.REJECT_TOO_LARGE, "文件超过大小上限")
     with open(path, "rb") as fh:
         head = fh.read(_MAGIC_WINDOW)
@@ -260,8 +261,14 @@ def _page_image_blocks(
     return out
 
 
+_STATE_LOCK = threading.Lock()
+
+
 def _remote_text(png_bytes: bytes, state: dict) -> str:
-    """远程 OCR 调用（带熔断）。不可用或失败抛 RuntimeError。"""
+    """远程 OCR 调用（带熔断）。不可用或失败抛 RuntimeError。
+
+    并行 OCR 下多个线程共享 state（失败计数/熔断标记），更新必须加锁。
+    """
     if not state.get("remote_ok"):
         raise RuntimeError("远程 OCR 不可用")
     from app.parsing import paddle_client
@@ -269,12 +276,14 @@ def _remote_text(png_bytes: bytes, state: dict) -> str:
     try:
         text = paddle_client.remote_ocr_page(png_bytes)
     except RuntimeError:
-        state["remote_failures"] = int(state.get("remote_failures", 0)) + 1
-        if state["remote_failures"] >= config.ocr_max_failures():
-            state["remote_ok"] = False
-            state["tripped"] = True
+        with _STATE_LOCK:
+            state["remote_failures"] = int(state.get("remote_failures", 0)) + 1
+            if state["remote_failures"] >= config.ocr_max_failures():
+                state["remote_ok"] = False
+                state["tripped"] = True
         raise
-    state["remote_failures"] = 0
+    with _STATE_LOCK:
+        state["remote_failures"] = 0
     return text
 
 
@@ -480,7 +489,7 @@ def ocr_pages_text(
 
     # Each task owns a distinct Context; run identity, frozen model settings,
     # cancellation and activity observers must survive these executor threads.
-    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="targeted-ocr") as pool:
+    with ThreadPoolExecutor(max_workers=config.ocr_page_concurrency(), thread_name_prefix="targeted-ocr") as pool:
         pending = deque()
         source = iter(enumerate(page_nos, 1))
 
@@ -585,8 +594,26 @@ def _rescue_ocr_text(png_bytes: bytes, engine: str) -> str:
     raise RuntimeError("OCR 未完成")
 
 
-def extract_pdf(path: str) -> ExtractedDocument:
-    """解析 PDF：页文本 + 行 bbox + 表格 bbox + 扫描页 OCR 兜底。"""
+_MATERIAL_HINTS = (
+    "合同", "发票", "验收", "证书", "认证", "资质", "营业执照", "社保", "授权",
+    "业绩", "案例", "检测", "设备", "购置", "审计", "信用", "资信", "体系",
+    "ISO", "CMMI", "简历", "职称", "售后", "承诺", "供应商", "证明", "用户报告",
+)
+
+
+def _ocr_priority(item: dict) -> tuple[int, int]:
+    """材料页优先：标题/正文命中证明材料关键词的扫描页先占 OCR 预算。"""
+    sample = " ".join(item["texts"])[:400]
+    hit = any(hint in sample for hint in _MATERIAL_HINTS)
+    return (0 if hit else 1, item["page_no"])
+
+
+def extract_pdf(path: str, on_progress: Callable[[int, int], None] | None = None) -> ExtractedDocument:
+    """解析 PDF：页文本 + 行 bbox + 表格 bbox + 扫描页 OCR 兜底。
+
+    ``on_progress(page_no, page_total)`` 逐页回调：大标书（数百页扫描件）单页
+    OCR 可达数秒，调用方据此刷新任务心跳，避免长任务被判僵尸重复领取。
+    """
     from types import SimpleNamespace
     from app.parsing.pdf_runtime import run_pdf_task
     from app.jobs.queue import JobCancelled
@@ -636,104 +663,152 @@ def extract_pdf(path: str) -> ExtractedDocument:
 
     total_chars = 0
     no_text_pages = 0
+    page_total = int(layout.get("page_count") or len(layout["pages"]))
+
+    # ── 第一遍：组装基础页信息、收集待 OCR 页 ──────────────────────────────
+    # 旧实现逐页串行 OCR（单页 2–7 秒），1200+ 页扫描标书一份要 30–40 分钟。
+    # 拆分两遍后 OCR 页可并行；预算截断时按"材料页优先"挑页，先保证证明材料。
+    records: list[dict] = []
     for record in layout["pages"]:
         i = int(record["page_no"])
+        if on_progress is not None:
+            on_progress(i, page_total)
         width, height = float(record["width"]), float(record["height"])
         texts, boxes = list(record["texts"]), list(record["boxes"])
         warnings.extend(record["warnings"])
         degraded = degraded or bool(record["warnings"])
-
-        page_text = "\n".join(texts)
         chars = sum(len(t) for t in texts)
         total_chars += chars
-        source = "text"
-        has_layer = bool(texts)
+        blank = chars == 0 and not record["has_images"]  # 真空白页（分隔页）：不浪费 OCR
+        records.append({
+            "page_no": i, "width": width, "height": height,
+            "texts": texts, "boxes": boxes, "has_layer": bool(texts),
+            "tables": record["tables"],
+            "source": "skipped" if blank else "text",
+            "need_ocr": (not blank) and (
+                chars < config.OCR_PAGE_MIN_CHARS
+                or (chars < config.OCR_MIXED_PAGE_MAX_CHARS and record["has_large_image"])
+            ),
+        })
 
-        need_ocr = chars < config.OCR_PAGE_MIN_CHARS or (
-            chars < config.OCR_MIXED_PAGE_MAX_CHARS and record["has_large_image"]
-        )
-        if need_ocr:
-            has_images = record["has_images"]
-            if chars == 0 and not has_images:
-                # 真空白页（分隔页）：不浪费 OCR，也不算退化
-                pages.append(ExtractedPage(
-                    page_no=i, text="", width=width, height=height,
-                    has_text_layer=False, source="skipped", line_boxes=[],
-                ))
-                continue
-            if ocr_budget > 0 and ocr_available:
-                try:
-                    prepared = _prepare_ocr_images(path, i, config.OCR_IMAGE_MIN_RATIO)
-                    path_kind = prepared["kind"]
-                    ocr_lines = []
-                    for image in prepared["images"]:
-                        if path_kind == "img":
-                            lines = _ocr_image_lines(image["png"], tuple(image["rect"]), ocr_engine, ocr_state)
-                        else:
-                            geometry = SimpleNamespace(rect=SimpleNamespace(width=width, height=height))
-                            lines = _ocr_render_lines(image["png"], geometry, ocr_engine, ocr_state)
-                        if not lines:
-                            raise RuntimeError("OCR 未完整读取全部目标图像")
-                        ocr_lines.extend(lines)
-                    low_yield = len("".join(t for t, _ in ocr_lines).strip()) < config.OCR_RENDER_MIN_CHARS
-                    # 与文字层合并（阅读序）：文字层常含标题/页码，OCR 补扫描内容
-                    merged = [(round(b[1], 1), b[0], t, b) for t, b in zip(texts, boxes)]
-                    merged += [
-                        (round(b[1], 1), b[0], t, b) for t, b in ocr_lines if t.strip()
-                    ]
-                    merged.sort(key=lambda r: (r[0], r[1]))
-                    texts = [m[2] for m in merged]
-                    boxes = [m[3] for m in merged]
-                    page_text = "\n".join(texts)
-                    source = "ocr_img" if path_kind == "img" else "ocr"
-                    ocr_used = True
-                    degraded = True
-                    ocr_budget -= 1
-                    ocr_pages += 1
-                    if path_kind == "img":
-                        ocr_img_pages += 1
-                    if low_yield:
-                        # 防"OCR 跑了但只读回页码"这类静默垃圾（旧实现无感知）
-                        warnings.append(
-                            f"第 {i} 页整页 OCR 产出过少（"
-                            f"{len(page_text.strip())} 字），页内有大图，内容可能未识别"
-                        )
-                except JobCancelled:
-                    raise
-                except Exception as exc:  # noqa: BLE001 —— OCR 失败按缺字页处理
-                    warnings.append(f"第 {i} 页 OCR 识别失败：{exc}")
-                    degraded = True
-                    if ocr_state.get("tripped"):
-                        warnings.append(
-                            f"远程 OCR 连续失败 {config.ocr_max_failures()} 次，"
-                            "本文档余下页跳过 OCR"
-                        )
-                        ocr_available = False
-            elif not ocr_available:
-                no_text_pages += 1
+    selected: list[dict] = []
+    candidates = [r for r in records if r["need_ocr"]]
+    if candidates and ocr_budget > 0 and ocr_available:
+        if config.ocr_prioritize_material():
+            candidates.sort(key=_ocr_priority)
+        selected = candidates[:ocr_budget]
+        for r in candidates[ocr_budget:]:
+            r["need_ocr"] = False
+            ocr_skipped_pages += 1
+            warnings.append(f"第 {r['page_no']} 页疑似扫描件，已超出 OCR 页数上限（"
+                            f"{config.ocr_max_pages()}），跳过")
+            degraded = True
+    else:
+        intentional_off = not config.ocr_enabled()
+        for r in candidates:
+            r["need_ocr"] = False
+            no_text_pages += 1
+            if intentional_off:
+                warnings.append(f"第 {r['page_no']} 页扫描件（OCR 已关闭，按扫描页标签处理）")
+            else:
                 warnings.append(
-                    f"第 {i} 页疑似扫描件（OCR 不可用：引擎 {ocr_engine}，"
+                    f"第 {r['page_no']} 页疑似扫描件（OCR 不可用：引擎 {ocr_engine}，"
                     "远程探针未通过且本地未安装 rapidocr-onnxruntime）"
                 )
-            elif ocr_budget <= 0:
-                ocr_skipped_pages += 1
-                warnings.append(f"第 {i} 页疑似扫描件，已超出 OCR 页数上限（"
-                                f"{config.ocr_max_pages()}），跳过")
+        if intentional_off and candidates:
+            warnings.append(f"扫描页 {len(candidates)} 页未做内容识别（BID_EVAL_OCR=0）")
+
+    # ── 第二遍：并行 OCR（每页独立：独立缓存目录 + 原子锁，互不共享页数据）──
+    def _ocr_one(item: dict) -> dict:
+        i = item["page_no"]
+        try:
+            prepared = _prepare_ocr_images(path, i, config.OCR_IMAGE_MIN_RATIO)
+            path_kind = prepared["kind"]
+            ocr_lines = []
+            for image in prepared["images"]:
+                if path_kind == "img":
+                    lines = _ocr_image_lines(image["png"], tuple(image["rect"]), ocr_engine, ocr_state)
+                else:
+                    geometry = SimpleNamespace(
+                        rect=SimpleNamespace(width=item["width"], height=item["height"])
+                    )
+                    lines = _ocr_render_lines(image["png"], geometry, ocr_engine, ocr_state)
+                if not lines:
+                    raise RuntimeError("OCR 未完整读取全部目标图像")
+                ocr_lines.extend(lines)
+            if on_progress is not None:
+                on_progress(i, page_total)
+            return {"ok": True, "lines": ocr_lines, "kind": path_kind}
+        except JobCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001 —— 调用方统一记警告
+            return {"ok": False, "error": str(exc)}
+
+    results: dict[int, dict] = {}
+    if selected:
+        workers = min(config.ocr_page_concurrency(), len(selected))
+        if workers <= 1:
+            for item in selected:
+                results[item["page_no"]] = _ocr_one(item)
+        else:
+            with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="ocr-page") as pool:
+                futures = {pool.submit(_ocr_one, item): item["page_no"] for item in selected}
+                try:
+                    for fut in as_completed(futures):
+                        results[futures[fut]] = fut.result()
+                except BaseException:
+                    for fut in futures:
+                        fut.cancel()
+                    raise
+
+    # ── 第三遍：按页序合并 OCR 结果 ─────────────────────────────────────
+    for item in records:
+        i = item["page_no"]
+        texts, boxes = item["texts"], item["boxes"]
+        source = item["source"]
+        res = results.get(i)
+        if res is not None:
+            if res["ok"]:
+                ocr_lines = res["lines"]
+                low_yield = len("".join(t for t, _ in ocr_lines).strip()) < config.OCR_RENDER_MIN_CHARS
+                # 与文字层合并（阅读序）：文字层常含标题/页码，OCR 补扫描内容
+                merged = [(round(b[1], 1), b[0], t, b) for t, b in zip(texts, boxes)]
+                merged += [(round(b[1], 1), b[0], t, b) for t, b in ocr_lines if t.strip()]
+                merged.sort(key=lambda r: (r[0], r[1]))
+                texts = [m[2] for m in merged]
+                boxes = [m[3] for m in merged]
+                source = "ocr_img" if res["kind"] == "img" else "ocr"
+                ocr_used = True
                 degraded = True
-
-        tables = record["tables"]
-        if tables:
-            table_boxes[i] = tables
-
+                ocr_pages += 1
+                if source == "ocr_img":
+                    ocr_img_pages += 1
+                if low_yield:
+                    # 防"OCR 跑了但只读回页码"这类静默垃圾（旧实现无感知）
+                    warnings.append(
+                        f"第 {i} 页整页 OCR 产出过少（"
+                        f"{len(chr(10).join(texts).strip())} 字），页内有大图，内容可能未识别"
+                    )
+            else:
+                warnings.append(f"第 {i} 页 OCR 识别失败：{res['error']}")
+                degraded = True
+        if item["tables"]:
+            table_boxes[i] = item["tables"]
         pages.append(ExtractedPage(
             page_no=i,
-            text=page_text,
-            width=width,
-            height=height,
-            has_text_layer=has_layer,
+            text="\n".join(texts),
+            width=item["width"],
+            height=item["height"],
+            has_text_layer=item["has_layer"],
             source=source,
             line_boxes=boxes,
         ))
+
+    if ocr_state.get("tripped"):
+        warnings.append(
+            f"远程 OCR 连续失败 {config.ocr_max_failures()} 次，"
+            "本文档部分页改用本地引擎或跳过"
+        )
 
     if ocr_pages or ocr_skipped_pages:
         warnings.append(
@@ -741,7 +816,10 @@ def extract_pdf(path: str) -> ExtractedDocument:
             + (f"，超限跳过 {ocr_skipped_pages} 页" if ocr_skipped_pages else "")
         )
 
-    if total_chars == 0 and no_text_pages == layout["page_count"] and layout["page_count"] > 0:
+    # OCR 主动关闭（用户指令：扫描件只打标签）时，纯扫描件不再整本拒绝——
+    # 保留页面结构/标签供"读取存疑"语义使用；仅在 OCR 应开而不可用时才拒绝。
+    if (total_chars == 0 and no_text_pages == layout["page_count"]
+            and layout["page_count"] > 0 and config.ocr_enabled()):
         raise DocumentRejectedError(
             config.REJECT_NO_TEXT_LAYER,
             "PDF 无文字层（疑似扫描件）。请配置 OCR 引擎"

@@ -66,6 +66,64 @@ def test_material_inventory_reads_contracts_personnel_certificates_and_services(
     assert any(c.level == "二级" for c in inventory.certs)
 
 
+def _person_inventory(monkeypatch):
+    from app.engine import material_inventory as mi
+    from app.engine.material_inventory import PersonRecord
+
+    monkeypatch.setattr(mi, "_persons_from_tables", lambda pages, path: [
+        PersonRecord(name="张三", role="驻场运维工程师", certs=["ITIL Foundation 证书"]),
+        PersonRecord(name="李四", role="项目负责人", certs=["PMP 证书"]),
+    ])
+    pages = [
+        {"document_id": 1, "page_no": 3, "source": "ocr_img",
+         "text": "This is to certify that Zhang San has achieved the ITIL Foundation Certificate, number 123."},
+        {"document_id": 1, "page_no": 5, "source": "ocr_img",
+         "text": "This is to certify that Li Si has achieved the PMP Certificate, number 456."},
+    ]
+    return mi.build_inventory(7, pages)
+
+
+def test_person_scope_certificates_plan_counts_team_members(monkeypatch):
+    inventory = _person_inventory(monkeypatch)
+    criterion = {
+        "code": "c27", "name": "拟派运维工程师ITIL Foundation认证",
+        "score_type": "count", "max_score": "2",
+        "description": "拟派运维工程师具有ITIL Foundation 认证得2 分。【证明材料】提供证书复印件，原件备查。",
+        "params": {"field": "certificates", "per_item": "2", "min_count": "1",
+                   "person_scope": "member", "max_items": "1", "_objective_form": "existence"},
+    }
+    assert build_objective_plan(criterion).kind == "person_certs"
+    result = score_objective(criterion, inventory)
+    assert result.score == Decimal("2")
+    assert "张三" in result.detail
+
+
+def test_person_scope_certificates_plan_counts_leader_targets(monkeypatch):
+    inventory = _person_inventory(monkeypatch)
+    criterion = {
+        "code": "c28", "name": "项目经理（项目负责人）认证",
+        "score_type": "count", "max_score": "2",
+        "description": "项目经理（项目负责人）具有PMP 证书得1 分；"
+                       "具有系统集成项目管理工程师认证得1 分，最高得2 分。",
+        "params": {"field": "certificates", "per_item": "1", "max_items": "2",
+                   "person_scope": "leader", "_objective_form": "existence"},
+    }
+    result = score_objective(criterion, inventory)
+    assert result.score == Decimal("1")
+    assert "PMP" in result.detail
+
+
+def test_person_scope_performance_plan_defers_to_llm():
+    """人员级业绩须逐案例核验人员归属，不得退回公司级合同桶（run128 c29）。"""
+    criterion = _criterion(
+        "c29", "服务团队技术力量", "count", "2",
+        "拟派运维工程师具有IT运维管理系统维护项目服务经验得1分。"
+        "【证明材料】业绩证明以提供合同的复印件为准。")
+    criterion["params"] = {"field": "performance", "per_item": "1",
+                           "person_scope": "member"}
+    assert build_objective_plan(criterion) is None
+
+
 def test_objective_fastpath_scores_all_supported_plans():
     inventory = build_inventory(7, _pages())
     criteria = {

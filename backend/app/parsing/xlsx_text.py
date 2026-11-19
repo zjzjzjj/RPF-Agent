@@ -17,7 +17,7 @@ log = logging.getLogger("bid_eval.parsing.xlsx")
 _PAGE_W, _PAGE_H = 595.0, 842.0
 
 
-def extract_xlsx(path: str) -> ExtractedDocument:
+def extract_xlsx(path: str, on_progress=None) -> ExtractedDocument:  # noqa: ANN001
     try:
         from openpyxl import load_workbook
     except ImportError as exc:  # 依赖缺失：明确拒绝而非崩溃
@@ -35,6 +35,8 @@ def extract_xlsx(path: str) -> ExtractedDocument:
     warnings: list[str] = []
     try:
         for i, ws in enumerate(wb.worksheets, start=1):
+            if on_progress is not None:
+                on_progress(i, len(wb.worksheets))
             lines: list[str] = [f"[工作表：{ws.title}]"]
             try:
                 for row in ws.iter_rows(values_only=True):

@@ -14,7 +14,15 @@
 """
 from __future__ import annotations
 
+import re
 from typing import Any
+
+# 公司级 ISO/体系类证书规则（确定性证书清单供给的准入面）。非 ISO 形态的证件项
+# （ITSS/ITIL/PMP…）按"证书总数"计数，若也供给全公司证书清单会直接放水。
+_RE_CERT_RULE_SCOPE = re.compile(
+    r"ISO|CMMI|GB/?T\s*\d|三体系|质量管理体系|环境管理体系|职业健康"
+    r"|信息安全管理体系|信息技术服务管理体系"
+)
 
 
 def build_supplied_facts(criterion: dict, pages: list[dict]) -> dict[str, dict]:
@@ -35,7 +43,7 @@ def build_supplied_facts(criterion: dict, pages: list[dict]) -> dict[str, dict]:
         return {}
     out: dict[str, dict] = {}
     if field == "certificates" or field == "cmmi":
-        _supply_cert_facts(out, pages)
+        _supply_cert_facts(out, pages, criterion)
     if engine == "deviation_deduct_table":
         _supply_deviation_counts(out, pages, criterion)
     return out
@@ -46,7 +54,8 @@ def build_supplied_facts(criterion: dict, pages: list[dict]) -> dict[str, dict]:
 # ---------------------------------------------------------------------------
 
 
-def _supply_cert_facts(out: dict[str, dict], pages: list[dict]) -> None:
+def _supply_cert_facts(out: dict[str, dict], pages: list[dict],
+                       criterion: dict) -> None:
     from app.engine.facts import extract_bid_facts
     from app.engine.objective import (
         classify_cert_backing,
@@ -74,24 +83,37 @@ def _supply_cert_facts(out: dict[str, dict], pages: list[dict]) -> None:
         }
     # det.state is None（盲态）→ 不供给不否定（红线）
 
+    params = criterion.get("params") or {}
+    rule_text = " ".join(str(criterion.get(key) or "") for key in (
+        "name", "description", "source_quote", "required_evidence",
+        "required_artifacts", "required_artifacts_raw",
+    ))
+    if params.get("person_scope") or not _RE_CERT_RULE_SCOPE.search(rule_text):
+        # 人员级证书（ITIL/PMP…）与点名单一非 ISO 证件（ITSS…）不进公司证书清单：
+        # 非 ISO 形态在 score_count 按"证书总数"计，供全会把公司证书当人员证书放水。
+        return
+
     full_text = "\n".join(str(p.get("text") or "") for p in pages)
     names = list(extract_bid_facts(full_text).certificates or [])
     if not names:
         return
     page_pairs = [(str(p.get("source") or ""), str(p.get("text") or "")) for p in pages]
-    backing = classify_cert_backing(names, page_pairs, (det.state is True, det.basis))
 
     class _F:
         certificates = names
 
+    backing = classify_cert_backing(_F, page_pairs, (det.state is True, det.basis))
+
     anchors: list[dict] = []
     ev_value: dict[str, str] = {}
+    kept: list[str] = []
     for name in names:
         anchored = find_cert_copy_pages_anchored(pages, name)
         best = (next((a for k, a in anchored if k == "copy"), None)
                 or next((a for k, a in anchored), None))
         if not best:
             continue  # 无锚证书不供给（模型照旧抽取，正向供给红线）
+        kept.append(name)
         key = normalize_no_ws(str(name))
         anchors.append({"key": key, "document_id": best.get("document_id"),
                         "page_no": best.get("page_no"), "quote": best.get("quote")})
@@ -99,7 +121,7 @@ def _supply_cert_facts(out: dict[str, dict], pages: list[dict]) -> None:
     if not anchors:
         return
     out["certificates"] = {
-        "value": names, "detector": "material_inventory.certs",
+        "value": kept, "detector": "material_inventory.certs",
         "identity": "normalize_cert", "exclusive": False, "mode": "evidence",
         "anchors": anchors,
     }
@@ -109,9 +131,9 @@ def _supply_cert_facts(out: dict[str, dict], pages: list[dict]) -> None:
         "anchors": anchors,
     }
     out["cert_backing"] = {
-        "value": {name: state for name, state in
-                  ((n, backing.get(_backing_key(n, backing))) for n in names)
-                  if state is not None},
+        # 三态全供（True/False/None）：None = 有锚但材料不可读/未绑上，
+        # 由 score_count 计入并标疑问（用友防线），不得在供给层丢弃后触发硬校验。
+        "value": {name: backing.get(_backing_key(name, backing)) for name in kept},
         "detector": "classify_cert_backing",
         "identity": "normalize_cert", "exclusive": False, "mode": "evidence",
         "anchors": anchors,

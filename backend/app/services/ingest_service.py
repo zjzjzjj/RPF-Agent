@@ -154,7 +154,12 @@ def parse_document(ctx: JobContext, payload: dict) -> dict:
         doc_kind = doc.kind
 
     try:
-        extracted = extract_document(path)
+        # 逐页续心跳：大标书（数百页扫描件，单页 OCR 数秒）解析期间任务不能被
+        # 判僵尸——心跳线程若干扰（SQLite 锁/异常）停摆时靠这里兜底。
+        extracted = extract_document(
+            path,
+            on_progress=lambda no, total: ctx.beat(f"解析第 {no}/{total} 页"),
+        )
     except DocumentRejectedError as rej:
         with session_scope() as s:
             doc = s.get(Document, document_id)

@@ -1496,6 +1496,12 @@ def _required_flags(
     """
     if person_scope:
         flags: list[str] = ["work_proof"]
+        # 细则要求"合同须体现评分人员信息"（否则需业主证明）→ 合同未体现人员
+        # 的案例不得计分（run135 142 c29 实证：模型已判 name_reflected=false，
+        # 旧闸门只看 work_proof=None 就按未核验计入，与模型结论相反）。
+        if re.search(r"体现[^。；]{0,12}(?:人员|姓名)|(?:人员|姓名)[^。；]{0,12}体现",
+                     artifacts + "\n" + rule_text):
+            flags.append("name_reflected")
         # 项目负责人经验要求"五年及以上工作经验证明"（独立文档）
         _exp_re = re.compile(r"\d+\s*年(?:以上|及以上)?[^。；]{0,12}(?:工作)?经验|经验证明")
         if (

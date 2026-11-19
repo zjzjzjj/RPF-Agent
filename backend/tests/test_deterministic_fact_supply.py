@@ -153,3 +153,52 @@ def test_schema_suppression_and_policy_in_payload() -> None:
     payload = replies.calls[0]["user"]
     assert "cert_section_present" not in payload["fact_schema"]
     assert "程序按确定性检测供给" in payload["supplied_fact_policy"]
+    # 预挂 manifest 只供宿主使用，绝不随 prompt 发给模型
+    assert "_supplied_facts" not in payload["rule"]
+
+
+# ---------------------------------------------------------------------------
+# 证书清单供给（2026-11-18 run128 回归锚）
+# ---------------------------------------------------------------------------
+CERT_PAGE = {"document_id": 7, "page_no": 3, "source": "text",
+             "text": "ISO9001质量管理体系认证证书\n证书编号：ABC123456，有效期至2027年"}
+CERT_RULE = {"code": "c1", "name": "质量管理体系认证", "score_type": "count",
+             "max_score": "1", "description": "具有ISO9001质量管理体系认证证书得1分。",
+             "params": {"field": "certificates", "per_item": "1", "max_items": "1"}}
+
+
+def test_cert_supply_carries_backing_for_anchored_certificates() -> None:
+    """_F 修复锚：classify_cert_backing 必须收到 facts 对象，供给的 backing 非空。"""
+    from app.engine.deterministic_facts import build_supplied_facts
+
+    supplies = build_supplied_facts(CERT_RULE, [CERT_PAGE])
+    assert supplies["certificates"]["value"] == ["ISO9001"]
+    assert supplies["cert_backing"]["value"] == {"ISO9001": True}
+
+
+def test_cert_supply_requires_page_anchor(monkeypatch) -> None:
+    """无页锚证书不供给（正向供给红线）：模型照旧抽取，不凭空注入。"""
+    from app.engine import deterministic_facts
+
+    monkeypatch.setattr("app.engine.objective.find_cert_copy_pages_anchored",
+                        lambda pages, name: [])
+    supplies = deterministic_facts.build_supplied_facts(CERT_RULE, [CERT_PAGE])
+    assert "certificates" not in supplies
+    assert "cert_backing" not in supplies
+
+
+def test_cert_supply_skips_person_scope_and_non_iso_rules() -> None:
+    """人员级证书与非 ISO 证件项不供公司证书清单（否则按证书总数放水）。"""
+    from app.engine.deterministic_facts import build_supplied_facts
+
+    person_rule = {"code": "c27", "name": "拟派运维工程师ITIL Foundation认证",
+                   "score_type": "count", "max_score": "2",
+                   "description": "拟派运维工程师具有ITIL Foundation认证得2分。",
+                   "params": {"field": "certificates", "per_item": "2",
+                              "person_scope": "member"}}
+    assert "certificates" not in build_supplied_facts(person_rule, [CERT_PAGE])
+    itss_rule = {"code": "c21", "name": "ITSS信息技术服务运行维护标准符合性证书",
+                 "score_type": "count", "max_score": "1",
+                 "description": "具有ITSS证书得1分。",
+                 "params": {"field": "certificates", "per_item": "1"}}
+    assert "certificates" not in build_supplied_facts(itss_rule, [CERT_PAGE])

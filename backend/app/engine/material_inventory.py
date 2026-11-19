@@ -278,6 +278,19 @@ def _contracts_from_case_table(pages: list[dict], pdf_path: str | None) -> list[
     try:
         rows = parse_case_table_at_section(pdf_path, section, recs, 4)
         if not rows:
+            # 索引指针落在错段（run128 143：索引 128-169、真实业绩表 181）→
+            # 以表头页（通用三元组判定，不猜项目）重试一次；仍空才放弃。
+            from app.evidence.case_evidence import (
+                SectionGuess, _find_case_table_header_page,
+            )
+            head = _find_case_table_header_page(recs)
+            if head is not None and not (section.start <= head <= section.end):
+                section = SectionGuess(
+                    head, min(head + 20, max(r.page_no for r in recs)),
+                    "heading_window", 0.6, None,
+                )
+                rows = parse_case_table_at_section(pdf_path, section, recs, 4)
+        if not rows:
             return []
         blocks = link_case_blocks(rows, recs, section)
         # Fast inventory: skip page_image_ratios/classify_materials, which scan
@@ -783,9 +796,22 @@ def _value_items_from_pages(pages: list[dict]) -> tuple[list[ValueItem], bool]:
 def build_inventory(bidder_id: int, pages: list[dict]) -> MaterialInventory:
     full_text = "\n".join(str(p.get("text") or "") for p in pages)
     facts = extract_bid_facts(full_text)
-    pdf_path = next((str(p.get("stored_path")) for p in pages
-                     if str(p.get("stored_path") or "").lower().endswith(".pdf")), None)
-    contracts = _contracts_from_case_table(pages, pdf_path)
+    # 主标书 = 页数最多的 PDF 文档。项目包把 1 页《开标一览表.pdf》当独立文档上传，
+    # 常排在主标书之前；旧实现取"第一份 PDF"会让业绩表/人员表解析打在 1 页文件上，
+    # 恒定 0 合同（run128 142/144、run126 c13 五家实证）。表解析只喂该文档自己的
+    # 页——页号必须与文件对齐，跨文档合并页会撞号。
+    by_doc: dict[int, list[dict]] = {}
+    for page in pages:
+        by_doc.setdefault(int(page.get("document_id") or 0), []).append(page)
+    pdf_docs = [
+        (doc_id, str(doc_pages[0].get("stored_path")))
+        for doc_id, doc_pages in by_doc.items()
+        if doc_pages and str(doc_pages[0].get("stored_path") or "").lower().endswith(".pdf")
+    ]
+    main_doc_id, pdf_path = (max(pdf_docs, key=lambda item: len(by_doc[item[0]]))
+                             if pdf_docs else (None, None))
+    main_pages = by_doc.get(main_doc_id, []) if main_doc_id is not None else []
+    contracts = _contracts_from_case_table(main_pages, pdf_path)
     contracts.extend(_contracts_from_text(pages))
     # A performance-table row and the prose contract copy often describe the
     # same agreement.  Merge the table row into the page-bound text record so
@@ -855,7 +881,7 @@ def build_inventory(bidder_id: int, pages: list[dict]) -> MaterialInventory:
         key = cert.normalized or cert.name
         if key in backing:
             cert.backing = backing[key]
-    persons = _persons_from_tables(pages, pdf_path)
+    persons = _persons_from_tables(main_pages, pdf_path)
     personnel_table_found = bool(persons)
     if not persons:
         persons = _persons_from_pages(pages)

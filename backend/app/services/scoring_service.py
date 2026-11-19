@@ -14,6 +14,7 @@ from sqlalchemy import delete, func, select
 from app import config
 from app.db.models import (
     Bidder,
+    Document,
     EvidenceCitation,
     EvaluationRun,
     ReviewRecord,
@@ -105,6 +106,24 @@ def create_run(
             bidder = s.get(Bidder, bid_id)
             if bidder is None or bidder.project_id != project_id:
                 raise NotFound(f"投标人 {bid_id} 不存在")
+        # 解析中禁止发起评分（2026-11-18 PRJ-20261118-42FO 实证）：自动化运行在
+        # 创建瞬间冻结输入快照（_inputs 含每份文档 parse_status/页文本哈希），
+        # 解析若仍在排队/进行中，评分任务真正启动时输入已漂移，initialize_run
+        # 会判"运行输入或评审配置已变化，请新建评分运行"并让运行 failed——用户
+        # 看到的是一条无头绪的 Conflict。这里提前拦下并给出可行动文案。
+        if auto:
+            parsing = s.execute(
+                select(func.count(Document.id)).where(
+                    Document.project_id == project_id,
+                    Document.kind.in_(("tender", "bid")),
+                    Document.parse_status == "pending",
+                )
+            ).scalar_one()
+            if parsing:
+                raise ValidationFailed(
+                    f"还有 {parsing} 份文档正在解析，请等待解析完成后再发起评分"
+                    "（解析进度见文档列表；大份扫描件单份可能需要数十分钟）"
+                )
         # 2026-11-13 输入格式重构：报价人工确认卡点取消——导入抽价即生效
         # （extracted/conflict 均为有效报价）。抽不到价的公司照常参评，
         # 价格段按引擎既有"报价为空或≤0"语义记 0 并排除基准（结果标注），
@@ -600,7 +619,7 @@ def execute_run(
         or any(k in str(ci.get("name") or "") for k in ("业绩", "案例"))
         for ci in count_items
     )
-    if _has_perf and config.auto_mode():
+    if _has_perf and config.auto_mode() and config.scoring_ocr_enabled():
         from app.services.ingest_service import rescue_material_pages, rescue_person_material_pages
 
         _has_person = any((ci.get("params") or {}).get("person_scope") for ci in count_items)

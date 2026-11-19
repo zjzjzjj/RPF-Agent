@@ -17,6 +17,7 @@ pdfplumber>=0.11           # MIT，回退引擎
 pypdfium2>=5.0             # Apache/BSD，页图渲染（证据高亮）与 OCR 页渲染
 python-docx>=1.2
 openpyxl>=3.1              # 开标一览表/分项报价表 xlsx 抽价（只读，不引 pandas）
+xlrd>=2.0                  # 旧版 .xls（供应商信息收集模板等）只读，BIFF 格式
 
 # ---- OCR（扫描件识别兜底）----
 # rapidocr-onnxruntime（Apache-2.0）：纯 pip 离线中文 OCR，无需系统二进制；

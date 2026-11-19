@@ -318,6 +318,20 @@ def _pointer_candidates(t: str, kw: str, line_window: int) -> list[tuple]:
         except (TypeError, ValueError):
             pass
     lines = t.splitlines()
+    # 2026-11-19 索引表折行（run144 财务制度实证）：表格单元格把
+    # 「见投标文件（898-1257）」与「页」拆到两行，且中间还夹着行标签行
+    # （"3 得2 分…财务制度"），按行 finditer 永远匹配不到 range 变体。
+    # 把独立成行的「页」并回最近的上方括号行；保持 splitlines 行数与行距不变，
+    # 不影响现有「同页多模块不抢配」的 distance 排序。
+    for i, ln in enumerate(lines):
+        if ln.strip() != "页":
+            continue
+        for j in range(i - 1, max(-1, i - 4), -1):
+            probe = lines[j].rstrip()
+            if probe and re.search(r"[）)]$", probe) and re.search(r"\d", probe):
+                lines[j] = probe + "页"
+                lines[i] = ""
+                break
     order = 0
     for i, ln in enumerate(lines):
         if kw in ln:

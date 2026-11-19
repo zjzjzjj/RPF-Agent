@@ -92,7 +92,7 @@ _IN_BATCH: ContextVar[bool] = ContextVar("inside_model_batch_worker", default=Fa
 
 
 def _scheduler() -> BatchScheduler:
-    workers = min(8, max(1, config.llm_max_concurrency()))
+    workers = min(config.llm_concurrency_ceiling(), max(1, config.llm_max_concurrency()))
     with _LOCK:
         if workers not in _SCHEDULERS:
             _SCHEDULERS[workers] = BatchScheduler(workers)

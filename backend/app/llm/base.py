@@ -25,6 +25,11 @@ class LLMError(Exception):
         self.reading_incomplete = False
         # 结构化的未读页清单 [{"document_id": int, "page_no": int}]（尽力而为）。
         self.unreadable_pages: list = []
+        # 2026-11-19：材料缺失结论建立在未 OCR 整页扫描件上（auto_review absence
+        # 防线）。外层 _assess_cell 据此转“未核验待人工复核”，而不是按
+        # failure_policy=stop 中断整轮运行。
+        self.presence_unverified = False
+        self.unverified_scan_pages: list = []
         super().__init__(message)
 
 

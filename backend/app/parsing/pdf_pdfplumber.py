@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Callable
 
 from app import config
 from app.parsing.base import DocumentRejectedError, ExtractedDocument, ExtractedPage
@@ -45,7 +46,7 @@ def _check_file(path: str) -> None:
     p = Path(path)
     if not p.exists() or p.stat().st_size == 0:
         raise DocumentRejectedError(config.REJECT_EMPTY_FILE, "文件为空或不存在")
-    if p.stat().st_size > config.max_upload_bytes():
+    if p.stat().st_size > config.max_parse_file_bytes():
         raise DocumentRejectedError(config.REJECT_TOO_LARGE, "文件超过大小上限")
     with open(path, "rb") as fh:
         head = fh.read(5)
@@ -53,8 +54,8 @@ def _check_file(path: str) -> None:
         raise DocumentRejectedError(config.REJECT_NOT_A_PDF, "文件不是 PDF 格式")
 
 
-def extract_pdf(path: str) -> ExtractedDocument:
-    """解析 PDF：页文本 + 行 bbox + 表格 bbox。"""
+def extract_pdf(path: str, on_progress: Callable[[int, int], None] | None = None) -> ExtractedDocument:
+    """解析 PDF：页文本 + 行 bbox + 表格 bbox（on_progress 逐页回调刷新任务心跳）。"""
     import pdfplumber
 
     _check_file(path)
@@ -85,7 +86,10 @@ def extract_pdf(path: str) -> ExtractedDocument:
                 "PDF 无文字层（疑似扫描件）。OCR 通道尚未启用，请提供数字版文件。",
             )
 
+        page_total = len(pdf.pages)
         for i, page in enumerate(pdf.pages, start=1):
+            if on_progress is not None:
+                on_progress(i, page_total)
             try:
                 text_lines = page.extract_text_lines() or []
             except Exception as exc:  # noqa: BLE001 —— 单页失败不让整本文档失败

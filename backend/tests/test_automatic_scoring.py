@@ -701,6 +701,113 @@ def test_certificate_query_screenshot_must_be_explicitly_reviewed():
                                 "params": {"field": "certificates", "per_item": "1"}}, decision, [])
 
 
+def test_certificate_uncertain_backing_counts_with_doubt():
+    """三态背书：None（复印件不可读/未绑上）计入并标疑问，不再整格暂定 0。"""
+    criterion = {"score_type": "count", "name": "ISO9001质量管理体系认证", "max_score": "1",
+                 "params": {"field": "certificates", "per_item": "1"}}
+    decision = AutoReviewDecision(
+        verdict="pass", reasoning="证书复印件不可读，按未核验计入", coverage_complete=True,
+        facts={"certificates": ["ISO9001"], "cert_backing": {"ISO9001": None}})
+    score, detail, _ = scoring._verified_count(criterion, decision, [])
+    assert score == 1
+    assert "未核验" in detail
+
+
+def test_certificate_backing_rejects_non_tristate_values():
+    criterion = {"score_type": "count", "name": "ISO9001质量管理体系认证", "max_score": "1",
+                 "params": {"field": "certificates", "per_item": "1"}}
+    decision = AutoReviewDecision(
+        verdict="pass", reasoning="x", coverage_complete=True,
+        facts={"certificates": ["ISO9001"],
+               "cert_backing": {"ISO9001": {"present": True}}})
+    with pytest.raises(LLMError, match="无效"):
+        scoring._verified_count(criterion, decision, [])
+
+
+def test_deterministic_cert_backing_never_downgrades_verified_true():
+    """只升不降：确定性分类看不清（None）不得覆盖模型已核验的 True。"""
+    decision = AutoReviewDecision(
+        verdict="pass", reasoning="x",
+        facts={"certificates": ["ISO9001"], "cert_backing": {"ISO9001": True}})
+    scoring._inject_deterministic_cert_backing(
+        {"name": "ISO9001"}, decision, [{"source": "ocr_img", "text": "ISO9001"}])
+    assert decision.facts["cert_backing"]["ISO9001"] is True
+
+
+def test_person_scope_cases_overlay_accepts_page_dicts():
+    """AS 路页是 dict；overlay 契约为 (page_no, text, source) 元组——不得解包崩溃。"""
+    criterion = {"score_type": "count", "name": "服务团队技术力量", "max_score": "2",
+                 "description": "拟派运维工程师具有IT运维管理系统维护项目服务经验得1分。",
+                 "params": {"field": "performance", "per_item": "1",
+                            "person_scope": "member"}}
+    decision = AutoReviewDecision(
+        verdict="pass", reasoning="案例已核验", coverage_complete=True,
+        facts={"verified_cases": [{
+            "name": "某运维项目", "person": "张三", "role": "member",
+            "contract": True, "invoice": True, "acceptance": True,
+            "work_proof": True, "social_security": True,
+        }]})
+    pages = [{"page_no": 1,
+              "text": "某运维项目 合同复印件 委托方 张三 社保 参保", "source": "text"}]
+    score, detail, _ = scoring._verified_count(criterion, decision, pages)
+    assert score == 1 and "可计 1 个" in detail
+
+
+def test_person_scope_cases_without_role_count_with_doubt():
+    """模型未标人员归属 → 按全部案例计并标疑问，不整格暂定 0。"""
+    criterion = {"score_type": "count", "name": "服务团队技术力量", "max_score": "2",
+                 "description": "拟派运维工程师具有IT运维管理系统维护项目服务经验得1分。",
+                 "params": {"field": "performance", "per_item": "1",
+                            "person_scope": "member"}}
+    decision = AutoReviewDecision(
+        verdict="pass", reasoning="案例已核验", coverage_complete=True,
+        facts={"verified_cases": [{
+            "name": "某运维项目", "person": "张三",
+            "contract": True, "invoice": True, "acceptance": True,
+            "work_proof": True, "social_security": True,
+        }]})
+    pages = [{"page_no": 1,
+              "text": "某运维项目 合同复印件 委托方 张三 社保 参保", "source": "text"}]
+    score, detail, _ = scoring._verified_count(criterion, decision, pages)
+    assert score == 1
+    assert "可计 1 个" in detail
+
+
+def _person_contract_criterion():
+    return {
+        "score_type": "count", "name": "服务团队技术力量", "max_score": "2",
+        "description": "拟派运维工程师具有IT运维管理系统维护项目服务经验得1分。"
+                       "【证明材料】业绩证明以提供合同的复印件为准"
+                       "（合同中不能体现评分人员信息的，则还需提供业主证明）。",
+        "params": {"field": "performance", "per_item": "1", "person_scope": "member"},
+    }
+
+
+def test_person_scope_contract_must_reflect_person():
+    """细则要求合同体现人员信息：name_reflected=False 的案例不计分。"""
+    decision = AutoReviewDecision(
+        verdict="fail", reasoning="合同未体现人员", coverage_complete=True,
+        facts={"verified_cases": [{
+            "name": "某运维项目", "person": "张三", "role": "member",
+            "contract": True, "name_reflected": False, "work_proof": True,
+        }]})
+    pages = [{"page_no": 1, "text": "某运维项目 合同复印件 张三", "source": "text"}]
+    score, detail, _ = scoring._verified_count(_person_contract_criterion(), decision, pages)
+    assert score == 0
+
+
+def test_person_scope_contract_reflecting_person_counts():
+    decision = AutoReviewDecision(
+        verdict="pass", reasoning="合同体现人员", coverage_complete=True,
+        facts={"verified_cases": [{
+            "name": "某运维项目", "person": "张三", "role": "member",
+            "contract": True, "name_reflected": True, "work_proof": True,
+        }]})
+    pages = [{"page_no": 1, "text": "某运维项目 合同复印件 张三", "source": "text"}]
+    score, _, _ = scoring._verified_count(_person_contract_criterion(), decision, pages)
+    assert score == 1
+
+
 def test_duplicate_person_cannot_inflate_attribute_score():
     decision = AutoReviewDecision(verdict="pass", reasoning="同一人员在简历及汇总表重复出现", coverage_complete=True,
                                   facts={"person_attributes": [{"name": "张三", "years": "10"},
@@ -1041,3 +1148,161 @@ def test_closure_reading_gap_keeps_unscored(managed_run, monkeypatch):
     state = automation.progress(managed_run["id"])
     assert state["completed"] == 1                           # 计完成（运行可收口）
     assert state["fallback"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-19 材料存在性（presence）接入
+# ---------------------------------------------------------------------------
+def _presence_criterion() -> dict:
+    return {
+        "name": "银行资信",
+        "score_type": "count",
+        "max_score": "1",
+        "description": "投标人具有银行资信证明且未出现负面信息，得1分，否则不得分。",
+        "params": {"_objective_form": "existence", "field": "items",
+                   "per_item": "1", "max_items": "1"},
+    }
+
+
+def _presence_pages() -> list[dict]:
+    return [
+        {"document_id": 7, "page_no": 1,
+         "text": "详细评审索引表\n4 见投标文件（10）页 银行资信\n",
+         "source": "text", "embedded_image_ratio": 0.0},
+        {"document_id": 7, "page_no": 10, "text": "2.12.2 银行资信证明",
+         "source": "text", "embedded_image_ratio": 0.67},
+    ]
+
+
+def test_presence_cell_settles_without_gateway():
+    def _gateway():
+        raise AssertionError("presence cell must not call the LLM gateway")
+
+    outcome = scoring._assess_cell(
+        _presence_criterion(), _presence_pages(), "synthetic", _gateway)
+    assert outcome.basis == "deterministic"
+    assert outcome.verdict == "pass"
+    assert outcome.score == Decimal("1.00")
+    assert outcome.raw["presence"]["state"] == "present"
+    assert "内容未核验" in outcome.reasoning
+
+
+def test_presence_unverified_is_fallback_not_zero():
+    pages = [{"document_id": 7, "page_no": 1, "text": "无关内容",
+              "source": "text", "embedded_image_ratio": 0.0}]
+    outcome = scoring._assess_cell(_presence_criterion(), pages, "synthetic", lambda: None)
+    assert outcome.basis == "fallback"
+    assert outcome.score is None
+    assert outcome.raw["fallback"]["kind"] == "presence_unverified"
+    assert outcome.warnings[0]["fallback_score"]["kind"] == "presence_unverified"
+
+
+def test_presence_guard_error_converts_to_fallback_outcome():
+    criterion = {"name": "业绩", "score_type": "count", "max_score": "2",
+                 "params": {"field": "performance"}}
+    pages = [{"document_id": 7, "page_no": 1, "text": "业绩表",
+              "source": "text", "embedded_image_ratio": 0.0}]
+
+    def _reviewer(*_args, **_kwargs):
+        err = LLMError("材料缺失结论涉及未 OCR 整页扫描件，不能确认未提供")
+        err.presence_unverified = True
+        raise err
+
+    outcome = scoring._assess_cell(
+        criterion, pages, "synthetic", lambda: None, reviewer=_reviewer)
+    assert outcome.basis == "fallback"
+    assert outcome.score is None
+    assert outcome.raw["fallback"]["kind"] == "presence_unverified"
+
+
+def test_closure_presence_unverified_keeps_unscored(managed_run):
+    from app.engine.presence import PresenceResult
+
+    criterion = managed_run["criteria"][1]
+    outcome = scoring._presence_outcome(
+        PresenceResult("unverified", None, "材料页无法判定；需人工复核"),
+        criterion, [],
+    )
+    scoring._persist_cell(managed_run["id"], managed_run["bidder"], criterion, outcome)
+    with session_scope() as s:
+        row = s.execute(select(ScoreRecord)).scalar_one()
+        assert row.final_score is None
+        assert row.ai_raw_json["auto_review"]["basis"] == "fallback"
+        assert row.ai_raw_json["auto_review"]["fallback"]["kind"] == "presence_unverified"
+        assert row.warnings_json[0]["fallback_score"]["kind"] == "presence_unverified"
+    state = automation.progress(managed_run["id"])
+    assert state["completed"] == 1
+    assert state["fallback"] == 1
+
+
+def test_sample_volume_cell_settles_without_gateway():
+    criterion = {
+        "name": "样品评审", "score_type": "subjective", "max_score": "10",
+        "description": "样品评审由样品评审专家小组负责评审。",
+        "params": {"in_total": False, "_objective_form": "unparsed_objective"},
+    }
+    pages = [
+        {"document_id": 7, "page_no": 1, "text": "目录\n样品评审.....10\n",
+         "source": "text", "embedded_image_ratio": 0.0},
+        {"document_id": 7, "page_no": 10, "text": "样品照片",
+         "source": "text", "embedded_image_ratio": 0.5},
+    ]
+
+    def _gateway():
+        raise AssertionError("sample volume must not call the LLM gateway")
+
+    outcome = scoring._assess_cell(criterion, pages, "synthetic", _gateway)
+    assert outcome.basis == "deterministic"
+    assert outcome.score == Decimal("3.00")
+    assert "数量档位" in outcome.reasoning
+
+
+def _absence_decision(reviewed: list[dict], facts: dict | None = None) -> AutoReviewDecision:
+    decision = AutoReviewDecision(
+        verdict="fail", reasoning="模型认为未提供", confirmed_absent=True,
+        facts=facts or {})
+    decision.coverage_complete = True
+    decision.reviewed_pages = reviewed
+    return decision
+
+
+def test_absence_zero_blocked_by_unocr_full_page_scan():
+    """run144 实证：confirmed_absent + no_facts 折 0 前，必须挡住未 OCR 扫描页。"""
+    criterion = _presence_criterion()
+    decision = _absence_decision([{"document_id": 7, "page_no": 10}])
+    with pytest.raises(LLMError) as info:
+        scoring._verified_count(criterion, decision, _presence_pages())
+    assert getattr(info.value, "presence_unverified", False) is True
+    assert info.value.unverified_scan_pages == [{"document_id": 7, "page_no": 10}]
+
+
+def test_absence_zero_allowed_when_scan_was_ocr_readable():
+    criterion = _presence_criterion()
+    decision = _absence_decision([{"document_id": 7, "page_no": 10}])
+    pages = [
+        {"document_id": 7, "page_no": 1,
+         "text": "详细评审索引表\n4 见投标文件（10）页 银行资信\n",
+         "source": "text", "embedded_image_ratio": 0.0},
+        {"document_id": 7, "page_no": 10, "text": "银行资信证明：资信状况良好",
+         "source": "ocr_img", "embedded_image_ratio": 0.67},
+    ]
+    score, detail, _ = scoring._verified_count(criterion, decision, pages)
+    assert score == Decimal(0)
+    assert "完整检索确认" in detail
+
+
+def test_absence_flag_does_not_block_nonzero_certificate_count():
+    """模型喊 confirmed_absent 但事实里已有 6 本证书 → 以确定性计数 3 分为准。"""
+    criterion = {"name": "体系认证", "score_type": "count", "max_score": "3",
+                 "description": "提供质量、环境、职业健康管理体系认证证书，一个得1分，合计3分。",
+                 "params": {"_objective_form": "existence", "field": "certificates",
+                            "per_item": "1", "max_items": "3"}}
+    decision = _absence_decision(
+        [{"document_id": 7, "page_no": 10}],
+        facts={"certificates": ["ISO9001", "ISO9000", "ISO8295",
+                                "ISO50001", "ISO14001", "ISO45001"]},
+    )
+    scan = {"document_id": 7, "page_no": 10, "text": "投标文件 2.12 体系认证",
+            "source": "text", "embedded_image_ratio": 0.67}
+    score, detail, _ = scoring._verified_count(criterion, decision, [scan])
+    assert score == Decimal("3.00")

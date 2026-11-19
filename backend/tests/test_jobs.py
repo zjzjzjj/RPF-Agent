@@ -12,7 +12,7 @@ import time
 from datetime import timedelta
 
 from app import config
-from app.db.models import EvaluationRun, Job, Project, RulePackage, utcnow
+from app.db.models import Document, EvaluationRun, Job, Project, RulePackage, utcnow
 from app.db.session import session_scope
 
 
@@ -142,3 +142,39 @@ def test_stale_job_reclaimed_below_max_attempts(app_env):
         row = s.get(Job, job_id)
         assert row.status == "running"
         assert row.attempts == 2
+
+
+def test_abandoned_parse_job_marks_document_failed(app_env):
+    """僵尸解析任务重试耗尽被放弃时，文档必须同步落 failed。
+
+    旧实现只把 job 置 failed，Document 永远停在 pending（2026-11-18 run129
+    doc321 实证：界面上一直显示"待解析"）。
+    """
+    from app.jobs import queue
+
+    with session_scope() as s:
+        s.add(Project(id="PRJ-TEST-PARSE", name="解析僵尸测试", status="draft"))
+    with session_scope() as s:
+        doc = Document(project_id="PRJ-TEST-PARSE", kind="bid",
+                       original_filename="标书.pdf", stored_path="/tmp/x.pdf",
+                       sha256="0" * 64, parse_status="pending")
+        s.add(doc)
+        s.flush()
+        job = Job(
+            kind="parse_document",
+            status="running",
+            heartbeat_at=utcnow() - timedelta(seconds=config.JOB_STALE_S + 60),
+            attempts=config.JOB_MAX_ATTEMPTS,
+            payload_json={"document_id": doc.id},
+        )
+        s.add(job)
+        s.flush()
+        job_id, doc_id = job.id, doc.id
+
+    queue._claim_next_job()
+
+    with session_scope() as s:
+        assert s.get(Job, job_id).status == "failed"
+        row = s.get(Document, doc_id)
+        assert row.parse_status == "failed"
+        assert (row.warnings_json or [{}])[0].get("code") == "PARSE_ABANDONED"

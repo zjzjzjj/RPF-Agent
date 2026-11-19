@@ -8,6 +8,7 @@ from __future__ import annotations
 from pathlib import Path
 from zipfile import ZipFile
 
+from app import config
 from app.llm.base import LLMError
 
 
@@ -58,9 +59,13 @@ def annotate_page_readability(
                            or bool(item.get("ocr_completed") or item.get("supplemented")))
             if (largest_ratio + 1e-9 >= MATERIAL_IMAGE_MIN_RATIO and source == "text"
                     and not already_ocr and not item.get("known_blank")):
-                item["unreadable"] = True
-                item["requires_vision"] = True
-                item["readability_reason"] = "原页存在尚未完成 OCR 或视觉核验的大幅嵌入图像"
+                if config.scoring_ocr_enabled():
+                    item["unreadable"] = True
+                    item["requires_vision"] = True
+                    item["readability_reason"] = "原页存在尚未完成 OCR 或视觉核验的大幅嵌入图像"
+                else:
+                    # 用户指令：扫描件只打标签，不做内容识别——不再作为读取故障。
+                    item["scan_unverified"] = True
         return copied
     except (LLMError, JobCancelled):
         raise

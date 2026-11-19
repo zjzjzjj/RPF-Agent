@@ -29,20 +29,31 @@ log = logging.getLogger("bid_eval.parsing.paddle")
 _PROBE_OK: bool | None = None  # 成功永久缓存
 _PROBE_FAILED_AT: float | None = None  # 失败 30s TTL（防一次抖动让整批文档零 OCR）
 _PROBE_FAIL_TTL_S = 30.0
-_OCR_HTTP_SLOTS = threading.BoundedSemaphore(2)
+_OCR_SLOT_LOCK = threading.Lock()
+_OCR_HTTP_SLOTS: threading.BoundedSemaphore | None = None
+
+
+def _ocr_slots() -> threading.BoundedSemaphore:
+    """并发槽位懒初始化：配置在运行时读取（测试/部署可调），默认 4。"""
+    global _OCR_HTTP_SLOTS
+    with _OCR_SLOT_LOCK:
+        if _OCR_HTTP_SLOTS is None:
+            _OCR_HTTP_SLOTS = threading.BoundedSemaphore(config.paddle_ocr_concurrency())
+        return _OCR_HTTP_SLOTS
 
 
 @contextmanager
 def _ocr_http_slot():
     from app.llm.request_control import check_cancelled
 
-    while not _OCR_HTTP_SLOTS.acquire(timeout=0.1):
+    slots = _ocr_slots()
+    while not slots.acquire(timeout=0.1):
         check_cancelled()
     try:
         check_cancelled()
         yield
     finally:
-        _OCR_HTTP_SLOTS.release()
+        slots.release()
 
 
 def _chat_payload(png_bytes: bytes, prompt: str) -> dict:

@@ -497,11 +497,13 @@ def test_cancel_before_http_dispatch_clears_queue_without_counting_request(check
     assert [event["event"] for event in events] == ["queued", "queue_cancelled"]
 
 
-def test_http_slots_never_exceed_eight_even_when_configuration_is_larger(checkpoint_env, monkeypatch):
+def test_http_slots_never_exceed_configured_ceiling(checkpoint_env, monkeypatch):
+    """并发槽位不能超过显式上限（旧实现硬顶 8；2026-11-19 改为可配置 ceiling）。"""
     from app import config
     from app.llm import request_control as control
 
     monkeypatch.setattr(config, "llm_max_concurrency", lambda: 999)
+    monkeypatch.setattr(config, "llm_concurrency_ceiling", lambda: 8)
     monkeypatch.setattr(control.threading, "get_ident", lambda: 8)
     opened = []
     original_open = control.os.open
@@ -513,6 +515,25 @@ def test_http_slots_never_exceed_eight_even_when_configuration_is_larger(checkpo
     monkeypatch.setattr(control.os, "open", record_open)
     with control._slot():
         assert opened[-1].endswith("slot-0.lock")
+
+
+def test_http_slots_scale_with_configured_ceiling(checkpoint_env, monkeypatch):
+    from app import config
+    from app.llm import request_control as control
+
+    monkeypatch.setattr(config, "llm_max_concurrency", lambda: 24)
+    monkeypatch.setattr(config, "llm_concurrency_ceiling", lambda: 32)
+    monkeypatch.setattr(control.threading, "get_ident", lambda: 8)
+    opened = []
+    original_open = control.os.open
+
+    def record_open(path, *args):
+        opened.append(str(path))
+        return original_open(path, *args)
+
+    monkeypatch.setattr(control.os, "open", record_open)
+    with control._slot():
+        assert opened[-1].endswith("slot-8.lock")
 
 
 def test_run_observer_covers_synthesis_and_does_not_double_count_nested_batch(checkpoint_env):

@@ -25,7 +25,7 @@ from sqlalchemy import and_, case, func, or_, select, update
 from sqlalchemy.exc import OperationalError
 
 from app import config
-from app.db.models import Job, utcnow
+from app.db.models import Document, Job, utcnow
 from app.db.session import session_scope
 from app.services.run_execution_lock import RunExecutionBusy
 
@@ -74,6 +74,7 @@ class JobContext:
         self.job_id = job_id
         self._done = 0
         self._total = 0
+        self._last_beat_at = None
         self._hb_stop = threading.Event()
         self._hb_thread: threading.Thread | None = None
 
@@ -91,6 +92,21 @@ class JobContext:
         """Report real work within a step without inventing completed items."""
         self._update(message)
         self.check_cancelled()
+
+    def beat(self, message: str | None = None) -> None:
+        """长循环里逐页续心跳（不改步数），节流为 JOB_HEARTBEAT_S 一次。
+
+        大标书解析（数百页扫描件，单页 OCR 数秒）主线程逐页回调这里：
+        即使心跳线程因 SQLite 锁/异常停摆，任务也不会被误判僵尸重复领取
+        （2026-11-18 run129：160MB 标书解析任务心跳超时 3 次后放弃）。
+        """
+        now = utcnow()
+        if self._last_beat_at is not None and (
+            (now - self._last_beat_at).total_seconds() < config.JOB_HEARTBEAT_S
+        ):
+            return
+        self._last_beat_at = now
+        self._update(message)
 
     def check_cancelled(self) -> None:
         # Progress and cancellation are control-plane writes; a transient
@@ -256,24 +272,39 @@ def _claim_next_job() -> int | None:
     领取必须用**条件 UPDATE**（WHERE 带上可领取状态并检查 rowcount），
     SELECT→无条件 UPDATE 的读改写在多 worker 下会把同一任务发给两个人。
     """
-    stale_before = utcnow() - timedelta(seconds=config.JOB_STALE_S)
+    stale_before = utcnow() - timedelta(seconds=config.job_stale_s())
     # 先把"僵尸且重试次数已用尽"的任务判死：否则它会每轮都被重新领取、
     # 无限重复执行（attempts 无上限时的真实风险）。
+    # 逐条处理而非一条 UPDATE：解析任务被放弃时，对应 Document 必须同步落
+    # failed——否则它永远停在 pending（2026-11-18 run129 doc321 实证）。
     with session_scope() as s:
-        s.execute(
-            update(Job)
-            .where(
-                Job.status == "running",
-                Job.heartbeat_at < stale_before,
-                Job.attempts >= config.JOB_MAX_ATTEMPTS,
-            )
-            .values(
-                status="failed",
-                message="执行失败：任务心跳超时",
-                error=f"任务心跳超时且重试次数已达上限（{config.JOB_MAX_ATTEMPTS} 次），已放弃",
-                finished_at=utcnow(),
-            )
+        dying = list(
+            s.execute(
+                select(Job).where(
+                    Job.status == "running",
+                    Job.heartbeat_at < stale_before,
+                    Job.attempts >= config.JOB_MAX_ATTEMPTS,
+                )
+            ).scalars()
         )
+        for job in dying:
+            job.status = "failed"
+            job.message = "执行失败：任务心跳超时"
+            job.error = f"任务心跳超时且重试次数已达上限（{config.JOB_MAX_ATTEMPTS} 次），已放弃"
+            job.finished_at = utcnow()
+            if job.kind == "parse_document":
+                doc_id = (job.payload_json or {}).get("document_id")
+                try:
+                    doc_id = int(doc_id)
+                except (TypeError, ValueError):
+                    doc_id = None
+                doc = s.get(Document, doc_id) if doc_id is not None else None
+                if doc is not None and doc.parse_status in (None, "pending"):
+                    doc.parse_status = "failed"
+                    doc.warnings_json = [{
+                        "code": "PARSE_ABANDONED",
+                        "message": "解析任务心跳超时、重试次数已用尽，已放弃；请重新解析该文档",
+                    }]
     reclaimable = (
         (Job.status == "running")
         & (Job.heartbeat_at < stale_before)

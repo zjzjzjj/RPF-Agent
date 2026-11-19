@@ -17,12 +17,15 @@ from datetime import datetime
 from decimal import ROUND_HALF_UP, Decimal
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
+from app import config as app_config
 from app.db.models import (
     Bidder,
     Criterion,
     CriterionLevel,
+    Document,
+    DocumentPage,
     EvaluationRun,
     EvidenceCitation,
     ReviewRecord,
@@ -469,6 +472,30 @@ def build_score_summary(
         all_bidders = list(
             s.execute(select(Bidder).where(Bidder.project_id == project_id)).scalars()
         )
+        # 投标文件解析健康度（2026-11-18 run129 教训）：主标书 TOO_LARGE/解析
+        # 任务放弃时，评分只看到报价表却静默出 0 分。这里显性告警，防止把
+        # "材料缺失"误读成"评审结论"。
+        bid_documents = list(
+            s.execute(
+                select(Document).where(
+                    Document.project_id == project_id, Document.kind == "bid"
+                )
+            ).scalars()
+        )
+        # 每家投标文件的可读文本量：判"主标书是否真的进来了"（报价表伪页只有
+        # 几百到几千字）。解析完成后这里会是数十万字符。
+        bid_doc_chars: dict[int, int] = {}
+        bid_doc_ids = [d.id for d in bid_documents]
+        if bid_doc_ids:
+            for doc_id, chars in s.execute(
+                select(
+                    DocumentPage.document_id,
+                    func.coalesce(func.sum(func.length(DocumentPage.text)), 0),
+                )
+                .where(DocumentPage.document_id.in_(bid_doc_ids))
+                .group_by(DocumentPage.document_id)
+            ):
+                bid_doc_chars[int(doc_id)] = int(chars or 0)
         scores = list(
             s.execute(select(ScoreRecord).where(ScoreRecord.run_id == run_id)).scalars()
         )
@@ -556,6 +583,41 @@ def build_score_summary(
     auto_dropped_set = set(auto_dropped)
     name_hits = [b.id for b in all_bidders if b.name in auto_dropped_set]
     warnings: list[str] = list(ranking.get("warnings") or [])
+
+    # 投标文件解析健康度告警：某家主标书全部未解析成功时，分数不是评审结论。
+    participants = (
+        [b for b in all_bidders if b.id in set(participant_ids)]
+        if participant_ids else list(all_bidders)
+    )
+    docs_by_bidder: dict[int, list[Document]] = {}
+    for doc in bid_documents:
+        if doc.bidder_id is not None:
+            docs_by_bidder.setdefault(doc.bidder_id, []).append(doc)
+    for bidder in participants:
+        docs = docs_by_bidder.get(bidder.id, [])
+        if not docs:
+            continue
+        broken = [d for d in docs if d.parse_status in ("failed", "pending")]
+        usable = [d for d in docs if d.parse_status in ("parsed", "degraded")]
+        usable_chars = sum(bid_doc_chars.get(d.id, 0) for d in usable)
+        filenames = "、".join(
+            f"{d.original_filename}（{'待解析' if d.parse_status == 'pending' else '解析失败'}）"
+            for d in broken[:3]
+        )
+        suffix = f" 等 {len(broken)} 份" if len(broken) > 3 else ""
+        if usable_chars < app_config.bid_text_min_chars():
+            # 主标书没进来：剩下的只是报价表（run129 实证 836–3340 字符，正常
+            # 解析后数十万字符）。这种"0 分"不是评审结论，必须显著告警。
+            detail = f"（{filenames}{suffix}）" if broken else ""
+            warnings.append(
+                f"{bidder.name}：投标文件可读文本仅约 {usable_chars} 字{detail}，"
+                "主标书疑似未解析成功——技术/商务结论不代表实际投标内容"
+            )
+        elif broken:
+            warnings.append(
+                f"{bidder.name}：{len(broken)} 份投标文件解析失败或待解析"
+                f"（{filenames}{suffix}），相关评分可能不完整"
+            )
 
     if not run_meta["ready"]:
         run_meta["incomplete_reason"] = (

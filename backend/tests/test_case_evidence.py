@@ -184,6 +184,28 @@ def test_resolve_index_pages_prefers_keyword_line_over_other_modules() -> None:
     assert (sec.start, sec.end) == (342, 344), f"抢配到他模块区间：{sec}"
 
 
+def test_resolve_index_pages_wrapped_page_suffix() -> None:
+    """run144 财务制度实形态：指针行 / 行标签行 / 独立「页」行三行拆开。
+
+    「页」不在指针行、也不与指针相邻，旧实现按行 finditer 永远漏配；
+    归并独立「页」行后应命中 (898, 1257)。
+    """
+    pages = [
+        PageRec(27,
+                "详细评审索引表\n"
+                "提供近3 年（2022 年、2023 年、2024 年）经\n"
+                "第三方审计的财务报表的得2 分。\n"
+                "见投标文件（898-1257）\n"
+                "3 得2 分，未提供或提供不全的均不得分。若投 财务制度\n"
+                "页\n"
+                "标人尚未取得2024 年度的财务报表，则提供\n"
+                "（2021 年、2022 年、2023 年）年度。\n", "text"),
+    ]
+    sec = resolve_index_pages(pages, "财务制度", line_window=3)
+    assert sec.found
+    assert (sec.start, sec.end) == (898, 1257), f"折行指针未命中：{sec}"
+
+
 def test_resolve_index_pages_line_window_zero_requires_same_line() -> None:
     """line_window=0（业绩旧口径）：指针与关键词必须同线，拆行形态不认。"""
     pages = [

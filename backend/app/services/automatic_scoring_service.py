@@ -61,6 +61,81 @@ class CellOutcome:
     warnings: list[dict] = field(default_factory=list)
 
 
+def _presence_outcome(result, criterion: dict, pages: list[dict]) -> CellOutcome:
+    """材料存在性结论 → CellOutcome（present/absent 确定性；unverified 暂定待复核）。"""
+    detail = str(getattr(result, "detail", "") or "")
+    presence_raw = {
+        "state": getattr(result, "state", "unverified"),
+        "windows": getattr(result, "windows", []) or [],
+        "material_pages": getattr(result, "material_pages", []) or [],
+        "years": getattr(result, "years", {}) or {},
+        "content_unverified": True,
+    }
+    raw = {
+        "calculation": detail,
+        "presence": presence_raw,
+        "coverage_complete": getattr(result, "state", "") != "unverified",
+        "confirmed_absent": getattr(result, "state", "") == "absent",
+        "zero_reason": "confirmed_absent" if getattr(result, "state", "") == "absent" else None,
+    }
+    if getattr(result, "state", "") == "unverified":
+        fallback = {
+            "kind": "presence_unverified",
+            "value": None,
+            "basis": "machine_fallback",
+            "reason": detail,
+            "windows": presence_raw["windows"],
+            "missing_years": [year for year, state in presence_raw["years"].items()
+                              if state != "present"],
+            "score_type": criterion.get("score_type"),
+        }
+        raw["fallback"] = fallback
+        return CellOutcome(
+            "concern", detail, None, [], pages, "fallback", 1, raw,
+            [{
+                "message": detail + "（需人工抽核）",
+                "verdict_source": "deterministic",
+                "fallback_score": fallback,
+            }],
+        )
+    score = getattr(result, "score", None)
+    verdict = "pass" if score is not None and score > 0 else "fail"
+    return CellOutcome(
+        verdict, detail, score, [], pages, "deterministic", 1, raw,
+        [{"message": detail + "（需人工抽核）", "verdict_source": "deterministic"}],
+    )
+
+
+def _presence_unverified_outcome(
+    criterion: dict, pages: list[dict], detail: str,
+) -> CellOutcome:
+    """absence 防线转来的“未核验”（不按 failure_policy=stop 冒泡）。"""
+    from app.engine.presence import PresenceResult
+
+    return _presence_outcome(
+        PresenceResult("unverified", None, detail, reason_code="absence_scan_guard"),
+        criterion, pages,
+    )
+
+
+def _unverified_scan_evidence(decision, pages: list[dict]) -> list[dict]:
+    """复核页中的未 OCR 整页扫描件（absence 0 分防线用）。"""
+    from app.engine.presence import is_unverified_full_page_scan
+
+    reviewed = {
+        (int(page.get("document_id") or 0), int(page.get("page_no") or 0))
+        for page in (getattr(decision, "reviewed_pages", None) or [])
+    }
+    if not reviewed:
+        return []
+    return [
+        {"document_id": page.get("document_id"), "page_no": page.get("page_no")}
+        for page in pages
+        if (int(page.get("document_id") or 0), int(page.get("page_no") or 0)) in reviewed
+        and is_unverified_full_page_scan(page)
+    ]
+
+
 def _decimal(value: Any, label: str) -> Decimal:
     try:
         number = Decimal(str(value))
@@ -136,6 +211,15 @@ def _load_pages(bidder_id: int) -> tuple[list[dict], str, list[dict]]:
                     or not (page.text or "").strip()
                     or (not page.has_text_layer and page.source not in ("ocr", "ocr_img"))
                 )
+                unverified_scan = (
+                    not page.has_text_layer and page.source not in ("ocr", "ocr_img")
+                )
+                if not config.scoring_ocr_enabled():
+                    # 用户指令（2026-11-19）：扫描件不做内容 OCR、只打标签。
+                    # 因此扫描页不能作为阻断性"读取故障"——否则所有涉及扫描页的
+                    # 格都会兜底 0 分（run138 实证）。保留 scan_unverified 标签
+                    # 供报告展示"扫描件未核验"，评审按现有文本进行。
+                    unreadable = False
                 document_pages.append({
                     "document_id": doc.id, "page_no": page.page_no,
                     "text": page.text or "", "source": page.source or "text",
@@ -145,6 +229,7 @@ def _load_pages(bidder_id: int) -> tuple[list[dict], str, list[dict]]:
                     "width": page.width, "height": page.height,
                     "known_blank": known_blank, "unreadable": unreadable,
                     "requires_vision": unreadable,
+                    "scan_unverified": unverified_scan,
                 })
             try:
                 pages.extend(annotate_page_readability(document_pages, doc.stored_path, doc.warnings_json))
@@ -225,8 +310,21 @@ def _requested_visual_pages(previous: dict | None, pages: list[dict]) -> tuple[b
     return True, {(int(p["document_id"]), int(p["page_no"])) for p in pages if int(p["page_no"]) in numbers}
 
 
-def _supplement_pages(criterion: dict, pages: list[dict], *, visual: bool, exhaustive: bool = False) -> list[dict]:
-    """Supplement only relevant source pages; retain originals and file/page IDs."""
+_VISUAL_HINTS = ("签字", "签章", "盖章", "公章", "印章", "签名", "密封", "授权")
+_SUPPLEMENT_HINTS = ("合同", "发票", "验收", "证书", "认证", "资质", "营业执照", "社保",
+                     "授权", "业绩", "案例", "检测", "设备", "购置", "审计", "信用", "资信",
+                     "体系", "简历", "职称", "售后", "承诺", "证明")
+
+
+def _supplement_pages(criterion: dict, pages: list[dict], *, visual: bool, exhaustive: bool = False,
+                      max_pages: int | None = None) -> list[dict]:
+    """Supplement only relevant source pages; retain originals and file/page IDs.
+
+    2026-11-19：BID_EVAL_SCORING_OCR=0 时整段跳过（用户指令：扫描件不做内容
+    OCR，只保留标签）——大扫描标书逐格补检会放大到数万次 OCR 请求，评分不可用。
+    """
+    if not config.scoring_ocr_enabled():
+        return pages
     from app.engine.auto_review import select_candidate_pages
 
     copied = [dict(p) for p in pages]
@@ -240,6 +338,20 @@ def _supplement_pages(criterion: dict, pages: list[dict], *, visual: bool, exhau
     # Exhaustive counts/absence require every unreadable page, including scans
     # whose headings cannot yet be retrieved by a text query.
     candidates = candidates + [p for p in copied if (p.get("unreadable") or p.get("requires_vision")) and not p.get("known_blank")]
+    # 预算上限（2026-11-19 run137 实证：大扫描标书补检被放大到数万次 OCR）。
+    # 截断时材料/签章关键词页与带页级标签的页优先，其余按页序。
+    if max_pages is None and visual:
+        max_pages = config.visual_max_pages()
+    if max_pages is not None and len(candidates) > max_pages:
+        hints = _VISUAL_HINTS if visual else _SUPPLEMENT_HINTS
+
+        def _rank(pg: dict) -> tuple[int, int]:
+            tags = pg.get("material_tags") or []
+            text = str(pg.get("text") or "")[:300]
+            hinted = any(k in text for k in hints)
+            return (0 if tags else 1 if hinted else 2, int(pg["page_no"]))
+
+        candidates = sorted(candidates, key=_rank)[:max_pages]
     targets = {(int(p["document_id"]), int(p["page_no"])) for p in candidates}
     if not targets:
         raise LLMError("自动补检没有定位到可读取的候选页")
@@ -270,10 +382,12 @@ def _supplement_pages(criterion: dict, pages: list[dict], *, visual: bool, exhau
             continue
         if page.get("supplemented") and not page.get("unreadable") and not page.get("requires_vision"):
             continue
+        # 2026-11-19：只对"几乎没有文字"的页补 OCR。旧判据（source!=text /
+        # 无文字层 / 字符数<800）把已识别页和内容页全部重复送 OCR——run137
+        # 2.8 万次请求、10 小时未出分的主因。
         if (page["document_id"], page["page_no"]) in targets and not _is_noise_page(page) and (
-            page.get("source") != "text" or not page.get("has_text_layer", True)
-            or page.get("unreadable") or page.get("requires_vision")
-            or len(str(page.get("text") or "")) < config.OCR_MIXED_PAGE_MAX_CHARS
+            page.get("unreadable") or page.get("requires_vision")
+            or len(str(page.get("text") or "").strip()) < config.ocr_supplement_min_chars()
             or _is_visual_requirement(criterion)
         ) and str(page.get("stored_path") or "").lower().endswith(".pdf"):
             by_doc.setdefault(page["document_id"], []).append(page["page_no"])
@@ -427,8 +541,18 @@ def _inject_deterministic_cert_backing(criterion: dict, decision, pages: list[di
     section = cert_evidence_present(page_pairs)
     backing = classify_cert_backing(facts, page_pairs, section)
     if backing:
-        decision.facts["cert_backing"] = backing
-        decision.facts["cert_section_present"] = bool(section[0])
+        # 只升不降（ADR 0015 同款）：确定性 True 可升模型的 None/False，但不得把
+        # 模型已核验的 True 用"材料看不清"降级——降级曾把整格打成暂定 0。
+        existing = decision.facts.get("cert_backing")
+        merged = {normalize_cert(str(k)): v for k, v in
+                  (existing.items() if isinstance(existing, dict) else ())}
+        for key, state in backing.items():
+            norm = normalize_cert(str(key))
+            if state is True or norm not in merged:
+                merged[norm] = state
+        decision.facts["cert_backing"] = merged
+        if "cert_section_present" not in decision.facts:
+            decision.facts["cert_section_present"] = bool(section[0])
 
 
 def _verified_count(criterion: dict, decision, pages: list[dict]) -> tuple[Decimal, str, dict]:
@@ -462,12 +586,17 @@ def _verified_count(criterion: dict, decision, pages: list[dict]) -> tuple[Decim
     if isinstance(cases, list) and cases and params.get("person_scope"):
         from app.services import scoring_service as _ss
 
-        _ss._overlay_social_security(cases, pages)
+        # SC 深评路 overlay 契约是 (page_no, text, source) 元组；AS 这里是页 dict，
+        # 直接传会把页 dict 当序列解包 → "too many values to unpack (expected 3)"
+        # （run130 c29 143 实证）。
+        overlay_pages = [(int(p.get("page_no") or 0), str(p.get("text") or ""),
+                          str(p.get("source") or "")) for p in pages]
+        _ss._overlay_social_security(cases, overlay_pages)
         if str(params.get("person_scope")) == "member":
-            _ss._overlay_work_proof(cases, pages)
+            _ss._overlay_work_proof(cases, overlay_pages)
         else:
-            _ss._overlay_experience_proof(cases, pages)
-            _ss._overlay_leader_table_proof(cases, pages)
+            _ss._overlay_experience_proof(cases, overlay_pages)
+            _ss._overlay_leader_table_proof(cases, overlay_pages)
     for name in ("response_hours", "warranty_months"):
         if name in values:
             number = _decimal(values[name], name)
@@ -480,8 +609,11 @@ def _verified_count(criterion: dict, decision, pages: list[dict]) -> tuple[Decim
         if not isinstance(backing, dict):
             raise LLMError("证书背书核验结果无效")
         backing = {normalize_cert(str(k)): v for k, v in backing.items()}
-        if any(not isinstance(backing.get(normalize_cert(cert)), bool) for cert in certificates):
-            raise LLMError("每本证书都必须完成实际证明材料核验")
+        if any(v is not None and not isinstance(v, bool) for v in backing.values()):
+            raise LLMError("证书背书核验结果无效")
+        # 背书三态（bool/None）：None = 复印件不可读/未绑上，由 score_count 计入
+        # 并标疑问（用友防线）；缺省同 None。防伪由 _validate_fact_sources 的证据
+        # 闸门负责——旧"逐本必须 bool"会把材料看不清的整格打成暂定 0（run128）。
         prepared["cert_backing"] = backing
     if params.get("engine") == "attribute_tier" and (params.get("attr") or "years") in ("years", "title"):
         attr = params.get("attr") or "years"
@@ -539,9 +671,10 @@ def _verified_count(criterion: dict, decision, pages: list[dict]) -> tuple[Decim
             # skipped every performance cell on real scans (run 88/89).
             if params.get("person_scope"):
                 role = _normalize_role(case)
-                if role is None:
-                    raise LLMError("人员案例未标明负责人或团队成员归属")
-                case["role"] = role
+                # 模型未标注归属 → 交给 score_count 的"按全部案例计 + 标疑问"
+                # 分支（与 SC 深评路同口径）；旧实现整格暂定 0（run134 142 c29）。
+                if role is not None:
+                    case["role"] = role
             if params.get("min_amount_yuan") or amount_tiers:
                 if case.get("amount_yuan") is None or _decimal(case["amount_yuan"], "案例金额") < 0:
                     raise LLMError("案例金额门槛仍无可核验的金额")
@@ -569,6 +702,18 @@ def _verified_count(criterion: dict, decision, pages: list[dict]) -> tuple[Decim
         if decision.confirmed_absent and decision.coverage_complete and result.unresolved == "no_facts":
             rule = requirements + str(criterion.get("description") or "") + str(criterion.get("source_quote") or "")
             if engine in (None, "count", "count_tier", "attribute_tier"):
+                scans = _unverified_scan_evidence(decision, pages)
+                if scans:
+                    # 2026-11-19 run144 实证：纯文本模式下整页扫描件只剩页眉，
+                    # 模型会把“没读到”判成“未提供”，确定性计数再把这个
+                    # confirmed_absent 折成 0 分。只要复核页里有未 OCR 整页
+                    # 扫描件，就不能按材料缺失计 0——转人工/暂定。
+                    err = LLMError(
+                        "材料缺失结论涉及未 OCR 整页扫描件，不能确认未提供；"
+                        "已转材料存在性复核")
+                    err.presence_unverified = True
+                    err.unverified_scan_pages = scans[:50]
+                    raise err
                 score = Decimal(0)
                 if engine != "attribute_tier" and params.get("tiers") and not amount_tiers:
                     from app.engine.objective import _tier_score
@@ -641,6 +786,21 @@ def _assess_cell(criterion: dict, pages: list[dict], data_class: str, gateway_fa
     from app.services.review_activity import report
 
     c = _route_criterion(criterion)
+    # 2026-11-19 材料存在性快路径（run144 c16/c17/c23/c29 实证）：目录/索引
+    # 定位 + 页级图像信号判定“有没有材料”，零 LLM/零 OCR，先于任何补读/模型
+    # 调用。present/absent 直接定格；unverified 落暂定待人工复核。新路径自身
+    # 异常只记日志并回落既有评审，绝不把格子打死。
+    try:
+        from app.engine import presence as _presence
+
+        if _presence.is_presence_criterion(c):
+            return _presence_outcome(_presence.score_material_presence(c, pages), c, pages)
+        if _presence.is_sample_criterion(c):
+            sample = _presence.score_sample_materials(c, pages)
+            if sample is not None:
+                return _presence_outcome(sample, c, pages)
+    except Exception:  # noqa: BLE001
+        log.exception("材料存在性快路径失败 criterion=%s", c.get("code"))
     if c.get("_external_fast") and is_external_requirement(c):
         reason = (
             "该横向条款依赖投标文件之外的事实，系统按外部事实边界结项；"
@@ -784,6 +944,16 @@ def _assess_cell(criterion: dict, pages: list[dict], data_class: str, gateway_fa
             from app.llm.request_sizing import ReviewContextExceeded
             from app.parsing.pdf_runtime import OCRProcessingError
 
+            if getattr(exc, "presence_unverified", False):
+                # auto_review absence 防线：确认“未提供”的窗口里有未 OCR
+                # 整页扫描件 → 不能按材料缺失结项，也不能按 stop 让整轮停下；
+                # 定格为“未核验待人工复核”（不计入正式总分）。
+                outcome = _presence_unverified_outcome(
+                    c, current_pages,
+                    str(exc) or "材料缺失结论涉及未 OCR 扫描页，需人工复核",
+                )
+                outcome.attempts = round_no + 1
+                return outcome
             if isinstance(exc, (ReviewContextExceeded, OCRProcessingError)) or (isinstance(exc, LLMError) and (
                     exc.transient or exc.review_attempts_exhausted)):
                 # Transport retries belong to the provider; an exhausted HTTP
@@ -1591,7 +1761,10 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
                     try:
                         if any(p.get("unreadable") or p.get("requires_vision") for p in pages):
                             report(f"读取 {bidder_names[bid_id]} 关联材料，OCR 尝试 {attempt + 1}")
-                            pages = _supplement_pages({}, pages, visual=False)
+                            pages = _supplement_pages(
+                                {}, pages, visual=False,
+                                max_pages=config.supplement_ocr_max_pages(),
+                            )
                         break
                     except JobCancelled:
                         raise
@@ -1735,16 +1908,31 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
                 )
                 if external_cross:
                     review_rule["_external_fast"] = True
-            if shared_collector is not None and is_cross_bidder_requirement(criterion):
-                outcome = _assess_cell(review_rule, pages, data_class, gateway_factory,
-                                       reviewer=shared_collector.review_criterion)
-            else:
-                outcome = _assess_cell(review_rule, pages, data_class, gateway_factory)
+            def _run_assess():
+                if shared_collector is not None and is_cross_bidder_requirement(criterion):
+                    return _assess_cell(review_rule, pages, data_class, gateway_factory,
+                                        reviewer=shared_collector.review_criterion)
+                return _assess_cell(review_rule, pages, data_class, gateway_factory)
+
+            # 并发提速（2026-11-19）后 SQLite 写锁升级冲突（read→write 同一事务）
+            # 会立即报 "database is locked"（busy_timeout 对升级冲突不生效），
+            # 单格直接落兜底会丢分。这里对锁冲突做有限重试；检查点可续跑，
+            # 已完成的批次不会重复调模型。
+            from sqlalchemy.exc import OperationalError
+
+            for _attempt in range(3):
+                try:
+                    outcome = _run_assess()
+                    break
+                except OperationalError as exc:
+                    if "database is locked" not in str(exc).lower() or _attempt == 2:
+                        raise
+                    time.sleep(0.3 * (_attempt + 1))
             merge_prepared_pages(bid_id, outcome.pages)
             return outcome
 
     errors: list[BaseException] = []
-    workers = min(8, len(cells) or 1, max(1, config.llm_max_concurrency()))
+    workers = min(config.llm_concurrency_ceiling(), len(cells) or 1, max(1, config.llm_max_concurrency()))
     cancelled = False
     cell_iter = iter(cells)
     last_report = 0.0

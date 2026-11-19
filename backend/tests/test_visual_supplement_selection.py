@@ -85,7 +85,9 @@ def test_ocr_still_ranks_text_even_when_visual_targets_are_present(monkeypatch):
 
     monkeypatch.setattr(auto_review, "select_candidate_pages", select)
     monkeypatch.setattr("app.parsing.pdf_pymupdf.ocr_pages_text", ocr)
-    monkeypatch.setattr(scoring.config, "OCR_MIXED_PAGE_MAX_CHARS", 1000)
+    # 2026-11-19：补检阈值改为 config.ocr_supplement_min_chars()（默认 80）。
+    # 这里放宽到 1000，保持"候选文本页也会被补检"的旧断言口径。
+    monkeypatch.setattr(scoring.config, "ocr_supplement_min_chars", lambda: 1000)
     result = scoring._supplement_pages({"_visual_page_keys": [(77, 5)]}, original, visual=False)
     assert ranked == [(5, 8)]
     assert recognized == [1, 3, 4]

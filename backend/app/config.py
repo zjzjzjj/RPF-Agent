@@ -578,6 +578,94 @@ def max_upload_bytes() -> int:
     return int(os.environ.get("BID_EVAL_MAX_UPLOAD_MB", MAX_UPLOAD_MB)) * 1024 * 1024
 
 
+def max_parse_file_bytes() -> int:
+    """解析期单文件上限，与 HTTP 上传限额解耦。
+
+    背景（2026-11-18 run129 实证）：项目包 zip 一键导入按
+    BID_EVAL_IMPORT_MAX_ZIP_MB（默认 8GB）放行，但真实主投标文件 PDF 单份
+    160–426MB，解析期再按上传限额 200MB 拒绝（TOO_LARGE）会让每家的主标书
+    "存在但不可见"——评分只剩报价表，技术分全 0。解析已按页流式处理，
+    单文件大小不构成内存风险；这里单独放宽到 4GB，上传接口限额保持不变。
+    """
+    return int(os.environ.get("BID_EVAL_MAX_PARSE_FILE_MB", "4096")) * 1024 * 1024
+
+
+def bid_text_min_chars() -> int:
+    """单个投标人可读投标文本量的告警下限（字符）。
+
+    低于该值说明主标书大概率没解析进来（run129 实证：只剩报价表时每家
+    836–3340 字符；正常解析后为数十万字符），结果页必须显著告警。
+    """
+    return int(os.environ.get("BID_EVAL_BID_TEXT_MIN_CHARS", "5000"))
+
+
+def ocr_page_concurrency() -> int:
+    """解析期同一文档内并行 OCR 的页数。
+
+    服务器有 6 台 PaddleOCR 容器，串行逐页调用是解析慢的主因（单页 2–7 秒）；
+    页间无共享可变状态（各自独立缓存目录 + 原子锁），可安全并行。
+    """
+    return min(8, max(1, int(os.environ.get("BID_EVAL_OCR_PAGE_CONCURRENCY", "4"))))
+
+
+def ocr_prioritize_material() -> bool:
+    """OCR 页预算内材料页优先：命中合同/发票/证书/人员等关键词的扫描页先识别。
+
+    OCR 页数上限（BID_EVAL_OCR_MAX_PAGES）截断时，优先保证明材料而不是
+    按页序吃满预算；未截断的文档行为不变（全部页都会被 OCR）。
+    """
+    return os.environ.get("BID_EVAL_OCR_PRIORITIZE_MATERIAL", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def paddle_ocr_concurrency() -> int:
+    """远程 OCR 并发槽位（进程内）。默认 4，可用 BID_EVAL_PADDLE_OCR_CONCURRENCY 调整。"""
+    return min(8, max(1, int(os.environ.get("BID_EVAL_PADDLE_OCR_CONCURRENCY", "4"))))
+
+
+def scoring_ocr_enabled() -> bool:
+    """评分期是否对扫描页做 OCR/视觉补读（默认开；置 0 = 只按现有文本评审）。
+
+    2026-11-19 用户指令：扫描件不做内容 OCR，只保留"扫描页"标签——评分直接
+    使用解析期已有的文字层/OCR 文本，缺内容的扫描页按读取存疑处理。
+    """
+    return os.environ.get("BID_EVAL_SCORING_OCR", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def presence_route_enabled() -> bool:
+    """材料存在性评分（existence/items）是否启用（默认开）。
+
+    2026-11-19：目录/索引定位 + 页级图像信号判定"有没有材料"，不解析内容、
+    不做 OCR。置 0 可一键回退到旧的计分路径。
+    """
+    return os.environ.get("BID_EVAL_PRESENCE_ROUTE", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def ocr_supplement_min_chars() -> int:
+    """评分补检只对"几乎没有文字"的页做 OCR（默认 80 字符）。
+
+    旧实现把 source!=text / 无文字层 / 字符数<800 都当作需重识别——大扫描标书
+    在评分阶段被逐格重复 OCR（2026-11-19 run137 实证：2.8 万次 OCR 请求、
+    10 小时未出分）。文字层已有≥80 字符的页按原文评审，不再重复识别。
+    """
+    return max(0, int(os.environ.get("BID_EVAL_OCR_SUPPLEMENT_MIN_CHARS", "80")))
+
+
+def supplement_ocr_max_pages() -> int:
+    """每家投标人评分前补检 OCR 的页数上限（默认 40，材料页优先）。"""
+    return max(0, int(os.environ.get("BID_EVAL_SUPPLEMENT_OCR_MAX_PAGES", "40")))
+
+
+def visual_max_pages() -> int:
+    """签章类视觉核验最多渲染的原页数（默认 12，签章关键词页优先）。"""
+    return min(60, max(1, int(os.environ.get("BID_EVAL_VISUAL_MAX_PAGES", "12"))))
+
+
 # ---------------------------------------------------------------------------
 # 页面渲染（证据高亮）
 # ---------------------------------------------------------------------------
@@ -655,6 +743,15 @@ def compile_chunk_chars() -> int:
 
 def llm_max_concurrency() -> int:
     return int(os.environ.get("BID_EVAL_LLM_CONCURRENCY", 4))
+
+
+def llm_concurrency_ceiling() -> int:
+    """进程内并发硬上限（旧代码多处 min(8, ...) 把并发静默锁死在 8）。
+
+    2026-11-19 用户要求"每家公司几分钟"：云端模型单次 ~2.4 秒，8 路并发
+    是评分慢的主闸门。默认放宽到 32，可经 BID_EVAL_LLM_CONCURRENCY_CEILING 调整。
+    """
+    return max(1, int(os.environ.get("BID_EVAL_LLM_CONCURRENCY_CEILING", "32")))
 
 
 def llm_daily_call_budget() -> int:
@@ -845,5 +942,10 @@ def llm_api_key_configured() -> bool:
 # 任务
 # ---------------------------------------------------------------------------
 JOB_HEARTBEAT_S = 5
-JOB_STALE_S = 300  # 心跳超时视为 worker 已死，任务可被重新拾取
+JOB_STALE_S = 300  # 心跳超时视为 worker 已死，任务可被重新拾取（可经环境变量覆盖）
 JOB_MAX_ATTEMPTS = 3  # 僵尸重领上限；超过则判 failed，不再无限重复执行
+
+
+def job_stale_s() -> int:
+    """僵尸判定阈值（秒）。大标书解析等长任务可经 BID_EVAL_JOB_STALE_S 放宽。"""
+    return max(60, int(os.environ.get("BID_EVAL_JOB_STALE_S", JOB_STALE_S)))

@@ -116,6 +116,15 @@ def build_objective_plan(criterion: dict) -> ObjectivePlan | None:
     params = dict(criterion.get("params") or {})
     expanded = f"{name}\n{text}"
 
+    # 人员级证书（拟派负责人/工程师的 ITIL、PMP 等）：从人员情况表的上岗证书
+    # 列确定性计数，按规则文本点名的证书族匹配；不再依赖模型逐案例产 facts
+    # （run128/133 c27/c28 恒 no_facts）。
+    if (score_type == "count" and params.get("person_scope")
+            and params.get("field") == "certificates"):
+        if not _person_cert_targets(text):
+            return None
+        return ObjectivePlan("person_certs", params)
+
     if "增值服务" in expanded:
         return ObjectivePlan("value_items", params)
     if "行业认证维修工程师" in expanded:
@@ -132,6 +141,10 @@ def build_objective_plan(criterion: dict) -> ObjectivePlan | None:
             r"[一二两三四五六七八九十\d]+\s*项[^。；]{0,12}?得\s*\d", expanded):
         return ObjectivePlan("cert_count_tier", params)
     if "业绩" in expanded or "合同金额" in expanded or "类似项目" in expanded:
+        if params.get("person_scope"):
+            # 人员级业绩必须逐案例核验人员归属（合同须体现拟派人员，否则需业主
+            # 证明）；公司级合同桶不得替代——run128 c29 曾把公司合同当团队经验。
+            return None
         return ObjectivePlan("contracts", params)
 
     if score_type == "subjective":
@@ -580,6 +593,118 @@ def _cert_level_sum_score(criterion: dict, inventory: MaterialInventory) -> Fast
     )
 
 
+# ---------------------------------------------------------------------------
+# Person-level certificates (拟派负责人/工程师的 ITIL、PMP 等)
+# ---------------------------------------------------------------------------
+_RE_CERT_TARGET = re.compile(r"(?:具有|具备|持有)\s*([^，。；;、]{2,40}?)\s*(?:认证|证书)")
+_RE_LEADER_ROLE = re.compile(r"负责人|项目经理|项目总监")
+
+
+def _norm_material_text(value: Any) -> str:
+    return re.sub(r"[^0-9a-zA-Z一-龥]", "", str(value or "")).lower()
+
+
+def _person_cert_targets(text: str) -> list[str]:
+    """规则文本点名的证书族：`具有<X>认证/证书得N分` → [X]。
+
+    只认"具有/具备/持有…认证/证书"句式——"提供证书复印件""以上认证证书"
+    等材料说明不会成为证书目标。
+    """
+    seen: set[str] = set()
+    out: list[str] = []
+    for match in _RE_CERT_TARGET.finditer(text or ""):
+        name = re.sub(r"\s+", " ", match.group(1)).strip(" 、，。；;")
+        key = _norm_material_text(name)
+        if len(key) < 2 or key in seen:
+            continue
+        seen.add(key)
+        out.append(name)
+    return out
+
+
+def _person_in_scope(person: PersonRecord, scope: str) -> bool:
+    is_leader = bool(_RE_LEADER_ROLE.search(str(person.role or "")))
+    if scope == "leader":
+        return is_leader
+    if scope == "member":
+        return not is_leader
+    return True
+
+
+def _person_has_cert(person: PersonRecord, target_key: str) -> bool:
+    return any(target_key and target_key in _norm_material_text(cert)
+               for cert in getattr(person, "certs", []) or [])
+
+
+def _cert_copy_state(target: str, pages: list[dict]) -> bool | None:
+    """证书复印件页三态（与公司证书背书同语义）：OCR/扫描页命中 → True；
+    仅文本申报、文档含扫描页 → None（计入+疑问）；全文可读且无命中 → False。"""
+    key = _norm_material_text(target)
+    if not key:
+        return None
+    has_scan = any(str(p.get("source") or "") in ("ocr", "ocr_img") for p in pages)
+    for page in pages:
+        if (str(page.get("source") or "") in ("ocr", "ocr_img")
+                and key in _norm_material_text(page.get("text") or "")):
+            return True
+    return None if has_scan else False
+
+
+def _person_cert_score(criterion: dict, inventory: MaterialInventory) -> FastPathResult:
+    params = dict(criterion.get("params") or {})
+    scope = str(params.get("person_scope") or "")
+    maximum = _max(criterion) or Decimal(0)
+    per_item = _decimal(params.get("per_item")) or Decimal(0)
+    max_items = int(params.get("max_items") or 0)
+    targets = _person_cert_targets(_rule_text(criterion))
+    persons = [p for p in inventory.persons if _person_in_scope(p, scope)]
+    matched: list[str] = []
+    backing: dict[str, bool | None] = {}
+    holders: list[str] = []
+    for target in targets:
+        key = _norm_material_text(target)
+        hit = [p for p in persons if _person_has_cert(p, key)]
+        if not hit:
+            continue
+        matched.append(target)
+        backing[target] = _cert_copy_state(target, inventory.pages)
+        holders.extend(f"{p.name}（{target}）" for p in hit)
+    if str(params.get("_objective_form") or "") == "per_item":
+        units = len({p.name for p in persons
+                     if any(_person_has_cert(p, _norm_material_text(t)) for t in targets)})
+    else:
+        units = len(matched)
+    effective = min(Decimal(units), Decimal(max_items)) if max_items else Decimal(units)
+    score = _cap(effective * per_item, criterion)
+    if matched:
+        detail = "人员证书：" + "、".join(holders)
+    elif not inventory.personnel_table_found:
+        detail = "未定位到项目团队人员情况表"
+    elif not persons:
+        detail = ("未识别到项目负责人" if scope == "leader" else "未识别到团队成员")
+    else:
+        detail = "团队人员情况表中未检出规则点名的证书"
+    doubts = [name for name, state in backing.items() if state is None]
+    if doubts:
+        detail += f"（{'、'.join(doubts)} 仅见申报、未见复印件页，按未核验计入并标疑问）"
+    missing = [name for name, state in backing.items() if state is False]
+    if missing:
+        detail += f"（{'、'.join(missing)} 确认无证书复印件，不计）"
+    complete = inventory.personnel_table_found and bool(persons)
+    zero_reason = None if score > 0 else ("confirmed_absent" if complete else "no_facts")
+    return FastPathResult(
+        score=score,
+        detail=detail + f"；合计 {score} 分",
+        verdict="pass" if score > 0 else ("fail" if complete else "concern"),
+        facts={"certificates": matched, "cert_backing": backing,
+               "holders": holders},
+        pages=[],
+        zero_reason=zero_reason,
+        complete=complete,
+        confidence="high" if inventory.personnel_table_found else "low",
+    )
+
+
 def _generic_engine_score(criterion: dict, inventory: MaterialInventory,
                          params: dict[str, Any]) -> FastPathResult | None:
     from app.services.automatic_scoring_service import _ENGINES
@@ -629,6 +754,8 @@ def score_objective(criterion: dict, inventory: MaterialInventory) -> FastPathRe
         return _person_equipment_score(criterion, inventory)
     if plan.kind == "value_items":
         return _value_items_score(criterion, inventory)
+    if plan.kind == "person_certs":
+        return _person_cert_score(criterion, inventory)
     if plan.kind == "cert_count_tier":
         return _cert_count_tier_score(criterion, inventory)
     if plan.kind == "cert_level_sum":

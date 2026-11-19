@@ -16,7 +16,7 @@ def _check_file(path: str) -> None:
     p = Path(path)
     if not p.exists() or p.stat().st_size == 0:
         raise DocumentRejectedError(config.REJECT_EMPTY_FILE, "文件为空或不存在")
-    if p.stat().st_size > config.max_upload_bytes():
+    if p.stat().st_size > config.max_parse_file_bytes():
         raise DocumentRejectedError(config.REJECT_TOO_LARGE, "文件超过大小上限")
     with open(path, "rb") as fh:
         if fh.read(2) != b"PK":
@@ -52,7 +52,7 @@ def _iter_block_lines(doc) -> list[str]:  # noqa: ANN001
     return lines
 
 
-def extract_docx(path: str) -> ExtractedDocument:
+def extract_docx(path: str, on_progress=None) -> ExtractedDocument:  # noqa: ANN001
     _check_file(path)
     try:
         from docx import Document
