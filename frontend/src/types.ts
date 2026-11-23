@@ -396,6 +396,9 @@ export interface Citation {
 
 export interface RankingRow {
   rank: number | null;
+  /** 参考名次＝原排序位次：正式名次（rank）为 null 时照发，仅供人工定位，
+   *  不构成评审结论；完整运行时 reference_rank === rank。 */
+  reference_rank: number | null;
   bidder_id: number;
   bidder_name: string;
   bid_price: string | null;

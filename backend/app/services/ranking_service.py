@@ -165,6 +165,10 @@ def compute_ranking(project_id: str, run_id: int | None = None) -> dict:
             out_rows.append(
                 {
                     "rank": r.rank,
+                    # 包B：参考名次=原排序位次（aggregate.rank_rows 算好、此处原样保留）。
+                    # 正式名次在下面两个分支被抑制为 None 时，参考名次照发——仅供
+                    # 人工定位，不构成评审结论（发布语义零改动，纯增量字段）。
+                    "reference_rank": r.rank,
                     "bidder_id": r.bidder_id,
                     "bidder_name": r.name,
                     "bid_price": str(r.bid_price) if r.bid_price is not None else None,
@@ -186,12 +190,15 @@ def compute_ranking(project_id: str, run_id: int | None = None) -> dict:
             )
 
         warnings = []
+        # 包B：正式名次被抑制时（下面两个分支），参考名次（=原排序位次）照发。
+        rank_suppressed = False
         if automation and not automation["is_final"]:
             for row in out_rows:
                 row["rank"] = None
                 row["tie_break_level"] = None
                 row["tie_explanations"] = []
             warnings.append("自动评审尚未全部完成，当前仅展示已完成分数，不发布最终排名")
+            rank_suppressed = True
         elif any(row["fallback"] for row in out_rows):
             # P0-1：含故障兜底暂定格的总分不是完整评审结论（报告自述"不构成
             # 有效最终分"），不发布名次，防止暂定 0 分误导排序（测试10 run113
@@ -201,6 +208,9 @@ def compute_ranking(project_id: str, run_id: int | None = None) -> dict:
                 row["tie_break_level"] = None
                 row["tie_explanations"] = []
             warnings.append("存在故障兜底暂定分（非评审结论），总分不完整，不发布最终排名；请补评或人工改分后重算")
+            rank_suppressed = True
+        if rank_suppressed and any(row.get("reference_rank") is not None for row in out_rows):
+            warnings.append("已提供参考名次（含暂定分/未完成项，仅供人工定位，不构成评审结论）")
         for row in out_rows:
             if row["missing_final"]:
                 warnings.append(

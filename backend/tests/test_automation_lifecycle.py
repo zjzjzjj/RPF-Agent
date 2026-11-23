@@ -71,6 +71,9 @@ def test_complete_run_and_failing_qualification_keep_bidder_ranked(managed):
     out = compute_ranking("auto-test", managed["run_id"])
     assert out["is_final"] is True
     assert out["rows"][0]["rank"] == 1
+    # 包B：完整运行 reference_rank == rank（纯增量字段，不改发布语义）
+    assert out["rows"][0]["reference_rank"] == 1
+    assert not any("参考名次" in w for w in out["warnings"])
     assert out["rows"][0]["total"] == "7.00"
     with session_scope() as s:
         assert s.get(Bidder, managed["bidder_id"]).status != "rejected"
@@ -208,6 +211,10 @@ def test_failed_run_rank_is_provisional_and_formal_report_blocked(managed):
     ranked = compute_ranking("auto-test", managed["run_id"])
     assert ranked["provisional"] is True
     assert ranked["rows"][0]["rank"] is None
+    # 包B：名次抑制时参考名次照发（原排序位次）+ 口径告警
+    assert ranked["rows"][0]["reference_rank"] == 1
+    assert any("参考名次" in w for w in ranked["warnings"])
+    assert any("不构成评审结论" in w for w in ranked["warnings"])
     with session_scope() as s:
         s.get(EvaluationRun, managed["run_id"]).status = "succeeded"
     assert build_report("auto-test", managed["run_id"])["status"] == "draft"
@@ -225,6 +232,9 @@ def test_failed_run_with_complete_cells_still_has_no_published_rank(managed):
     assert report["status"] == "draft"
     assert report["ranking"]["is_final"] is False
     assert report["ranking"]["rows"][0]["rank"] is None
+    # 包B：报告透传参考名次（发布语义不变，仅增量字段）
+    assert report["ranking"]["rows"][0]["reference_rank"] == 1
+    assert any("参考名次" in w for w in report["ranking"]["warnings"])
     summary = build_score_summary("auto-test", managed["run_id"])
     assert summary["run"]["ready"] is False
     assert summary["bidders"][0]["rank"] is None
@@ -621,9 +631,12 @@ def test_fallback_cell_excluded_from_total_and_rank(managed):
     assert row["provisional_total"] == "0.00"
     assert row["fallback"] == ["商务分"]
     assert row["rank"] is None
+    # 包B：兜底分支抑制正式名次，但参考名次（原排序位次）照发
+    assert row["reference_rank"] == 1
     assert out["has_fallback"] is True
     assert any("暂定分" in w for w in out["warnings"])
     assert any("不发布最终排名" in w for w in out["warnings"])
+    assert any("参考名次" in w and "不构成评审结论" in w for w in out["warnings"])
 
 
 def test_fallback_provisional_value_shown_in_dual_total(managed):
@@ -679,8 +692,12 @@ def test_settled_run_without_fallback_still_ranks_and_recommends(managed):
     auto.finish_run(managed["run_id"])
     out = compute_ranking("auto-test", managed["run_id"])
     assert out["rows"][0]["rank"] == 1
+    # 包B：完整运行 reference_rank 与正式名次一致，且不出现参考名次告警
+    assert out["rows"][0]["reference_rank"] == out["rows"][0]["rank"]
+    assert not any("参考名次" in w for w in out["warnings"])
     assert out["has_fallback"] is False
     report = build_formal_report("auto-test", managed["run_id"])
+    assert report["summary_rows"][0]["reference_rank"] == 1
     html = render_formal_html(report)
     assert "推荐中标候选人为" in html
     assert "暂不推荐中标候选人" not in html
@@ -716,7 +733,17 @@ def test_reading_gap_cell_is_settled_but_unscored(managed):
     assert row["fallback"] == ["商务分"]
     assert row["missing_final"] == []          # 不重复挂未定分清单
     assert row["rank"] is None                  # 总分不完整不发名次
+    assert row["reference_rank"] == 1           # 包B：参考名次照发（仅供定位）
     assert out["has_fallback"] is True
+    # 只加锁：不可读格（reading_incomplete）是"未定分"，永不写成暂定 0——
+    # ① 评分格本身 final_score 为 None；② 报告明细格不出现 0 分。
+    with session_scope() as s:
+        gap = s.execute(
+            select(ScoreRecord).where(ScoreRecord.run_id == managed["run_id"],
+                                      ScoreRecord.criterion_id == managed["score_id"])
+        ).scalar_one()
+        assert gap.final_score is None
+    assert [b for b in row["breakdown"] if b["code"] == "S1"][0]["final_score"] is None
 
 
 def test_reading_gap_run_can_resume_and_reruns_only_gap_cells(managed):
@@ -770,3 +797,37 @@ def test_reading_gap_report_labels_gap_not_zero(managed):
     text = "\n".join(p.text for p in doc.paragraphs)
     assert "读取故障待补读，未定分" in text
     assert "当前 None 分" not in text
+
+
+# ==== 包B：参考名次（正式名次抑制时的原排序位次，仅供人工定位） ====
+
+def test_reference_rank_shown_in_report_when_rank_suppressed(managed):
+    """正式名次不发布时，报告透传并展示「参考第N名」，且声明非评审结论。"""
+    from io import BytesIO
+
+    from docx import Document as DocxDocument
+
+    from app.services.ranking_service import compute_ranking
+    from app.services.report_service import build_formal_report, render_docx
+
+    _cell(managed, managed["veto_id"])
+    _cell(managed, managed["score_id"], score=Decimal("7"),
+          meta=_fallback_meta(), warnings=[{"message": "兜底", "fallback_score": {
+              "kind": "provisional_zero", "value": "0"}}])
+    auto.finish_run(managed["run_id"])
+    out = compute_ranking("auto-test", managed["run_id"])
+    assert out["rows"][0]["rank"] is None           # 发布语义零改动
+    assert out["rows"][0]["reference_rank"] == 1    # 参考名次=原排序位次
+    assert any("参考名次" in w for w in out["warnings"])
+
+    report = build_formal_report("auto-test", managed["run_id"])
+    assert report["summary_rows"][0]["rank"] is None
+    assert report["summary_rows"][0]["reference_rank"] == 1
+    doc = DocxDocument(BytesIO(render_docx(report)))
+    cells = [c.text for t in doc.tables for r in t.rows for c in r.cells]
+    assert any("参考第1名" in c for c in cells)
+    paras = "\n".join(p.text for p in doc.paragraphs)
+    assert "仅供人工定位" in paras and "不构成评审结论" in paras
+    # 参考名次不参与中标候选人推荐（发布语义零改动）
+    assert "第1中标候选人" not in paras
+    assert "暂不推荐中标候选人" in paras

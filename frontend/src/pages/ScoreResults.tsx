@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useParams, useSearchParams } from "react-router-dom";
 import {
   Alert,
@@ -33,6 +33,7 @@ import {
   useBidders,
   useMatrix,
   useModels,
+  useRanking,
   useReport,
   useRules,
   useScoreSummary,
@@ -83,6 +84,21 @@ export default function ScoreResults() {
   const { data: summary, isLoading: summaryLoading } = useScoreSummary(runId, pid, { live: currentRunActive });
   const { data: matrix, isLoading: matrixLoading } = useMatrix(runId, { live: currentRunActive });
   const { data: report, isError: reportError } = useReport(pid, runId);
+  // 包B：参考名次（reference_rank）取自 ranking 端点——score-summary 只带
+  // 正式名次 rank（不完整运行恒为 null）。运行执行中不下发：排序随分数实时
+  // 变化，旧快照会与左侧按总分陈列的列表错位；进入终态时 invalidateResults
+  // 会重新拉取。
+  const { data: ranking } = useRanking(pid, runId);
+  const referenceRanks = useMemo(() => {
+    if (currentRunActive || !ranking) return null;
+    const map: Record<number, number> = {};
+    for (const row of ranking.rows) {
+      if (row.reference_rank != null) map[row.bidder_id] = row.reference_rank;
+    }
+    return map;
+  }, [ranking, currentRunActive]);
+  const refRankOf = (b: BidderSummary): number | null =>
+    referenceRanks != null ? referenceRanks[b.bidder_id] ?? null : null;
   const automation = currentRun?.automation ?? summary?.run.automation;
   const managed = automation != null;
   const partialResult = currentRun?.status === "partial";
@@ -119,6 +135,8 @@ export default function ScoreResults() {
   const selected: BidderSummary | null =
     listedBidders.find((b) => b.bidder_id === selectedBidderId) ??
     listedBidders.find((b) => b.rank === 1) ??
+    // 正式名次未发布时按参考名次选默认项（仅供定位，不构成评审结论）
+    listedBidders.find((b) => refRankOf(b) === 1) ??
     listedBidders[0] ??
     null;
 
@@ -432,6 +450,7 @@ export default function ScoreResults() {
                       onSelect={selectBidder}
                       managed={managed}
                       provisional={managed && !formalReady}
+                      referenceRanks={referenceRanks}
                     />
                   </div>
                 </Col>
@@ -453,9 +472,18 @@ export default function ScoreResults() {
                       <Card size="small" styles={{ body: { padding: "12px 16px" } }}>
                         <Space wrap size={12}>
                           <Typography.Title level={5} style={{ margin: 0 }}>
-                            {selected.rank != null ? `第 ${selected.rank} 名 · ` : ""}
+                            {selected.rank != null
+                              ? `第 ${selected.rank} 名 · `
+                              : refRankOf(selected) != null
+                                ? `参考第 ${refRankOf(selected)} 名 · `
+                                : ""}
                             {selected.name}
                           </Typography.Title>
+                          {selected.rank == null && refRankOf(selected) != null && (
+                            <Tooltip title="参考名次（含暂定分/未完成项，仅供人工定位，不构成评审结论）">
+                              <Tag color="blue">参考名次（非评审结论）</Tag>
+                            </Tooltip>
+                          )}
                           <Tag color={selected.veto_flag ? "red" : "green"}>
                             {managed ? selected.veto_flag ? "存在不符合项，继续参评" : "AI 自动评审" : selected.veto_flag ? "存在否决建议" : "无否决建议"}
                           </Tag>

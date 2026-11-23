@@ -7,6 +7,9 @@ interface Props {
   onSelect: (bidderId: number) => void;
   managed?: boolean;
   provisional?: boolean;
+  /** 参考名次（bidder_id → 原排序位次）：正式名次为 null 时展示 "~N"。
+   *  来自 /projects/{pid}/ranking 的 reference_rank，非评审结论。 */
+  referenceRanks?: Record<number, number> | null;
 }
 
 const RANK_COLOR = ["#d4a017", "#8c8c8c", "#a97142"];
@@ -37,7 +40,14 @@ function isBucketMissingOnly(b: BidderSummary, key: string): boolean {
 }
 
 /** 左栏：排名列表。点选一家，右侧显示该家的分桶与逐项明细。 */
-export default function BidderRankList({ bidders, selectedId, onSelect, managed = false, provisional = false }: Props) {
+export default function BidderRankList({
+  bidders,
+  selectedId,
+  onSelect,
+  managed = false,
+  provisional = false,
+  referenceRanks = null,
+}: Props) {
   if (bidders.length === 0) {
     return (
       <Card size="small">
@@ -50,6 +60,10 @@ export default function BidderRankList({ bidders, selectedId, onSelect, managed 
       {bidders.map((b) => {
         const selected = b.bidder_id === selectedId;
         const excluded = b.state === "excluded";
+        // 包B：正式名次未发布（rank=null）但有参考名次时展示 "~N"+显著标注；
+        // 参考名次仅供人工定位，不构成评审结论。
+        const refRank = referenceRanks?.[b.bidder_id] ?? null;
+        const showRef = !excluded && b.rank == null && refRank != null;
         return (
           <Card
             key={b.bidder_id}
@@ -76,10 +90,23 @@ export default function BidderRankList({ bidders, selectedId, onSelect, managed 
                     color: "#fff",
                     background: excluded
                       ? "#bfbfbf"
-                      : (b.rank != null && RANK_COLOR[b.rank - 1]) || "#29745a",
+                      : b.rank != null
+                        ? RANK_COLOR[b.rank - 1] || "#29745a"
+                        : showRef
+                          ? "#5b6570" // 参考名次：中性石板灰，不套前三名奖牌色
+                          : "#29745a",
                   }}
                 >
-                  {excluded || provisional ? "—" : (b.rank ?? "—")}
+                  {excluded
+                    ? "—"
+                    // 沿用既有行为：暂定运行不展示正式名次（rank 本就恒为 null）
+                    : provisional && b.rank != null
+                      ? "—"
+                      : b.rank != null
+                        ? b.rank
+                        : showRef
+                          ? `~${refRank}`
+                          : "—"}
                 </div>
                 <div>
                   <Typography.Text strong style={{ fontSize: 14 }}>
@@ -106,6 +133,11 @@ export default function BidderRankList({ bidders, selectedId, onSelect, managed 
               </Tooltip>
             ) : (
               <Space size={4} wrap style={{ marginTop: 8 }}>
+                {showRef && (
+                  <Tooltip title="参考名次（含暂定分/未完成项，仅供人工定位，不构成评审结论）">
+                    <Tag color="blue">参考名次（非评审结论）</Tag>
+                  </Tooltip>
+                )}
                 <Tag color={b.veto_flag ? "red" : "green"}>
                   {managed ? b.veto_flag ? "存在不符合项" : "评审结果" : b.veto_flag ? "存在否决建议" : "无否决建议"}
                 </Tag>
