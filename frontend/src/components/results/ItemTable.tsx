@@ -1,4 +1,5 @@
 import { Button, Space, Table, Tag, Tooltip, Typography } from "antd";
+import type { TableProps } from "antd";
 import type { SummaryBucket, SummaryItem } from "../../types";
 import { automaticEvidenceCellLabel, evidenceCellLabel } from "../../utils/evidenceText";
 
@@ -64,6 +65,12 @@ function reasonSummary(item: SummaryItem, managed: boolean): string {
 /** 单个分桶的逐项明细表：得分 / 满分 / 失分 / 状态 / 理由 / 证据。 */
 export default function ItemTable({ bucket, onOpenReason, onOpenEvidence, onViewSource, managed = false }: Props) {
   const isVerdictBucket = bucket.kind === "verdict";
+  const maxScoreColumn: NonNullable<TableProps<SummaryItem>["columns"]>[number] = {
+    title: "满分",
+    width: 64,
+    align: "right" as const,
+    render: (_, item) => item.max_score ?? "—",
+  };
 
   return (
     <Table<SummaryItem>
@@ -98,12 +105,8 @@ export default function ItemTable({ bucket, onOpenReason, onOpenEvidence, onView
             </>
           ),
         },
-        {
-          title: "满分",
-          width: 64,
-          align: "right" as const,
-          render: (_, item) => (isVerdictBucket ? "—" : (item.max_score ?? "—")),
-        },
+        // 资格/符合性细项不展示"满分"列（判定项无分值，2026-11-23 用户拍板）
+        ...(isVerdictBucket ? [] : [maxScoreColumn]),
         {
           title: "得分",
           width: 96,
