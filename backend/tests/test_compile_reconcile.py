@@ -650,3 +650,90 @@ def test_compile_job_result_carries_reconcile_report_untruncated(app_env, monkey
     assert "selection_meta" in result, "未截断文档也必须带 selection_meta（恒写）"
     assert result["selection_meta"].get("skeleton_reconcile"), "对账报告必须可见"
     assert result["selection_meta"].get("weight_pruned") == ["利群(休闲细支)商标条盒"]
+
+
+# --- 2026-11-23 样品分部：章节标记 + in_total 结构优先（测试12 利群实证） -------
+
+def test_reconcile_section_mark_recognizes_sample() -> None:
+    from app.rules import reconcile as rec
+
+    m = rec._RE_SECTION_MARK.search("4、样品部分（10分）")
+    assert m is not None, "样品分部必须是严格章节标记"
+    assert rec._SECTION_CAT[m.group(1)] == "technical"
+
+
+def test_reconcile_category_at_sample_rows() -> None:
+    """样品行落在「报价部分」标记之后——旧正则不认样品 → category_at 回落 price
+    （测试12 c32 被归价格桶的根因路径）。"""
+    from app.rules import reconcile as rec
+
+    pages = {1: "3、报价部分（50分）\n3.1 计算报价的偏离情况\n"
+                "4、样品部分（10分）\n1 样品评审 0-10分"}
+    idx = rec._PageIndex(pages)
+    pos_sample = idx.find("1 样品评审 0-10分")
+    assert pos_sample is not None
+    assert idx.category_at(pos_sample) == "technical"
+    # 报价段仍归 price（回归锁）
+    pos_price = idx.find("3.1 计算报价的偏离情况")
+    assert pos_price is not None
+    assert idx.category_at(pos_price) == "price"
+
+
+def test_category_for_group_sample_direct() -> None:
+    from app.rules import reconcile as rec
+
+    assert rec._category_for_group("样品部分", {1: "x"}) == "technical"
+    assert rec._category_for_group("样品评审", {1: "x"}) == "technical"
+
+
+def test_sample_in_total_structure_overrides_three_parts_clause() -> None:
+    """测试12 利群 p112：口径句说三部分，但细则四分部 商务8+技术32+报价50+
+    样品10=100 → 按分部结构计入总分，与口径句冲突必须留痕。"""
+    from app.rules.compiler import enrich_extracted
+    from app.rules.model import ExtractedCriterion
+
+    c = ExtractedCriterion(
+        category="technical", name="样品评审", score_type="subjective",
+        max_score=10, description="样品外观与检测报告评审",
+    )
+    tender = ("投标人的综合得分为以上三部分得分的总和。\n"
+              "五、评标细则\n1、商务部分（8 分）\n2、技术部分（32分）\n"
+              "3、报价部分（50分）\n4、样品部分（10分）")
+    enrich_extracted([c], tender)
+    params = c.params or {}
+    assert params.get("in_total") is True, "细则四分部之和==满分 → 按结构计入"
+    assert params.get("_in_total_conflict"), "与三部分口径句的冲突必须留痕"
+    assert "结构" in (params.get("in_total_basis") or "")
+
+
+def test_sample_in_total_explicit_exclusion_beats_structure() -> None:
+    from app.rules.compiler import enrich_extracted
+    from app.rules.model import ExtractedCriterion
+
+    c = ExtractedCriterion(
+        category="technical", name="样品评审", score_type="subjective",
+        max_score=10, description="样品评审",
+    )
+    tender = ("综合得分为以上三部分得分的总和。样品分单列不计入综合得分。\n"
+              "1、商务部分（8 分）\n2、技术部分（32分）\n"
+              "3、报价部分（50分）\n4、样品部分（10分）")
+    enrich_extracted([c], tender)
+    assert (c.params or {}).get("in_total") is False, "明示排除是最强文本信号"
+
+
+def test_sample_in_total_outside_full_mark_single_listed() -> None:
+    from app.rules.compiler import enrich_extracted
+    from app.rules.model import ExtractedCriterion
+
+    c = ExtractedCriterion(
+        category="technical", name="样品评审", score_type="subjective",
+        max_score=10, description="样品评审",
+    )
+    # 非样品分部之和==100 → 样品在满分构成之外，单列
+    tender = ("综合得分为以上三部分得分的总和。\n"
+              "1、商务部分（10 分）\n2、技术部分（40分）\n"
+              "3、报价部分（50分）\n4、样品部分（10分）")
+    enrich_extracted([c], tender)
+    params = c.params or {}
+    assert params.get("in_total") is False
+    assert "结构" in (params.get("in_total_basis") or "")

@@ -909,6 +909,8 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
         judge_labels = [f"证据簇{i}" for i in range(1, committee_size + 1)]
 
     # ---- 评审结果汇总表（评委矩阵 + 最终得分 + 名次） ----
+    # 陈列序=投标人自然序，≠发布名次：名次只看 rank（None=不发布），
+    # 参考名次（reference_rank）仅供定位，不参与任何排序/推荐。
     summary_rows = []
     for bidder in bidders:
         rk = rank_by_bidder.get(bidder.id, {})
@@ -937,6 +939,9 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
             "provisional_total": rk.get("provisional_total"),
             "incomplete": bool(rk.get("missing_final")) or bool(rk.get("fallback")),
             "rank": rk.get("rank"),
+            # 包B：正式名次（rank）为 None 时的原排序位次——仅供人工定位，
+            # 不构成评审结论；完整运行时 reference_rank == rank。
+            "reference_rank": rk.get("reference_rank"),
             "veto_flag": rk.get("veto_flag", False),
             "has_noncompliance": automated and any(
                 entry[0].machine_status == "fail" and not _is_lightweight(entry[0])
@@ -1032,9 +1037,23 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
     qualification_table = _review_table("qualification")
     compliance_table = _review_table("compliance")
 
-    # ---- 分项得分表（technical/commercial 主观项：因素原文 × 各家 × 评委） ----
+    # ---- 分项得分表（计分类别：因素原文 × 各家 × 评委） ----
+    # 2026-11-23 P2-11 类别缺项防线：原写死 (technical, commercial) 两桶——细则里
+    # 独立分部的类别（如样品评审）一旦落到别的 category 就整类不进报告（测试12
+    # 实证）。改为按规则包实际出现的计分类别动态遍历；资格/符合性/价格各有专表
+    # 不进本表。技术/商务保持原顺序在前，其余按首现顺序追加。
+    _A3_LABELS = {"technical": "技术评审", "commercial": "商务评审"}
+    _A3_SKIP = {"qualification", "compliance", "price"}
+    _cats: list[str] = []
+    for c in criteria:
+        cat = c.category or ""
+        if cat and cat not in _A3_SKIP and cat not in _cats:
+            _cats.append(cat)
+    _ordered = [k for k in ("technical", "commercial") if k in _cats]
+    _ordered += [k for k in _cats if k not in _ordered]
     score_groups = []
-    for cat, label in (("technical", "技术评审"), ("commercial", "商务评审")):
+    for cat in _ordered:
+        label = _A3_LABELS.get(cat, cat)
         crits = [c for c in criteria if c.category == cat]
         if not crits:
             continue
@@ -1257,15 +1276,27 @@ def render_docx(report: dict) -> bytes:
             marks += f"（资格建议：{r['qualification_suggestion']['label']}）"
         if not automated and r["veto_flag"]:
             marks += "（有否决建议）"
+        # 包B：正式名次为 None 时展示参考名次（原排序位次），并显式标注其非结论性。
+        if r.get("rank") is not None:
+            rank_cell = str(r["rank"])
+        elif r.get("reference_rank") is not None:
+            rank_cell = f"参考第{r['reference_rank']}名"
+        else:
+            rank_cell = "-"
         rows.append(
             [r["bidder"], r["bid_price"] or "-", r["price_no_tax"] or "-"]
             + [j["total"] for j in r["judge_totals"]]
-            + [final_cell, str(r["rank"] or "-") + marks]
+            + [final_cell, rank_cell + marks]
         )
     table(headers, rows)
     if any(r.get("incomplete") for r in report["summary_rows"]):
         para("注：以上「最终得分」仅合计已定分格；带「不完整」标注的投标人尚有未定分或故障兜底暂定分格"
              "（见下方兜底分清单），暂定分不是评审结论，不发布最终名次。")
+    if any(r.get("rank") is None and r.get("reference_rank") is not None
+           for r in report["summary_rows"]):
+        # 包B：正式名次未发布时的参考名次口径声明（陈列序≠发布名次）。
+        para("注：表中「参考第N名」为按当前已完成分数（含暂定分/未完成项）的排序位次，"
+             "仅供人工定位，不构成评审结论；正式名次待补评或人工改分后发布。")
     heading("三、" + report["review_notes_title"], 1)
     if not report["review_notes"]:
         para(report["no_review_notes"])
@@ -1284,6 +1315,18 @@ def render_docx(report: dict) -> bytes:
                 # P0-3：读取故障待补读——未定分，既不是 0 分也不是材料缺失。
                 para(f"　· {f['bidder']}：{f['criterion']}（读取故障待补读，未定分；"
                      f"{f.get('machine_message') or '须补读原页图像后重评'}）")
+            elif f.get("final_score") is None:
+                # 已定格未定分族（reading_incomplete 之外：presence_unverified /
+                # sample_volume_unverified / value_extraction_unresolved）——
+                # 不渲染成"当前 None 分"，按未定分口径展示（2026-11-23 包A）。
+                kind_label = {
+                    "presence_unverified": "材料存在性未核验待人工复核",
+                    "sample_volume_unverified": "样品数量未核验待人工复核",
+                    "value_extraction_unresolved": "承诺字段抽取未果，暂定待人工",
+                }.get(f["kind"], f["kind"])
+                msg = f.get("machine_message")
+                para(f"　· {f['bidder']}：{f['criterion']}（{kind_label}，未定分"
+                     + (f"；{msg}" if msg else "") + "）")
             else:
                 para(f"　· {f['bidder']}：{f['criterion']}（当前 {f['final_score']} 分，"
                      f"类型 {f['kind']}）")

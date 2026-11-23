@@ -727,13 +727,52 @@ def enrich_extracted(
         # P1-C.6 样品分总分口径（代际反转实证：老代"四部分总和"样品入总分、
         # 新代"三部分总和"样品单列）——原文口径挂到样品项 params.in_total，
         # ranking 据此决定是否计入总分；无样品项/无口径句 → 不动（默认计入=旧行为）
+        # 2026-11-23 结构优先（测试12 利群实证：p112 口径句说"三部分"，但 p115-119
+        # 细则是 商务8+技术32+报价50+样品10=100 四分部、人工总分含样品——口径句与
+        # 分部结构冲突）：
+        #   ① 明示排除（"样品分单列/不计入综合得分"）→ false（最强文本信号）；
+        #   ② 明示计入（"四部分"）→ true；
+        #   ③ 细则分部声明含样品且各分部之和==满分（默认100）→ 按结构计入，
+        #      与"三部分"句冲突时留痕告警（结构=评分表本身，口径句是通用条文）；
+        #   ④ 只有"三部分"句 → false（原行为）；⑤ 无句 → 不动（默认计入）。
         if "样品" in (c.name or ""):
+            text = tender_text or ""
+            params = dict(c.params or {})
+            m_excl = re.search(
+                r"样品[^。；\n]{0,20}(?:单列|不计入(?:综合得分|总分|得分))", text)
             m_scope = re.search(
-                r"综合得(?:分为|是)?以上\s*([三四])\s*部分得分的总和", tender_text or ""
-            )
-            if m_scope:
-                params = dict(c.params or {})
-                params["in_total"] = m_scope.group(1) == "四"
+                r"综合得(?:分为|是)?以上\s*([三四])\s*部分得分的总和", text)
+            in_total: bool | None = None
+            basis = ""
+            if m_excl:
+                in_total, basis = False, "原文明示样品单列不计入"
+            elif m_scope and m_scope.group(1) == "四":
+                in_total, basis = True, "综合得分四部分口径"
+            else:
+                parts: dict[str, float] = {}
+                for label, val in re.findall(
+                    r"(商务报价|商务技术|商务|技术|价格|报价|资信|样品)"
+                    r"(?:部分|评审)\s*[（(]\s*(?:0\s*[-–—~～至]\s*)?"
+                    r"(\d+(?:\.\d+)?)\s*分", text,
+                ):
+                    parts.setdefault(label, float(val))
+                if "样品" in parts:
+                    m_full = re.search(r"满分\s*[为是]?\s*(\d+(?:\.\d+)?)\s*分", text)
+                    target = float(m_full.group(1)) if m_full else 100.0
+                    if abs(sum(parts.values()) - target) < 1e-6:
+                        in_total, basis = True, "细则分部结构（各分部之和==满分）"
+                        if m_scope and m_scope.group(1) == "三":
+                            params["_in_total_conflict"] = (
+                                "口径句称三部分总和，但细则分部含样品且之和=="
+                                f"{target:g} 分——按分部结构计入总分")
+                    elif abs(sum(v for k, v in parts.items() if k != "样品")
+                              - target) < 1e-6:
+                        in_total, basis = False, "细则分部结构（样品在满分构成之外）"
+            if in_total is None and m_scope:
+                in_total, basis = m_scope.group(1) == "四", "综合得分口径句"
+            if in_total is not None:
+                params["in_total"] = in_total
+                params["in_total_basis"] = basis
                 c.params = params
         if c.category == "price":
             window = _price_window(c, tender_text)
@@ -1315,6 +1354,15 @@ def run_validations(package_id: int) -> list[dict]:
     with session_scope() as s:
         pkg = s.get(RulePackage, package_id)
         source_doc = pkg.source_document_id if pkg else None
+        # ⑬ 分部覆盖检查需要招标文件全文（模板包/法条包 source_doc 为 None → 跳过）
+        doc_text: str | None = None
+        if source_doc is not None:
+            from app.db.models import DocumentPage
+
+            rows = s.execute(
+                select(DocumentPage.text).where(DocumentPage.document_id == source_doc)
+            ).all()
+            doc_text = "\n".join(t or "" for t, in rows)
 
     def _node_exists(node_id: str) -> bool:
         # 法律规则的引用指向法条知识库而非项目文档（设计稿 §4.4）：
@@ -1330,7 +1378,7 @@ def run_validations(package_id: int) -> list[dict]:
                 select(DocNode.id).where(DocNode.document_id == source_doc, DocNode.node_id == node_id)
             ).first() is not None
 
-    findings = run_checks(snapshot, node_exists=_node_exists)
+    findings = run_checks(snapshot, node_exists=_node_exists, document_text=doc_text)
     # Finding.subject_id 是 criterion code（字符串）；落库列是 Integer，
     # 解析成数据库 id，前端才能把 issue 定位到具体规则。
     code_to_id = {c["code"]: c.get("id") for c in criteria}

@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from decimal import Decimal
 from typing import Any, Callable
@@ -113,18 +114,73 @@ def _check_formula_source(c: dict, f: dict, ext: dict, criteria: list[dict]) -> 
     return out
 
 
+# ⑬ 分部声明："4、样品部分（10 分）" / "1、资信部分（8 分）" / "4、样品评审（10 分）"
+# （长前缀优先；区间形态取上界——与 scoring_skeleton._RE_LEDGER 同源口径）
+_RE_PART_DECL = re.compile(
+    r"(商务报价|商务技术|商务|技术|价格|报价|资信|样品)(?:部分|评审)"
+    r"\s*[（(]\s*(?:0\s*[-–—~～至]\s*)?(\d+(?:\.\d+)?)\s*分"
+)
+_PART_CATEGORY = {"商务": "commercial", "技术": "technical",
+                  "价格": "price", "报价": "price"}
+
+
+def _check_part_coverage(document_text: str, criteria: list[dict]) -> list[Finding]:
+    """细则声明的计分分部必须有计分项覆盖（P2-11 类别缺项防线）。
+
+    测试12 实证：细则四分部之一「4、样品部分（10分）」的条目一旦类别错挂/口径
+    错误，报告层整类不展示、总分系统性少计 10 分——此前只有 TOTAL_SCORE（Σ满分
+    ≠100）一条间接防线，条目存在但归错桶时完全漏检。覆盖判定：
+    - 标准分部（商务/技术/价格/报价）按 category 判；
+    - 非标分部（样品/资信/复合组名）按分部名关键词命中计分项文本判——样品条目
+      category 归技术桶，按 category 判会把"缺样品"误判成已覆盖；
+    - 复合组名（商务报价/商务技术）任一组件类别有计分项即算覆盖；
+    - 只判零覆盖（整类缺失，error），部分覆盖不拦。
+    document_text 为 None（模板包/法条包/无源文档）时跳过。
+    """
+    findings: list[Finding] = []
+    scored = [c for c in criteria
+              if c.get("score_type") in ("formula", "count", "subjective")]
+    parts: dict[str, float] = {}
+    for m in _RE_PART_DECL.finditer(document_text):
+        parts.setdefault(m.group(1), float(m.group(2)))
+    for label in parts:
+        if label in _PART_CATEGORY:
+            cat = _PART_CATEGORY[label]
+            covered = any(c.get("category") == cat for c in scored)
+        elif label in ("商务报价", "商务技术"):
+            comp_cats = [_PART_CATEGORY[k] for k in ("商务", "技术", "价格", "报价")
+                         if k in label]
+            covered = any(c.get("category") in comp_cats for c in scored)
+        else:
+            covered = any(
+                label in f"{c.get('name') or ''}{c.get('description') or ''}"
+                         f"{c.get('source_quote') or ''}"
+                for c in scored)
+        if not covered:
+            findings.append(Finding(
+                "PART_COVERAGE", "error",
+                f"细则声明的分部「{label}…（{parts[label]:g} 分）」没有任何计分项覆盖"
+                "——评分类别整类缺失",
+                "package", None,
+                hint="重新编译规则包让对账补齐该分部评分项，或手动新增该分部评分项后重试",
+            ))
+    return findings
+
+
 def run_validators(
     snapshot: dict,
     node_exists: Callable[[str], bool] | None = None,
     *,
     total_max: Decimal | str | int | None = None,
     price_weight_range: tuple[Decimal | str | int, Decimal | str | int] | None = None,
+    document_text: str | None = None,
 ) -> list[Finding]:
     """按顺序跑全部校验器，返回 findings（error 在前）。
 
     total_max / price_weight_range 为可选覆盖（语料库等非完整规则包场景用）；
     缺省时保持原行为：total_max 取 snapshot.package.total_max 或 100，
     price_weight_range 取 (10, 60)。
+    document_text 为招标文件全文（提供时启用 ⑬ 分部覆盖检查；模板/法条包不传）。
     """
     findings: list[Finding] = []
     criteria = snapshot.get("criteria", [])
@@ -438,6 +494,10 @@ def run_validators(
     for c in criteria:
         if c["score_type"] == "subjective":
             findings += _check_level_monotonic(c)
+
+    # ⑬ 分部覆盖（document_text 提供时启用，见 _check_part_coverage）
+    if document_text:
+        findings += _check_part_coverage(document_text, criteria)
 
     # ④ 已并入 ①（闭合检查包含连续性）；这里保留 code 稳定性说明
     errors = [f for f in findings if f.severity == "error"]

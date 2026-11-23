@@ -105,9 +105,12 @@ def _crit_text(c: ExtractedCriterion) -> str:
 SCORING_TYPES = ("formula", "count", "subjective")
 
 # 严格章节标记："X部分（N 分）"（带分值后缀才算；正文"3.3 报价部分。"、"商务技术部分、"不算）
-_RE_SECTION_MARK = re.compile(r"(商务|技术|价格|报价)部分\s*[（(]\s*\d+(?:\.\d+)?\s*分")
+# 样品分部（测试12 利群 p119「4、样品部分（10分）」实证）：骨架 _PART_GROUP 早已
+# 认识样品，这里漏配 → 样品行的类别校正回退到最近的「报价部分」标记被改成 price
+# （报告 P0-3 整类缺失的根因之一）。样品按 2026-11-23 用户拍板归技术桶。
+_RE_SECTION_MARK = re.compile(r"(商务|技术|价格|报价|样品)部分\s*[（(]\s*\d+(?:\.\d+)?\s*分")
 _SECTION_CAT = {"商务": "commercial", "技术": "technical",
-                "价格": "price", "报价": "price"}
+                "价格": "price", "报价": "price", "样品": "technical"}
 
 
 class _PageIndex:
@@ -167,18 +170,25 @@ def _category_for_row(row: SkeletonRow, index: "_PageIndex") -> str | None:
 # ---------------------------------------------------------------------------
 
 def _category_for_group(group: str, pages_by_no: dict[int, str]) -> str:
-    """按「商务/技术/报价部分」标题在全文中的位置给组定类别。"""
+    """按「商务/技术/报价部分」标题在全文中的位置给组定类别。
+
+    样品组名（「样品部分」「样品评审」）直接归技术桶（2026-11-23 用户拍板：
+    样品评审放在技术分之下）——不再回退到位置上最近的「报价部分」标记。
+    """
+    if group and "样品" in group:
+        return "technical"
     full = "\n".join(t for _, t in sorted(pages_by_no.items()))
     full_n = _norm(full)
     gpos = full_n.find(_norm(group))
     best, best_pos = "technical", -1
-    for m in re.finditer(r"(商务|技术|价格|报价)部分", full):
+    for m in re.finditer(r"(商务|技术|价格|报价|样品)部分", full):
         label = m.group(1)
         pos = len(_norm(full[: m.start()]))
         if pos <= gpos and pos > best_pos:
             best_pos = pos
             best = {"商务": "commercial", "技术": "technical",
-                    "价格": "price", "报价": "price"}[label]
+                    "价格": "price", "报价": "price",
+                    "样品": "technical"}[label]
     return best
 
 

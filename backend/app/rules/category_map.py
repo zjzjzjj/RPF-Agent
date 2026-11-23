@@ -29,7 +29,12 @@ log = logging.getLogger("bid_eval.rules.category_map")
 CATEGORY_KEYWORDS: list[tuple[str, tuple[str, ...]]] = [
     ("price", ("报价部分", "价格部分", "报价评分", "报价分", "价格分", "投标报价得分", "评审价格")),
     ("commercial", ("商务部分", "商务分", "商务标", "商务项")),
-    ("technical", ("技术部分", "技术分", "技术标", "技术项", "服务部分")),
+    ("technical", ("技术部分", "技术分", "技术标", "技术项", "服务部分",
+                   # 样品分部归技术桶（2026-11-23 用户拍板：样品评审放在技术分之下；
+                   # 测试12 利群 p119「4、样品部分（10分）」——不加词表时节点标题/
+                   # 引文回扫都认不出样品章节，落回 LLM 自报的 price）。
+                   # 只收"章节标题化"的形态，避免正文「投标样品要求」等误触发。
+                   "样品部分", "样品评审")),
     ("qualification", ("资格审查", "资格要求", "资格条件", "资格文件", "资格性")),
     ("compliance", ("符合性审查", "符合性", "响应性审查", "形式审查")),
 ]
@@ -135,9 +140,9 @@ def load_page_texts(document_id: int, around: set[int] | None = None) -> list[tu
 # 多分部节点判定：节点正文含 ≥2 个不同「X部分（N分）」章节标记时，节点标题只
 # 描述了首个分部（真实文档节点切分会把商务表与技术表并在同一节点）——该节点
 # 不再作 category 权威，退回引文位置通道；引文通道也给不出类别时保持 LLM 原值。
-_RE_SECTION_PART = re.compile(r"(商务|技术|价格|报价)部分\s*[（(]\s*\d+(?:\.\d+)?\s*分")
+_RE_SECTION_PART = re.compile(r"(商务|技术|价格|报价|样品)部分\s*[（(]\s*\d+(?:\.\d+)?\s*分")
 _SECTION_PART_CAT = {"商务": "commercial", "技术": "technical",
-                     "价格": "price", "报价": "price"}
+                     "价格": "price", "报价": "price", "样品": "technical"}
 
 
 def node_part_categories(text: str | None) -> set[str]:

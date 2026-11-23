@@ -91,4 +91,54 @@ def test_prompt_match_wording_fixed_and_version_bumped() -> None:
     assert "match（满足条件得分）" not in p, "误导措辞必须移除（把计分行推向 match 的病根）"
     assert "match" in p and "不计分" in p
     assert "权重表" in p and "禁止抽成 criterion" in p
-    assert config.llm_prompt_version() == "2026-11-18.1"
+    assert config.llm_prompt_version() == "2026-11-19.1"
+
+
+# --- ⑬ 分部覆盖（P2-11 类别缺项防线，测试12 样品整类缺失实证） ---------------
+
+_PART_DOC = ("1、商务部分（8 分）\n2、技术部分（32分）\n"
+             "3、报价部分（50分）\n4、样品部分（10分）")
+
+
+def _base_crits():  # noqa: ANN202
+    return [
+        _crit(code="c1", name="供货业绩", category="commercial", max_score="8"),
+        _crit(code="c2", name="技术方案", category="technical", max_score="32"),
+        _crit(code="c3", name="报价得分", category="price",
+              score_type="formula", max_score="50"),
+    ]
+
+
+def test_part_coverage_sample_missing_is_error() -> None:
+    findings = run_validators(
+        {"package": {"total_max": 100}, "criteria": _base_crits()},
+        document_text=_PART_DOC)
+    f = next((x for x in findings if x.code == "PART_COVERAGE"), None)
+    assert f is not None, "样品部分声明了分值却零覆盖 → 必须报错"
+    assert f.severity == "error"
+    assert "样品" in f.message
+
+
+def test_part_coverage_sample_present_passes() -> None:
+    crits = _base_crits() + [
+        _crit(code="c4", name="样品评审", category="technical", max_score="10")]
+    findings = run_validators(
+        {"package": {"total_max": 100}, "criteria": crits},
+        document_text=_PART_DOC)
+    assert "PART_COVERAGE" not in {f.code for f in findings}
+
+
+def test_part_coverage_standard_part_missing_is_error() -> None:
+    crits = [c for c in _base_crits() if c["category"] != "commercial"] + [
+        _crit(code="c4", name="样品评审", category="technical", max_score="10")]
+    findings = run_validators(
+        {"package": {"total_max": 100}, "criteria": crits},
+        document_text=_PART_DOC)
+    f = next((x for x in findings if x.code == "PART_COVERAGE"), None)
+    assert f is not None and "商务" in f.message
+
+
+def test_part_coverage_skipped_without_document_text() -> None:
+    findings = run_validators(
+        {"package": {"total_max": 100}, "criteria": _base_crits()})
+    assert "PART_COVERAGE" not in {f.code for f in findings}

@@ -320,3 +320,27 @@ def test_normalize_multi_part_node_keeps_llm_category(client) -> None:  # noqa: 
     assert stats["category_corrected"] == 0
     with session_scope() as s:
         assert s.get(Criterion, crit_id).category == "technical"
+
+
+# --- 2026-11-23 样品分部归技术桶（测试12 利群 p119「4、样品部分（10分）」） -------
+
+def test_category_from_titles_sample_part() -> None:
+    assert category_map.category_from_titles(["4、样品部分（10 分）"]) == "technical"
+    assert category_map.category_from_titles(["4、样品评审（10 分）"]) == "technical"
+    # 裸"样品"不进词表：用户需求章节「九、投标样品要求」不是评分分部标题
+    assert category_map.category_from_titles(["九、投标样品要求"]) is None
+
+
+def test_category_from_quote_position_sample_section() -> None:
+    pages = [
+        (119, "3、报价部分（50分）\n3.1 计算报价的偏离情况\n4、样品部分（10分）\n"
+              "序号 评审项目 分值 评审细则\n1 样品评审 0-10分"),
+    ]
+    cat = category_map.category_from_quote_position(pages, "1 样品评审 0-10分", 119)
+    assert cat == "technical", "回扫最近标题必须命中样品部分，而非落回报价部分"
+
+
+def test_node_part_categories_recognizes_sample() -> None:
+    cats = category_map.node_part_categories(
+        "2、技术部分（32分）……3、报价部分（50分）……4、样品部分（10分）")
+    assert "technical" in cats and "price" in cats
