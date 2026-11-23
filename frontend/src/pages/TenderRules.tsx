@@ -1000,7 +1000,7 @@ export default function TenderRules() {
           </Form.Item>
           <Form.Item
             name="score_column"
-            label="文件口径（主/客观分列值）"
+            label="主/客观分列值"
             extra="严格取评标文件「主/客观分」列值；文件无该列不选（显示「—」，不推断）。"
           >
             <Select
@@ -1150,7 +1150,7 @@ function CriterionModal({
           <Tag>页码：{criterion.source_page ?? "未定位"}</Tag>
           <Tag>条款：{criterion.source_node_id ?? "未定位"}</Tag>
           <Tag color={criterion.score_column === "subjective" ? "magenta" : criterion.score_column === "objective" ? "green" : "default"}>
-            文件口径：{criterion.score_column === "subjective" ? "主观" : criterion.score_column === "objective" ? "客观" : "—"}
+            {criterion.score_column === "subjective" ? "主观" : criterion.score_column === "objective" ? "客观" : "—"}
           </Tag>
           {criterion.confidence != null && <Tag>抽取置信度 {Math.round(criterion.confidence * 100)}%</Tag>}
         </Space>
@@ -1182,7 +1182,7 @@ function CriterionModal({
         </Form.Item>
         <Form.Item
           name="score_column"
-          label="文件口径（主/客观分列值）"
+          label="主/客观分列值"
           extra="严格取评标文件「主/客观分」列值；清空=文件无该列（显示「—」，不推断）。"
           style={{ width: 320 }}
         >

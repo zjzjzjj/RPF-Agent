@@ -199,7 +199,7 @@ export default function RuleList({
                     <Tag>{CATEGORY_LABELS[c.category] ?? c.category}</Tag>
                     <Tooltip title={c.score_column_source === "inferred" ? "推断值，非评标文件列值" : c.score_column_source === "llm_copy" ? "LLM 照抄评标文件列值" : c.score_column_source === "file" ? "评标文件「主/客观分」列值" : "评标文件无「主/客观分」列"}>
                       <Tag color={c.score_column === "subjective" ? "magenta" : c.score_column === "objective" ? "green" : "default"}>
-                        口径：{c.score_column === "subjective" ? "主观" : c.score_column === "objective" ? "客观" : "—"}
+                        {c.score_column === "subjective" ? "主观" : c.score_column === "objective" ? "客观" : "—"}
                       </Tag>
                     </Tooltip>
                     {c.is_veto ? (

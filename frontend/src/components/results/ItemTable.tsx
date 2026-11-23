@@ -87,12 +87,12 @@ export default function ItemTable({ bucket, onOpenReason, onOpenEvidence, onView
         { title: "编号", dataIndex: "code", width: 76, fixed: "left" as const },
         { title: "评分项", dataIndex: "name", width: 190, ellipsis: true },
         {
-          title: "评审方式｜口径",
+          title: "评审方式",
           width: 168,
           render: (_, item) => (
             <>
               <Tag color={METHOD_COLOR[item.scoring_method] ?? "default"}>{item.scoring_method}</Tag>
-              <Tag color={BASIS_COLOR[item.scoring_basis] ?? "default"}>口径：{item.scoring_basis}</Tag>
+              <Tag color={BASIS_COLOR[item.scoring_basis] ?? "default"}>{item.scoring_basis}</Tag>
             </>
           ),
         },
