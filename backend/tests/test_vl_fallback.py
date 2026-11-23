@@ -39,7 +39,7 @@ PAGE_IMAGES = [
     {"data_url": "data:image/png;base64,CC", "document_id": 1, "page_no": 3},
 ]
 
-CRIT = {"name": "供货业绩", "description": "每提供1个案例得2分，最高6分", "max_score": "6",
+CRIT = {"name": "供货业绩", "description": "每提供1个案例得2分，最高6分；须提供业绩证明及近六个月社保缴纳证明", "max_score": "6",
         "score_type": "count"}
 VERDICT_CRIT = {"name": "签章检查", "description": "投标文件须加盖公章", "score_type": "veto"}
 
@@ -375,8 +375,10 @@ def test_maybe_vl_rescue_material_pages_first(tmp_path, monkeypatch) -> None:  #
                                  {2: (pages, "synthetic")}, vl_fallback.Budget())
     assert out is fb
     order = [p["page_no"] for p in captured["pages"]]
-    # 材料标签页(5,2) → 关键词页(4) → 其余(3) → 噪声(1,6)；同档内页序
-    assert order[:2] == [2, 5], f"材料标签页应最前：{order}"
-    assert order[2] == 4, f"关键词命中页次之：{order}"
-    assert order[-1] in (1, 6), f"噪声页垫底：{order}"
-    assert order.index(1) > order.index(3), f"目录页在普通页之后：{order}"
+    # CRIT=供货业绩（锚词含 业绩/案例/证明）：
+    # 锚词命中倒序：4（业绩+社保+证明=3击）→ 5（社保证明=2击）→ 2/3（0击，
+    # 有标签的2先于无标签3）→ 噪声(1,6)垫底。run154 实证：仅按页序会让
+    # 文档最前的资格页占满名额，p200 的业绩页进不来。
+    assert order[:2] == [4, 5], f"该格锚词命中页应最前：{order}"
+    assert order[2:4] == [2, 3], f"零命中时有标签先于无标签：{order}"
+    assert order[4:] == [1, 6], f"噪声页垫底且保页序：{order}"

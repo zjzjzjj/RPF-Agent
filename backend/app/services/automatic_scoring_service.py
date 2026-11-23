@@ -1345,21 +1345,24 @@ def _maybe_vl_rescue(run_id: int, bid_id: int, criterion: dict,
                                             "stored_path": up.get("stored_path"),
                                             "sha256": up.get("sha256")})
                 named_keys.append(key)
-    def _vl_rank(pg: dict) -> tuple[int, int]:
-        """run153 实证：送审窗口选到的是封面/索引（索引中毒在 VL 路径重演），
-        模型反复"8 页均为封面目录，未见材料"弃权。候选页三档排序（与
-        _supplement_pages._rank 同口径，复用 material_tags 解析期分类）：
-        0=带材料标签的实体页 / 1=材料关键词命中页 / 2=其余 / 3=结构性噪声页垫底。
-        稳定排序保证同档内保持页序；纯文本计算，零 OCR。"""
-        tags = pg.get("material_tags") or []
-        if _is_noise_page(pg):
-            return (3, int(pg.get("page_no") or 0))
-        if tags:
-            return (0, int(pg.get("page_no") or 0))
-        text = str(pg.get("text") or "")[:300]
-        if any(k in text for k in _SUPPLEMENT_HINTS):
-            return (1, int(pg.get("page_no") or 0))
-        return (2, int(pg.get("page_no") or 0))
+    crit_text = (str(criterion.get("name") or "") + str(criterion.get("description") or "")
+                 + str(criterion.get("quote") or "") + str(criterion.get("required_evidence") or ""))
+    # 该格自己的材料锚词（细则里出现的合同/社保/业绩/证书…）——run154 实证：
+    # 仅按"有标签+页序"排序时，文档最前的资格页（营业执照/信用报告，同为
+    # material_tags）占满 8 图名额，p200 的业绩合同永远进不来，模型仍弃权。
+    crit_anchors = [a for a in _SUPPLEMENT_HINTS if a in crit_text]
+
+    def _vl_rank(pg: dict) -> tuple[int, int, int, int]:
+        """候选页排序：噪声垫底 → 该格锚词命中数倒序 → 有标签优先 → 页序。
+
+        锚词命中把"本条细则要的材料页"顶到前面（业绩/社保/合同页 > 资格页）；
+        纯文本计算（material_tags 解析期分类 + 文本层关键词），零 OCR。
+        """
+        tags = [str(t) for t in (pg.get("material_tags") or [])]
+        noise = 1 if _is_noise_page(pg) else 0
+        hay = " ".join(tags) + " " + str(pg.get("text") or "")[:500]
+        hits = sum(1 for a in crit_anchors if a in hay)
+        return (noise, -hits, 0 if tags else 1, int(pg.get("page_no") or 0))
 
     rest = [q for k, q in candidates.items() if k not in set(named_keys)]
     rest.sort(key=_vl_rank)
