@@ -23,15 +23,11 @@ type AxisCounts = { subj: number; obj: number; un: number; ai: number; rule: num
 
 function AxisBadges({ counts }: { counts: AxisCounts | null }) {
   if (!counts) return null;
+  // 2026-11-23 用户拍板：桶卡只显示口径构成（主/客/—），不显示 AI/规则/混合
   const axis = [
     counts.subj ? `主 ${counts.subj}` : "",
     counts.obj ? `客 ${counts.obj}` : "",
     counts.un ? `— ${counts.un}` : "",
-  ].filter(Boolean).join("·");
-  const method = [
-    counts.ai ? `AI ${counts.ai}` : "",
-    counts.rule ? `规则 ${counts.rule}` : "",
-    counts.mixed ? `混合 ${counts.mixed}` : "",
   ].filter(Boolean).join("·");
   return (
     <span
@@ -45,7 +41,7 @@ function AxisBadges({ counts }: { counts: AxisCounts | null }) {
         background: "#fff",
       }}
     >
-      {axis || "—"}｜{method || "—"}
+      {axis || "—"}
     </span>
   );
 }
