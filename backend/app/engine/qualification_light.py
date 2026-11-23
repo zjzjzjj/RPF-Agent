@@ -6,18 +6,22 @@ Qualification/eligibility is deliberately *not* a deep review here:
 - no OCR, no images, no per-criterion review loop;
 - conclusions are advisory only and never block scoring, ranking or price.
 
-Statuses are intentionally distinct from the scoring vocabulary and are
-**tristate since schema v2** (2026-11-16): every clause settles as
-``pass`` / ``fail`` / ``concern`` — a deterministic suggestion is always
-produced and ``not_deeply_reviewed`` is gone from the producing side
-(legacy rows keep the status for display only).
+**Binary reject-screen since schema v3** (2026-11-23, 决策 0017): every clause
+settles as ``pass`` / ``fail`` — displayed 通过 / 存疑（建议否决，需人工确认）.
+``pass`` means "no definite reject point found" (未见确定性否决点), *not*
+"conformity confirmed"; ``fail`` means "a definite reject point was found"
+and is only a rejection *suggestion* (AI 不裁决否决，不阻断计分/排名/价格).
 
-Reject discipline ("AI 尽量不否决，宁存疑不错杀"):
-- a deterministic hard fail (date out of window, threshold unmet, ...) → ``fail``;
-- an LLM screen may reject **only** with verbatim counter-evidence that is
-  re-verified locally against the reviewed pages; missing / unreadable /
-  unextractable material is always ``concern``, never ``fail``;
-- an unverifiable or absent counter-quote degrades the reject to ``concern``.
+Reject points come from affirmative counter-facts only (误否决绝对不可接受):
+- deterministic fact contradictions — extracted value/date/count/math vs the
+  frozen rule text — → ``fail`` (reject_source=deterministic);
+- an LLM screen may suggest reject **only** with verbatim counter-evidence
+  re-verified locally against the reviewed pages (reject_source=llm).
+
+Everything else falls to ``pass``: 材料/短语未见（缺证据≠不符合）, scanned
+pages, visual/external items (签章、密封、递交时间…), quick-screen failure,
+unverified reject quotes — none of these may suggest rejection. Legacy v1/v2
+rows (pass/fail/concern/not_deeply_reviewed) keep their display unchanged.
 """
 from __future__ import annotations
 
@@ -30,19 +34,20 @@ from app import config
 from app.engine.facts import BidFacts, extract_bid_facts
 from app.engine.objective import run_check
 
-SCHEMA_VERSION = 2
-PROMPT_VERSION = "2026-11-16.qual-light.2"
+SCHEMA_VERSION = 3
+PROMPT_VERSION = "2026-11-23.qual-light.3"
 RULE_TEXT_LIMIT = 300
 MAX_REJECT_QUOTES = 5
 
-SYSTEM_PROMPT = """你是招标评审的资格/符合性轻量预检助手。这不是完整资格审查，只做一次合并快审。
+SYSTEM_PROMPT = """你是招标评审的资格/符合性轻量预检助手。这不是完整资格审查，只做一次合并快审，目标是筛查"确定性否决点"。
+你的结论中只有 reject 会被采纳为"建议否决（存疑，需人工确认）"；pass/concern 仅作人工参考线索，不构成资格结论。
 输入包含：投标人结构化事实、已解析的投标文件页面文本（可能是节选）、待审条款列表。
 对每个条款 code 输出且只输出一个 status：
-- pass：材料/事实初步支持符合；
-- concern：存在疑点、信息不足、材料缺失、无法读取或需要人工核对；
+- pass：材料/事实初步支持符合，或未见反面事实；
+- concern：存在疑点但拿不出逐字反面原文、信息不足、材料缺失、无法读取或需要人工核对；
 - reject：材料中存在明确反面事实、可逐字引用原文证明不符合（如资质等级低于要求、承诺明确不满足条款原文）。
-否决必须极度克制、宁存疑不错杀：只有反面事实清晰无歧义、且能给出逐字反面原文时才可 reject；
-材料缺失、抽取不到、扫描件不可读、仅有推断或无法确定，一律 concern，绝不 reject。
+reject 标准必须极度克制、宁漏勿错杀（误否决绝对不可接受）：只有反面事实清晰无歧义、且能给出逐字反面原文时才可 reject；
+材料缺失、抽取不到、扫描件不可读、仅有推断或无法确定，一律不得 reject（缺证据≠不符合）。
 reject 必须附 evidence 数组：反面原文逐字摘录（≥10 字，不得改写、不得编造、不得省略号截断关键断言），
 每条含 quote、document_id、page_no（照抄输入 pages 中的值）；引文必须能在输入页面文本中逐字找到。
 禁止编造原文、材料或页码；目录、模板、投标人自述不能当作证明材料。
@@ -79,7 +84,7 @@ class _QuickReview(BaseModel):
 
 @dataclass
 class LightResult:
-    status: str                    # pass|fail|concern（三态；not_deeply_reviewed 仅历史数据）
+    status: str                    # pass|fail（二值：pass=未见确定性否决点；fail=存疑/建议否决，需人工确认）
     reason: str
     deterministic: str = "unknown"  # pass|fail|concern|unknown
     quick: str = "skipped"          # pass|concern|reject|unknown|skipped|failed
@@ -87,6 +92,7 @@ class LightResult:
     input_complete: bool = True
     reject_source: str = ""         # ""|deterministic|llm
     evidence_items: list = field(default_factory=list)  # llm 否决的已逐字核验反面引文
+    needs_human_check: bool = False  # pass 格里"AI 未真正查验"的（签章/未覆盖/快审失败/引文未核验）
 
 
 _DETERMINISTIC_CHECKS = ("document_present", "contains_phrase", "value_in_range",
@@ -163,7 +169,7 @@ def _build_pages_digest(criteria: list[dict], pages: list[dict], budget: int) ->
         seen: set[tuple[int, int]] = set()
         chosen = []
         for criterion in criteria:
-            for page in select_candidate_pages(criterion, ordered, max_pages=4):
+            for page in select_candidate_pages(criterion, ordered, max_pages=6):
                 key = (int(page["document_id"]), int(page["page_no"]))
                 if key not in seen:
                     seen.add(key)
@@ -280,7 +286,7 @@ def review_bidder_qualification(criteria: list[dict], pages: list[dict], data_cl
         visual = _is_visual_requirement(criterion)
         external = is_external_requirement(criterion)
         results[code] = LightResult(
-            status="concern",
+            status="pass",  # 占位；第二循环归并必覆盖（二值：pass|fail）
             reason="",
             deterministic=det,
             quick="skipped",
@@ -320,7 +326,7 @@ def review_bidder_qualification(criteria: list[dict], pages: list[dict], data_cl
                 elif raw == "reject":
                     status = "reject"
                 else:
-                    # unknown / 乱码 / 旧词一律安全侧存疑（绝不放行成 pass 或 reject）
+                    # unknown / 乱码 / 旧词一律降为 concern 线索（归并阶段只作参考，不作为否决点）
                     status = "concern"
                 evidence = [
                     {"quote": e.quote, "document_id": e.document_id, "page_no": e.page_no}
@@ -343,55 +349,64 @@ def review_bidder_qualification(criteria: list[dict], pages: list[dict], data_cl
 
         visual = _is_visual_requirement(criterion)
         external = is_external_requirement(criterion)
+        # 二值化（决策 0017）：fail=发现确定性否决点（显示"存疑/建议否决"，需人工确认）；
+        # 其余一律 pass=未见确定性否决点。缺证据、看不见、核验不了都不作为否决依据。
         if result.deterministic == "fail":
-            # 确定性硬性不符 → 建议否决（仅报告，不阻断计分/排名）
+            # 提取事实与规则原文矛盾（数值门槛/有效期越窗/计数不足）→ 确定性否决点
             result.status = "fail"
             result.reject_source = "deterministic"
-            result.reason = "确定性预检不符合（建议否决，仅报告，不阻断计分/排名）：" + result.reason
+            result.reason = "建议否决（仅建议，需人工确认，不阻断计分/排名）：事实与规则原文矛盾——" + result.reason
         elif result.deterministic == "concern":
-            result.status = "concern"
-            result.reason = "确定性预检存在冲突，建议人工核对：" + result.reason
+            # 仅 math_relation 会走到这里：报价大小写/分项合计矛盾（不自动选边，但矛盾本身是反面事实）
+            result.status = "fail"
+            result.reject_source = "deterministic"
+            result.reason = "建议否决（仅建议，需人工确认，不阻断计分/排名）：数学关系矛盾——" + result.reason
         elif visual or external:
-            # 需要原件/视觉/外部记录的事项 AI 不下结论 → 存疑（不是“未深评”）
-            result.status = "concern"
-            result.reason = ("存疑（需人工核对原件/视觉/外部记录）：" + result.reason)[:500]
+            # 签章/原件/视觉/外部记录事项 AI 不查验 → 未见否决点，需人工核对
+            result.status = "pass"
+            result.needs_human_check = True
+            result.reason = "通过（未见确定性否决点）：签章/原件/视觉/外部记录事项 AI 不查验，需人工核对"
         elif result.deterministic == "pass":
             result.status = "pass"
-            result.reason = "确定性预检通过（轻量预检，未做完整资格审查）"
+            result.reason = "通过（确定性预检符合，轻量预检，不构成完整资格审查）"
         elif quick_status == "reject":
             verified = _verified_counter_quotes(quick_evidence, pages)
             if verified:
                 result.status = "fail"
                 result.reject_source = "llm"
                 result.evidence_items = verified
-                result.reason = ("快审发现明确反面事实（建议否决，仅报告，不阻断计分/排名）："
+                result.reason = ("建议否决（仅建议，需人工确认，不阻断计分/排名）：快审发现明确反面事实——"
                                  + quick_reason[:400])
             else:
-                # 反面引文缺失/无法逐字核验（可能编造）→ 降级存疑，绝不放行成否决
-                result.status = "concern"
-                result.reason = "快审拟判不符合但反面引文未能逐字核验，降级存疑：" + quick_reason[:400]
-        elif quick_status == "pass":
-            if input_complete:
+                # 反面引文缺失/无法逐字核验（可能编造）→ 不作为否决点，线索保留
                 result.status = "pass"
-                result.reason = "轻量快审通过（仅基于已解析材料，不构成完整审查）：" + quick_reason[:400]
-            else:
-                result.status = "concern"
-                result.reason = "仅节选材料快审通过，存疑待人工核对：" + quick_reason[:400]
+                result.needs_human_check = True
+                result.reason = ("通过（未见确定性否决点）：快审拟判不符合但反面引文未能逐字核验，"
+                                 "线索保留——" + quick_reason[:400])
+        elif quick_status == "pass":
+            result.status = "pass"
+            # 节选 pass 的覆盖有限：结论仍是 pass，但归入待人工核对（误放须可见）
+            result.needs_human_check = not input_complete
+            cover = "" if input_complete else "（材料为节选，快审覆盖有限）"
+            result.reason = "通过（未见确定性否决点）：轻量快审未发现反面事实" + cover + "——" + quick_reason[:300]
         elif quick_status == "concern":
-            result.status = "concern"
-            result.reason = "轻量快审存疑：" + quick_reason[:400]
+            result.status = "pass"
+            # 存疑线索保留 → 待人工核对（prompt 本身就要求"需要人工核对"落 concern）
+            result.needs_human_check = True
+            result.reason = "通过（未见确定性否决点）：快审存疑线索但无确凿反面事实，线索保留——" + quick_reason[:300]
         else:
-            # 兜底：快审失败/未给出结论/未覆盖 → 一律存疑，不再产生“未深评”
-            result.status = "concern"
+            # 兜底：快审失败/未给出结论/未覆盖 → 未见否决点，不提出否决
+            result.status = "pass"
+            result.needs_human_check = True
             if quick_state == "failed":
-                detail = "快审调用失败"
+                detail = "快审调用失败，未能核查"
             elif quick_state == "skipped":
                 detail = "快审未执行"
             elif not input_complete:
-                detail = "材料为节选"
+                detail = "材料为节选，快审覆盖有限"
             else:
                 detail = "快审未给出结论"
-            result.reason = f"存疑（{detail}）：" + result.reason
+            result.reason = f"通过（未见确定性否决点）：{detail}，未提出否决"
 
     return results
 
@@ -408,4 +423,5 @@ def cell_payload(result: LightResult) -> dict:
         "method": "deterministic+quick",
         "reject_source": result.reject_source or None,
         "reject_quotes": result.evidence_items,
+        "needs_human_check": result.needs_human_check,
     }

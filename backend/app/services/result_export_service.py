@@ -53,6 +53,8 @@ def export_results_csv(run_id: int) -> str:
         verdicts = {"pass": "符合", "fail": "不符合", "unverifiable": "现有材料无法证实"}
         light_verdicts = {"pass": "通过", "fail": "建议否决",
                           "concern": "存疑", "not_deeply_reviewed": "未深评"}
+        # 二值化（决策 0017，schema v3）：fail 显示"存疑"（建议否决语义在理由列）
+        light_verdicts_v3 = {"pass": "通过", "fail": "存疑"}
         for bidder in manifest["bidders"]:
             for criterion in manifest["criteria"]:
                 key = (int(bidder["id"]), int(criterion["id"]))
@@ -60,7 +62,11 @@ def export_results_csv(run_id: int) -> str:
                 meta = ((row.ai_raw_json or {}).get("auto_review") or {}) if row else {}
                 completed = key in valid
                 status = "已完成" if completed else "故障跳过" if meta.get("state") == "failed" and state["failure_policy"] == "continue" else "执行失败" if meta.get("state") == "failed" else "未完成"
-                labels = light_verdicts if meta.get("basis") == "lightweight" else verdicts
+                light_payload = meta.get("lightweight") if isinstance(meta.get("lightweight"), dict) else {}
+                if meta.get("basis") == "lightweight":
+                    labels = light_verdicts_v3 if light_payload.get("schema_version") == 3 else light_verdicts
+                else:
+                    labels = verdicts
                 writer.writerow([_text(bidder["name"]), _text(criterion.get("code")), _text(criterion.get("name")),
                                  criterion.get("max_score"), str(row.final_score) if completed and row.final_score is not None else "",
                                  labels.get(row.machine_status, row.machine_status) if completed else "", status,

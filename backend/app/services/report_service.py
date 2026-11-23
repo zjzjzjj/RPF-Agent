@@ -70,17 +70,40 @@ AUTOMATIC_REVIEW_METHOD = _METHOD_HEAD + _METHOD_QUAL_DEEP + _METHOD_TAIL
 
 
 QUALIFICATION_LIGHT_METHOD = (
-    "资格与符合性采用确定性预检与每家投标人一次轻量快审，"
-    "每条给出通过/建议否决/存疑三态结论，并按项汇总每家资格建议；"
-    "建议否决仅来自确定性硬性不符或附逐字反面引文的快审结论，"
-    "材料缺失/不可读一律存疑。"
+    "资格与符合性采用确定性预检与每家投标人一次轻量快审，做否决点筛查："
+    "每条给出通过/存疑二值结论——通过表示未发现确定性否决点（不等于确认符合），"
+    "存疑表示发现确定性不符事实、建议否决，须人工确认"
+    "（2026-11-23 起；此前运行为通过/建议否决/存疑三态）。"
+    "建议否决仅来自事实矛盾型确定性预检不符，或附逐字反面引文且经本地核验的快审结论；"
+    "材料缺失/不可读/签章类事项一律不作为否决依据。"
     "结论仅作报告提示，不构成完整资格审查，不阻断计分、排名与价格基准价。"
 )
 
 
-def _report_verdict(status: str | None, automated: bool, lightweight: bool = False) -> str:
+def _light_schema(score) -> int | None:
+    """轻量 payload 的 schema_version（v3=二值化；v1/v2=旧显示口径）。"""
+    light = ((score.ai_raw_json or {}).get("auto_review") or {}).get("lightweight")
+    if isinstance(light, dict) and isinstance(light.get("schema_version"), int):
+        return light["schema_version"]
+    return None
+
+
+def _needs_human_check(score) -> bool:
+    """轻量 v3 格是否属"AI 未真正查验"（签章/未覆盖/快审失败/引文未核验）。"""
+    light = ((score.ai_raw_json or {}).get("auto_review") or {}).get("lightweight")
+    return bool(light.get("needs_human_check")) if isinstance(light, dict) else False
+
+
+def _report_verdict(status: str | None, automated: bool, lightweight: bool = False,
+                    light_schema: int | None = None) -> str:
     if automated:
         if lightweight:
+            if light_schema == 3:
+                # 二值化（决策 0017）：fail 显示"存疑"（建议否决语义在理由里），不写"不通过/建议否决"
+                return {
+                    "pass": "通过", "fail": "存疑",
+                    "execution_failed": "评审执行失败",
+                }.get(status or "", "存疑")
             return {
                 "pass": "通过", "fail": "建议否决",
                 "concern": "存疑", "not_deeply_reviewed": "未深评",  # legacy v1 行
@@ -93,9 +116,12 @@ def _report_verdict(status: str | None, automated: bool, lightweight: bool = Fal
     return MACHINE_VERDICT_LABELS.get(status or "", status or "-")
 
 
-def _report_method(score_type: str, automated: bool, lightweight: bool = False) -> str:
+def _report_method(score_type: str, automated: bool, lightweight: bool = False,
+                   light_schema: int | None = None) -> str:
     if automated:
         if lightweight and score_type in ("veto", "match"):
+            if light_schema == 3:
+                return "确定性预检 + 单次轻量快审（二值否决点筛查：通过=未见确定性否决点，存疑=建议否决）"
             return "确定性预检 + 单次轻量快审（三态结论，不构成完整审查）"
         return {
             "subjective": "AI 按细则评分",
@@ -597,7 +623,8 @@ def build_report(project_id: str, run_id: int | None = None) -> dict:
                     "is_veto": frozen.get("score_type", crit.score_type) == "veto",
                     "is_verdict": frozen.get("score_type", crit.score_type) in ("veto", "match"),
                     "machine_status": score.machine_status,
-                    "verdict": _report_verdict(score.machine_status, automated, _is_lightweight(score)),
+                    "verdict": _report_verdict(score.machine_status, automated, _is_lightweight(score),
+                                               light_schema=_light_schema(score)),
                     "reasoning": _report_reasoning(score, automated) if automated or score.ai_revealed_at is not None or score.review_status in SETTLED_STATUSES else None,
                     "auto_review": auto_review,
                     "auto_completed": cell_completed,
@@ -956,6 +983,8 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
             "qualification_suggestion": derive_qualification_suggestion([
                 {"score_type": crit.score_type,
                  "lightweight": _is_lightweight(e[0]) if e is not None else False,
+                 "lightweight_schema_version": _light_schema(e[0]) if e is not None else None,
+                 "needs_human_check": _needs_human_check(e[0]) if e is not None else None,
                  "machine_status": e[0].machine_status if e is not None else None}
                 for crit in criteria if crit.score_type in ("veto", "match")
                 for e in [score_by_key.get((bidder.id, crit.id))]
@@ -987,7 +1016,8 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
                 "criterion": crit.name,
                 "category": CATEGORY_LABELS.get(crit.category, crit.category),
                 "final": str(score.final_score) if score.final_score is not None else None,
-                "verdict": _report_verdict(score.machine_status, automated, _is_lightweight(score)),
+                "verdict": _report_verdict(score.machine_status, automated, _is_lightweight(score),
+                                           light_schema=_light_schema(score)),
                 "reason": reason[:500],
             })
         if items:
@@ -1023,7 +1053,8 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
                             reason = str(w["message"])
                             break
                 cells.append({
-                    "verdict": _report_verdict(score.machine_status, automated, _is_lightweight(score)),
+                    "verdict": _report_verdict(score.machine_status, automated, _is_lightweight(score),
+                                               light_schema=_light_schema(score)),
                     "reason": reason[:300],
                 })
             rows.append({
@@ -1078,7 +1109,8 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
                 "name": crit.name,
                 "factor": crit.source_quote or crit.description or "",
                 "max_score": str(crit.max_score) if crit.max_score is not None else None,
-                "method": _report_method(crit.score_type, automated, _is_lightweight(score)),
+                "method": _report_method(crit.score_type, automated, _is_lightweight(score),
+                                         light_schema=_light_schema(score)),
                 "per_bidder": per_bidder,
             })
         score_groups.append({"category": label, "items": items})
@@ -1111,7 +1143,8 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
                 "code": crit.code,
                 "name": crit.name,
                 "max_score": str(crit.max_score) if crit.max_score is not None else None,
-                "method": _report_method(crit.score_type, automated, _is_lightweight(score)),
+                "method": _report_method(crit.score_type, automated, _is_lightweight(score),
+                                         light_schema=_light_schema(score)),
                 "judges": [
                     {
                         "judge": f"{'证据簇' if cluster_mode else JUDGE_LABEL}{m.get('judge_no')}",
@@ -1354,7 +1387,9 @@ def render_docx(report: dict) -> bytes:
     ):
         heading(f"附表 {tname}", 1)
         if report.get("qualification_mode") == "light":
-            para("本表为轻量预检三态结论（通过/建议否决/存疑），仅作报告提示，不阻断计分、排名与价格基准价；"
+            para("本表为轻量预检结论：二值否决点筛查（通过=未发现确定性否决点，不等于确认符合；"
+                 "存疑=发现确定性不符事实、建议否决，需人工确认；2026-11-23 起，"
+                 "此前运行为通过/建议否决/存疑三态），仅作报告提示，不阻断计分、排名与价格基准价；"
                  "按项汇总的每家资格建议见汇总表标注。")
         for row in tab["rows"]:
             heading(f"{row['code']} {row['name']}", 3)

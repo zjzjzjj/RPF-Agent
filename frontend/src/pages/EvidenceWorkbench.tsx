@@ -84,16 +84,22 @@ export default function EvidenceWorkbench() {
   const isMatch = score.score_type === "match";
   const isSubjective = score.score_type === "subjective";
   const verdictSource = verdictSourceFromWarnings(score.warnings_json);
-  // 轻量预检三态（pass/fail/concern + legacy not_deeply_reviewed）：
+  // 轻量预检（pass/fail/concern + legacy not_deeply_reviewed）：
   // 旧逻辑把 auto_confirmed 的 concern 显示成"符合"，这里按 basis 分流修正。
+  // v3（决策 0017）二值否决点筛查：pass=未见确定性否决点，fail 显示"存疑"（建议否决，需人工确认）。
   const isLightweight = score.auto_review?.basis === "lightweight";
+  const lightV3 = (score.auto_review?.lightweight?.schema_version ?? 0) >= 3;
   const managedMessage = score.machine_status === "execution_failed"
     ? "自动评审遇到技术故障，已保留进度"
     : isLightweight
       ? score.machine_status === "pass"
-        ? "预检通过（轻量预检）"
+        ? lightV3
+          ? "通过：未发现确定性否决点（二值否决点筛查，不等于确认符合）"
+          : "预检通过（轻量预检）"
         : score.machine_status === "fail"
-          ? "建议否决（轻量预检，仅报告，投标人继续参与计分和排名）"
+          ? lightV3
+            ? "存疑：发现确定性不符事实，建议否决（仅建议，需人工确认；投标人继续参与计分和排名）"
+            : "建议否决（轻量预检，仅报告，投标人继续参与计分和排名）"
           : score.machine_status === "not_deeply_reviewed"
             ? "未深评（v1 旧数据，未做完整资格审查）"
             : "存疑（轻量预检，待人工核对原件）"
@@ -198,7 +204,11 @@ export default function EvidenceWorkbench() {
                       : score.machine_status === "recommend_reject"
                         ? "建议否决（全自动模式已裁决收敛，见留痕）"
                         : score.machine_status === "fail"
-                          ? "不通过（已自动裁决）"
+                          ? isLightweight
+                            ? lightV3
+                              ? "存疑：建议否决（仅建议，需人工确认；轻量预检）"
+                              : "建议否决（轻量预检，仅报告）"
+                            : "不通过（已自动裁决）"
                           : score.machine_status === "conflict_flagged"
                             ? "冲突，需人工裁决"
                             : "待人工"}

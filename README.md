@@ -47,7 +47,7 @@ PDF 会检查实际嵌入图像，文字层较长也不能跳过扫描图核验�
 
 ## 资格轻量化与全量出分（2026-11-10）
 
-**资格只报告，不阻断**（[决策记录 0011](docs/decisions/0011-qualification-light.md) + [0013 三态化](docs/decisions/0013-qualification-tristate.md)）：新运行默认 `qualification_mode=light`——每家投标人一次确定性预检 + 一次合并 LLM 快审（不 OCR、不逐条款深评），每条给出**通过 / 建议否决 / 存疑**三态结论并按项汇总每家资格建议，**只写进报告，不参与计分、排名与价格基准价**。建议否决仅来自确定性硬性不符或附逐字反面引文的快审结论；材料缺失/不可读一律存疑，绝不因此否决。旧运行保留 full 模式；`BID_EVAL_QUALIFICATION_MODE_DEFAULT=full` 可切回。
+**资格只报告，不阻断**（[决策记录 0011](docs/decisions/0011-qualification-light.md) + [0013 三态化](docs/decisions/0013-qualification-tristate.md) + [0017 二值化](docs/decisions/0017-qualification-binary.md)）：新运行默认 `qualification_mode=light`——每家投标人一次确定性预检 + 一次合并 LLM 快审（不 OCR、不逐条款深评），做**否决点筛查**，每条给出**通过 / 存疑**二值结论并按项汇总每家资格建议，**只写进报告，不参与计分、排名与价格基准价**。通过=未发现确定性否决点（不等于确认符合）；存疑=发现确定性不符事实、建议否决，需人工确认（AI 不完全否决）。建议否决仅来自事实矛盾型确定性预检不符（数值/日期/计数/大小写合计矛盾）或附逐字反面引文且经本地核验的快审结论；材料缺失/不可读/签章类事项一律不作为否决依据（缺证据≠不符合），落"通过"并进待人工核对注记。旧运行保留 full 模式；`BID_EVAL_QUALIFICATION_MODE_DEFAULT=full` 可切回。
 
 **每个评分格都必须落终态**（[决策记录 0012](docs/decisions/0012-always-score-deterministic-objective.md)）：
 
@@ -100,7 +100,7 @@ PDF 会检查实际嵌入图像，文字层较长也不能跳过扫描图核验�
 |---|---|---|
 | count | 计数分（最先执行） | existence 存在性项先走材料存在性确定性路由（索引/目录定位 + 页级图像信号，零 LLM/OCR，见「资格轻量化与全量出分」节）；其余确定性快路径在 OCR/LLM 前出分（material_inventory + objective_fastpath）；未覆盖格再走 AI 逐件核验；故障按闭合写显式暂定分 |
 | subjective | 主观分 | 默认直评：选页后单轮 AI 出分，缺引文/子项不挡；`BID_EVAL_SUBJECTIVE_DIRECT=0` 回退分层证据簇 + 引文闸门路径 |
-| veto / match | 资格与符合性（收尾执行） | 默认轻量快审三态结论（通过 / 建议否决 / 存疑）+ 每家资格建议，只报告不阻断（见「资格轻量化」节）；全量模式 AI 输出“符合 / 不符合 / 现有材料无法证实”，投标人继续参与评分和排名 |
+| veto / match | 资格与符合性（收尾执行） | 默认轻量快审二值否决点筛查（通过=未见确定性否决点 / 存疑=建议否决需人工确认）+ 每家资格建议，只报告不阻断（见「资格轻量化」节）；全量模式 AI 输出“符合 / 不符合 / 现有材料无法证实”，投标人继续参与评分和排名 |
 | price | 价格分（最后执行） | 报价缺失或冲突先自动补抽；全部计分格完成后由纯 Decimal 引擎执行门槛、基准价与冻结公式；无法形成基准价时暂定出分 |
 
 ```
@@ -267,7 +267,7 @@ backend/app/
 ├─ evidence/     引文→页码+坐标定位（三级回退）、核验（verified 唯一写入点）、页图渲染
 ├─ rules/        规则契约、LLM 编译器、12 条确定性校验器、冻结（canonical JSON + 哈希）、
 │                规则包库（templates/ 内置模板 + law_packs/ 固化法规包，loader fail-fast）
-├─ engine/       纯代码评分：价格公式、排名并列、资格三态原语、事实抽取（五级报价兜底）、
+├─ engine/       纯代码评分：价格公式、排名并列、资格二值否决点筛查原语、事实抽取（五级报价兜底）、
 │                主观分校验层、LLM 裁决（auto_judge）、章节约束选段
 ├─ llm/          provider 抽象（OpenAI 兼容：DeepSeek/Qwen/GLM/Kimi/硅基流动；未配置 fail-fast）、
 │                网关（缓存/限速/预算/数据分级）

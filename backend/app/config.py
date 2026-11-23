@@ -146,9 +146,13 @@ def count_deterministic_default() -> str:
 
 
 def qualification_quick_chars() -> int:
-    """资格轻量快审的页面文本预算（字符）。"""
+    """资格轻量快审的页面文本预算（字符）。
+
+    二值化否决点筛查（决策 0017）后快审的职责是找"确定性反面事实"，
+    预算过小会漏掉反面证据；默认从 8000 提到 24000（可通过环境变量覆盖）。
+    """
     try:
-        return max(4000, int(os.environ.get("BID_EVAL_QUALIFICATION_QUICK_CHARS", "8000")))
+        return max(4000, int(os.environ.get("BID_EVAL_QUALIFICATION_QUICK_CHARS", "24000")))
     except ValueError:
         return 24000
 

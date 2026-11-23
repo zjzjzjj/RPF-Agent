@@ -99,22 +99,46 @@ LIGHTWEIGHT_VERDICT_LABELS = {
     "not_deeply_reviewed": "未深评",  # legacy：仅历史 v1 行显示
 }
 
+# 二值化（2026-11-23 决策 0017，仅 schema v3）：通过=未见确定性否决点；
+# fail 显示"存疑"（不写"不通过"），建议否决语义在理由/每家建议里表达。
+LIGHTWEIGHT_VERDICT_LABELS_V3 = {"pass": "通过", "fail": "存疑"}
+
 # 每家资格建议（纯投影，2026-11-16 三态化）：任一否决→建议否决；有存疑无否决→存疑；
 # 全过→通过；无轻量资格判定条目（full 模式/未评）→ None。
 QUALIFICATION_SUGGESTION_LABELS = {"pass": "通过", "concern": "存疑", "reject": "建议否决"}
+# 二值化每家建议（schema v3）：只有确定性否决点才落"存疑（建议否决）"；
+# 其余一律"通过"（附待人工核对注记）——"没发现证明材料"绝不否决。
+QUALIFICATION_SUGGESTION_LABELS_V3 = {
+    "pass": "通过", "reject": "存疑（建议否决，需人工确认）", "concern": "存疑",
+}
 
 
 def derive_qualification_suggestion(items: list[dict]) -> dict | None:
     """每家资格建议（纯投影）。仅对轻量运行（存在 lightweight 格）产出。
 
-    范围=该家**全部** veto/match 条目：深评残留、故障兜底（basis=fallback）、
-    execution_failed 与未评格绝不能被过滤掉——否则个别格故障/未评时会误报
-    "通过"（2026-11-16 复核实证）。任一 fail/recommend_reject→建议否决；
+    范围=该家**全部** veto/match 条目。schema v3（二值化）：任一确定性否决点
+    （machine_status=fail）→"存疑（建议否决，需人工确认）"；否则→"通过"，
+    并附 needs_human_check 计数作待人工核对注记（缺证据/未查验绝不否决）。
+    v1/v2 旧运行保持三态投影逐字不变：任一 fail/recommend_reject→建议否决；
     其余任一非 pass（含 None/未评）→存疑；全 pass→通过。
     """
     verdict_items = [i for i in items if i.get("score_type") in ("veto", "match")]
     if not any(i.get("lightweight") for i in verdict_items):
         return None  # full 模式不出轻量建议
+    if any((i.get("lightweight_schema_version") or 0) >= 3 for i in verdict_items if i.get("lightweight")):
+        reject_items = [i for i in verdict_items if i.get("machine_status") in ("fail", "recommend_reject")]
+        if reject_items:
+            return {"code": "reject", "label": QUALIFICATION_SUGGESTION_LABELS_V3["reject"],
+                    "reject_count": len(reject_items)}
+        out: dict = {"code": "pass", "label": QUALIFICATION_SUGGESTION_LABELS_V3["pass"]}
+        # 待人工核对注记=所有"非清洁通过"格：needs_human_check 的 pass 格
+        # （签章/材料未见/节选覆盖有限/快审存疑线索/快审失败/引文核验不过）
+        # + 故障兜底/未评/外部边界等残留格（2026-11-16 教训：残留在"通过"注记里必须可见）。
+        manual = sum(1 for i in verdict_items
+                     if not (i.get("machine_status") == "pass" and not i.get("needs_human_check")))
+        if manual:
+            out["manual_check_count"] = manual
+        return out
     if any(i.get("machine_status") in ("fail", "recommend_reject") for i in verdict_items):
         return {"code": "reject", "label": QUALIFICATION_SUGGESTION_LABELS["reject"]}
     if any(i.get("machine_status") != "pass" for i in verdict_items):
@@ -348,10 +372,18 @@ def _build_item(
 
     auto_review_out = public_auto_review(score)
     lightweight = (auto_review_out or {}).get("basis") == "lightweight"
+    light_payload = (auto_review_out or {}).get("lightweight") if lightweight else None
+    light_schema = light_payload.get("schema_version") if isinstance(light_payload, dict) else None
 
     verdict = None
     if state in ("veto", "match") and score is not None and score.machine_status:
-        labels = LIGHTWEIGHT_VERDICT_LABELS if lightweight else MACHINE_VERDICT_LABELS
+        if lightweight and light_schema == 3:
+            # 二值化 v3：fail 显示"存疑"（建议否决语义在理由里），不写"不通过/建议否决"
+            labels = LIGHTWEIGHT_VERDICT_LABELS_V3
+        elif lightweight:
+            labels = LIGHTWEIGHT_VERDICT_LABELS
+        else:
+            labels = MACHINE_VERDICT_LABELS
         verdict = labels.get(score.machine_status, score.machine_status)
 
     cit_out = [
@@ -383,6 +415,10 @@ def _build_item(
                            + ("（轻量）" if lightweight else "")),
         "is_veto": is_veto,
         "lightweight": lightweight,
+        "lightweight_schema_version": light_schema if lightweight else None,
+        "needs_human_check": (
+            bool(light_payload.get("needs_human_check")) if isinstance(light_payload, dict) else None
+        ),
         "bucket": BUCKET_BY_CATEGORY.get(crit.category, "qualification_compliance"),
         "state": state,
         "max_score": _s(max_dec),
@@ -709,7 +745,8 @@ def build_score_summary(
                 for i in items:
                     ms = i["machine_status"] or "need_human"
                     if i.get("lightweight"):
-                        # 轻量三态计桶：通过/建议否决/存疑（legacy not_deeply_reviewed 归存疑桶）
+                        # 轻量计桶：pass/fail 各归各桶（v3 fail=存疑/建议否决）；
+                        # legacy concern/not_deeply_reviewed 归存疑桶
                         verdicts[ms if ms in ("pass", "fail") else "concern"] += 1
                     elif ms in ("pass", "fail", "recommend_reject", "need_human",
                                 "unverifiable", "execution_failed"):

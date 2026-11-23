@@ -340,12 +340,19 @@ def _valid_cell(score: ScoreRecord, criterion: dict, citations: list[EvidenceCit
         return scoring and bool(score.ai_reasoning or meta.get("reasoning"))
     if basis == "lightweight":
         light = meta.get("lightweight") or {}
-        if not isinstance(light, dict) or light.get("schema_version") not in (1, 2):
+        if not isinstance(light, dict) or light.get("schema_version") not in (1, 2, 3):
             return False
         if light.get("schema_version") == 2:
             # 三态化（2026-11-16）：状态必须是 pass/fail/concern；LLM 否决必带
             # 逐字反面引文，缺失则 cell 不算完成（run 不收口，逼出 prompt 漂移）
             if light.get("status") not in ("pass", "fail", "concern"):
+                return False
+            if light.get("reject_source") == "llm" and not light.get("reject_quotes"):
+                return False
+        if light.get("schema_version") == 3:
+            # 二值化（2026-11-23 决策 0017）：状态必须是 pass/fail（fail=存疑/建议否决）；
+            # LLM 否决仍必带逐字反面引文（缺失不收口，逼出 prompt 漂移）
+            if light.get("status") not in ("pass", "fail"):
                 return False
             if light.get("reject_source") == "llm" and not light.get("reject_quotes"):
                 return False

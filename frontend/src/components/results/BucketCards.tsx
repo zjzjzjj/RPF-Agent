@@ -85,11 +85,16 @@ export default function BucketCards({ bidder, managed = false, provisional = fal
   ];
 
   const verdictBucket = bidder.buckets.find((b) => b.key === "qualification_compliance");
-  // 轻量 fail（建议否决）与深评 fail（不通过）语义不同，后端合并进同一个
+  // 轻量 fail（建议否决/二值化"存疑"）与深评 fail（不通过）语义不同，后端合并进同一个
   // verdicts["fail"] 键——这里按条目拆回两个计数，避免混跑时互相冒充。
   const verdictItems = verdictBucket?.items ?? [];
-  const lightFailCount = verdictItems.filter((it) => it.machine_status === "fail" && it.lightweight).length;
+  const lightFailItems = verdictItems.filter((it) => it.machine_status === "fail" && it.lightweight);
+  const lightFailCount = lightFailItems.length;
   const deepFailCount = verdictItems.filter((it) => it.machine_status === "fail" && !it.lightweight).length;
+  // 二值化 v3（决策 0017）：轻量 fail 显示"存疑"（不写"不通过/建议否决"）；v1/v2 旧显示不变
+  const lightFailLabel = lightFailItems.some((it) => (it.lightweight_schema_version ?? 0) >= 3)
+    ? "存疑"
+    : "建议否决";
   const verdictLabel = (k: string) => {
     if (managed && k === "need_human") return "待自动完成"; // deep/fallback 行特例
     return VERDICT_META[k]?.label ?? k;
@@ -154,16 +159,20 @@ export default function BucketCards({ bidder, managed = false, provisional = fal
                 style={{ marginRight: 8 }}
               >
                 总评价：{bidder.qualification_suggestion.label}
+                {bidder.qualification_suggestion.code === "pass" &&
+                (bidder.qualification_suggestion.manual_check_count ?? 0) > 0
+                  ? `（${bidder.qualification_suggestion.manual_check_count} 项待人工核对）`
+                  : ""}
               </Tag>
             )}
             <SideTag side="verdict" />
             {Object.entries(verdictBucket.verdicts)
               .flatMap(([k, v]) => {
                 if (k === "fail") {
-                  // 合并计数还原：轻量 fail=建议否决、深评 fail=不通过
+                  // 合并计数还原：轻量 fail=存疑/建议否决、深评 fail=不通过
                   return [
                     ...(lightFailCount > 0
-                      ? [{ key: "light_fail", v: lightFailCount, label: "建议否决", color: "#cf1322" }]
+                      ? [{ key: "light_fail", v: lightFailCount, label: lightFailLabel, color: "#cf1322" }]
                       : []),
                     ...(deepFailCount > 0
                       ? [{ key: "fail", v: deepFailCount, label: "不通过", color: "#cf1322" }]

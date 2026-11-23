@@ -4,10 +4,13 @@ import type { MatrixCell } from "../../types";
 export function cellStyle(cell: MatrixCell | undefined, managed = false): { bg: string; label: string; tip: string } {
   if (!cell) return { bg: "#f0f0f0", label: "—", tip: "未评分" };
   if (managed && cell.auto_review_basis === "lightweight") {
-    const tip =
-      "资格轻量预检 + 每家一次快审，不构成完整资格审查；建议否决仅作报告提示，不阻断计分、排名与价格基准价";
+    const v3 = (cell.lightweight_schema_version ?? 0) >= 3;
+    const tip = v3
+      ? "资格二值否决点筛查（确定性预检+每家一次快审）：通过=未发现确定性否决点（不等于确认符合）；存疑=发现确定性不符事实、建议否决，需人工确认。不阻断计分、排名与价格基准价"
+      : "资格轻量预检 + 每家一次快审，不构成完整资格审查；建议否决仅作报告提示，不阻断计分、排名与价格基准价";
     if (cell.machine_status === "fail")
-      return { bg: "#fff1f0", label: "建议否决", tip };
+      // 二值化（决策 0017）：不写"不通过/建议否决"，显示"存疑"（建议否决依据见理由）
+      return { bg: "#fff1f0", label: v3 ? "存疑" : "建议否决", tip };
     if (cell.machine_status === "concern")
       return { bg: "#fff7e6", label: "存疑", tip };
     if (cell.machine_status === "not_deeply_reviewed")

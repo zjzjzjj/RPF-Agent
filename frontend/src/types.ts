@@ -293,6 +293,8 @@ export interface MatrixCell {
   veto_flag: boolean;
   machine_status: string | null;
   auto_review_basis?: string | null;
+  /** 轻量 payload schema_version（3=二值化；1/2=旧三态口径） */
+  lightweight_schema_version?: number | null;
 }
 
 export interface Matrix {
@@ -366,6 +368,7 @@ export interface AutoReviewMetadata {
   }[];
   /** basis === "lightweight" 时的资格轻量预检负载（qualification_light.cell_payload） */
   lightweight?: {
+    schema_version?: number;
     status?: string;
     reason?: string;
     deterministic?: string | null;
@@ -376,6 +379,8 @@ export interface AutoReviewMetadata {
     reject_source?: string | null;
     /** 快审带逐字核验的反面引文（仅 fail 且 reject_source === "llm" 时非空） */
     reject_quotes?: { quote: string; document_id: number; page_no: number }[];
+    /** v3：pass 格里"AI 未真正查验"的（签章/未覆盖/快审失败/引文未核验） */
+    needs_human_check?: boolean;
   } | null;
 }
 
@@ -586,6 +591,10 @@ export interface SummaryItem {
   artifacts_check: SummaryArtifact[];
   /** 资格轻量预检条目（lightweight 运行）；legacy 四态运行无此字段 */
   lightweight?: boolean;
+  /** 轻量 payload schema_version：3=二值化否决点筛查（通过=未见否决点/存疑=建议否决）；1/2=旧三态口径 */
+  lightweight_schema_version?: number | null;
+  /** 二值化 pass 格里"AI 未真正查验"的（签章/未覆盖/快审失败/引文未核验）→ 待人工核对注记 */
+  needs_human_check?: boolean | null;
   evidence: {
     status: string;
     verified_count: number;
@@ -627,8 +636,16 @@ export interface BidderSummary {
   bidder_status_is_run_snapshot: boolean;
   rank: number | null;
   veto_flag: boolean;
-  /** 每家资格建议汇总（lightweight 运行；full 模式为 null）：任一资格格 fail→reject，有非 pass→concern，全 pass→pass */
-  qualification_suggestion?: { code: "pass" | "concern" | "reject"; label: string } | null;
+  /** 每家资格建议汇总（lightweight 运行；full 模式为 null）：v3 二值化=任一确定性否决点→reject（存疑/建议否决），
+   *  否则 pass（通过，附 manual_check_count 待人工核对注记）；v1/v2 旧三态投影不变 */
+  qualification_suggestion?: {
+    code: "pass" | "concern" | "reject";
+    label: string;
+    /** v3：确定性否决点条数 */
+    reject_count?: number;
+    /** v3：通过时"AI 未真正查验"条数（待人工核对注记） */
+    manual_check_count?: number;
+  } | null;
   tie_break_level: number | null;
   tie_explanations: string[];
   summary: {

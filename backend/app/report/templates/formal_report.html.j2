@@ -77,7 +77,7 @@
 {% else %}<p>暂无可排序的评分结果。</p>{% endif %}
 
 <h2>附表 A1 资格性审查表</h2>
-{% if qualification_mode == "light" %}<p class="note">本表为轻量预检三态结论（通过/建议否决/存疑），仅作报告提示，不阻断计分、排名与价格基准价；按项汇总的每家资格建议见汇总表〔资格建议〕标注。</p>{% endif %}
+{% if qualification_mode == "light" %}<p class="note">本表为轻量预检结论：二值否决点筛查（通过=未发现确定性否决点，不等于确认符合；存疑=发现确定性不符事实、建议否决，需人工确认；2026-11-23 起，此前运行为通过/建议否决/存疑三态），仅作报告提示，不阻断计分、排名与价格基准价；按项汇总的每家资格建议见汇总表〔资格建议〕标注。</p>{% endif %}
 {% for row in qualification_table.rows %}
 <h3>{{ row.code }} {{ row.name }}</h3>
 {% if row.factor %}<p class="factor">评审因素（招标文件原文）：{{ row.factor[:400] }}</p>{% endif %}
@@ -87,7 +87,7 @@
 {% endfor %}
 
 <h2>附表 A2 符合性审查表</h2>
-{% if qualification_mode == "light" %}<p class="note">本表为轻量预检三态结论（通过/建议否决/存疑），仅作报告提示，不阻断计分、排名与价格基准价。</p>{% endif %}
+{% if qualification_mode == "light" %}<p class="note">本表为轻量预检结论：二值否决点筛查（通过=未发现确定性否决点，不等于确认符合；存疑=建议否决，需人工确认），仅作报告提示，不阻断计分、排名与价格基准价。</p>{% endif %}
 {% for row in compliance_table.rows %}
 <h3>{{ row.code }} {{ row.name }}</h3>
 {% if row.factor %}<p class="factor">评审因素（招标文件原文）：{{ row.factor[:400] }}</p>{% endif %}

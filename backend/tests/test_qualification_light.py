@@ -1,7 +1,11 @@
 """资格轻量通道：确定性预检 + 每家一次快审，不 OCR、不逐条款 LLM、不阻断。
 
-三态化（2026-11-16）：每条款必给 pass/fail/concern（通过/建议否决/存疑），
-不再产生 not_deeply_reviewed；LLM 否决必带逐字反面引文（本地核验不过降级存疑）。
+二值化（2026-11-23 决策 0017）：每条款必给 pass/fail（通过/存疑）——
+pass=未发现确定性否决点（不等于确认符合），fail=存疑/建议否决（需人工确认）。
+确定性否决点只有两类：事实矛盾型预检不符（数值/日期/计数/数学关系）与
+LLM 逐字反面引文本地核验命中；材料缺失、扫描件不可读、签章类事项、
+快审失败、引文核验不过一律 pass（缺证据≠不符合，误否决不可接受）。
+v1/v2 旧运行的四态/三态显示逐字保留（见 _valid_cell 与派生的 legacy 分支）。
 """
 from __future__ import annotations
 
@@ -55,6 +59,7 @@ def test_deterministic_pass_plus_one_quick_review_per_bidder():
 
 
 def test_hard_deterministic_fail_is_not_overridden():
+    """事实矛盾型预检不符（注册资本低于门槛）=确定性否决点，不被 LLM pass 覆盖。"""
     pages = [_page("注册资本人民币10万元。")]
     criteria = [{"code": "C1", "name": "注册资本门槛", "score_type": "veto",
                  "check_type": "value_in_range",
@@ -66,23 +71,27 @@ def test_hard_deterministic_fail_is_not_overridden():
     assert results["C1"].reject_source == "deterministic"
 
 
-def test_quick_review_failure_becomes_concern_never_pass():
+def test_quick_review_failure_passes_without_reject_point():
+    """快审调用失败=未能核查≠不符合：落 pass（未见否决点），留痕待人工核对。"""
     pages = [_page("普通材料文本。")]
     criteria = [{"code": "Q1", "name": "授权委托书", "score_type": "veto",
                  "check_type": "human_only", "params": {}}]
     gateway = FakeGateway(error=RuntimeError("provider down"))
     results = light.review_bidder_qualification(criteria, pages, "synthetic", gateway)
-    assert results["Q1"].status == "concern"
+    assert results["Q1"].status == "pass"
     assert results["Q1"].quick_state == "failed"
+    assert results["Q1"].needs_human_check is True
 
 
-def test_visual_clause_is_concern_without_vision():
+def test_visual_clause_passes_with_human_check_note():
+    """签章类视觉/外部事项 AI 不查验：落 pass 并标待人工核对（决策 0017 口径③）。"""
     pages = [_page("投标文件须加盖投标人公章。")]
     criteria = [{"code": "S1", "name": "投标文件签章", "score_type": "veto",
                  "check_type": "human_only", "params": {}}]
     gateway = FakeGateway(items=[{"code": "S1", "status": "pass", "reason": "应当有章"}])
     results = light.review_bidder_qualification(criteria, pages, "synthetic", gateway)
-    assert results["S1"].status == "concern"
+    assert results["S1"].status == "pass"
+    assert results["S1"].needs_human_check is True
 
 
 def test_llm_reject_with_verified_quote_becomes_fail():
@@ -99,7 +108,7 @@ def test_llm_reject_with_verified_quote_becomes_fail():
     assert results["R1"].evidence_items == [
         {"quote": "资质证书显示等级为二级", "document_id": 1, "page_no": 1}]
     payload = light.cell_payload(results["R1"])
-    assert payload["schema_version"] == 2
+    assert payload["schema_version"] == 3
     assert payload["reject_source"] == "llm"
     assert payload["reject_quotes"] == results["R1"].evidence_items
 
@@ -118,7 +127,8 @@ def test_llm_reject_relocates_wrong_page_hint():
     assert results["R1"].evidence_items[0]["page_no"] == 1
 
 
-def test_llm_reject_with_unverifiable_quote_degrades_to_concern():
+def test_llm_reject_with_unverifiable_quote_passes_with_lead():
+    """引文核验不过（可能编造）→ 不作为否决点：落 pass，线索保留在理由里。"""
     pages = [_page("资质证书显示等级为一级，满足招标要求。")]
     criteria = [{"code": "R1", "name": "资质等级", "score_type": "veto",
                  "check_type": "human_only", "params": {}}]
@@ -127,31 +137,36 @@ def test_llm_reject_with_unverifiable_quote_degrades_to_concern():
         "evidence": [{"quote": "资质证书显示等级为特级以下不予认可", "document_id": 1, "page_no": 1}],
     }])
     results = light.review_bidder_qualification(criteria, pages, "synthetic", gateway)
-    assert results["R1"].status == "concern"
+    assert results["R1"].status == "pass"
     assert results["R1"].reject_source == ""
     assert results["R1"].evidence_items == []
+    assert results["R1"].needs_human_check is True
 
 
-def test_llm_reject_without_evidence_degrades_to_concern():
+def test_llm_reject_without_evidence_passes_with_lead():
+    """无引文的 reject 绝不放行成否决点（宁漏勿错杀）。"""
     pages = [_page("普通材料文本，未见资质描述。")]
     criteria = [{"code": "R1", "name": "资质等级", "score_type": "veto",
                  "check_type": "human_only", "params": {}}]
     gateway = FakeGateway(items=[{"code": "R1", "status": "reject", "reason": "不满足"}])
     results = light.review_bidder_qualification(criteria, pages, "synthetic", gateway)
-    assert results["R1"].status == "concern"
+    assert results["R1"].status == "pass"
     assert results["R1"].reject_source == ""
 
 
-def test_llm_unknown_status_maps_to_concern():
+def test_llm_unknown_status_passes_without_reject_point():
     pages = [_page("普通材料文本。")]
     criteria = [{"code": "Q1", "name": "授权委托书", "score_type": "veto",
                  "check_type": "human_only", "params": {}}]
     gateway = FakeGateway(items=[{"code": "Q1", "status": "unknown", "reason": "无法判断"}])
     results = light.review_bidder_qualification(criteria, pages, "synthetic", gateway)
-    assert results["Q1"].status == "concern"
+    assert results["Q1"].status == "pass"
+    # 快审存疑线索保留 → 待人工核对注记（线索在理由里）
+    assert results["Q1"].needs_human_check is True
 
 
-def test_excerpt_quick_pass_is_concern(monkeypatch):
+def test_excerpt_quick_pass_stays_pass(monkeypatch):
+    """节选不再降级：快审 pass 即 pass（pass=未见否决点，节选只影响覆盖注记）。"""
     monkeypatch.setenv("BID_EVAL_QUALIFICATION_QUICK_CHARS", "4000")  # 配置有 4000 下限
     pages = [_page("材料内容" * 1500)]  # 6000 字符 > 4000 预算 → 节选
     criteria = [{"code": "Q1", "name": "服务承诺", "score_type": "veto",
@@ -159,7 +174,26 @@ def test_excerpt_quick_pass_is_concern(monkeypatch):
     gateway = FakeGateway(items=[{"code": "Q1", "status": "pass", "reason": "看起来齐全"}])
     results = light.review_bidder_qualification(criteria, pages, "synthetic", gateway)
     assert results["Q1"].input_complete is False
-    assert results["Q1"].status == "concern"
+    assert results["Q1"].status == "pass"
+    # 节选 pass 覆盖有限 → 归入待人工核对（误放须可见，决策 0017 注记口径）
+    assert results["Q1"].needs_human_check is True
+
+
+def test_absence_and_missing_material_never_reject():
+    """材料/短语未见型不符（document_present/contains_phrase）=缺证据≠不符合：pass。"""
+    pages = [_page("普通材料文本，没有任何证书复印件。")]
+    criteria = [
+        {"code": "D1", "name": "资质证书", "score_type": "veto",
+         "check_type": "document_present", "params": {"document": "资质证书"}},
+        {"code": "P1", "name": "承诺短语", "score_type": "veto",
+         "check_type": "contains_phrase", "params": {"phrase": "完全响应招标文件"}},
+    ]
+    gateway = FakeGateway(items=[])
+    results = light.review_bidder_qualification(criteria, pages, "synthetic", gateway)
+    assert results["D1"].status == "pass"
+    assert results["D1"].reject_source == ""
+    assert results["P1"].status == "pass"
+    assert results["P1"].reject_source == ""
 
 
 def _light_run(monkeypatch, app_env):
@@ -230,13 +264,13 @@ def test_executor_uses_light_path_without_ocr_or_collection(monkeypatch, app_env
 
 
 def test_executor_persists_llm_reject_citations_and_summary(monkeypatch, app_env):
-    """LLM 否决（带逐字反面引文）端到端：引文落库、evidence_status 回写、汇总建议=建议否决。"""
+    """LLM 否决（带逐字反面引文）端到端：引文落库、evidence_status 回写、汇总建议=存疑（建议否决）。"""
     run = _light_run(monkeypatch, app_env)
     doc_id = run["doc_id"]
 
     def fake_review(criteria, pages, data_class, gateway):
         return {"Q1": light.LightResult(
-            status="fail", reason="快审发现明确反面事实（建议否决，仅报告）：未提供运行维护方案",
+            status="fail", reason="建议否决（仅建议，需人工确认）：快审发现明确反面事实——未提供运行维护方案",
             deterministic="unknown", quick="reject", quick_state="completed",
             reject_source="llm",
             evidence_items=[{"quote": "投标人提供运行维护方案，服务响应及时", "document_id": doc_id, "page_no": 1}])}
@@ -256,13 +290,14 @@ def test_executor_persists_llm_reject_citations_and_summary(monkeypatch, app_env
         assert cit.verified
         assert row.evidence_status == "verified"
         light_payload = row.ai_raw_json["auto_review"]["lightweight"]
-        assert light_payload["schema_version"] == 2
+        assert light_payload["schema_version"] == 3
         assert light_payload["reject_source"] == "llm"
 
     from app.services.score_summary_service import build_score_summary
     summary = build_score_summary("qual-light", run["id"])
     bidder_out = summary["bidders"][0]
-    assert bidder_out["qualification_suggestion"] == {"code": "reject", "label": "建议否决"}
+    assert bidder_out["qualification_suggestion"] == {
+        "code": "reject", "label": "存疑（建议否决，需人工确认）", "reject_count": 1}
     verdict_bucket = next(b for b in bidder_out["buckets"] if b["kind"] == "verdict")
     assert verdict_bucket["verdicts"]["fail"] == 1
 
@@ -283,6 +318,24 @@ def test_summary_projects_pass_suggestion(monkeypatch, app_env):
     verdict_bucket = next(b for b in bidder_out["buckets"] if b["kind"] == "verdict")
     assert verdict_bucket["verdicts"]["pass"] == 1
     assert verdict_bucket["verdicts"]["concern"] == 0
+
+
+def test_summary_pass_suggestion_carries_manual_check_count(monkeypatch, app_env):
+    """无建议否决项 → "通过"（附待人工核对注记）；needs_human_check 只作注记，绝不否决。"""
+    run = _light_run(monkeypatch, app_env)
+
+    def fake_review(criteria, pages, data_class, gateway):
+        return {"Q1": light.LightResult(status="pass", reason="通过（未见确定性否决点）：签章类需人工查验",
+                                        deterministic="unknown", quick="skipped", quick_state="skipped",
+                                        needs_human_check=True)}
+
+    monkeypatch.setattr(light, "review_bidder_qualification", fake_review)
+    scoring.execute_automatic_run(run["id"])
+    from app.services.score_summary_service import build_score_summary
+    summary = build_score_summary("qual-light", run["id"])
+    bidder_out = summary["bidders"][0]
+    assert bidder_out["qualification_suggestion"] == {
+        "code": "pass", "label": "通过", "manual_check_count": 1}
 
 
 @pytest.mark.parametrize("status", ["pass", "fail", "concern", "not_deeply_reviewed"])
@@ -329,6 +382,50 @@ def test_valid_cell_rejects_v2_llm_reject_without_quotes():
     assert not _valid_cell(row, {"score_type": "veto"}, [])
 
 
+@pytest.mark.parametrize("status", ["pass", "fail"])
+def test_valid_cell_accepts_lightweight_v3_binary(status):
+    """v3（二值化）：pass/fail 闭合；llm 否决必带引文规则同 v2。"""
+    from app.db.models import ScoreRecord
+    from app.services.automation_service import _valid_cell
+
+    row = ScoreRecord(run_id=1, bidder_id=1, criterion_id=1, review_status="auto_confirmed",
+                      machine_status=status, ai_reasoning="轻量预检理由",
+                      ai_raw_json={"auto_review": {"state": "completed", "basis": "lightweight",
+                                                   "reasoning": "轻量预检理由",
+                                                   "lightweight": {"schema_version": 3, "status": status,
+                                                                   "quick_state": "completed"}}})
+    assert _valid_cell(row, {"score_type": "veto"}, [])
+
+
+def test_valid_cell_rejects_v3_third_state():
+    """v3 只收 pass/fail：三态残留（concern）不闭合——逼出引擎口径漂移。"""
+    from app.db.models import ScoreRecord
+    from app.services.automation_service import _valid_cell
+
+    row = ScoreRecord(run_id=1, bidder_id=1, criterion_id=1, review_status="auto_confirmed",
+                      machine_status="concern", ai_reasoning="x",
+                      ai_raw_json={"auto_review": {"state": "completed", "basis": "lightweight",
+                                                   "reasoning": "x",
+                                                   "lightweight": {"schema_version": 3, "status": "concern",
+                                                                   "quick_state": "completed"}}})
+    assert not _valid_cell(row, {"score_type": "veto"}, [])
+
+
+def test_valid_cell_rejects_v3_llm_reject_without_quotes():
+    from app.db.models import ScoreRecord
+    from app.services.automation_service import _valid_cell
+
+    row = ScoreRecord(run_id=1, bidder_id=1, criterion_id=1, review_status="auto_confirmed",
+                      machine_status="fail", ai_reasoning="x",
+                      ai_raw_json={"auto_review": {"state": "completed", "basis": "lightweight",
+                                                   "reasoning": "x",
+                                                   "lightweight": {"schema_version": 3, "status": "fail",
+                                                                   "reject_source": "llm",
+                                                                   "reject_quotes": [],
+                                                                   "quick_state": "completed"}}})
+    assert not _valid_cell(row, {"score_type": "veto"}, [])
+
+
 def test_valid_cell_rejects_lightweight_on_scoring_item():
     from app.db.models import ScoreRecord
     from app.services.automation_service import _valid_cell
@@ -345,6 +442,7 @@ def test_valid_cell_rejects_lightweight_on_scoring_item():
 # 汇总投影（每家资格建议，纯派生）
 # ---------------------------------------------------------------------------
 def test_derive_qualification_suggestion_cases():
+    """v1/v2 旧运行的三态投影逐字不变（无 lightweight_schema_version 字段）。"""
     from app.services.score_summary_service import derive_qualification_suggestion
 
     def items(*statuses, lightweight=True, score_type="veto"):
@@ -377,20 +475,53 @@ def test_derive_qualification_suggestion_cases():
     assert derive_qualification_suggestion([]) is None
 
 
+def test_derive_qualification_suggestion_v3_binary():
+    """v3 二值化投影：只有确定性否决点（fail）→存疑（建议否决）；否则通过（附待核对注记）。"""
+    from app.services.score_summary_service import derive_qualification_suggestion
+
+    def items(*pairs, score_type="veto"):
+        # pairs: (machine_status, needs_human_check)
+        return [{"lightweight": True, "lightweight_schema_version": 3,
+                 "machine_status": st, "needs_human_check": nhc, "score_type": score_type}
+                for st, nhc in pairs]
+
+    assert derive_qualification_suggestion(items(("fail", False), ("pass", False))) == {
+        "code": "reject", "label": "存疑（建议否决，需人工确认）", "reject_count": 1}
+    assert derive_qualification_suggestion(items(("pass", False), ("pass", False))) == {
+        "code": "pass", "label": "通过"}
+    # 无否决点 + 待核对项 → 通过（附注记）：缺证据/未查验绝不否决
+    assert derive_qualification_suggestion(items(("pass", False), ("pass", True), ("pass", True))) == {
+        "code": "pass", "label": "通过", "manual_check_count": 2}
+    # fail 优先于注记
+    assert derive_qualification_suggestion(items(("fail", True), ("pass", True))) == {
+        "code": "reject", "label": "存疑（建议否决，需人工确认）", "reject_count": 1}
+    # 故障兜底/未评残留格计入待核对注记（2026-11-16 教训：残留在"通过"里必须可见）
+    residual = items(("pass", False)) + [
+        {"lightweight": True, "lightweight_schema_version": 3,
+         "machine_status": "execution_failed", "score_type": "veto"},
+        {"lightweight": False, "machine_status": None, "score_type": "veto"}]
+    assert derive_qualification_suggestion(residual) == {
+        "code": "pass", "label": "通过", "manual_check_count": 2}
+
+
 def test_report_verdict_lightweight_labels():
     from app.services.report_service import _report_verdict
 
+    # v1/v2 旧显示逐字不变
     assert _report_verdict("pass", True, True) == "通过"
     assert _report_verdict("fail", True, True) == "建议否决"
     assert _report_verdict("concern", True, True) == "存疑"
     assert _report_verdict("not_deeply_reviewed", True, True) == "未深评"  # legacy 行
+    # v3 二值化：fail 显示"存疑"（不写"不通过/建议否决"）
+    assert _report_verdict("pass", True, True, light_schema=3) == "通过"
+    assert _report_verdict("fail", True, True, light_schema=3) == "存疑"
     # deep 口径不变
     assert _report_verdict("fail", True, False) == "不符合"
     assert _report_verdict("pass", True, False) == "符合"
 
 
-def test_lightweight_labels_no_unreviewed_production():
-    """三态化核心锚：引擎不再产生 not_deeply_reviewed。"""
+def test_lightweight_binary_anchor_no_third_state():
+    """二值化核心锚：引擎任何路径只产生 pass/fail，不产生第三态。"""
     pages = [_page("普通材料文本。")]
     criteria = [{"code": "A", "name": "外部事项", "score_type": "veto",
                  "check_type": "human_only", "params": {}},
@@ -398,7 +529,8 @@ def test_lightweight_labels_no_unreviewed_production():
                  "check_type": "human_only", "params": {}}]
     for gateway in (FakeGateway(error=RuntimeError("down")),
                     FakeGateway(items=[]),
-                    FakeGateway(items=[{"code": "B", "status": "unknown", "reason": "无法判断"}])):
+                    FakeGateway(items=[{"code": "B", "status": "unknown", "reason": "无法判断"}]),
+                    FakeGateway(items=[{"code": "B", "status": "reject", "reason": "无引文"}])):
         results = light.review_bidder_qualification(criteria, pages, "synthetic", gateway)
-        assert all(r.status in ("pass", "fail", "concern") for r in results.values())
+        assert all(r.status in ("pass", "fail") for r in results.values())
         assert all(r.status != "not_deeply_reviewed" for r in results.values())

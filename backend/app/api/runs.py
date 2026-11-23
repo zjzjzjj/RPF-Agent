@@ -53,6 +53,12 @@ class RunOut(BaseModel):
     count_deterministic_mode: str | None = None
 
 
+def _light_schema_version(score) -> int | None:
+    """轻量 payload 的 schema_version（3=二值化；1/2=旧三态口径）。"""
+    light = ((score.ai_raw_json or {}).get("auto_review") or {}).get("lightweight")
+    return light.get("schema_version") if isinstance(light, dict) else None
+
+
 class MatrixCell(BaseModel):
     score_record_id: int
     criterion_code: str
@@ -67,6 +73,8 @@ class MatrixCell(BaseModel):
     veto_flag: bool
     machine_status: str | None
     auto_review_basis: str | None = None
+    # 轻量 payload 的 schema_version（3=二值化否决点筛查；1/2=旧三态显示口径）
+    lightweight_schema_version: int | None = None
 
 
 @router.post("/projects/{project_id}/runs")
@@ -279,6 +287,7 @@ def run_matrix(run_id: int) -> dict:
             veto_flag=score.veto_flag,
             machine_status=score.machine_status,
             auto_review_basis=(score.ai_raw_json or {}).get("auto_review", {}).get("basis"),
+            lightweight_schema_version=_light_schema_version(score),
         )
     return {
         "run_id": run_id,

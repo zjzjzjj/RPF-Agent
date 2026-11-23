@@ -498,6 +498,10 @@ export default function ScoreResults() {
                               }
                             >
                               资格建议：{selected.qualification_suggestion.label}
+                              {selected.qualification_suggestion.code === "pass" &&
+                              (selected.qualification_suggestion.manual_check_count ?? 0) > 0
+                                ? `（${selected.qualification_suggestion.manual_check_count} 项待人工核对）`
+                                : ""}
                             </Tag>
                           )}
                           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
@@ -548,6 +552,10 @@ export default function ScoreResults() {
                                       style={{ marginRight: 0 }}
                                     >
                                       总评价：{selected.qualification_suggestion.label}
+                                      {selected.qualification_suggestion.code === "pass" &&
+                                      (selected.qualification_suggestion.manual_check_count ?? 0) > 0
+                                        ? `（${selected.qualification_suggestion.manual_check_count} 项待人工核对）`
+                                        : ""}
                                     </Tag>
                                   )}
                                 </Space>
