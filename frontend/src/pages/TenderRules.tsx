@@ -998,6 +998,20 @@ export default function TenderRules() {
               ]}
             />
           </Form.Item>
+          <Form.Item
+            name="score_column"
+            label="文件口径（主/客观分列值）"
+            extra="严格取评标文件「主/客观分」列值；文件无该列不选（显示「—」，不推断）。"
+          >
+            <Select
+              allowClear
+              placeholder="评标文件无该列"
+              options={[
+                { value: "subjective", label: "主观" },
+                { value: "objective", label: "客观" },
+              ]}
+            />
+          </Form.Item>
           <Form.Item name="max_score" label="满分">
             <InputNumber min={0} step={0.5} style={{ width: "100%" }} />
           </Form.Item>
@@ -1135,6 +1149,9 @@ function CriterionModal({
         <Space>
           <Tag>页码：{criterion.source_page ?? "未定位"}</Tag>
           <Tag>条款：{criterion.source_node_id ?? "未定位"}</Tag>
+          <Tag color={criterion.score_column === "subjective" ? "magenta" : criterion.score_column === "objective" ? "green" : "default"}>
+            文件口径：{criterion.score_column === "subjective" ? "主观" : criterion.score_column === "objective" ? "客观" : "—"}
+          </Tag>
           {criterion.confidence != null && <Tag>抽取置信度 {Math.round(criterion.confidence * 100)}%</Tag>}
         </Space>
       </Card>
@@ -1149,6 +1166,7 @@ function CriterionModal({
           required_evidence: criterion.required_evidence ?? "",
           score_type: criterion.score_type,
           veto_consequence: criterion.veto_consequence,
+          score_column: criterion.score_column ?? undefined,
         }}
       >
         <Space align="start" size={12}>
@@ -1161,6 +1179,21 @@ function CriterionModal({
         </Space>
         <Form.Item name="description" label="判据描述">
           <Input.TextArea rows={2} placeholder="该评分项的判据说明" />
+        </Form.Item>
+        <Form.Item
+          name="score_column"
+          label="文件口径（主/客观分列值）"
+          extra="严格取评标文件「主/客观分」列值；清空=文件无该列（显示「—」，不推断）。"
+          style={{ width: 320 }}
+        >
+          <Select
+            allowClear
+            placeholder="评标文件无该列"
+            options={[
+              { value: "subjective", label: "主观" },
+              { value: "objective", label: "客观" },
+            ]}
+          />
         </Form.Item>
         <Form.Item
           name="required_evidence"

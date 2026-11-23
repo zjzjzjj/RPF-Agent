@@ -19,6 +19,12 @@ def validate_execution_schema(bind) -> None:
     required_base = ("evaluation_runs", "documents", "document_pages", "score_records",
                      "evidence_citations", "criteria", "bidders", "jobs")
     missing = [name for name in required_base if not inspector.has_table(name)]
+    # 2026-11-23 二轴制：criteria 的"主/客观分"列值两列（见 models.Criteria）。
+    # 旧库缺列会让 ORM 查询直接炸（no such column），这里提前 fail-fast 指到迁移脚本。
+    if inspector.has_table("criteria"):
+        existing_criteria = {col["name"] for col in inspector.get_columns("criteria")}
+        if {"score_column", "score_column_source"} - existing_criteria:
+            missing.append("criteria(score_column/score_column_source→scripts/migrate_score_column.py)")
     for model in _models():
         table = model.__table__
         if not inspector.has_table(table.name):

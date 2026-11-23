@@ -272,6 +272,9 @@ def load_criteria_for_snapshot(s: Session, package_id: int) -> list[dict[str, An
                 "source_quote": c.source_quote,
                 "status": c.status,
                 "sort_order": c.sort_order,
+                # 二轴制：文件"主/客观分"列值（显示口径单一来源，报告/前端消费）
+                "score_column": c.score_column,
+                "score_column_source": c.score_column_source,
                 "origin": c.origin,
                 "template_code": c.template_code,
                 "template_hash": c.template_hash,
@@ -324,7 +327,8 @@ def edit_criterion(criterion_id: int, patch: dict[str, Any], actor: str, reason:
     if not reason.strip():
         raise ValidationFailed("修改评分项必须填写理由")
     allowed = {"name", "description", "max_score", "weight", "category", "score_type",
-               "is_veto", "veto_consequence", "required_evidence", "source_quote"}
+               "is_veto", "veto_consequence", "required_evidence", "source_quote",
+               "score_column"}
     with session_scope() as s:
         crit = s.get(Criterion, criterion_id)
         if crit is None:
@@ -344,6 +348,9 @@ def edit_criterion(criterion_id: int, patch: dict[str, Any], actor: str, reason:
                 old = getattr(crit, key)
                 if key == "source_quote" and value != old:
                     quote_changed = True
+                if key == "score_column":
+                    # 二轴制：人工改列值=人工断言来自文件（留痕由 _record_edit 记）
+                    crit.score_column_source = "file" if value else None
                 setattr(crit, key, value)
                 _record_edit(s, crit, key, old, value, actor, reason)
         # 类型与否决标记保持一致：改成非否决类型即不再是"否决项"，
@@ -581,6 +588,9 @@ def add_criterion(package_id: int, body: dict, actor: str, reason: str) -> Crite
             origin="manual",  # 人工新增：覆盖率/来源标签必须与招标文件抽取区分
             status="verified",
             sort_order=900 + n,
+            # 二轴制：人工断言的"主/客观分"列值（来自评标文件 → file）
+            score_column=body.get("score_column") or None,
+            score_column_source=("file" if body.get("score_column") else None),
         )
         s.add(crit)
         s.flush()
@@ -1521,6 +1531,7 @@ _CRIT_FIELDS = (
     "is_veto", "veto_consequence", "required_evidence", "source_node_id", "source_page",
     "source_quote", "status", "origin", "template_code", "template_hash", "library_version",
     "override_json", "signoff_json", "p_source", "edit_json", "confidence", "sort_order",
+    "score_column", "score_column_source",
 )
 
 

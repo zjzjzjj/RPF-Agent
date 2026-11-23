@@ -1,5 +1,5 @@
 import { Card, Col, Row, Tag, Tooltip, Typography } from "antd";
-import type { BidderSummary } from "../../types";
+import type { BidderSummary, SummaryBucket } from "../../types";
 
 interface Props {
   bidder: BidderSummary;
@@ -17,16 +17,22 @@ const VERDICT_META: Record<string, { label: string; color: string }> = {
   execution_failed: { label: "执行失败", color: "#cf1322" },
 };
 
-/** 分项口径标签：固定口径（不随数据变化）——价格/商务为确定性客观分，技术分含 AI 主观评审。 */
-const SIDE_META: Record<string, { label: string; color: string; border: string }> = {
-  objective: { label: "客观", color: "#0958d9", border: "#adc6ff" },
-  subjective: { label: "主观", color: "#531dab", border: "#d3adf7" },
-  mixed: { label: "主观+客观", color: "#08979c", border: "#87e8de" },
-  verdict: { label: "客观·判定", color: "#0958d9", border: "#adc6ff" },
-};
+// 二轴制（2026-11-23）：桶卡徽标由桶计数驱动——口径（主/客/—）+ 方式（AI/规则/混合）；
+// 旧 SIDE_META 固定口径（"价格=客观、技术=主观+客观"硬编码）废弃。
+type AxisCounts = { subj: number; obj: number; un: number; ai: number; rule: number; mixed: number };
 
-function SideTag({ side }: { side: keyof typeof SIDE_META }) {
-  const m = SIDE_META[side];
+function AxisBadges({ counts }: { counts: AxisCounts | null }) {
+  if (!counts) return null;
+  const axis = [
+    counts.subj ? `主 ${counts.subj}` : "",
+    counts.obj ? `客 ${counts.obj}` : "",
+    counts.un ? `— ${counts.un}` : "",
+  ].filter(Boolean).join("·");
+  const method = [
+    counts.ai ? `AI ${counts.ai}` : "",
+    counts.rule ? `规则 ${counts.rule}` : "",
+    counts.mixed ? `混合 ${counts.mixed}` : "",
+  ].filter(Boolean).join("·");
   return (
     <span
       style={{
@@ -34,14 +40,31 @@ function SideTag({ side }: { side: keyof typeof SIDE_META }) {
         lineHeight: "16px",
         padding: "0 5px",
         borderRadius: 3,
-        color: m.color,
-        border: `1px solid ${m.border}`,
+        color: "#595959",
+        border: "1px solid #d9d9d9",
         background: "#fff",
       }}
     >
-      {m.label}
+      {axis || "—"}｜{method || "—"}
     </span>
   );
+}
+
+function axisOf(buckets: SummaryBucket[], key: string): AxisCounts | null {
+  const src = key === "total"
+    ? buckets.filter((b) => b.kind === "score")
+    : buckets.filter((b) => b.key === key);
+  if (!src.length) return null;
+  const sum = (f: (b: (typeof src)[number]) => number | undefined) =>
+    src.reduce((n, b) => n + (f(b) || 0), 0);
+  return {
+    subj: sum((b) => b.subjective_count),
+    obj: sum((b) => b.objective_count),
+    un: sum((b) => b.unlabeled_count),
+    ai: sum((b) => b.ai_count),
+    rule: sum((b) => b.rule_count),
+    mixed: sum((b) => b.mixed_count),
+  };
 }
 
 /** 四个分桶的汇总卡：总分 / 价格分 / 技术分 / 商务分（资格桶显示判定计数）。 */
@@ -113,7 +136,7 @@ export default function BucketCards({ bidder, managed = false, provisional = fal
             <Card size="small" styles={{ body: { padding: "10px 12px" } }}>
               <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                 <span style={{ fontSize: 12, color: "#888" }}>{t.label}</span>
-                <SideTag side={t.side} />
+                <AxisBadges counts={axisOf(bidder.buckets, t.key)} />
               </div>
               <div style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
                 <span
@@ -158,14 +181,10 @@ export default function BucketCards({ bidder, managed = false, provisional = fal
                 }
                 style={{ marginRight: 8 }}
               >
-                总评价：{bidder.qualification_suggestion.label}
-                {bidder.qualification_suggestion.code === "pass" &&
-                (bidder.qualification_suggestion.manual_check_count ?? 0) > 0
-                  ? `（${bidder.qualification_suggestion.manual_check_count} 项待人工核对）`
-                  : ""}
+                资格审核：{bidder.qualification_suggestion.label}
               </Tag>
             )}
-            <SideTag side="verdict" />
+            <AxisBadges counts={axisOf(bidder.buckets, "qualification_compliance")} />
             {Object.entries(verdictBucket.verdicts)
               .flatMap(([k, v]) => {
                 if (k === "fail") {

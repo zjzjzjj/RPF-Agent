@@ -297,6 +297,8 @@ def _append_document(s, target_package_id: int, d_id: int, actor: str, reason: s
         status=d.status,
         confidence=d.confidence,
         sort_order=800 + d.sort_order,
+        score_column=d.score_column,
+        score_column_source=d.score_column_source,
     )
     s.add(new_c)
     s.flush()

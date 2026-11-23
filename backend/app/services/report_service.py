@@ -16,6 +16,7 @@ from app.db.models import (
     AuditLog,
     Bidder,
     Criterion,
+    CriterionCheck,
     EvidenceCitation,
     EvaluationRun,
     Project,
@@ -31,16 +32,25 @@ from app.services.automation_service import (
     public_auto_review,
 )
 from app.services.ranking_service import compute_ranking
-from app.services.score_summary_service import SCORE_TYPE_LABELS, derive_qualification_suggestion
+from app.services.score_summary_service import (
+    METHOD_AI,
+    SCORE_TYPE_LABELS,
+    _verdict_source,
+    derive_qualification_suggestion,
+    scoring_basis_of,
+    scoring_method_of,
+)
 
 TEMPLATE_DIR = Path(__file__).resolve().parent.parent / "report" / "templates"
 
+# 二轴制（2026-11-23）：类别名不再内嵌口径——口径由逐项"口径：X"标注表达，
+# 桶名只说类别（价格分/技术分/商务分）。
 CATEGORY_LABELS = {
     "qualification": "资格性审查",
     "compliance": "符合性审查",
-    "price": "价格分（客观）",
-    "technical": "技术分（主观+客观）",
-    "commercial": "商务分（客观）",
+    "price": "价格分",
+    "technical": "技术分",
+    "commercial": "商务分",
 }
 
 REVIEW_LABELS = {
@@ -59,6 +69,8 @@ _METHOD_HEAD = (
     "AI 按冻结细则核验资格与符合性事实，并按评分细则评定主观分值；"
     "未解决项按需执行定向检索、补充 OCR、视觉核验与 AI 复评，"
     "计数、客观分和价格分由程序按冻结规则确定性重算。"
+    "执行方式（AI 评审/规则评审/混合）与评标文件“主/客观分”列值分列标注；"
+    "文件无该列的条目显示“—”，不推断。"
 )
 _METHOD_QUAL_DEEP = (
     "资格与符合性给出“符合”“不符合”或仅针对缺失外部事实的“现有材料无法证实”最终结论；"
@@ -117,20 +129,16 @@ def _report_verdict(status: str | None, automated: bool, lightweight: bool = Fal
 
 
 def _report_method(score_type: str, automated: bool, lightweight: bool = False,
-                   light_schema: int | None = None) -> str:
-    if automated:
-        if lightweight and score_type in ("veto", "match"):
-            if light_schema == 3:
-                return "确定性预检 + 单次轻量快审（二值否决点筛查：通过=未见确定性否决点，存疑=建议否决）"
-            return "确定性预检 + 单次轻量快审（三态结论，不构成完整审查）"
-        return {
-            "subjective": "AI 按细则评分",
-            "count": "AI 核验事实，程序确定性计数",
-            "formula": "程序按冻结公式计算",
-            "veto": "AI 事实核验与最终符合性判定",
-            "match": "AI 事实核验与最终符合性判定",
-        }.get(score_type, score_type)
-    return SCORE_TYPE_LABELS.get(score_type, score_type)
+                   light_schema: int | None = None, *,
+                   params: dict | None = None, ai_raw: dict | None = None,
+                   verdict_source: str | None = None) -> str:
+    # 二轴制：方法轴=执行方式三标签（scoring_method_of 单一决策树）；
+    # 轻量判定的执行措辞（确定性预检+快审）保留不动。
+    if automated and lightweight and score_type in ("veto", "match"):
+        if light_schema == 3:
+            return "确定性预检 + 单次轻量快审（二值否决点筛查：通过=未见确定性否决点，存疑=建议否决）"
+        return "确定性预检 + 单次轻量快审（三态结论，不构成完整审查）"
+    return scoring_method_of(score_type, params, ai_raw=ai_raw, verdict_source=verdict_source)
 
 
 def _is_lightweight(score) -> bool:
@@ -842,6 +850,14 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
             select(Criterion).where(Criterion.package_id == run.package_id, Criterion.status != "retired")
             .order_by(Criterion.sort_order)
         ).scalars().all()
+        # 二轴制：方法轴需要形态标记（_objective_form/_objective_route 等，存 check params）
+        check_params_by_id = {
+            int(c.criterion_id): (c.params_json or {})
+            for c in s.execute(
+                select(CriterionCheck).where(
+                    CriterionCheck.criterion_id.in_([x.id for x in criteria] or [-1]))
+            ).scalars()
+        }
         score_rows = s.execute(
             select(ScoreRecord, Criterion, Bidder)
             .join(Criterion, Criterion.id == ScoreRecord.criterion_id)
@@ -1109,8 +1125,14 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
                 "name": crit.name,
                 "factor": crit.source_quote or crit.description or "",
                 "max_score": str(crit.max_score) if crit.max_score is not None else None,
-                "method": _report_method(crit.score_type, automated, _is_lightweight(score),
-                                         light_schema=_light_schema(score)),
+                "method": _report_method(
+                    crit.score_type, automated, _is_lightweight(score),
+                    light_schema=_light_schema(score),
+                    params=getattr(crit, "params", None) or check_params_by_id.get(crit.id),
+                    ai_raw=score.ai_raw_json if score is not None else None,
+                    verdict_source=_verdict_source(score, crit.score_type)),
+                "basis": scoring_basis_of(getattr(crit, "score_column", None),
+                                          getattr(crit, "score_column_source", None)),
                 "per_bidder": per_bidder,
             })
         score_groups.append({"category": label, "items": items})
@@ -1134,6 +1156,12 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
         for crit in criteria:
             if crit.score_type != "subjective":
                 continue
+            # 二轴制：A5 收录=方法轴 AI 评审的计分项——重路由落确定性引擎的
+            # 主观条目（方法=混合）不再冒充"AI 评审明细"。
+            if scoring_method_of(
+                    "subjective",
+                    getattr(crit, "params", None) or check_params_by_id.get(crit.id)) != METHOD_AI:
+                continue
             entry = score_by_key.get((bidder.id, crit.id))
             if entry is None:
                 continue
@@ -1143,8 +1171,14 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
                 "code": crit.code,
                 "name": crit.name,
                 "max_score": str(crit.max_score) if crit.max_score is not None else None,
-                "method": _report_method(crit.score_type, automated, _is_lightweight(score),
-                                         light_schema=_light_schema(score)),
+                "method": _report_method(
+                    crit.score_type, automated, _is_lightweight(score),
+                    light_schema=_light_schema(score),
+                    params=getattr(crit, "params", None) or check_params_by_id.get(crit.id),
+                    ai_raw=score.ai_raw_json if score is not None else None,
+                    verdict_source=_verdict_source(score, crit.score_type)),
+                "basis": scoring_basis_of(getattr(crit, "score_column", None),
+                                          getattr(crit, "score_column_source", None)),
                 "judges": [
                     {
                         "judge": f"{'证据簇' if cluster_mode else JUDGE_LABEL}{m.get('judge_no')}",
@@ -1406,7 +1440,7 @@ def render_docx(report: dict) -> bytes:
         for item in group["items"]:
             heading(f"{item['code']} {item['name']}（满分 {item['max_score']}）", 3)
             if automated:
-                para(f"评审方法：{item['method']}")
+                para(f"评审方法：{item['method']}｜口径：{item.get('basis') or '—'}")
             if item["factor"]:
                 para(f"评审因素（原文）：{item['factor'][:400]}")
             table(
@@ -1422,7 +1456,7 @@ def render_docx(report: dict) -> bytes:
     )
     para("注：" + report["tax_note"])
     # A5 AI 评审明细
-    heading("附表 A5 AI 评审明细（主观项）", 1)
+    heading("附表 A5 AI 评审明细（AI 评审项）", 1)
     for detail in report["ai_detail"]:
         heading(detail["bidder"], 2)
         for it in detail["items"]:

@@ -37,6 +37,10 @@ class ExtractedCriterion(BaseModel):
     score_type: ScoreType
     # P0-C：评分表"主/客观分"明文列的照抄值（仅 hint，骨架 reconcile 仍是权威）
     subjectivity_hint: str | None = None
+    # 2026-11-23 二轴制：文件"主/客观分"列值 + 来源（file=骨架列解析，权威；
+    # llm_copy=LLM 照抄；inferred=措辞推断不作显示来源；None=无列不猜）
+    score_column: str | None = None
+    score_column_source: str | None = None
     is_veto: bool = False
     veto_consequence: VetoConsequence | None = None
     description: str | None = None

@@ -151,11 +151,7 @@ export default function BidderRankList({
                           : "green"
                     }
                   >
-                    资格建议：{b.qualification_suggestion.label}
-                    {b.qualification_suggestion.code === "pass" &&
-                    (b.qualification_suggestion.manual_check_count ?? 0) > 0
-                      ? `（${b.qualification_suggestion.manual_check_count} 项待人工核对）`
-                      : ""}
+                    资格审核：{b.qualification_suggestion.label}
                   </Tag>
                 )}
                 {(b.summary?.missing_count ?? 0) > 0 && (

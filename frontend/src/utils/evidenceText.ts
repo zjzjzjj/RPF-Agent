@@ -36,6 +36,19 @@ export function sideFromScoreType(scoreType: string | null | undefined): Side {
   return "objective";
 }
 
+/** 二轴制：方法轴标签（后端 scoring_method_of 同口径）；ScoreOut 无新字段时
+ *  按 score_type 兜底（count 细分 presence/混合需 params，兜底给混合）。 */
+export function methodFromItem(item: {
+  scoring_method?: string | null;
+  score_type?: string | null;
+}): string {
+  if (item.scoring_method) return item.scoring_method;
+  const st = item.score_type;
+  if (st === "subjective") return "AI评审";
+  if (st === "count") return "混合（AI核验事实+规则计数）";
+  return "规则评审";
+}
+
 /** 证据引文空态文案（EvidencePanel 的 emptyText）。 */
 export function evidenceEmptyText(
   side: Side,

@@ -259,6 +259,9 @@ def _generate_for_row(row: SkeletonRow, pages_by_no: dict[int, str],
         quote=_quote_for_row(row, pages_by_no),
         page_hint=row.page_no,
         confidence=1.0,
+        # 二轴制：骨架"主/客观分"列值=文件口径权威（无列则 None→显示"—"不猜）
+        score_column=row.subjectivity,
+        score_column_source=("file" if row.subjectivity is not None else None),
     )
 
 
@@ -591,6 +594,10 @@ def reconcile_with_skeleton(
         if not (is_match or has_column):
             continue
         new_type, params = _score_type_for_row(row)
+        if has_column:
+            # 二轴制：列是 ground truth——文件口径按列覆盖（含 LLM 照抄值）
+            c.score_column = row.subjectivity
+            c.score_column_source = "file"
         if not is_match and new_type == c.score_type:
             # 与列一致：只补参数缺口（既有显式参数优先，不覆盖）
             if params:

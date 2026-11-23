@@ -18,11 +18,16 @@ const STATE_TAG: Record<string, { color: string; text: string }> = {
   not_run: { color: "default", text: "未执行" },
 };
 
-// 主观/客观口径配色：主观=紫（AI 评委），客观=蓝（确定性计算），判定项=青（只出结论）
-const METHOD_TAG: Record<string, { color: string }> = {
-  subjective: { color: "purple" },
-  objective: { color: "blue" },
-  verdict: { color: "cyan" },
+// 二轴制配色：方法轴 AI评审=紫/规则评审=蓝/混合=青；口径轴 主观=品红/客观=绿/—=灰
+const METHOD_COLOR: Record<string, string> = {
+  "AI评审": "purple",
+  "规则评审": "blue",
+  "混合（AI核验事实+规则计数）": "cyan",
+};
+const BASIS_COLOR: Record<string, string> = {
+  "主观": "magenta",
+  "客观": "green",
+  "—": "default",
 };
 
 function verdictTag(item: SummaryItem) {
@@ -82,12 +87,14 @@ export default function ItemTable({ bucket, onOpenReason, onOpenEvidence, onView
         { title: "编号", dataIndex: "code", width: 76, fixed: "left" as const },
         { title: "评分项", dataIndex: "name", width: 190, ellipsis: true },
         {
-          title: "评分方式",
-          width: 104,
-          render: (_, item) => {
-            const m = METHOD_TAG[item.side] ?? { color: "default" };
-            return <Tag color={m.color}>{item.scoring_method}</Tag>;
-          },
+          title: "评审方式｜口径",
+          width: 168,
+          render: (_, item) => (
+            <>
+              <Tag color={METHOD_COLOR[item.scoring_method] ?? "default"}>{item.scoring_method}</Tag>
+              <Tag color={BASIS_COLOR[item.scoring_basis] ?? "default"}>口径：{item.scoring_basis}</Tag>
+            </>
+          ),
         },
         {
           title: "满分",

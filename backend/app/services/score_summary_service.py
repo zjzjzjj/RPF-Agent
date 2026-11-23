@@ -23,6 +23,7 @@ from app import config as app_config
 from app.db.models import (
     Bidder,
     Criterion,
+    CriterionCheck,
     CriterionLevel,
     Document,
     DocumentPage,
@@ -79,6 +80,49 @@ def _score_side(score_type: str | None) -> str:
     if score_type in VERDICT_SCORE_TYPES:
         return "verdict"
     return "objective"
+
+
+# ---- 二轴制显示口径（2026-11-23 用户拍板）：报告/前端只消费，不各自派生 ----
+# 方法轴=执行方式（AI评审/规则评审/混合）；口径轴=评标文件"主/客观分"列值
+# （Criterion.score_column，来源 score_column_source）。缺列/措辞推断 → "—"不猜。
+METHOD_AI = "AI评审"
+METHOD_RULE = "规则评审"
+METHOD_MIXED = "混合（AI核验事实+规则计数）"
+
+
+def scoring_basis_of(score_column: str | None, score_column_source: str | None) -> str:
+    """口径轴：严格取文件列值（file=骨架列解析/llm_copy=LLM 照抄列）；
+    inferred（措辞推断）与缺列 → "—"（不猜，红线）。"""
+    if score_column in ("subjective", "objective") and score_column_source in ("file", "llm_copy"):
+        return "主观" if score_column == "subjective" else "客观"
+    return "—"
+
+
+def scoring_method_of(score_type: str | None, params: dict | None = None, *,
+                      ai_raw: dict | None = None,
+                      verdict_source: str | None = None) -> str:
+    """方法轴：执行方式三标签。特例口径表（2026-11-23 方案）：
+    主观引擎→AI评审；objective_as_subjective 代判→AI评审（口径=客观）；
+    count→混合；presence/样品数量档位→规则评审；formula→规则评审；
+    _objective_route 重路由→混合；veto/match 按 verdict_source 分 AI/规则。
+    """
+    params = params or {}
+    raw = ai_raw or {}
+    if score_type in ("veto", "match"):
+        return METHOD_AI if (verdict_source or "machine") == "llm" else METHOD_RULE
+    if score_type == "formula":
+        return METHOD_RULE
+    if score_type == "count":
+        # presence/样品数量档位 = 零 LLM 确定性（raw.presence 标记）→ 规则评审；
+        # 其余计数 = AI 核验事实 + 程序计数 → 混合
+        return METHOD_RULE if raw.get("presence") else METHOD_MIXED
+    # subjective
+    if (params.get("_objective_form") or "") in ("all_or_nothing", "unparsed_objective"):
+        return METHOD_AI  # 客观列→主观引擎代判（口径轴如实显示客观）
+    if (raw.get("presence") or raw.get("calculation")
+            or params.get("_objective_route") or params.get("engine")):
+        return METHOD_MIXED  # 重路由/快路径确定性引擎出分
+    return METHOD_AI
 
 
 MACHINE_VERDICT_LABELS = {
@@ -315,6 +359,7 @@ def _build_item(
     review: ReviewRecord | None,
     max_reason_chars: int,
     max_score_parts: list[Decimal],
+    params: dict | None = None,
 ) -> dict:
     from app.services.automation_service import public_auto_review
 
@@ -411,8 +456,16 @@ def _build_item(
         "category": crit.category,
         "score_type": score_type,
         "side": _score_side(score_type),
-        "scoring_method": (SCORE_TYPE_LABELS.get(score_type or "", score_type or "—")
-                           + ("（轻量）" if lightweight else "")),
+        # 二轴制：口径轴=文件列值（—=无列不猜）；方法轴=执行方式三标签
+        "scoring_basis": scoring_basis_of(getattr(crit, "score_column", None),
+                                          getattr(crit, "score_column_source", None)),
+        "scoring_basis_source": getattr(crit, "score_column_source", None),
+        "scoring_method": scoring_method_of(
+            score_type,
+            params=params or {},
+            ai_raw=score.ai_raw_json if score is not None else None,
+            verdict_source=_verdict_source(score, score_type),
+        ),
         "is_veto": is_veto,
         "lightweight": lightweight,
         "lightweight_schema_version": light_schema if lightweight else None,
@@ -573,6 +626,18 @@ def build_score_summary(
             if criteria
             else []
         )
+        # 二轴制：方法轴要读形态标记（_objective_form 等），补一次轻量 check join
+        check_rows = (
+            list(
+                s.execute(
+                    select(CriterionCheck).where(
+                        CriterionCheck.criterion_id.in_([c.id for c in criteria]))
+                ).scalars()
+            )
+            if criteria
+            else []
+        )
+        params_by_crit = {c.criterion_id: (c.params_json or {}) for c in check_rows}
 
         config = run.config_json if isinstance(run.config_json, dict) else {}
         participant_ids = [int(x) for x in config.get("bidder_ids") or []]
@@ -730,14 +795,20 @@ def build_score_summary(
                         review=review_by_score.get(score.id) if score is not None else None,
                         max_reason_chars=max_reason_chars,
                         max_score_parts=max_parts,
+                        params=params_by_crit.get(crit.id),
                     )
                 )
 
             scored_count = sum(1 for i in items if i["state"] == "scored")
             missing_count = sum(1 for i in items if i["state"] == "missing_final")
             fallback_count = sum(1 for i in items if i.get("fallback"))
-            subjective_count = sum(1 for i in items if i["side"] == "subjective")
-            objective_count = sum(1 for i in items if i["side"] == "objective")
+            # 二轴制：口径轴计数（主/客/—）+ 方法轴计数（AI/规则/混合）
+            subjective_count = sum(1 for i in items if i.get("scoring_basis") == "主观")
+            objective_count = sum(1 for i in items if i.get("scoring_basis") == "客观")
+            unlabeled_count = sum(1 for i in items if i.get("scoring_basis") == "—")
+            ai_count = sum(1 for i in items if i.get("scoring_method") == METHOD_AI)
+            rule_count = sum(1 for i in items if i.get("scoring_method") == METHOD_RULE)
+            mixed_count = sum(1 for i in items if i.get("scoring_method") == METHOD_MIXED)
             verdicts = None
             if bdef["kind"] == "verdict":
                 verdicts = {"pass": 0, "recommend_reject": 0, "need_human": 0, "fail": 0,
@@ -782,6 +853,10 @@ def build_score_summary(
                     "fallback_count": fallback_count,
                     "subjective_count": subjective_count,
                     "objective_count": objective_count,
+                    "unlabeled_count": unlabeled_count,
+                    "ai_count": ai_count,
+                    "rule_count": rule_count,
+                    "mixed_count": mixed_count,
                     "verdicts": verdicts,
                     "items": items,
                 }

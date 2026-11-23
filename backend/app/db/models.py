@@ -253,6 +253,12 @@ class Criterion(Base):
     edit_json: Mapped[dict | None] = mapped_column(JSON)  # {by,at,reason,model_value}
     confidence: Mapped[float | None] = mapped_column(Float)
     sort_order: Mapped[int] = mapped_column(Integer, default=0)
+    # 2026-11-23 显示口径二轴制：评分表"主/客观分"列值（严格取文件列；NULL=无列，
+    # 显示"—"不猜）。source：file=骨架表格列解析（权威）| llm_copy=LLM 照抄列值 |
+    # inferred=量化措辞推断（不作显示来源）。显示口径由 score_summary_service
+    # 单一投影（scoring_basis_of）消费，禁止各处按 score_type 再派生。
+    score_column: Mapped[str | None] = mapped_column(String(16))
+    score_column_source: Mapped[str | None] = mapped_column(String(16))
 
     __table_args__ = (
         UniqueConstraint("package_id", "code", name="uq_criteria_package_code"),
@@ -270,6 +276,15 @@ class Criterion(Base):
         ),
         CheckConstraint(
             "origin IN ('template','document','manual','law')", name="origin_valid"
+        ),
+        CheckConstraint(
+            "score_column IS NULL OR score_column IN ('subjective','objective')",
+            name="score_column_valid",
+        ),
+        CheckConstraint(
+            "score_column_source IS NULL OR "
+            "score_column_source IN ('file','llm_copy','inferred')",
+            name="score_column_source_valid",
         ),
     )
 

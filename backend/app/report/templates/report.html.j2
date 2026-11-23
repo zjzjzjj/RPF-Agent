@@ -76,8 +76,8 @@
   {% if run.automation %}
   <b>自动评审说明：</b>{{ automatic_method }}
   {% else %}
-  <b>合规声明：</b>本报告由 AI 辅助评标系统生成。客观分（资格性/符合性审查、价格分、计数类评分）由确定性程序计算，
-  可复算、可审计；主观分由 AI 提供建议并附原文依据，最终分值由评审人员逐项确认。
+  <b>合规声明：</b>本报告由 AI 辅助评标系统生成。规则评审项（资格性/符合性审查、价格分、确定性计数）由程序按冻结规则计算，
+  可复算、可审计；AI 评审项由 AI 提供建议并附原文依据，最终分值由评审人员逐项确认。执行方式与评标文件“主/客观分”列值分列标注（缺列显示“—”）。
   所有否决类结论均需人工确认方可生效。本报告不替代评标委员会的法定评审职责，最终评审结论以评标委员会确认为准。
   {% endif %}
 </div>
@@ -87,7 +87,7 @@
   {% for w in ranking.warnings %}<div class="warn tag">提示：{{ w }}</div>{% endfor %}
 {% endif %}
 <table>
-  <tr><th>名次</th><th>投标人</th><th>投标报价（元）</th><th>总分</th><th>价格分（客观）</th><th>技术分（主观+客观）</th><th>商务分（客观）</th><th>备注</th></tr>
+  <tr><th>名次</th><th>投标人</th><th>投标报价（元）</th><th>总分</th><th>价格分</th><th>技术分</th><th>商务分</th><th>备注</th></tr>
   {% for row in ranking.rows %}
   <tr>
     <td>{{ row.rank if row.rank is not none else "未发布" }}</td>

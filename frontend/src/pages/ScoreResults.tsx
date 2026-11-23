@@ -497,11 +497,7 @@ export default function ScoreResults() {
                                     : "green"
                               }
                             >
-                              资格建议：{selected.qualification_suggestion.label}
-                              {selected.qualification_suggestion.code === "pass" &&
-                              (selected.qualification_suggestion.manual_check_count ?? 0) > 0
-                                ? `（${selected.qualification_suggestion.manual_check_count} 项待人工核对）`
-                                : ""}
+                              资格审核：{selected.qualification_suggestion.label}
                             </Tag>
                           )}
                           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
@@ -530,9 +526,8 @@ export default function ScoreResults() {
                                   {bucket.score ?? "—"}
                                   {bucket.max ? ` / ${bucket.max}` : ""}
                                   {`　${bucket.item_count} 项`}
-                                  {bucket.subjective_count > 0 || bucket.objective_count > 0
-                                    ? `（主观 ${bucket.subjective_count} · 客观 ${bucket.objective_count}）`
-                                    : ""}
+                                  {`（口径：主 ${bucket.subjective_count}·客 ${bucket.objective_count}·— ${bucket.unlabeled_count ?? 0}` +
+                                    `｜方式：AI ${bucket.ai_count ?? 0}·规则 ${bucket.rule_count ?? 0}·混合 ${bucket.mixed_count ?? 0}）`}
                                   {bucket.missing_count > 0 ? `（${bucket.missing_count} 项未定分）` : ""}
                                 </Typography.Text>
                               ) : (
@@ -551,11 +546,7 @@ export default function ScoreResults() {
                                       }
                                       style={{ marginRight: 0 }}
                                     >
-                                      总评价：{selected.qualification_suggestion.label}
-                                      {selected.qualification_suggestion.code === "pass" &&
-                                      (selected.qualification_suggestion.manual_check_count ?? 0) > 0
-                                        ? `（${selected.qualification_suggestion.manual_check_count} 项待人工核对）`
-                                        : ""}
+                                      资格审核：{selected.qualification_suggestion.label}
                                     </Tag>
                                   )}
                                 </Space>

@@ -128,7 +128,7 @@ export default function MatrixPanel({ pid, matrix, isLoading, managed = false }:
             <Tag color="green">✓ 有据</Tag>
             <Tag color="orange">证据待核</Tag>
             <Tag color="red">无证据</Tag>
-            {managed ? "格内证据角注：证据由系统自动核验；确定性项的计算过程可复算" : "格内证据角注：红＝主观项缺引文需人工处置；确定性项（判定/计算）无引文属设计"}
+            {managed ? "格内证据角注：证据由系统自动核验；确定性项的计算过程可复算" : "格内证据角注：红＝AI 评审项缺引文需人工处置；规则评审项（判定/计算）无引文属设计"}
           </span>
         </Space>
       </div>

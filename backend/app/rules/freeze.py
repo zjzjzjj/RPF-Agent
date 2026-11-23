@@ -68,6 +68,8 @@ def build_snapshot(
                 "source_quote": c.get("source_quote"),
                 "status": c.get("status"),
                 "sort_order": c.get("sort_order", 0),
+                "score_column": c.get("score_column"),
+                "score_column_source": c.get("score_column_source"),
                 "origin": c.get("origin", "document"),
                 "template_code": c.get("template_code"),
                 "template_hash": c.get("template_hash"),

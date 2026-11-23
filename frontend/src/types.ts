@@ -78,6 +78,10 @@ export interface CriterionOut {
   max_score: string | null;
   weight: string | null;
   score_type: string;
+  /** 二轴制：评标文件"主/客观分"列值（null=无列，显示"—"不猜） */
+  score_column: string | null;
+  /** 列值来源：file/llm_copy/inferred（inferred 不作显示来源） */
+  score_column_source: string | null;
   is_veto: boolean;
   veto_consequence: string | null;
   required_evidence: string | null;
@@ -559,10 +563,14 @@ export interface SummaryItem {
   name: string;
   category: string;
   score_type: string;
-  /** 主观/客观口径：主观＝AI 评委评审，客观＝公式/计数确定性计算，verdict＝只出结论不计分 */
+  /** 旧口径（score_type 派生，兼容保留）：verdict＝只出结论不计分 */
   side: "subjective" | "objective" | "verdict";
-  /** 评分方式中文标签（与规则页类型措辞一致） */
+  /** 方法轴：执行方式三标签（AI评审/规则评审/混合（AI核验事实+规则计数）） */
   scoring_method: string;
+  /** 口径轴：评标文件"主/客观分"列值；"—"＝文件无该列（不猜） */
+  scoring_basis: "主观" | "客观" | "—";
+  /** 列值来源：file=骨架列解析（权威）/llm_copy=LLM 照抄/inferred=推断（不作显示）/null */
+  scoring_basis_source: "file" | "llm_copy" | "inferred" | null;
   is_veto: boolean;
   bucket: string;
   state: SummaryItemState;
@@ -621,6 +629,12 @@ export interface SummaryBucket {
   missing_count: number;
   subjective_count: number;
   objective_count: number;
+  /** 二轴制：口径轴"—"（文件无列）计数（旧数据缺省按 0） */
+  unlabeled_count?: number;
+  /** 二轴制：方法轴计数（AI评审/规则评审/混合） */
+  ai_count?: number;
+  rule_count?: number;
+  mixed_count?: number;
   verdicts: Record<string, number> | null;
   items: SummaryItem[];
 }

@@ -712,6 +712,9 @@ def enrich_extracted(
         if c.category in ("technical", "commercial"):
             hint = c.subjectivity_hint if c.subjectivity_hint in (
                 "objective", "subjective") else None
+            if hint is not None and c.score_column is None:
+                # 二轴制：LLM 照抄列值（骨架 reconcile 会以 source="file" 覆盖为权威）
+                c.score_column, c.score_column_source = hint, "llm_copy"
             if hint is None:
                 text_c = f"{c.name or ''}\n{c.description or ''}\n{c.quote or ''}"
                 if re.search(
@@ -720,6 +723,9 @@ def enrich_extracted(
                     text_c,
                 ):
                     hint = "objective"
+                    if c.score_column is None:
+                        # 二轴制：措辞推断——留痕但不作显示来源（显示"—"）
+                        c.score_column, c.score_column_source = "objective", "inferred"
             if hint == "objective":
                 params = dict(c.params or {})
                 params.setdefault("_subjectivity_hint", hint)
@@ -1221,6 +1227,9 @@ def _persist_criterion(
         status=status,
         confidence=c.confidence,
         sort_order=seq,
+        # 二轴制：文件"主/客观分"列值 + 来源（显示口径单一来源，见 score_summary）
+        score_column=c.score_column,
+        score_column_source=c.score_column_source,
     )
     s.add(crit)
     s.flush()

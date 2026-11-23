@@ -153,16 +153,29 @@ def test_subjective_objective_side_projection(client, summary_chain):  # noqa: A
     assert by_cat["technical"] == {"subjective"}
     assert by_cat["qualification"] == {"verdict"}
 
-    # 桶级计数是纯投影：主观 + 客观 = 计分条目数（判定桶另有 verdicts）
+    # 二轴制（2026-11-23）：桶级计数=纯投影，口径轴（主/客/—）与方法轴（AI/规则/混合）
+    # 分别与条目逐项一致；本夹具无文件列值 → 口径全为"—"（不猜）。
     for b in d["bidders"]:
         for bucket in b["buckets"]:
-            sub = sum(1 for i in bucket["items"] if i["side"] == "subjective")
-            obj = sum(1 for i in bucket["items"] if i["side"] == "objective")
-            assert bucket["subjective_count"] == sub
-            assert bucket["objective_count"] == obj
-            assert sub + obj + sum(1 for i in bucket["items"] if i["side"] == "verdict") == len(
-                bucket["items"]
-            )
+            its = bucket["items"]
+            assert bucket["subjective_count"] == sum(1 for i in its if i["scoring_basis"] == "主观")
+            assert bucket["objective_count"] == sum(1 for i in its if i["scoring_basis"] == "客观")
+            assert bucket["unlabeled_count"] == sum(1 for i in its if i["scoring_basis"] == "—")
+            assert bucket["subjective_count"] + bucket["objective_count"] + bucket[
+                "unlabeled_count"] == len(its)
+            assert bucket["ai_count"] == sum(1 for i in its if i["scoring_method"] == "AI评审")
+            assert bucket["rule_count"] == sum(1 for i in its if i["scoring_method"] == "规则评审")
+            assert bucket["mixed_count"] == sum(
+                1 for i in its if i["scoring_method"] == "混合（AI核验事实+规则计数）")
+            assert bucket["ai_count"] + bucket["rule_count"] + bucket["mixed_count"] == len(its)
+
+    # 方法轴决策树（模板夹具）：formula→规则评审、count→混合、subjective→AI评审
+    method_by_cat: dict[str, set[str]] = {}
+    for i in items:
+        method_by_cat.setdefault(i["category"], set()).add(i["scoring_method"])
+    assert method_by_cat["price"] == {"规则评审"}
+    assert method_by_cat["commercial"] == {"混合（AI核验事实+规则计数）"}
+    assert method_by_cat["technical"] == {"AI评审"}
 
 
 def test_totals_equal_ranking(client, summary_chain):  # noqa: ANN001

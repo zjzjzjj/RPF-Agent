@@ -529,7 +529,8 @@ def test_managed_reports_describe_actual_automatic_methods(managed, verdict, lab
     assert report["review_notes"][0]["items"][0]["verdict"] == label
     assert report["judge_labels"] == []
     assert report["ai_detail"][0]["items"][0]["judges"] == []
-    assert report["ai_detail"][0]["items"][0]["method"] == "AI 按细则评分"
+    # 二轴制（2026-11-23）：A5 方法列=执行方式三标签（AI评审/规则评审/混合）
+    assert report["ai_detail"][0]["items"][0]["method"] == "AI评审"
     doc = DocxDocument(BytesIO(render_docx(report)))
     doc_text = "\n".join([p.text for p in doc.paragraphs] + [
         cell.text for table in doc.tables for row in table.rows for cell in row.cells
