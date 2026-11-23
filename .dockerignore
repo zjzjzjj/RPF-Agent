@@ -9,3 +9,6 @@ docs
 logs
 *.log
 **/__pycache__
+releases
+incoming
+diagnostics

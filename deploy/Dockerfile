@@ -10,7 +10,9 @@ RUN pip install --no-cache-dir -r requirements-frozen.txt \
     -i https://pypi.tuna.tsinghua.edu.cn/simple
 
 # OpenCV / RapidOCR need these shared libraries in the slim runtime image.
-RUN sed -i 's|http://deb.debian.org|https://deb.debian.org|g' /etc/apt/sources.list.d/debian.sources \
+# 2026-11-23：apt 换清华镜像——deb.debian.org 直连实测 18s/包（构建缓存被挤掉后
+# 重建卡 15 分钟+），与 pip 层同源走镜像。
+RUN sed -i 's|http://deb.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g; s|https://deb.debian.org|https://mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list.d/debian.sources \
     && apt-get -o Acquire::Retries=2 -o Acquire::https::Timeout=30 update \
     && apt-get -o Acquire::Retries=2 -o Acquire::https::Timeout=30 install -y --no-install-recommends libgl1 libglib2.0-0 libxcb1 \
     && rm -rf /var/lib/apt/lists/*
