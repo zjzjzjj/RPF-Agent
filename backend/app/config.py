@@ -707,7 +707,8 @@ def llm_api_key() -> str | None:
 
 
 def llm_model() -> str:
-    return os.environ.get("BID_EVAL_LLM_MODEL", "deepseek-chat")
+    # 2026-11-23 用户拍板：云端模型统一收口 DeepSeek-V4.1-Flash（文本+视觉）
+    return os.environ.get("BID_EVAL_LLM_MODEL", "deepseek-ai/DeepSeek-V4.1-Flash")
 
 
 def llm_timeout_s() -> float:
@@ -945,54 +946,11 @@ def vl_fallback_min_pages() -> int:
 # ---------------------------------------------------------------------------
 DEFAULT_MODEL_PRESETS: list[dict] = [
     {
-        "id": "deepseek-ai/DeepSeek-V4-Flash",
-        "label": "DeepSeek V4 Flash",
-        "family": "DeepSeek",
-        "note": "均衡之选，JSON 抽取稳定（默认）",
-    },
-    {
         "id": "deepseek-ai/DeepSeek-V4.1-Flash",
         "label": "DeepSeek V4.1 Flash",
         "family": "DeepSeek",
-        "note": "云端主用：可用性稳定、轻推理、JSON 稳定",
-    },
-    {
-        "id": "zai-org/GLM-5.3-Flash",
-        "label": "GLM 5.3 Flash",
-        "family": "GLM",
-        "note": "推理模型，中文强（高峰期常 503）",
-    },
-    {
-        "id": "zai-org/GLM-5.2",
-        "label": "GLM 5.2",
-        "family": "GLM",
-        "note": "中文理解强",
-    },
-    {
-        "id": "Pro/moonshotai/Kimi-K2.6",
-        "label": "Kimi K2.6",
-        "family": "Kimi",
-        "note": "推理模型：先思考再作答，更慢更贵但判断更细",
-    },
-    {
-        "id": "Qwen/Qwen3.8-27B",
-        "label": "Qwen3.8 27B",
-        "family": "Qwen",
-        "note": "通义最新代，速度快",
-    },
-    {
-        "id": "Qwen/Qwen2.5-VL-72B-Instruct",
-        "label": "Qwen2.5 VL 72B（视觉）",
-        "family": "Qwen-VL",
         "vision": True,
-        "note": "材料审核视觉兜底：看图定分+页级观察（BID_EVAL_VISION_MODEL 选用）",
-    },
-    {
-        "id": "zai-org/GLM-4.5V",
-        "label": "GLM 4.5V（视觉）",
-        "family": "GLM-VL",
-        "vision": True,
-        "note": "视觉理解备选：材料图像审核",
+        "note": "唯一允许的云端模型（2026-11-23 用户拍板收口）：文本+视觉统一用它，轻推理、JSON 稳定",
     },
 ]
 
