@@ -1218,10 +1218,27 @@ def _write_closure_fallback(s, row: ScoreRecord, criterion: dict, error: BaseExc
             "error": detail,
         },
     }
-    row.warnings_json = [{
+    warnings = [{
         "message": reason,
         "fallback_score": fallback,
     }]
+    vl_note = getattr(error, "vl_fallback_note", None)
+    if isinstance(vl_note, dict):
+        # run152 观测性补：错误路径的 VL 兜底失败原因一并落库
+        warnings.append({
+            "verdict_source": "visual",
+            "message": f"视觉AI兜底未定分：{vl_note.get('reason')}",
+            "reasoning": str(vl_note.get("reasoning") or "")[:500],
+            "clues": vl_note.get("clues") or [],
+        })
+        row.ai_raw_json = {
+            **(row.ai_raw_json or {}),
+            "auto_review": {
+                **((row.ai_raw_json or {}).get("auto_review") or {}),
+                "visual_fallback_note": vl_note,
+            },
+        }
+    row.warnings_json = warnings
     s.add(ReviewRecord(
         subject_type="score", subject_id=str(row.id), action="confirm", actor="auto",
         reason=reason,
@@ -1256,8 +1273,14 @@ def _persist_light_reject_citations(run_id: int, bidder_id: int, criterion: dict
     )
 
 
-def _vl_note(outcome: CellOutcome | None, note: dict) -> CellOutcome | None:
-    """VL 兜底未定分时的留痕（不改变原暂定语义——天然安全态）。"""
+def _vl_note(outcome: CellOutcome | None, note: dict,
+             error: BaseException | None = None) -> CellOutcome | None:
+    """VL 兜底未定分时的留痕（不改变原暂定语义——天然安全态）。
+
+    run152 实证可观测性漏洞：错误路径（outcome=None）留痕被整体丢弃，收口
+    兜底格的失败原因不可见。现同时挂 error.vl_fallback_note，由
+    _write_closure_fallback 落进 warnings 与 auto_review。
+    """
     if outcome is not None:
         raw = dict(outcome.raw or {})
         raw["visual_fallback_note"] = note
@@ -1266,6 +1289,11 @@ def _vl_note(outcome: CellOutcome | None, note: dict) -> CellOutcome | None:
             "verdict_source": "visual",
             "message": f"视觉AI兜底未定分：{note.get('reason')}",
         }]
+    if error is not None:
+        try:
+            setattr(error, "vl_fallback_note", note)
+        except Exception:  # noqa: BLE001 —— 不可抛错盖掉原错误
+            pass
     return outcome
 
 
@@ -1301,7 +1329,7 @@ def _maybe_vl_rescue(run_id: int, bid_id: int, criterion: dict,
     cell_key = f"{run_id}:{bid_id}:{criterion.get('id')}"
     ok, why = budget.consume(bid_id, cell_key)
     if not ok:
-        return _vl_note(outcome, {"visual_fallback": "skipped", "reason": why}), error
+        return _vl_note(outcome, {"visual_fallback": "skipped", "reason": why}, error), error
 
     # 材料页=该格送审页（含 fallback 点名的不可读页，优先）；一页一图
     from app.evidence.renderer import render_page_png
@@ -1338,12 +1366,17 @@ def _maybe_vl_rescue(run_id: int, bid_id: int, criterion: dict,
                             "page_no": int(cp["page_no"])})
     if not page_images:
         return _vl_note(outcome, {"visual_fallback": "failed",
-                                  "reason": "no_renderable_pages"}), error
+                                  "reason": "no_renderable_pages"}, error), error
 
     vres = vl_fallback.rescue(criterion, page_images, data_class=data_class)
     if vres.kind == "failed":
+        # 统一失败日志（run152 实证：vl_no_valid_score 等契约类失败此前零日志）
+        log.warning("VL 兜底未定分：criterion=%s reason=%s reasoning=%s",
+                    criterion.get("name"), vres.reason, (vres.reasoning or "")[:200])
         return _vl_note(outcome, {"visual_fallback": "failed", "reason": vres.reason,
-                                  "clues": vres.clues}), error
+                                  "clues": vres.clues,
+                                  "reasoning": (vres.reasoning or "")[:500],
+                                  "observations": len(vres.observations)}, error), error
     # 页级视觉证据：观察页落到候选页（严格匹配，同文档页码最近兜底）
     merged = list(candidates.values())
     evidence: list[dict] = []
@@ -1369,10 +1402,13 @@ def _maybe_vl_rescue(run_id: int, bid_id: int, criterion: dict,
     if vres.kind == "clue_only":
         # 否决/资格/符合性格：只收线索，结论仍暂定/存疑（AI 不否决）
         return _vl_note(outcome, {"visual_fallback": "clue_only",
-                                  "clues": vres.clues, "reasoning": vres.reasoning}), error
+                                  "clues": vres.clues,
+                                  "reasoning": (vres.reasoning or "")[:500]}, error), error
     if not evidence:
         return _vl_note(outcome, {"visual_fallback": "failed",
-                                  "reason": "vl_observations_out_of_scope"}), error
+                                  "reason": "vl_observations_out_of_scope"}, error), error
+    log.info("VL 兜底定分：criterion=%s score=%s pages=%d",
+             criterion.get("name"), vres.score, len(page_images))
     new_outcome = CellOutcome(
         "pass", vres.reasoning or "视觉AI核验定分（页级证据）",
         vres.score, evidence, merged, "visual_fallback", 1,

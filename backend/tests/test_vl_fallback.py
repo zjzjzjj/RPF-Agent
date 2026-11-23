@@ -283,3 +283,56 @@ def test_valid_cell_visual_fallback() -> None:
     assert not _valid_cell(rec("8"), crit, []), "越界分拒收"
     assert not _valid_cell(rec("-1"), crit, []), "负分拒收"
     assert not _valid_cell(rec("4", visual=False), crit, []), "无视觉证据拒收"
+
+
+# ---- run152 观测性补：错误路径留痕与统一日志 ---------------------------------
+
+def test_vl_note_attaches_to_error() -> None:
+    from app.services import automatic_scoring_service as asv
+
+    err = RuntimeError("boom")
+    out = asv._vl_note(None, {"visual_fallback": "failed", "reason": "vl_no_valid_score",
+                              "reasoning": "模型：扫描件无法判定"}, err)
+    assert out is None
+    assert err.vl_fallback_note["reason"] == "vl_no_valid_score"
+    assert err.vl_fallback_note["reasoning"] == "模型：扫描件无法判定"
+
+
+def test_closure_fallback_records_vl_note() -> None:
+    from app.db.models import ScoreRecord
+    from app.llm.base import LLMError
+    from app.services.automatic_scoring_service import _write_closure_fallback
+
+    class _S:
+        def add(self, x):  # noqa: ANN001, ANN202
+            return None
+
+    err = LLMError("需要视觉核验但未提供可读取原页图像")
+    err.vl_fallback_note = {"visual_fallback": "failed", "reason": "vl_no_valid_score",
+                            "reasoning": "模型：页图不清晰，无法核验金额", "clues": []}
+    row = ScoreRecord()
+    _write_closure_fallback(_S(), row, {"score_type": "count"}, err)
+    assert any(w.get("verdict_source") == "visual" for w in row.warnings_json),         "错误路径 VL 失败原因必须进 warnings（run152 漏洞）"
+    assert row.ai_raw_json["auto_review"]["visual_fallback_note"]["reason"] == "vl_no_valid_score"
+    assert "模型：页图不清晰" in row.warnings_json[1]["reasoning"]
+
+
+def test_rescue_failed_logs_unified(tmp_path, monkeypatch, caplog) -> None:  # noqa: ANN001
+    import logging
+
+    from app.services import automatic_scoring_service as asv
+    from app.services.automatic_scoring_service import CellOutcome
+
+    _png_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(vl_fallback, "rescue", lambda *a, **k: vl_fallback.VlResult(
+        "failed", reason="vl_no_valid_score", observations=[{}],
+        reasoning="模型给了 unverifiable"))
+    fb = CellOutcome("concern", "暂定", None, [], [], "fallback", 1,
+                     {"fallback": {"kind": "provisional_zero"}})
+    pages = [{"document_id": 9, "page_no": 1, "stored_path": "x.pdf", "sha256": "s"}]
+    with caplog.at_level(logging.WARNING, logger="app.services.automatic_scoring_service"):
+        out, _ = asv._maybe_vl_rescue(1, 2, CRIT, fb, None,
+                                      {2: (pages, "synthetic")}, vl_fallback.Budget())
+    assert "VL 兜底未定分" in caplog.text and "vl_no_valid_score" in caplog.text
+    note = out.raw["visual_fallback_note"]
+    assert note["reasoning"] == "模型给了 unverifiable", "reasoning 必须落进留痕"
