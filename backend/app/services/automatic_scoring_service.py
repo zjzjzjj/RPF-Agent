@@ -1345,8 +1345,25 @@ def _maybe_vl_rescue(run_id: int, bid_id: int, criterion: dict,
                                             "stored_path": up.get("stored_path"),
                                             "sha256": up.get("sha256")})
                 named_keys.append(key)
-    ordered = [candidates[k] for k in named_keys if k in candidates]
-    ordered += [q for k, q in candidates.items() if k not in set(named_keys)]
+    def _vl_rank(pg: dict) -> tuple[int, int]:
+        """run153 实证：送审窗口选到的是封面/索引（索引中毒在 VL 路径重演），
+        模型反复"8 页均为封面目录，未见材料"弃权。候选页三档排序（与
+        _supplement_pages._rank 同口径，复用 material_tags 解析期分类）：
+        0=带材料标签的实体页 / 1=材料关键词命中页 / 2=其余 / 3=结构性噪声页垫底。
+        稳定排序保证同档内保持页序；纯文本计算，零 OCR。"""
+        tags = pg.get("material_tags") or []
+        if _is_noise_page(pg):
+            return (3, int(pg.get("page_no") or 0))
+        if tags:
+            return (0, int(pg.get("page_no") or 0))
+        text = str(pg.get("text") or "")[:300]
+        if any(k in text for k in _SUPPLEMENT_HINTS):
+            return (1, int(pg.get("page_no") or 0))
+        return (2, int(pg.get("page_no") or 0))
+
+    rest = [q for k, q in candidates.items() if k not in set(named_keys)]
+    rest.sort(key=_vl_rank)
+    ordered = [candidates[k] for k in named_keys if k in candidates] + rest
     ordered = [q for q in ordered if q.get("page_no") is not None and q.get("stored_path")]
     selected = ordered[: config.vl_fallback_max_images()]
 

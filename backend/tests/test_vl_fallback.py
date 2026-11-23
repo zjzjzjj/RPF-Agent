@@ -336,3 +336,47 @@ def test_rescue_failed_logs_unified(tmp_path, monkeypatch, caplog) -> None:  # n
     assert "VL 兜底未定分" in caplog.text and "vl_no_valid_score" in caplog.text
     note = out.raw["visual_fallback_note"]
     assert note["reasoning"] == "模型给了 unverifiable", "reasoning 必须落进留痕"
+
+
+def test_maybe_vl_rescue_material_pages_first(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """run153 实证：候选页必须材料页优先——封面/索引/目录噪声垫底。
+
+    送审窗口选到封面+目录（索引中毒），模型反复"未见材料"弃权；
+    解析期 material_tags 命中页排最前，_SUPPLEMENT_HINTS 关键词页次之，
+    噪声页（toc/目录）最后；同档内保持页序。
+    """
+    from app.services import automatic_scoring_service as asv
+    from app.services.automatic_scoring_service import CellOutcome
+
+    _png_env(tmp_path, monkeypatch)
+    captured = {}
+
+    def fake_rescue(criterion, page_images, **kw):  # noqa: ANN001, ANN202
+        captured["pages"] = page_images
+        return vl_fallback.VlResult("failed", reason="probe")
+
+    monkeypatch.setattr(vl_fallback, "rescue", fake_rescue)
+    fb = CellOutcome("concern", "暂定", None, [], [], "fallback", 1,
+                     {"fallback": {"kind": "provisional_zero"}})
+
+    def page(n, tags=None, text=""):  # noqa: ANN001, ANN202
+        return {"document_id": 9, "page_no": n, "stored_path": "x.pdf",
+                "sha256": "s", "material_tags": tags or [], "text": text}
+
+    pages = [
+        page(1, tags=["目录", "toc"], text="目 录 ……"),
+        page(2, tags=["营业执照"], text="营业执照"),
+        page(3, text="封面 资格文件"),                       # 无标签无锚词
+        page(4, text="投标人自2022年以来业绩合同一览…社保缴纳证明"),
+        page(5, tags=["社保证明"], text="社会保险缴纳证明"),
+        page(6, tags=["分隔页"], text="—"),
+    ]
+    out, _ = asv._maybe_vl_rescue(1, 2, CRIT, fb, None,
+                                 {2: (pages, "synthetic")}, vl_fallback.Budget())
+    assert out is fb
+    order = [p["page_no"] for p in captured["pages"]]
+    # 材料标签页(5,2) → 关键词页(4) → 其余(3) → 噪声(1,6)；同档内页序
+    assert order[:2] == [2, 5], f"材料标签页应最前：{order}"
+    assert order[2] == 4, f"关键词命中页次之：{order}"
+    assert order[-1] in (1, 6), f"噪声页垫底：{order}"
+    assert order.index(1) > order.index(3), f"目录页在普通页之后：{order}"
