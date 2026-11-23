@@ -941,6 +941,27 @@ def vl_fallback_min_pages() -> int:
         return 5
 
 
+def vl_fallback_max_images() -> int:
+    """一页一图多图单请求：每次 VL 调用最多携带的页图数（默认 8）。
+
+    2026-11-23 run 151 实证：整本长图十几 MB 被服务商拒收（HTTP 400）——
+    改逐页渲染、限页图数后单请求体积可控（文字仍可读，分辨率不降）。
+    """
+    try:
+        return max(1, int(os.environ.get("BID_EVAL_VL_FALLBACK_MAX_IMAGES", "8")))
+    except ValueError:
+        return 8
+
+
+def vl_timeout_s() -> float:
+    """VL 兜底单次调用超时秒（默认 90）——不陪跑 llm_timeout_s 的长默认值。"""
+    try:
+        v = float(os.environ.get("BID_EVAL_VL_TIMEOUT", "90"))
+        return v if v > 0 else 90.0
+    except ValueError:
+        return 90.0
+
+
 # ---------------------------------------------------------------------------
 # 模型目录（硅基流动，OpenAI 兼容）
 # ---------------------------------------------------------------------------

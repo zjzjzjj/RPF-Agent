@@ -113,8 +113,9 @@ class Budget:
 
 
 SYSTEM_PROMPT = (
-    "你是招投标材料审核的视觉评审助手。给你若干张投标文件材料长图"
-    "（每张图是同一份材料文档的连续页竖拼），以及一条评标细则原文。\n"
+    "你是招投标材料审核的视觉评审助手。给你若干张投标文件材料页图"
+    "（每张图是一页材料，图号与页码的对应关系在用户消息中给出），"
+    "以及一条评标细则原文。\n"
     "必须遵守：\n"
     "1. 只依据图中实际所见与细则原文判断，不得使用图外知识、不得猜测；\n"
     "2. 输出严格 JSON（不要多余文字），结构：\n"
@@ -131,7 +132,8 @@ SYSTEM_PROMPT = (
 )
 
 
-def build_user_prompt(criterion: dict, *, is_verdict: bool) -> str:
+def build_user_prompt(criterion: dict, *, is_verdict: bool,
+                      page_images: list[dict] | None = None) -> str:
     max_score = criterion.get("max_score")
     head = "本条为否决/资格/符合性条款：只给观察与线索，禁止给分、禁止判不符合。" \
         if is_verdict else (
@@ -144,6 +146,11 @@ def build_user_prompt(criterion: dict, *, is_verdict: bool) -> str:
     ]
     if criterion.get("required_evidence"):
         parts.append(f"证明材料要求：{str(criterion['required_evidence'])[:500]}")
+    if page_images:
+        mapping = "；".join(
+            f"第{i + 1}张图=文档{pi.get('document_id')}第{pi.get('page_no')}页"
+            for i, pi in enumerate(page_images))
+        parts.append(f"页码对照：{mapping}。observation 的 page_no 请填上述实际页码。")
     return "\n".join(parts)
 
 
@@ -167,40 +174,46 @@ def _coerce_score(value: Any, max_score: Any) -> Decimal | None:
 
 def rescue(
     criterion: dict,
-    segments: list[dict],
+    page_images: list[dict],
     *,
     is_verdict: bool | None = None,
     data_class: str | None = None,
     gateway: Any | None = None,
 ) -> VlResult:
-    """对一份材料长图段集发起一次 VL 兜底；失败一律 VlResult(kind="failed")。
+    """对一组材料页图发起一次 VL 兜底；失败一律 VlResult(kind="failed")。
 
-    gateway 可注入（测试 mock）；缺省走 auto_review.get_vision_gateway()
-    （涉密闸门在 Gateway.complete 内，未放行会抛 LLMError → 按失败处理）。
+    一页一图多图单请求（2026-11-23 run 151 实证：整本长图被拒收 400）；
+    gateway 可注入（测试 mock），缺省走 auto_review.get_vision_gateway
+    （timeout=config.vl_timeout_s()，涉密闸门在网关内）。
+    重试纪律：本层不加重试——provider 内部对瞬时错误（超时/429/5xx）自重试；
+    拒收类（LLMError.transient=False，如 HTTP 400）直接判失败不重试。
     """
     if not config.vl_fallback_enabled():
         return VlResult("failed", reason="vl_fallback_disabled")
-    if not segments:
-        return VlResult("failed", reason="no_material_segments")
+    if not page_images:
+        return VlResult("failed", reason="no_material_pages")
     if is_verdict is None:
         is_verdict = is_verdict_criterion(criterion)
     try:
         if gateway is None:
             from app.engine.auto_review import get_vision_gateway
 
-            gateway = get_vision_gateway()
+            gateway = get_vision_gateway(timeout=config.vl_timeout_s())
     except Exception as exc:  # noqa: BLE001 —— 未配置 VL 模型=兜底不可用，维持暂定
         return VlResult("failed", reason=f"vision_gateway_unavailable:{type(exc).__name__}")
 
-    user_prompt = build_user_prompt(criterion, is_verdict=is_verdict)
-    # 一份材料文档一张长图：同一文档的段按序号一并发（多段=同一文档分段）
-    images = [s["data_url"] for s in segments]
+    user_prompt = build_user_prompt(criterion, is_verdict=is_verdict,
+                                    page_images=page_images)
+    images = [pi["data_url"] for pi in page_images]
     try:
         result = gateway.chat(SYSTEM_PROMPT, user_prompt, images=images,
                               data_class=data_class or "synthetic")
         text = getattr(result, "content", None) or str(result)
     except Exception as exc:  # noqa: BLE001 —— 网络/涉密闸门/模型故障=维持暂定
         log.warning("VL 兜底调用失败：%s", exc)
+        if getattr(exc, "transient", True) is False:
+            # 拒收类（HTTP 400 等）：重试必然同样被拒，直接失败
+            return VlResult("failed", reason="vl_call_rejected")
         return VlResult("failed", reason=f"vl_call_failed:{type(exc).__name__}")
 
     try:

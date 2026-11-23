@@ -58,6 +58,7 @@ def _scoring_config(*, prompt_version: str | None = None) -> dict:
             "paddle_ocr_max_tokens", "calibration_profile", "vision_model", "render_scale",
             "vl_fallback_enabled", "vl_fallback_max_per_cell", "vl_fallback_max_per_bidder",
             "vl_fallback_max_pages_per_segment", "vl_fallback_min_pages",
+            "vl_fallback_max_images", "vl_timeout_s",
         )
         if hasattr(config, name)
     }

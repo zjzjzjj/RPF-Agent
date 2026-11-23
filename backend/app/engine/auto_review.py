@@ -238,7 +238,7 @@ def resolve_price_limit_requirement(criterion: dict) -> dict:
                 for item in candidates]}
 
 
-def get_vision_gateway() -> Gateway:
+def get_vision_gateway(timeout: float | None = None) -> Gateway:
     from app.services.execution_version import execution_config_value
 
     model = execution_config_value("vision_model")
@@ -248,6 +248,7 @@ def get_vision_gateway() -> Gateway:
 
     return Gateway(OpenAICompatProvider(
         model=model, base_url=execution_config_value("vision_base_url"), api_key=config.vision_api_key(),
+        timeout=timeout,
     ))
 
 
