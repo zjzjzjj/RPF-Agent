@@ -1443,7 +1443,9 @@ def render_docx(report: dict) -> bytes:
         for item in group["items"]:
             heading(f"{item['code']} {item['name']}（满分 {item['max_score']}）", 3)
             if automated:
-                para(f"评审方法：{item['method']}｜{item.get('basis') or '—'}")
+                _basis = item.get("basis")
+                para(f"评审方法：{item['method']}"
+                     + (f"｜{_basis}" if _basis in ("主观", "客观") else ""))
             if item["factor"]:
                 para(f"评审因素（原文）：{item['factor'][:400]}")
             table(

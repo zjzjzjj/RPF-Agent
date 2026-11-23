@@ -122,7 +122,7 @@ export default function EvidenceWorkbench() {
         </Typography.Title>
         <Tag color={isVeto ? "red" : isMatch ? "geekblue" : isSubjective ? "purple" : "blue"}>
           {isVeto ? managed ? "符合性结论" : "否决项" : isMatch ? "判断项" : isSubjective ? managed ? "AI 自动评分" : "AI 评审（建议）" : "规则评审（确定性计算）"}
-          {(score as { scoring_basis?: string }).scoring_basis ? `（${(score as { scoring_basis?: string }).scoring_basis}）` : ""}
+          {(score as { scoring_basis?: string }).scoring_basis && (score as { scoring_basis?: string }).scoring_basis !== "—" ? `（${(score as { scoring_basis?: string }).scoring_basis}）` : ""}
         </Tag>
         <Tag>{managed && score.machine_status === "execution_failed" ? "执行失败，可恢复" : managed && !["auto_confirmed", "not_applicable"].includes(score.review_status) ? "待自动完成" : REVIEW_STATUS_LABELS[score.review_status] ?? score.review_status}</Tag>
         {score.evidence_status === "verified" && <Tag color="green">证据已核验</Tag>}

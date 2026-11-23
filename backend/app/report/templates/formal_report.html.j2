@@ -100,7 +100,7 @@
 {% for group in score_groups %}
 <h3>{{ group.category }}</h3>
 {% for item in group['items'] %}
-<h4>{{ item.code }} {{ item.name }}（满分 {{ item.max_score }}）<span class="method">［{{ item.method }}｜{{ item.basis or "—" }}］</span></h4>
+<h4>{{ item.code }} {{ item.name }}（满分 {{ item.max_score }}）<span class="method">［{{ item.method }}{{ "｜" + item.basis if item.basis in ("主观", "客观") else "" }}］</span></h4>
 {% if item.factor %}<p class="factor">评审因素（原文）：{{ item.factor[:400] }}</p>{% endif %}
 <table><tr><th class="left">投标人</th>{% for j in judge_labels %}<th>{{ j }}</th>{% endfor %}<th>{{ final_score_label }}</th></tr>
 {% for p in item.per_bidder %}
@@ -125,7 +125,7 @@
 {% for detail in ai_detail %}
 <h3>{{ detail.bidder }}</h3>
 {% for it in detail['items'] %}
-<h4>{{ it.code }} {{ it.name }}（满分 {{ it.max_score }}）<span class="method">［{{ it.method }}｜{{ it.basis or "—" }}］</span> → 最终 {{ it.final }}</h4>
+<h4>{{ it.code }} {{ it.name }}（满分 {{ it.max_score }}）<span class="method">［{{ it.method }}{{ "｜" + it.basis if it.basis in ("主观", "客观") else "" }}］</span> → 最终 {{ it.final }}</h4>
 {% if it.judges %}<p>{% for j in it.judges %}<span {% if j.dropped %}class="dropped"{% endif %}>{{ j.judge }} {{ j.score }}{% if j.dropped %}（已弃）{% endif %}</span>{% if not loop.last %} ｜ {% endif %}{% endfor %}</p>{% endif %}
 {% if it.reasoning %}<p class="left">评审依据：{{ it.reasoning }}</p>{% endif %}
 {% for c in it.citations %}<p class="note">引文（p{{ c.page_no }}{% if c.verified %}✓已核验{% else %}未核验{% endif %}）：{{ c.quote }}</p>{% endfor %}

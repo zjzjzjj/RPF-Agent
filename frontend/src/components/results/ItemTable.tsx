@@ -92,7 +92,9 @@ export default function ItemTable({ bucket, onOpenReason, onOpenEvidence, onView
           render: (_, item) => (
             <>
               <Tag color={METHOD_COLOR[item.scoring_method] ?? "default"}>{item.scoring_method}</Tag>
-              <Tag color={BASIS_COLOR[item.scoring_basis] ?? "default"}>{item.scoring_basis}</Tag>
+              {item.scoring_basis !== "—" && (
+                <Tag color={BASIS_COLOR[item.scoring_basis] ?? "default"}>{item.scoring_basis}</Tag>
+              )}
             </>
           ),
         },
