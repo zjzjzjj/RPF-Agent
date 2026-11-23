@@ -698,7 +698,8 @@ def test_sample_in_total_structure_overrides_three_parts_clause() -> None:
     )
     tender = ("投标人的综合得分为以上三部分得分的总和。\n"
               "五、评标细则\n1、商务部分（8 分）\n2、技术部分（32分）\n"
-              "3、报价部分（50分）\n4、样品部分（10分）")
+              "3、报价部分（50分）\n4、样品部分（10分）\n"
+              "1、样品满分 10分，样品评审由招标人组建的专家小组现场评审。")
     enrich_extracted([c], tender)
     params = c.params or {}
     assert params.get("in_total") is True, "细则四分部之和==满分 → 按结构计入"
@@ -736,4 +737,24 @@ def test_sample_in_total_outside_full_mark_single_listed() -> None:
     enrich_extracted([c], tender)
     params = c.params or {}
     assert params.get("in_total") is False
+    assert "结构" in (params.get("in_total_basis") or "")
+
+
+def test_sample_in_total_row_level_fullmark_not_poisoning() -> None:
+    """测试12 实证回归：细则行级"样品满分 10分"不得被当成总体满分——
+    否则 target=10 与四分部之和 100 对不上，结构判定被口径句击败。"""
+    from app.rules.compiler import enrich_extracted
+    from app.rules.model import ExtractedCriterion
+
+    c = ExtractedCriterion(
+        category="technical", name="样品评审", score_type="subjective",
+        max_score=10, description="样品评审",
+    )
+    tender = ("投标人的综合得分为以上三部分得分的总和。\n"
+              "五、评标细则\n1、商务部分（8 分）\n2、技术部分（32分）\n"
+              "3、报价部分（50分）\n4、样品部分（10分）\n"
+              "1、样品满分 10分，样品评审由招标人组建的专家小组现场评审。")
+    enrich_extracted([c], tender)
+    params = c.params or {}
+    assert params.get("in_total") is True, params
     assert "结构" in (params.get("in_total_basis") or "")

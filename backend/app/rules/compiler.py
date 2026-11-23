@@ -763,8 +763,12 @@ def enrich_extracted(
                 ):
                     parts.setdefault(label, float(val))
                 if "样品" in parts:
-                    m_full = re.search(r"满分\s*[为是]?\s*(\d+(?:\.\d+)?)\s*分", text)
-                    target = float(m_full.group(1)) if m_full else 100.0
+                    # 总体满分提取：排除"样品满分 10分"这类行级满分（测试12 实证：
+                    # 首个"满分"匹配=样品行的10 → 和100对不上 → 结构判定被口径句
+                    # 击败）。取非样品前缀的满分匹配最大值；无匹配默认 100。
+                    fulls = [float(v) for v in re.findall(
+                        r"(?<!样品)满分\s*[为是]?\s*(\d+(?:\.\d+)?)\s*分", text)]
+                    target = max(fulls) if fulls else 100.0
                     if abs(sum(parts.values()) - target) < 1e-6:
                         in_total, basis = True, "细则分部结构（各分部之和==满分）"
                         if m_scope and m_scope.group(1) == "三":
