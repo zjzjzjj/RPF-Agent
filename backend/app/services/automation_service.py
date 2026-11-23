@@ -56,6 +56,8 @@ def _scoring_config(*, prompt_version: str | None = None) -> dict:
             "window_extend_enabled", "material_index_enabled", "material_ocr_max_pages",
             "ocr_enabled", "ocr_engine", "paddle_ocr_model", "paddle_ocr_prompt",
             "paddle_ocr_max_tokens", "calibration_profile", "vision_model", "render_scale",
+            "vl_fallback_enabled", "vl_fallback_max_per_cell", "vl_fallback_max_per_bidder",
+            "vl_fallback_max_pages_per_segment", "vl_fallback_min_pages",
         )
         if hasattr(config, name)
     }
@@ -278,6 +280,22 @@ def _valid_cell(score: ScoreRecord, criterion: dict, citations: list[EvidenceCit
     if score.machine_status in ("need_human", "conflict_flagged", "execution_failed", "failed"):
         return False
     basis = meta.get("basis")
+    if basis == "visual_fallback":
+        # 视觉AI核验定分（2026-11-23 优化②）：页级视觉证据在场 + 计分格分数
+        # 在 [0, max]；证据口径=visual_evidence（页图+观察），不产逐字引文。
+        if not meta.get("visual_evidence"):
+            return False
+        if score.final_score is not None:
+            try:
+                v = float(score.final_score)
+                if v < 0:
+                    return False
+                if (criterion.get("max_score") is not None
+                        and v > float(criterion["max_score"]) + 1e-9):
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return bool(score.ai_reasoning or meta.get("reasoning"))
     if basis == "fallback" and ((meta.get("fallback") or {}).get("kind")) in (
             "reading_incomplete", "presence_unverified", "sample_volume_unverified",
             "value_extraction_unresolved"):

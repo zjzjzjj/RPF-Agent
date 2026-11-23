@@ -138,7 +138,10 @@ def _report_method(score_type: str, automated: bool, lightweight: bool = False,
         if light_schema == 3:
             return "确定性预检 + 单次轻量快审（二值否决点筛查：通过=未见确定性否决点，存疑=建议否决）"
         return "确定性预检 + 单次轻量快审（三态结论，不构成完整审查）"
-    return scoring_method_of(score_type, params, ai_raw=ai_raw, verdict_source=verdict_source)
+    method = scoring_method_of(score_type, params, ai_raw=ai_raw, verdict_source=verdict_source)
+    if (ai_raw or {}).get("auto_review", {}).get("basis") == "visual_fallback":
+        method += "（视觉AI核验）"
+    return method
 
 
 def _is_lightweight(score) -> bool:

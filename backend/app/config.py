@@ -899,6 +899,48 @@ def allow_remote_confidential() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# 材料审核视觉大模型兜底（2026-11-23 优化②：失败格长图过 VL，页级视觉核验）
+# ---------------------------------------------------------------------------
+def vl_fallback_enabled() -> bool:
+    """VL 兜底总开关（kill switch，回滚置 0）。仅文本链路失败格触发，不碰 OCR。"""
+    return os.environ.get("BID_EVAL_VL_FALLBACK", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def vl_fallback_max_per_cell() -> int:
+    """每格 VL 调用次数上限（默认 2）。"""
+    try:
+        return max(1, int(os.environ.get("BID_EVAL_VL_FALLBACK_MAX_PER_CELL", "2")))
+    except ValueError:
+        return 2
+
+
+def vl_fallback_max_per_bidder() -> int:
+    """每家 VL 调用总次数上限（默认 10）。"""
+    try:
+        return max(1, int(os.environ.get("BID_EVAL_VL_FALLBACK_MAX_PER_BIDDER", "10")))
+    except ValueError:
+        return 10
+
+
+def vl_fallback_max_pages_per_segment() -> int:
+    """长图分段页数上限（默认 30）。"""
+    try:
+        return max(1, int(os.environ.get("BID_EVAL_VL_FALLBACK_MAX_PAGES_PER_SEGMENT", "30")))
+    except ValueError:
+        return 30
+
+
+def vl_fallback_min_pages() -> int:
+    """长图粒度下限（默认 5）——尾段不足时并入前段。"""
+    try:
+        return max(1, int(os.environ.get("BID_EVAL_VL_FALLBACK_MIN_PAGES", "5")))
+    except ValueError:
+        return 5
+
+
+# ---------------------------------------------------------------------------
 # 模型目录（硅基流动，OpenAI 兼容）
 # ---------------------------------------------------------------------------
 DEFAULT_MODEL_PRESETS: list[dict] = [
@@ -937,6 +979,20 @@ DEFAULT_MODEL_PRESETS: list[dict] = [
         "label": "Qwen3.8 27B",
         "family": "Qwen",
         "note": "通义最新代，速度快",
+    },
+    {
+        "id": "Qwen/Qwen2.5-VL-72B-Instruct",
+        "label": "Qwen2.5 VL 72B（视觉）",
+        "family": "Qwen-VL",
+        "vision": True,
+        "note": "材料审核视觉兜底：看图定分+页级观察（BID_EVAL_VISION_MODEL 选用）",
+    },
+    {
+        "id": "zai-org/GLM-4.5V",
+        "label": "GLM 4.5V（视觉）",
+        "family": "GLM-VL",
+        "vision": True,
+        "note": "视觉理解备选：材料图像审核",
     },
 ]
 

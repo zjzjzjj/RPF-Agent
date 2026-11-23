@@ -108,6 +108,8 @@ def scoring_method_of(score_type: str | None, params: dict | None = None, *,
     """
     params = params or {}
     raw = ai_raw or {}
+    if ((raw.get("auto_review") or {}).get("basis") == "visual_fallback"):
+        return METHOD_AI  # ② VL 兜底：视觉AI核验定分（展示层另加"（视觉AI核验）"）
     if score_type in ("veto", "match"):
         return METHOD_AI if (verdict_source or "machine") == "llm" else METHOD_RULE
     if score_type == "formula":

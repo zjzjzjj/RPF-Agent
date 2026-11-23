@@ -1255,6 +1255,138 @@ def _persist_light_reject_citations(run_id: int, bidder_id: int, criterion: dict
     )
 
 
+def _vl_note(outcome: CellOutcome | None, note: dict) -> CellOutcome | None:
+    """VL 兜底未定分时的留痕（不改变原暂定语义——天然安全态）。"""
+    if outcome is not None:
+        raw = dict(outcome.raw or {})
+        raw["visual_fallback_note"] = note
+        outcome.raw = raw
+        outcome.warnings = [*list(outcome.warnings or []), {
+            "verdict_source": "visual",
+            "message": f"视觉AI兜底未定分：{note.get('reason')}",
+        }]
+    return outcome
+
+
+def _maybe_vl_rescue(run_id: int, bid_id: int, criterion: dict,
+                     outcome: CellOutcome | None, error: BaseException | None,
+                     pages_by_bidder: dict, budget) -> tuple[CellOutcome | None, BaseException | None]:
+    """材料审核视觉大模型兜底（2026-11-23 优化②）：文本链路失败格 → 长图过 VL。
+
+    触发集=暂定族 fallback（provisional_zero/reading_incomplete/value_extraction_
+    unresolved/presence_unverified 等）与 closure 错误路径；材料页=该格送审页按
+    文档竖拼长图（evidence.renderer.render_long_image，一份材料一张长图）。
+    VL 成功（计分格定分）→ basis=visual_fallback 的正常结论（页级视觉核验，
+    不产逐字引文）；否决/资格/符合性格只收线索（VL 结论绝不成否决）；其余
+    （预算耗尽/涉密拦截/契约失败/渲染失败）→ 原暂定语义不变。
+    不调用 OCR、不受 scoring_ocr 开关约束；成本上限由 Budget 保证。
+    """
+    from app.engine import vl_fallback
+
+    if not config.vl_fallback_enabled():
+        return outcome, error
+    if error is not None:
+        if not config.score_closure_enabled():
+            return outcome, error  # execution_failed=可恢复技术态，不是暂定族
+    elif outcome is None or outcome.basis != "fallback":
+        return outcome, error
+    loaded = pages_by_bidder.get(bid_id)
+    if loaded is None:
+        return outcome, error
+    pages, data_class = loaded
+    pages = list(pages or [])
+    if not pages:
+        return outcome, error
+    cell_key = f"{run_id}:{bid_id}:{criterion.get('id')}"
+    ok, why = budget.consume(bid_id, cell_key)
+    if not ok:
+        return _vl_note(outcome, {"visual_fallback": "skipped", "reason": why}), error
+
+    # 材料页=该格送审页（含 fallback 点名的不可读页），按文档分组
+    candidates = {(_p.get("document_id"), _p.get("page_no")): dict(_p) for _p in pages}
+    fallback_meta = ((outcome.raw or {}).get("fallback") if outcome is not None else None) or {}
+    for up in (fallback_meta.get("unreadable_pages") or []):
+        if isinstance(up, dict):
+            key = (up.get("document_id"), up.get("page_no"))
+            if key[1] is not None:
+                candidates.setdefault(key, {"document_id": key[0], "page_no": key[1],
+                                            "stored_path": up.get("stored_path"),
+                                            "sha256": up.get("sha256")})
+    by_doc: dict[str, list[dict]] = {}
+    for cp in candidates.values():
+        if cp.get("page_no") is not None and cp.get("stored_path"):
+            by_doc.setdefault(str(cp["stored_path"]), []).append(cp)
+    from app.evidence.renderer import render_long_image
+
+    segments: list[dict] = []
+    for stored, plist in by_doc.items():
+        plist.sort(key=lambda x: int(x["page_no"]))
+        try:
+            segments.extend(render_long_image(
+                str(plist[0].get("sha256") or ""), stored,
+                [int(x["page_no"]) for x in plist]))
+        except Exception as exc:  # noqa: BLE001 - 渲染失败=兜底不可用
+            log.warning("VL 兜底长图渲染失败（维持暂定）：%s", exc)
+    if not segments:
+        return _vl_note(outcome, {"visual_fallback": "failed", "reason": "no_segments"}), error
+
+    vres = vl_fallback.rescue(criterion, segments, data_class=data_class)
+    if vres.kind == "failed":
+        return _vl_note(outcome, {"visual_fallback": "failed", "reason": vres.reason,
+                                  "clues": vres.clues}), error
+    # 页级视觉证据：观察页落到候选页（严格匹配，同文档页码最近兜底）；
+    # 页图=该页所在长图段（data_url），满足 _persist_cell 的视觉证据契约。
+    seg_of: dict[int, dict] = {}
+    for seg in segments:
+        for pn in seg["page_numbers"]:
+            seg_of[int(pn)] = seg
+    merged = list(candidates.values())
+    evidence: list[dict] = []
+    for ob in vres.observations:
+        try:
+            doc_key = ob.get("document_id")
+            page_no = int(ob.get("page_no"))
+        except (TypeError, ValueError):
+            continue
+        page = candidates.get((doc_key, page_no)) or candidates.get((None, page_no))
+        if page is None:
+            same_doc = [q for q in merged
+                        if q.get("page_no") is not None
+                        and (doc_key is None or q.get("document_id") == doc_key)]
+            if same_doc:
+                page = min(same_doc, key=lambda q: abs(int(q["page_no"]) - page_no))
+        if page is None:
+            continue
+        seg = seg_of.get(int(page["page_no"]))
+        if seg is not None and not page.get("image_url"):
+            page["image_url"] = seg["data_url"]
+            page["image_sha256"] = seg["image_sha256"]
+        evidence.append({"kind": "visual",
+                         "document_id": int(page.get("document_id") or 0),
+                         "page_no": int(page["page_no"]),
+                         "observation": ob.get("observation") or ""})
+    if vres.kind == "clue_only":
+        # 否决/资格/符合性格：只收线索，结论仍暂定/存疑（AI 不否决）
+        return _vl_note(outcome, {"visual_fallback": "clue_only",
+                                  "clues": vres.clues, "reasoning": vres.reasoning}), error
+    if not evidence:
+        return _vl_note(outcome, {"visual_fallback": "failed",
+                                  "reason": "vl_observations_out_of_scope"}), error
+    new_outcome = CellOutcome(
+        "pass", vres.reasoning or "视觉AI核验定分（页级证据）",
+        vres.score, evidence, merged, "visual_fallback", 1,
+        {"visual_fallback": {
+            "score": str(vres.score), "reasoning": vres.reasoning,
+            "clues": vres.clues,
+            "trigger": (fallback_meta.get("kind") if outcome is not None
+                        else type(error).__name__ if error is not None else None),
+        }},
+        [{"verdict_source": "visual",
+          "message": "视觉AI核验定分（页级证据，非逐字引文）"}],
+    )
+    return new_outcome, None
+
+
 def _persist_cell(run_id: int, bidder_id: int, criterion: dict, outcome: CellOutcome | None,
                   error: BaseException | None = None) -> None:
     from app.evidence.verifier import verify_automatic_citation
@@ -2099,6 +2231,10 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
             return outcome
 
     errors: list[BaseException] = []
+    # VL 兜底预算（每格<=2、每家<=10，线程安全；跨 worker 共享）
+    from app.engine.vl_fallback import Budget as _VlBudget
+
+    vl_budget = _VlBudget()
     workers = min(config.llm_concurrency_ceiling(), len(cells) or 1, max(1, config.llm_max_concurrency()))
     cancelled = False
     cell_iter = iter(cells)
@@ -2139,6 +2275,10 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
                 try:
                     outcome = future.result()
                     if outcome is not None:
+                        # VL 兜底：暂定族 outcome 尝试视觉定分（失败=原暂定不变）
+                        outcome, _ = _maybe_vl_rescue(
+                            run_id, bid_id, criterion, outcome, None,
+                            pages_by_bidder, vl_budget)
                         _persist_cell(run_id, bid_id, criterion, outcome)
                         completed.add((bid_id, criterion["id"]))
                         success = True
@@ -2147,12 +2287,21 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
                     user_cancelled.set()
                     stop.set()
                 except Exception as exc:
-                    _persist_cell(run_id, bid_id, criterion, None, exc)
-                    errors.append(exc)
-                    if continue_errors:
-                        skipped.add((bid_id, criterion["id"]))
+                    # VL 兜底：closure 错误路径（落暂定族）先试视觉定分
+                    rescued, err = _maybe_vl_rescue(
+                        run_id, bid_id, criterion, None, exc,
+                        pages_by_bidder, vl_budget)
+                    if rescued is not None:
+                        _persist_cell(run_id, bid_id, criterion, rescued)
+                        completed.add((bid_id, criterion["id"]))
+                        success = True
                     else:
-                        stop.set()
+                        _persist_cell(run_id, bid_id, criterion, None, err)
+                        errors.append(err)
+                        if continue_errors:
+                            skipped.add((bid_id, criterion["id"]))
+                        else:
+                            stop.set()
                 if ctx and not cancelled:
                     try:
                         step = int(success or (continue_errors and (bid_id, criterion["id"]) in skipped))
