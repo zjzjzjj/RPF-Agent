@@ -655,13 +655,24 @@ def test_unknown_case_type_cannot_receive_provisional_points():
         scoring._verified_count(criterion, decision, [])
 
 
-def test_missing_verified_scalar_cannot_fall_back_to_text_heuristic():
+def test_missing_verified_scalar_extracts_from_fulltext_or_still_fails():
+    """包A（2026-11-19）：模型未供承诺值 → 确定性全文抽取兜底；全文也抽不到才报 no_facts。
+
+    旧断言锁的是"verified_facts 非 None 即整段跳过抽取"——该短路正是快路径
+    托管 dict（{"inventory": …}，永远没有 response_hours）恒 no_facts→0 的根因。
+    新口径：核验值缺席时按投标原文确定性抽取（与 P0-4 偏离表计数同款兜底），
+    抽取也失败仍必须报错，不得猜值。
+    """
     criterion = {"score_type": "count", "name": "响应时间", "max_score": "4", "params": {
         "engine": "value_tier", "field": "response_hours", "tiers": [{"max_value": "4", "score": "4"}],
     }}
     decision = AutoReviewDecision(verdict="pass", reasoning="尚未核实承诺值", coverage_complete=True)
+    score, detail, _ = scoring._verified_count(
+        criterion, decision, [{"text": "响应时间为4小时，模板供填写参考。"}])
+    assert score == Decimal("4")
+    assert "4" in detail
     with pytest.raises(LLMError, match="no_facts"):
-        scoring._verified_count(criterion, decision, [{"text": "响应时间为4小时，模板供填写参考。"}])
+        scoring._verified_count(criterion, decision, [{"text": "响应时间见附表，模板供填写参考。"}])
 
 
 def test_incomplete_count_rule_cannot_generate_default_zero():

@@ -1607,20 +1607,90 @@ def _normalize_role(case: dict) -> str | None:
 # - 抽不到事实 → unresolved="no_facts"（机器没抽到 ≠ 0 分结论，照 0 分记但标疑问）。
 # ===========================================================================
 
-# 响应时间承诺："2 小时内到达现场" / "响应时间：4 小时"（优先带标签的首匹配）
+# 响应时间承诺："2 小时内到达现场" / "响应时间：4 小时"（优先带标签的首匹配）。
+# 包A（2026-11-19）现实写法补齐：分隔符形态（表格管道/全角冒号/"为"）、
+# 单位换算（分钟/天 → 小时）、中文数字（半/两/二十…）、全角数字——全部是
+# 结构性写法差异，不含任何项目级阈值。
+_RE_VALUE_SEP = r"\s*(?:为|是|限|：|:|=|＝|、|,|，|\||｜|\t)*\s*"
+_NUM_TOKEN = r"([0-9]+(?:\.[0-9]+)?|[零一二两三四五六七八九十百半]+)"
 _RE_HOURS_LABELED = re.compile(
-    r"(?:响应时间|故障响应|到场时间|到达时间|响应时限)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*(?:个)?\s*小时"
+    r"(?:响应时间|故障响应|到场时间|到达时间|响应时限)"
+    + _RE_VALUE_SEP + r"(?:不超过|不多于|不大于|小于等于)?"
+    + _NUM_TOKEN + r"\s*(?:个)?\s*(小时|分钟|天)"
 )
 _RE_HOURS = re.compile(
-    r"(\d+(?:\.\d+)?)\s*(?:个)?\s*小时(?:内|以内|之内)?(?:到达|到现场|到场|响应)"
+    _NUM_TOKEN + r"\s*(?:个)?\s*(小时|分钟|天)(?:内|以内|之内)?"
+    r"(?:到达|到现场|到场|响应)"
 )
-# 质保期承诺："免费保修 3 年" / "质保期：36 个月" / "质保 3 年"
+# 质保期承诺："免费保修 3 年" / "质保期：36 个月" / "质保期为 3 年" / "质保 3 年"
 _RE_WARRANTY_LABELED = re.compile(
-    r"(?:免费保修|质保期|保修期|质量保证期)\s*[:：]?\s*(\d+(?:\.\d+)?)\s*(年|个月|月)"
+    r"(?:免费保修|质保期|保修期|质量保证期|质保|保修)"
+    + _RE_VALUE_SEP
+    + _NUM_TOKEN + r"\s*(?:个)?\s*(年|个月|月)"
 )
 _RE_WARRANTY = re.compile(
-    r"(\d+(?:\.\d+)?)\s*(?:年|个月|月)\s*(?:的)?(?:免费)?(?:保修|质保)"
+    _NUM_TOKEN + r"\s*(?:个)?\s*(年|个月|月)\s*(?:的)?\s*(?:免费)?(?:保修|质保)"
 )
+# 锚词预筛（包A）：全文扫描/残差 LLM 前先确认文本里确有承诺语境词。
+# 上述正则命中的形式必然落在这些锚词内（标签词/单位词/承诺动词），预筛
+# 只会跳过"完全不可能抽出值"的文本，不改变任何命中结果。
+_RE_HOURS_ANCHOR = re.compile(r"响应|到场|到达|故障|小时|分钟|承诺|时限")
+_RE_WARRANTY_ANCHOR = re.compile(r"质保|保修|质量保证|承诺")
+# 全角数字/冒号等归一（"３０分钟""响应时间：" → 半角），与
+# auto_review._numeric_values 的归一同口径。
+_FULLWIDTH_TRANS = str.maketrans("０１２３４５６７８９．：；，（）｜＝", "0123456789.:;,()|=")
+_CN_DIGITS = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+              "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+
+
+def _cn_decimal(raw: str) -> Decimal | None:
+    """数字 token → 数值：阿拉伯数字原样，中文数字（"半"=0.5、"二十"=20）换算。"""
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    if re.fullmatch(r"\d+(?:\.\d+)?", raw):
+        return Decimal(raw)
+    if raw == "半":
+        return Decimal("0.5")
+    if not re.fullmatch(r"[零一二两三四五六七八九十百]+", raw):
+        return None
+    total = digit = 0
+    for ch in raw:
+        if ch in ("十", "百"):
+            total += (digit or 1) * (10 if ch == "十" else 100)
+            digit = 0
+        else:
+            digit = _CN_DIGITS[ch]
+    return Decimal(total + digit)
+
+
+def _hours_from_match(m: re.Match) -> Decimal | None:
+    """响应时间 token → 小时（分钟 ÷60、天 ×24、小时原样）。"""
+    number = _cn_decimal(m.group(1))
+    if number is None or number < 0:
+        return None
+    unit = (m.group(2) or "小时").lower()
+    if unit in ("小时", "h"):
+        return number
+    if unit == "分钟":
+        return number / 60
+    if unit == "天":
+        return number * 24
+    return None
+
+
+def _months_from_match(m: re.Match) -> Decimal | None:
+    """质保 token → 月（"3 年"=36、"24 个月"=24；不含天/周——细则档位是年/月）。"""
+    number = _cn_decimal(m.group(1))
+    if number is None or number < 0:
+        return None
+    return _units_to_months(number, m.group(2))
+
+
+def _norm_value_text(text: str | None) -> str:
+    return (text or "").translate(_FULLWIDTH_TRANS)
+
+
 # 技术偏离表定位与行状态
 _RE_DEV_SECTION = re.compile(r"技术偏离表|技术响应偏离表|偏离表")
 _RE_DEV_NEG = re.compile(r"负偏离|低于(?:要求|招标)|不满足")
@@ -1707,44 +1777,82 @@ def _pick_value(cands: list[tuple[Decimal, str, int, int]]) -> tuple[Decimal | N
     return value, snippet
 
 
-def _extract_response_hours(text: str, window: str | None = None) -> tuple[Decimal | None, str]:
+def _scan_value(
+    src: str, labeled: re.Pattern, plain: re.Pattern, to_value, anchor: re.Pattern
+) -> list[tuple[Decimal, str, int, int]]:
+    """锚词预筛后再跑候选正则（包A 性能闸）：无承诺语境词的文本直接跳过。"""
+    if not src or not anchor.search(src):
+        return []
+    return _value_candidates(src, labeled, plain, to_value)
+
+
+def _extract_response_hours(
+    text: str, window: str | None = None, fulltext: str | None = None
+) -> tuple[Decimal | None, str]:
     """投标人响应时间承诺（小时）。
 
     ``window``（索引指针/承诺章节解析出的文本）非空时只在窗口内收集——投标人的
     索引表自报"服务承诺…见投标文件（N-M）页"，窗口是材料自声明位置，权威且零拟合；
-    窗口无匹配回退全文。返回 (值, 原文片段)。
+    窗口无匹配回退全文；``fulltext``（服务层注入的该家全文文本层语料，包A）是
+    第三级兜底，前两级都抽不到且锚词命中时才扫。返回 (值, 原文片段)。
     """
-    src = window if (window and window.strip()) else (text or "")
-    cands = _value_candidates(
-        src, _RE_HOURS_LABELED, _RE_HOURS,
-        lambda m: Decimal(m.group(1)),
-    )
-    if not cands and window and window.strip() and text:
-        cands = _value_candidates(
-            text, _RE_HOURS_LABELED, _RE_HOURS,
-            lambda m: Decimal(m.group(1)),
-        )
+    text_n = _norm_value_text(text)
+    window_n = _norm_value_text(window)
+    full_n = _norm_value_text(fulltext)
+    src = window_n if window_n.strip() else text_n
+    cands = _scan_value(src, _RE_HOURS_LABELED, _RE_HOURS, _hours_from_match,
+                        _RE_HOURS_ANCHOR)
+    if not cands and window_n.strip() and text_n:
+        cands = _scan_value(text_n, _RE_HOURS_LABELED, _RE_HOURS, _hours_from_match,
+                            _RE_HOURS_ANCHOR)
+    if not cands and full_n and full_n not in (src, text_n):
+        cands = _scan_value(full_n, _RE_HOURS_LABELED, _RE_HOURS, _hours_from_match,
+                            _RE_HOURS_ANCHOR)
     return _pick_value(cands)
 
 
-def _extract_warranty_months(text: str, window: str | None = None) -> tuple[Decimal | None, str]:
-    """投标人质保期承诺（统一换算月）。窗口语义同 _extract_response_hours。"""
-
-    def _to_months(m: re.Match) -> Decimal | None:
-        try:
-            if m.lastindex and m.lastindex >= 2 and m.group(2):
-                return _units_to_months(Decimal(m.group(1)), m.group(2))
-            raw = m.group(0)
-            unit = "月" if "个月" in raw else "年"
-            return _units_to_months(Decimal(m.group(1)), unit)
-        except Exception:  # noqa: BLE001
-            return None
-
-    src = window if (window and window.strip()) else (text or "")
-    cands = _value_candidates(src, _RE_WARRANTY_LABELED, _RE_WARRANTY, _to_months)
-    if not cands and window and window.strip() and text:
-        cands = _value_candidates(text, _RE_WARRANTY_LABELED, _RE_WARRANTY, _to_months)
+def _extract_warranty_months(
+    text: str, window: str | None = None, fulltext: str | None = None
+) -> tuple[Decimal | None, str]:
+    """投标人质保期承诺（统一换算月）。窗口/全文/语料三级语义同 _extract_response_hours。"""
+    text_n = _norm_value_text(text)
+    window_n = _norm_value_text(window)
+    full_n = _norm_value_text(fulltext)
+    src = window_n if window_n.strip() else text_n
+    cands = _scan_value(src, _RE_WARRANTY_LABELED, _RE_WARRANTY, _months_from_match,
+                        _RE_WARRANTY_ANCHOR)
+    if not cands and window_n.strip() and text_n:
+        cands = _scan_value(text_n, _RE_WARRANTY_LABELED, _RE_WARRANTY, _months_from_match,
+                            _RE_WARRANTY_ANCHOR)
+    if not cands and full_n and full_n not in (src, text_n):
+        cands = _scan_value(full_n, _RE_WARRANTY_LABELED, _RE_WARRANTY, _months_from_match,
+                            _RE_WARRANTY_ANCHOR)
     return _pick_value(cands)
+
+
+def value_anchor_snippets(
+    field: str, text: str, *, radius: int = 160, limit: int = 6
+) -> list[str]:
+    """锚词预筛出的候选段（包A 残差 LLM 输入）：纯文本切片，零 OCR/零读页图。
+
+    以承诺锚词命中点为中心取 ±radius 字符并合并重叠区间，最多 limit 段——
+    供 LLM 在"正则解析不出但语境确实存在"的格子里抽值（调用方另做逐字引文
+    与数值复算校验）。
+    """
+    if not text:
+        return []
+    anchor = _RE_HOURS_ANCHOR if field == "response_hours" else _RE_WARRANTY_ANCHOR
+    spans: list[list[int]] = []
+    for m in anchor.finditer(text):
+        start = max(0, m.start() - radius)
+        end = min(len(text), m.end() + radius)
+        if spans and start <= spans[-1][1]:
+            spans[-1][1] = max(spans[-1][1], end)
+        else:
+            if len(spans) >= limit:
+                break
+            spans.append([start, end])
+    return [text[lo:hi].strip() for lo, hi in spans if text[lo:hi].strip()]
 
 
 def _deviation_table_region(text: str) -> tuple[str, str] | None:
@@ -1974,8 +2082,16 @@ def score_value_tier(
     # 窗口文本（索引指针/承诺章节解析）优先——criterion 由 scoring_service 注入
     # value_window_text（2026-11-02 run77：偏离表"8小时"首匹配抢掉承诺函"4小时"）
     _window = criterion.get("value_window_text") if isinstance(criterion, dict) else None
+    # 全文语料（包A）：服务层注入的该家全文文本层（source=='text' 页），第三级兜底
+    _corpus = criterion.get("fulltext_corpus") if isinstance(criterion, dict) else None
     verified = criterion.get("verified_facts") or {}
-    if criterion.get("verified_facts") is not None:
+    value, snippet = None, ""
+    if verified.get(field) is not None:
+        # 模型已核验的值优先（证据契约不变）；核验值缺席/非法时**必须**落到
+        # 确定性抽取——旧实现 "verified_facts 非 None 即整段跳过抽取" 把快路径
+        # 托管 dict（{"inventory": …}，永远没有该字段）短路成恒 no_facts→0
+        # （2026-11-19 测试4/5/7/9 response_hours 全列落零的根因，包A 修复；
+        # 与 P0-4 偏离表计数"核验值缺席时确定性兜底"同款语义）。
         try:
             value = Decimal(str(verified.get(field)))
             if not value.is_finite() or value < 0:
@@ -1983,14 +2099,18 @@ def score_value_tier(
             snippet = "AI 已逐页核验的承诺值"
         except (ValueError, TypeError, ArithmeticError):
             value, snippet = None, ""
-    elif field == "response_hours":
-        value, snippet = _extract_response_hours(facts.text or "", window=_window)
-    else:
-        value, snippet = _extract_warranty_months(facts.text or "", window=_window)
+    if value is None:
+        if field == "response_hours":
+            value, snippet = _extract_response_hours(
+                facts.text or "", window=_window, fulltext=_corpus)
+        else:
+            value, snippet = _extract_warranty_months(
+                facts.text or "", window=_window, fulltext=_corpus)
     if value is None:
         return CountResult(
             Decimal(0),
-            f"未在投标文件中抽取到 {field} 的承诺值（按 0 分记，待人工核对）",
+            f"未在投标文件中抽取到 {field} 的承诺值"
+            f"（抽取未果，暂定待人工核对，不构成不符合结论）",
             True, unresolved="no_facts",
         )
     best: Decimal | None = None
@@ -2046,8 +2166,11 @@ def score_value_linear(
             unresolved="field_missing",
         )
     _window = criterion.get("value_window_text") if isinstance(criterion, dict) else None
+    _corpus = criterion.get("fulltext_corpus") if isinstance(criterion, dict) else None
     verified = criterion.get("verified_facts") or {}
-    if criterion.get("verified_facts") is not None:
+    value, snippet = None, ""
+    if verified.get(field) is not None:
+        # 核验值优先、缺席时确定性抽取兜底（包A，语义同 score_value_tier）
         try:
             value = Decimal(str(verified.get(field)))
             if not value.is_finite() or value < 0:
@@ -2055,14 +2178,18 @@ def score_value_linear(
             snippet = "AI 已逐页核验的承诺值"
         except (ValueError, TypeError, ArithmeticError):
             value, snippet = None, ""
-    elif field == "warranty_months":
-        value, snippet = _extract_warranty_months(facts.text or "", window=_window)
-    else:
-        value, snippet = _extract_response_hours(facts.text or "", window=_window)
+    if value is None:
+        if field == "warranty_months":
+            value, snippet = _extract_warranty_months(
+                facts.text or "", window=_window, fulltext=_corpus)
+        else:
+            value, snippet = _extract_response_hours(
+                facts.text or "", window=_window, fulltext=_corpus)
     if value is None:
         return CountResult(
             Decimal(0),
-            f"未在投标文件中抽取到 {field} 的承诺值（按 0 分记，待人工核对）",
+            f"未在投标文件中抽取到 {field} 的承诺值"
+            f"（抽取未果，暂定待人工核对，不构成不符合结论）",
             True, unresolved="no_facts",
         )
     steps = max(Decimal(0), (value - base) / step)

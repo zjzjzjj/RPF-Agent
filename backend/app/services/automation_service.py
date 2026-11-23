@@ -279,12 +279,16 @@ def _valid_cell(score: ScoreRecord, criterion: dict, citations: list[EvidenceCit
         return False
     basis = meta.get("basis")
     if basis == "fallback" and ((meta.get("fallback") or {}).get("kind")) in (
-            "reading_incomplete", "presence_unverified", "sample_volume_unverified"):
+            "reading_incomplete", "presence_unverified", "sample_volume_unverified",
+            "value_extraction_unresolved"):
         # P0-3（测试10 run113）：读取故障待补读格是"已定格但未定分"的终态——
         # 计完成（运行可收口、报告可出），但没有数值分（ranking 按未定分排除，
         # 报告标注"读取故障待补读"，补读完成后可续评重跑）。
         # 2026-11-19：材料存在性“无法判定”同属已定格未定分（presence_unverified），
         # 由人工复核，不能收口成 provisional_zero。
+        # 包A：承诺值抽取未果（value_extraction_unresolved）同属已定格未定分——
+        # "抽取失败"不是"不符合 0 分"结论，暂定待人工，不得按 provisional_zero
+        # 收口（否则结论式 0 复活）。
         return bool(score.ai_reasoning or meta.get("reasoning"))
     for warning in score.warnings_json or []:
         if isinstance(warning, dict) and (warning.get("fallback_score") or warning.get("unresolved")):

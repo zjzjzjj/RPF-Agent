@@ -21,6 +21,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+from pydantic import BaseModel
 from sqlalchemy import delete, select
 
 from app import config
@@ -115,6 +116,153 @@ def _presence_unverified_outcome(
     return _presence_outcome(
         PresenceResult("unverified", None, detail, reason_code="absence_scan_guard"),
         criterion, pages,
+    )
+
+
+def _value_extraction_unresolved_outcome(
+    criterion: dict, pages: list[dict], detail: str,
+) -> CellOutcome:
+    """承诺值抽取未果 → 暂定待人工（包A 第 3 步）。
+
+    与 presence_unverified/reading_incomplete 同构：basis=fallback、**未定分**
+    （final=None，不进 final_score 定格、不压名次），kind=value_extraction_unresolved
+    供 _valid_cell 计完成、报告按兜底清单渲染——"抽取失败"绝不冒充"不符合 0 分"
+    结论；确认缺失（confirmed_absent+制裁句）的 0 分结论仍走 _verified_count 原通道。
+    """
+    reason = (
+        f"承诺值抽取未果，暂定待人工核对（非不符合结论、非 0 分）：{detail}"
+    )
+    fallback = {
+        "kind": "value_extraction_unresolved",
+        "value": None,
+        "basis": "machine_fallback",
+        "reason": str(detail or "").strip()[:500],
+        "score_type": criterion.get("score_type"),
+    }
+    raw = {
+        "calculation": reason,
+        "coverage_complete": False,
+        "zero_reason": "value_extraction_unresolved",
+        "fallback": fallback,
+    }
+    return CellOutcome(
+        "concern", reason, None, [], pages, "fallback", 1, raw,
+        [{
+            "message": reason,
+            "verdict_source": "deterministic",
+            "fallback_score": fallback,
+            # 结构化 unresolved（report._count_problem 疑问清单同键口径）：
+            # "机器没抽到事实"进 count_no_facts 疑问，不冒充评审结论。
+            "unresolved": "no_facts",
+        }],
+    )
+
+
+class _ValueExtractOut(BaseModel):
+    """承诺值残差抽取的 LLM 输出契约（包A 第 2 步）：抽值 + 逐字引文。"""
+
+    value: str = ""
+    quote: str = ""
+
+
+def _value_extraction_residual(
+    criterion: dict, pages: list[dict], inventory, gateway_factory,
+) -> CellOutcome | None:
+    """残差轮（包A 第 2 步）：锚词命中但正则解析不出 → 一次纯文本 LLM 抽值。
+
+    三道校验全过才出分：① 逐字引文必须在该家原文中可定位（空白归一）；
+    ② 数值必须能从引文复算（auto_review._numeric_values，与模型事实证据闸门
+    同一通道）；③ 按冻结档位/线性参数复算计分。任一不过、开关
+    BID_EVAL_VALUE_EXTRACT_LLM=0、LLM 未配置/故障 → None（调用方落暂定兜底）。
+    只送文本片段，绝不触发 OCR/视觉/读页图。
+    """
+    if not config.value_extract_llm_enabled():
+        return None
+    params = dict(criterion.get("params") or {})
+    field = str(params.get("field") or "")
+    if field not in ("response_hours", "warranty_months"):
+        return None
+    from app.engine.auto_review import _numeric_values
+    from app.engine.objective import value_anchor_snippets
+    from app.parsing.normalize import normalize_no_ws
+    from app.rules.prompts import VALUE_EXTRACT_SYSTEM_PROMPT, VALUE_EXTRACT_USER_TEMPLATE
+
+    corpus = str(getattr(inventory, "full_text", "") or "")
+    snippets = value_anchor_snippets(field, corpus)
+    if not snippets:
+        return None
+    rule = "\n".join(str(criterion.get(key) or "") for key in
+                     ("name", "description", "source_quote"))
+    user = VALUE_EXTRACT_USER_TEMPLATE.format(
+        rule=rule.strip(), field=field, snippets="\n---\n".join(snippets))
+    try:
+        gateway = gateway_factory()
+        out, _result = gateway.chat_json(
+            VALUE_EXTRACT_SYSTEM_PROMPT, user, _ValueExtractOut)
+    except JobCancelled:
+        raise
+    except Exception:  # noqa: BLE001 - LLM 未配置/配额/契约失败 → 暂定兜底
+        log.info("承诺值残差抽取不可用 criterion=%s", criterion.get("code"), exc_info=True)
+        return None
+    quote = str(out.quote or "").strip()
+    raw_value = str(out.value or "").strip()
+    if not quote or not raw_value:
+        return None
+    norm_quote = normalize_no_ws(quote)
+    if not norm_quote or norm_quote not in normalize_no_ws(corpus):
+        return None  # 引文不是原文逐字片段 → 拒绝
+    try:
+        value = Decimal(raw_value)
+    except (InvalidOperation, ValueError, TypeError):
+        return None
+    if not value.is_finite() or value < 0:
+        return None
+    if value not in _numeric_values(quote, field):
+        return None  # 数值无法从引文复算 → 拒绝（与事实证据闸门同口径）
+    scorer = score_value_tier if str(params.get("engine")) == "value_tier" else score_value_linear
+    try:
+        scored = scorer(
+            {"max_score": criterion.get("max_score"),
+             "verified_facts": {field: str(value)}},
+            params, BidFacts(text=corpus),
+        )
+    except Exception:  # noqa: BLE001 - 档位参数异常 → 暂定兜底
+        return None
+    if scored.unresolved:
+        return None
+    try:
+        score = _score_in_range(scored.score, criterion)
+    except (LLMError, InvalidOperation, TypeError, ValueError):
+        return None
+    evidence: list[dict] = []
+    if len(norm_quote) >= config.MIN_QUOTE_CHARS:
+        for page in pages:
+            # 落页证前按 verify_automatic_citation 同口径自检（引文必须逐字落
+            # 在单页原文内），否则 _persist_cell 的逐字核验会掀翻整格。
+            if (page.get("document_id") is None or page.get("page_no") is None):
+                continue
+            if norm_quote in normalize_no_ws(str(page.get("text") or "")):
+                evidence = [{
+                    "document_id": page.get("document_id"),
+                    "page_no": page.get("page_no"),
+                    "quote": quote, "kind": "text",
+                }]
+                break
+    detail = (
+        f"残差抽取（LLM 纯文本）：{field}={value}，引文复算通过"
+        f"（{quote[:60]}）→ {scored.detail}"
+    )
+    raw = {
+        "calculation": detail,
+        "verified_facts": {field: str(value), f"{field}_quote": quote},
+        "coverage_complete": True,
+        "zero_reason": None,
+        "deterministic_plan": True,
+    }
+    return CellOutcome(
+        "pass" if score > 0 else "fail", detail, score, evidence, pages,
+        "deterministic", 1, raw,
+        [{"message": detail, "verdict_source": "llm"}],
     )
 
 
@@ -604,6 +752,12 @@ def _verified_count(criterion: dict, decision, pages: list[dict]) -> tuple[Decim
                 raise LLMError(f"{name}不能小于零")
             values[name] = str(number)
     prepared = {**criterion, "verified_facts": values}
+    # 承诺值字段的全文抽取语料（包A）：该家 source=='text' 页文本层拼接，
+    # 供 score_value_* 在模型未供值时做确定性抽取的第三级兜底（零 OCR）。
+    prepared["fulltext_corpus"] = "\n".join(
+        str(p.get("text") or "") for p in pages
+        if str(p.get("source") or "text") == "text"
+    )
     backing = values.get("cert_backing") or {}
     if certificates:
         if not isinstance(backing, dict):
@@ -1650,6 +1804,16 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
                 log.info("客观快路径影子 bid=%s criterion=%s score=%s detail=%s",
                          bid_id, criterion.get("code"), result.score, result.detail[:200])
                 return None
+            # 包A 第 2/3 步：承诺值"抽取失败"不进下面的确定性定格——先试一次
+            # 纯文本残差 LLM 抽值（锚词命中才调），仍抽不到则落暂定兜底
+            # （kind=value_extraction_unresolved，未定分待人工，非"不符合 0 分"）。
+            if result.zero_reason == "value_extraction_unresolved":
+                residual = _value_extraction_residual(
+                    criterion, pages, inventory, gateway_factory)
+                if residual is not None:
+                    return residual
+                return _value_extraction_unresolved_outcome(
+                    criterion, pages, str(result.detail or ""))
             # Once a deterministic plan exists, always settle from the
             # inventory.  Falling back to the full-document LLM count path here
             # re-reads every page in dozens of batches and was the dominant
@@ -1719,7 +1883,8 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
         from app.engine.qualification_light import LightResult, cell_payload
 
         if result is None:
-            result = LightResult(status="concern", reason="轻量预检未覆盖该条款，存疑待人工核对")
+            result = LightResult(status="pass", reason="通过（未见确定性否决点）：轻量预检未覆盖该条款，未能核查，未提出否决",
+                                 quick="skipped", quick_state="skipped", needs_human_check=True)
         payload = cell_payload(result)
         verdict_source = "llm" if payload["quick"] in ("pass", "concern", "reject") else "machine"
         return CellOutcome(
@@ -1862,10 +2027,12 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
                             cached = review_bidder_qualification(
                                 light_criteria_by_bidder.get(bid_id, []), pages, data_class, gateway_obj)
                         except Exception as exc:  # noqa: BLE001
+                            # 无法核验≠不符合：执行异常一律落"通过（未见否决点）"并留痕，绝不否决
                             cached = {
                                 str(c.get("code") or ""): LightResult(
-                                    status="concern",
-                                    reason=f"轻量预检异常（{type(exc).__name__}），存疑待人工核对")
+                                    status="pass",
+                                    reason=f"通过（未见确定性否决点）：轻量预检执行异常（{type(exc).__name__}），未能核查，未提出否决",
+                                    quick="failed", quick_state="failed", needs_human_check=True)
                                 for c in light_criteria_by_bidder.get(bid_id, [])
                             }
                         light_reviews[bid_id] = cached

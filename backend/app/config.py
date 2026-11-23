@@ -788,8 +788,22 @@ def llm_prompt_version() -> str:
     变更），升版作废旧缓存。
     2026-11-18：规则抽取 prompt 修 match 措辞（"满足条件得分"误导计分行标 match，
     利群 7 条实证）+ 权重表禁抽 + 主/客观列最终依据声明，升版作废旧缓存。
+    2026-11-19：新增承诺值残差抽取 prompt（VALUE_EXTRACT_*，包A 抽取失败≠结论0），
+    升版作废旧缓存（新 prompt 不与旧键共享命中）。
     """
-    return os.environ.get("BID_EVAL_PROMPT_VERSION", "2026-11-18.1")
+    return os.environ.get("BID_EVAL_PROMPT_VERSION", "2026-11-19.1")
+
+
+def value_extract_llm_enabled() -> bool:
+    """承诺值残差抽取 LLM 轮开关（包A 第 2 步，BID_EVAL_VALUE_EXTRACT_LLM）。
+
+    送审窗口/全文正则都抽不到、但锚词确实命中的格子，把命中文本片段（纯文本，
+    零 OCR/零页图）交给 LLM 抽一次值——带逐字引文与数值复算校验。默认开；
+    置 0 回退纯确定性路径（抽取失败直接落暂定兜底 value_extraction_unresolved）。
+    """
+    return os.environ.get("BID_EVAL_VALUE_EXTRACT_LLM", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
 
 
 def veto_batch_size() -> int:

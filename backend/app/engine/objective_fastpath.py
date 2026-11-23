@@ -712,11 +712,19 @@ def _generic_engine_score(criterion: dict, inventory: MaterialInventory,
 
     facts = inventory.to_bid_facts()
     engine = params.get("engine")
+    # 承诺值字段的全文抽取语料（包A）：该家 source=='text' 页的文本层拼接，
+    # 纯文本零成本（严禁 OCR/视觉/读页图）。facts.text 已是全页文本，语料作为
+    # score_value_* 的第三级兜底契约注入，供前两级（窗口/送审选段）都抽不到时使用。
+    text_corpus = "\n".join(
+        str(p.get("text") or "") for p in inventory.pages
+        if str(p.get("source") or "text") == "text"
+    )
     scoring_criterion = {
         **criterion,
         "verified_facts": {"inventory": inventory.audit},
         "cert_backing": inventory.cert_backing,
         "cert_section_present": inventory.cert_section_present,
+        "fulltext_corpus": text_corpus,
     }
     try:
         if engine in _ENGINES:
@@ -727,14 +735,24 @@ def _generic_engine_score(criterion: dict, inventory: MaterialInventory,
         return None
     score = _cap(Decimal(str(result.score or 0)), criterion)
     zero_reason = getattr(result, "zero_reason", None)
+    unresolved = getattr(result, "unresolved", None)
+    verdict = "pass" if score > 0 else "fail"
+    complete = not bool(unresolved)
+    if engine in ("value_tier", "value_linear") and unresolved == "no_facts":
+        # 包A 第 3 步：承诺值"抽取失败"不是"不符合"结论——不得按 fail/0 定格。
+        # 交 fastpath_cell 走残差 LLM 抽值轮，仍抽不到则落暂定兜底
+        # （kind=value_extraction_unresolved，未定分待人工）。
+        zero_reason = "value_extraction_unresolved"
+        verdict = "concern"
+        complete = False
     return FastPathResult(
         score=score, detail=str(result.detail or "") + f"；合计 {score} 分",
-        verdict="pass" if score > 0 else "fail",
+        verdict=verdict,
         facts={"detail": result.detail},
         pages=[],
         zero_reason=zero_reason,
         confidence="medium",
-        complete=not bool(getattr(result, "unresolved", None)),
+        complete=complete,
     )
 
 
