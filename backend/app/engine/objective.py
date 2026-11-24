@@ -514,7 +514,9 @@ def _anchor_window(text: str, pos: int, width: int = 60) -> dict:
     return {"quote": t[start:end].strip()}
 
 
-def detect_cert_section(pages: list[dict]) -> CertSectionDetection:
+def detect_cert_section(
+    pages: list[dict], locator_windows: list[tuple[int, int]] | None = None,
+) -> CertSectionDetection:
     """认证"查询截图"证据双通道三态判定（带命中页锚）。
 
     pages 是 [{document_id, page_no, source, text, ...}]。通道 A 对全部页文本层
@@ -562,6 +564,14 @@ def detect_cert_section(pages: list[dict]) -> CertSectionDetection:
                 break
     if hits:
         return CertSectionDetection(state=True, basis=hits[0]["basis"], hits=hits)
+    # PR3（2026-11-24）：目录/索引列示"查询截图"窗口 = 节存在的第三信号
+    # （与标题/平台指纹双通道并列）——TOC 声明截图节存在而文本层看不见时，
+    # 依"不允许漏评分"口径按存在计，不盲态也不判缺。
+    if locator_windows:
+        _lo, _hi = locator_windows[0]
+        return CertSectionDetection(
+            state=True,
+            basis=f"目录/索引列示'查询截图'窗口 p{_lo}-{_hi}（存在性信号，内容未核验）")
     # 无命中：存在零文本/低文本高图页 → 盲态不猜。run155 咏数实证：截图页
     # 是扫描图但带 OCR 噪声文本 → 旧口径（只认完全空文本）判"确认无"→ 清零
     # ISO——机器看不见 ≠ 不存在（2026-11-24）。

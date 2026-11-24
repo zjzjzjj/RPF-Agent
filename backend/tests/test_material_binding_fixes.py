@@ -139,3 +139,122 @@ def test_screenshot_gate_confirmed_missing_zeroes_iso() -> None:
     result = score_count(criterion, criterion.get("params") or {}, facts)
     assert (result.score or 0) == 0
     assert result.zero_reason in ("confirmed_absent", "unreadable", "no_facts")
+
+
+# ---- PR3/PR4：存在性接入 locator + 漏评分护栏 ------------------------------
+
+def test_cmmi_locator_record_when_text_misses() -> None:
+    """扫描 CMMI 页无 cert_context 词被文本路跳过（run155 c45 全 0 残余场景）
+    → 目录列示的 CMMI 窗口登记为存在性记录（计入+疑问，不静默 0）。"""
+    from app.engine.material_inventory import build_inventory
+
+    toc = {"document_id": 1, "page_no": 1, "source": "text", "known_blank": False,
+           "material_tags": [],
+           "text": "投标文件目录\nCMMI 能力成熟度证书………30\n其他材料………40"}
+    pages = [toc] + [
+        {"document_id": 1, "page_no": n, "source": "ocr", "known_blank": False,
+         "material_tags": [], "text": ""} for n in range(2, 45)
+    ]
+    inv = build_inventory(9, pages)
+    assert any((c.normalized or "") == "CMMI" for c in inv.certs), inv.certs
+    assert "CMMI" in (inv.facts.certificates or [])
+
+
+def test_detect_cert_section_locator_window_signal() -> None:
+    """目录列示'查询截图'窗口 = 节存在信号（文本层看不见时不盲态不判缺）。"""
+    from app.engine.objective import detect_cert_section
+
+    pages = [{"document_id": 1, "page_no": 1, "source": "text", "known_blank": False,
+              "text": "投标文件正文，无任何截图标题与平台指纹。" * 5}]
+    det = detect_cert_section(pages, locator_windows=[(30, 35)])
+    assert det.state is True
+    assert "目录" in det.basis
+
+
+_D = Decimal
+
+RULE10 = (
+    "投标产品业绩：根据投标人提供自2022年1月1日（合同签订时间为准）至今的同类产品业绩，"
+    "要求合同金额100万及以上，每个得1分，最高得2分。"
+    "【证明材料】须提供业绩合同、验收证明材料及合同配套的至少一张发票复印件并加盖投标人公章，"
+    "以上资料未提供的不得分。"
+)
+
+
+def _perf_rule(description=None, **param_changes):  # noqa: ANN001, ANN202
+    params = {"field": "performance", "per_item": "1",
+              "min_amount_yuan": "1000000", **param_changes}
+    return {"code": "c25", "name": "投标产品业绩", "score_type": "count",
+            "max_score": "2", "description": description or RULE10, "params": params}
+
+
+def test_guard_escalates_missing_to_unverified(monkeypatch) -> None:  # noqa: ANN001
+    """护栏：目录列有材料页但绑定未闭合 -> 禁止按缺件判 0（计入+疑问）。"""
+    from app.engine.facts import BidFacts
+    from app.engine.material_inventory import ContractRecord, MaterialInventory
+    from app.engine.objective_fastpath import _score_contracts
+
+    inv = MaterialInventory(
+        bidder_id=1, pages=[], full_text="", facts=BidFacts(text=""),
+        contracts=[], locator_index={"invoice": {50}, "acceptance": {60}},
+        performance_section_found=True,
+    )
+    record = ContractRecord(
+        name="某研究所维保", amount_yuan=_D("1200000"),
+        pages=[1], materials={"contract": [1]}, source="table",
+        materials_state={"contract": True, "invoice": False, "acceptance": False})
+    inv.contracts = [record]
+    monkeypatch.setenv("BID_EVAL_MATERIAL_LOCATOR", "on")
+    monkeypatch.setenv("BID_EVAL_MATERIAL_GUARD", "1")
+    result = _score_contracts(_perf_rule(RULE10), inv)
+    assert result.score > 0, "目录列有材料页 -> 禁止按缺件判 0"
+    assert any("目录列有材料页" in (w.get("message") or "") for w in result.warnings)
+    assert result.verdict == "concern"
+
+
+def test_guard_zero_reason_material_binding_conflict(monkeypatch) -> None:  # noqa: ANN001
+    """护栏升级后 0 分 -> zero_reason=material_binding_conflict（非评审结论）。"""
+    from app.engine.facts import BidFacts
+    from app.engine.material_inventory import ContractRecord, MaterialInventory
+    from app.engine.objective_fastpath import _score_contracts
+
+    inv = MaterialInventory(
+        bidder_id=1, pages=[], full_text="", facts=BidFacts(text=""),
+        contracts=[], locator_index={"invoice": {50}},
+        performance_section_found=True,
+    )
+    inv.contracts = [ContractRecord(
+        name="某研究所维保", amount_yuan=_D("1200000"), pages=[1],
+        materials={"contract": [1]}, source="table",
+        materials_state={"contract": True, "invoice": False})]
+    monkeypatch.setenv("BID_EVAL_MATERIAL_LOCATOR", "on")
+    monkeypatch.setenv("BID_EVAL_MATERIAL_GUARD", "1")
+    # 无档位细则 + per_item=0：护栏升级留痕但计分 0 → 零因必须是
+    # binding_conflict（0 分不是评审结论）
+    no_tier_rule = ("投标产品业绩：每个得1分，最高得2分。【证明材料】须提供"
+                    "业绩合同、验收证明及发票复印件，以上资料未提供的不得分。")
+    result = _score_contracts(_perf_rule(no_tier_rule, per_item="0"), inv)
+    assert result.score == 0
+    assert result.zero_reason == "material_binding_conflict", result.zero_reason
+
+
+def test_guard_off_keeps_confirmed_absence_zero(monkeypatch) -> None:  # noqa: ANN001
+    """护栏关闭：确认缺件仍判 0（红线）。"""
+    from app.engine.facts import BidFacts
+    from app.engine.material_inventory import ContractRecord, MaterialInventory
+    from app.engine.objective_fastpath import _score_contracts
+
+    inv = MaterialInventory(
+        bidder_id=1, pages=[], full_text="", facts=BidFacts(text=""),
+        contracts=[], locator_index={"invoice": {50}},
+        performance_section_found=True,
+    )
+    inv.contracts = [ContractRecord(
+        name="某研究所维保", amount_yuan=_D("1200000"), pages=[1],
+        materials={"contract": [1]}, source="table",
+        materials_state={"contract": True, "invoice": False, "acceptance": False})]
+    monkeypatch.setenv("BID_EVAL_MATERIAL_LOCATOR", "on")
+    monkeypatch.setenv("BID_EVAL_MATERIAL_GUARD", "0")
+    result = _score_contracts(_perf_rule(RULE10), inv)
+    assert result.score == 0
+    assert "未提供的不得分" in result.detail

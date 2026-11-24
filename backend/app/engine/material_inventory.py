@@ -81,6 +81,9 @@ class MaterialInventory:
     value_items: list[ValueItem] = field(default_factory=list)
     cert_section_present: bool = False
     cert_backing: dict[str, bool | None] = field(default_factory=dict)
+    # PR3（2026-11-24）：目录驱动定位页集（kind→页号）——存在性核验页源；
+    # shadow=只审计，on=供护栏/判定消费
+    locator_index: dict[str, set[int]] = field(default_factory=dict)
     performance_section_found: bool = False
     personnel_section_found: bool = False
     personnel_table_found: bool = False
@@ -914,14 +917,34 @@ def build_inventory(bidder_id: int, pages: list[dict]) -> MaterialInventory:
             current.source = "table"
     contracts = list(deduped.values())
 
+    # PR3（2026-11-24）：目录驱动存在性信号（纯文本计算；shadow=只审计）
+    locator_index: dict[str, set[int]] = {}
+    try:
+        from app.engine import material_locator
+
+        if material_locator.locator_enabled() in ("on", "shadow"):
+            locator_index = material_locator.material_page_index(pages)
+    except Exception:  # noqa: BLE001 —— 定位失败不阻断
+        locator_index = {}
     certs = _certs_from_pages(pages)
+    if locator_index.get("cmmi") and not any(
+            (c.normalized or "") == "CMMI" for c in certs):
+        # 扫描 CMMI 页无 cert_context 词被文本路跳过（run155 c45 全 0 残余
+        # 场景）→ 目录列示的 CMMI 窗口登记为存在性记录：backing=None
+        # → 计入+疑问（不静默 0），内容核验留给点读/VL
+        certs.append(CertRecord(name="CMMI", normalized="CMMI",
+                                pages=[min(locator_index["cmmi"])]))
     # Ensure the generic facts list reflects the structured certificate scan.
     cert_names = [c.normalized or c.name for c in certs]
     facts.certificates = list(dict.fromkeys(cert_names))
     try:
         from app.engine.objective import classify_cert_backing, detect_cert_section
         page_pairs = [(str(p.get("source") or "text"), str(p.get("text") or "")) for p in pages]
-        detection = detect_cert_section(pages)
+        _shot_wins = [(_w.start, _w.end) for _w in (
+            (material_locator.locate_material_sections(pages).get("query_screenshot") or [])
+            if locator_index else []
+        )]
+        detection = detect_cert_section(pages, locator_windows=_shot_wins or None)
         cert_section = (detection.state is True, detection.basis)
         cert_section_state = detection.state  # 三态进 audit（None=盲态不猜）
         cert_section_hits = len(detection.hits)
@@ -971,6 +994,7 @@ def build_inventory(bidder_id: int, pages: list[dict]) -> MaterialInventory:
         value_items=value_items,
         cert_section_present=bool(cert_section[0]),
         cert_backing=backing,
+        locator_index=locator_index,
         performance_section_found=performance_found,
         personnel_section_found=personnel_found,
         personnel_table_found=personnel_table_found,
@@ -992,5 +1016,6 @@ def build_inventory(bidder_id: int, pages: list[dict]) -> MaterialInventory:
             # None 盲态语义留痕不猜）
             "cert_section_state": cert_section_state,
             "cert_section_hits": cert_section_hits,
+            "locator_kinds": {k: len(v) for k, v in locator_index.items() if v},
         },
     )

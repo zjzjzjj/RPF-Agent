@@ -962,6 +962,14 @@ def vl_timeout_s() -> float:
         return 90.0
 
 
+def material_guard_enabled() -> bool:
+    """漏评分护栏（2026-11-24 PR4）：目录列有材料页而绑定未闭合时禁止按
+    缺件判 0（计入+疑问+护栏报警）。独立开关便于单独回退报警层。"""
+    return os.environ.get("BID_EVAL_MATERIAL_GUARD", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
 def material_locator_mode() -> str:
     """目录驱动材料页定位（2026-11-24 PR2）：shadow=只写审计 / on=生效 / off=关。
 

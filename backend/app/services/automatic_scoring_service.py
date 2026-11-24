@@ -1352,7 +1352,17 @@ def _maybe_vl_rescue(run_id: int, bid_id: int, criterion: dict,
     # material_tags）占满 8 图名额，p200 的业绩合同永远进不来，模型仍弃权。
     crit_anchors = [a for a in _SUPPLEMENT_HINTS if a in crit_text]
 
-    def _vl_rank(pg: dict) -> tuple[int, int, int, int]:
+    locator_nos: set[int] = set()
+    try:
+        from app.engine import material_locator as _ml
+
+        if _ml.locator_enabled() == "on":
+            for _ns in _ml.material_page_index(pages).values():
+                locator_nos |= _ns
+    except Exception:  # noqa: BLE001
+        locator_nos = set()
+
+    def _vl_rank(pg: dict) -> tuple[int, int, int, int, int]:
         """候选页排序：噪声垫底 → 该格锚词命中数倒序 → 有标签优先 → 页序。
 
         锚词命中把"本条细则要的材料页"顶到前面（业绩/社保/合同页 > 资格页）；
@@ -1362,7 +1372,8 @@ def _maybe_vl_rescue(run_id: int, bid_id: int, criterion: dict,
         noise = 1 if _is_noise_page(pg) else 0
         hay = " ".join(tags) + " " + str(pg.get("text") or "")[:500]
         hits = sum(1 for a in crit_anchors if a in hay)
-        return (noise, -hits, 0 if tags else 1, int(pg.get("page_no") or 0))
+        loc = 0 if int(pg.get("page_no") or 0) in locator_nos else 1
+        return (noise, loc, -hits, 0 if tags else 1, int(pg.get("page_no") or 0))
 
     rest = [q for k, q in candidates.items() if k not in set(named_keys)]
     rest.sort(key=_vl_rank)

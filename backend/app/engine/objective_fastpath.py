@@ -289,6 +289,17 @@ def _missing_required_materials(
     return missing, unverified
 
 
+def _guard_on(inventory: MaterialInventory) -> bool:
+    """PR4 护栏开关：BID_EVAL_MATERIAL_GUARD=1 且 locator 生效（on）才升级。"""
+    try:
+        from app import config
+        from app.engine.material_locator import locator_enabled
+
+        return config.material_guard_enabled() and locator_enabled() == "on"
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathResult:
     text = _rule_text(criterion)
     maximum = _max(criterion) or Decimal(0)
@@ -316,6 +327,20 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
         if required_materials:
             missing, unverified = _missing_required_materials(
                 record, required_materials, or_group)
+            # PR4 护栏（2026-11-24 用户口径"不允许漏评分"）：目录/索引列有该
+            # 材料页但绑定未闭合 → **禁止按缺件判 0**，计入并标疑问（护栏
+            # 报警）；目录也没有 → 真缺件判 0（红线保留）。翻转方向只升不降。
+            if missing and _guard_on(inventory):
+                _kind_of_label = {"合同": "contract", "发票": "invoice",
+                                  "验收证明": "acceptance", "业主证明": "acceptance"}
+                escalated = [m for m in missing
+                             if (inventory.locator_index or {}).get(
+                                 _kind_of_label.get(m, ""))]
+                if escalated:
+                    unverified_notes.append(
+                        f"{record.name}（{'/'.join(escalated)}目录列有材料页但绑定未闭合，"
+                        "计入并标疑问）")
+                    missing = [m for m in missing if m not in escalated]
             if missing:
                 rejected.append(f"{record.name}（缺{'/'.join(missing)}，细则：未提供的不得分）")
                 continue
@@ -355,7 +380,11 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
                 and not unverified_notes)
     zero_reason = None
     if score == 0:
-        zero_reason = "confirmed_absent" if complete else "no_facts"
+        if unverified_notes:
+            # 护栏：目录列有材料页但绑定未闭合——0 分不是评审结论
+            zero_reason = "material_binding_conflict"
+        else:
+            zero_reason = "confirmed_absent" if complete else "no_facts"
     warnings = []
     if unverified_notes:
         warnings.append({"code": "material_unverified",
