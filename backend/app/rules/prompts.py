@@ -37,6 +37,10 @@ RULE_SYSTEM_PROMPT = """你是一名严谨的招标文件结构化助手。
   | "count_at_least"（业绩/数量门槛）| "contains_phrase"（须包含声明）| "math_relation"（报价算术/限价）
   | "human_only"（无法自动判定，如密封、签字）
 - params: check_type 的参数，如 {"min": 10000000} 或 {"document": "投标保证金缴纳凭证"}
+  math_relation 限价条款必须给出限价参数（**单位一律为元**，禁止万元数值、禁止 max_yuan 键）：
+  总价限价 → {"max_amount_yuan": "1872000", "price_includes_tax": true, "tax_rate": "6"}；
+  分年度限价 → {"yearly_max_amount_yuan": ["1519800", "1683200", "1846600"], ...}；
+  原文未写限价金额时省略这些键（不得编造数字）。
 - count_at_least 必须在 **params 内**给出 field（数什么），只能是这两个值之一：
   "performance"（业绩案例数）| "certificates"（认证/资质证书数）
   例：业绩每个得 2 分 → {"check_type":"count_at_least","params":{"field":"performance","per_item":"2"}}

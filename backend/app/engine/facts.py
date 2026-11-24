@@ -409,6 +409,9 @@ class BidFacts:
     bid_price: Decimal | None = None
     bid_price_upper: str | None = None
     bid_price_upper_value: Decimal | None = None
+    # R46-A 税口径（None=原文未声明，盲态）：限价比较的对齐决策表用
+    bid_price_includes_tax: bool | None = None
+    bid_price_tax_rate: Decimal | None = None
     price_items_total: Decimal | None = None
     registered_capital: Decimal | None = None
     performance_amounts: list[Decimal] = field(default_factory=list)
@@ -424,6 +427,29 @@ class BidFacts:
     person_attributes: list[dict] = field(default_factory=list)
 
 
+def _tax_zone(text: str, pos: int, span: int = 60) -> tuple[bool | None, Decimal | None]:
+    """pos 邻域的含税口径与税率（勾选框形态优先；None=盲态）。"""
+    zone = text[max(0, pos - 10) : pos + span]
+    incl: bool | None = None
+    if re.search(r"[☑✓√]\s*不含税", zone):
+        incl = False
+    elif re.search(r"[☑✓√]\s*含税", zone):
+        incl = True
+    elif "不含增值税" in zone or "不含税" in zone:
+        incl = False
+    elif "含增值税" in zone or "含税" in zone:
+        incl = True
+    rate: Decimal | None = None
+    if rm := re.search(r"税率?\s*[：:]?\s*(\d{1,2}(?:\.\d+)?)\s*%", zone):
+        try:
+            v = Decimal(rm.group(1))
+            if v < 50:
+                rate = v
+        except InvalidOperation:
+            rate = None
+    return incl, rate
+
+
 def extract_bid_facts(text: str, documents: list[str] | None = None) -> BidFacts:
     facts = BidFacts(text=text, documents=documents or [])
 
@@ -431,20 +457,32 @@ def extract_bid_facts(text: str, documents: list[str] | None = None) -> BidFacts
     # ① "投标总价：金额" 同行 → ② 标签后窗口内的小写/大写金额（真实标书的换行表格）
     # → ③ "投标价（含增值税…）" 合计行 → ④ 带语境的 ¥。
     price: Decimal | None = None
+    price_incl: bool | None = None
+    price_rate: Decimal | None = None
     if m := _RE_PRICE_TOTAL_ROW.search(text):
         price = _money(m.group(1))
         if price is not None and m.group(2):
             price *= Decimal(10_000)  # "投标总价：179.67万元" → 元（单位显式捕获）
+        if price is not None:
+            price_incl, price_rate = _tax_zone(text, m.start(), 60)
     if price is None and (near := _price_near_total_label(text)) is not None:
         price = near
+        if lm := _RE_TOTAL_LABEL.search(text):
+            price_incl, price_rate = _tax_zone(text, lm.start(), _PRICE_LABEL_WINDOW + 20)
     if price is None and (m := _RE_PRICE_INCL_VAT.search(text)):
         price = _money(m.group(1))
+        price_incl, price_rate = True, None  # "投标价（含增值税…）"明确含税
     if price is None and (ob := _price_from_open_bid_section(text)) is not None:
         # ⑤ 结构锚点兜底（强于④的全局弱启发）：开标一览表跨行断裂表单
         price = ob
+        if am := _RE_OPEN_BID_HEADING.search(text):
+            price_incl, price_rate = _tax_zone(text, am.start(), 400)
     if price is None:
         price = _contextual_price(text)
+        # 弱语境回退：口径盲态（None），交决策表按"单边不对称→停比"处理
     facts.bid_price = price
+    facts.bid_price_includes_tax = price_incl
+    facts.bid_price_tax_rate = price_rate
     # 大写金额
     if m := _RE_PRICE_TOTAL_CN.search(text):
         facts.bid_price_upper = m.group(1)

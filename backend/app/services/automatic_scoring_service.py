@@ -899,14 +899,18 @@ def _verified_count(criterion: dict, decision, pages: list[dict]) -> tuple[Decim
 
 def _verified_price_limit(criterion: dict, decision) -> tuple[str, str, dict]:
     """Never infer annual compliance from a confirmed total or a model verdict."""
+    from app.engine.price_limit import resolve_limit_keys
+
     params = criterion.get("params") or {}
     frozen = criterion.get("_frozen_bidder") or {}
     values = {}
     missing = []
     comparisons = []
     exceeded = False
-    checks = [("bid_price", params.get("max_amount_yuan"))] if params.get("max_amount_yuan") is not None else []
-    checks += [(f"yearly_bid_price_{i}", cap) for i, cap in enumerate(params.get("yearly_max_amount_yuan") or [], 1)]
+    # R46-A 键归一：别名 max_yuan/max 与规范键走同一严核验路径
+    total, yearly, _incl, _rate, _kind = resolve_limit_keys(params)
+    checks = [("bid_price", total)] if total is not None else []
+    checks += [(f"yearly_bid_price_{i}", cap) for i, cap in enumerate(yearly or [], 1)]
     for key, cap in checks:
         limit = _decimal(cap, "最高限价")
         value = decision.facts.get(key)

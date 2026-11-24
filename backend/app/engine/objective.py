@@ -275,7 +275,12 @@ def _check_math(
     轻量路径 concern→fail 建议否决，语义均不变。
     BID_EVAL_MATH_SCOPE_FILTER=0 回退旧无条件三查。
     """
-    from app.engine.price_limit import infer_math_scope, resolve_limit_keys
+    from app.engine.price_limit import (
+        align_tax_basis,
+        infer_math_scope,
+        parse_price_limit_text,
+        resolve_limit_keys,
+    )
 
     scope = infer_math_scope(criterion, params)
     if not scope:
@@ -293,23 +298,67 @@ def _check_math(
     executed: list[str] = []
 
     if "limit" in scope:
-        total, yearly, _incl, _rate, kind = resolve_limit_keys(params)
+        total_p, yearly_p, incl_p, rate_p, kind_p = resolve_limit_keys(params)
+        # R46-A 条款原文确定性解析：params 缺失时兜底；两者不等 → 原文为准
+        total, yearly, incl, rate, kind = total_p, yearly_p, incl_p, rate_p, kind_p
+        parse_warn = ""
+        blob = ""
+        if criterion:
+            blob = "\n".join(
+                str(criterion.get(k) or "") for k in ("name", "description", "source_quote")
+            )
+        parsed, pwarn = parse_price_limit_text(blob) if blob else (None, None)
+        if parsed:
+            total_n, yearly_n, incl_n, rate_n, kind_n = resolve_limit_keys(parsed)
+            if total_p is not None and total_n is not None and total_p != total_n:
+                parse_warn = (
+                    f"限价以细则原文解析为准（规则包 {_money(total_p)} vs 原文 {_money(total_n)}）"
+                )
+                total, yearly, incl, rate, kind = total_n, yearly_n, incl_n, rate_n, kind_n
+            elif total_p is None and yearly_p is None and kind_p is None:
+                total, yearly, incl, rate, kind = total_n, yearly_n, incl_n, rate_n, kind_n
+            else:
+                # params 已有限价值：原文补口径/税率缺口
+                if incl is None and incl_n is not None:
+                    incl = incl_n
+                if rate is None and rate_n is not None:
+                    rate = rate_n
+        if pwarn:
+            parse_warn = (parse_warn + "；" if parse_warn else "") + pwarn
         limit_value = total or (sum(yearly) if yearly else None)
         if kind == "unit_price":
-            # 单价型限价（元/万套）：无总价可比，绝不拿单价当总价比（R46-A 细化）
+            # 单价型限价（元/万套）：无总价可比，绝不拿单价当总价比
             skipped.append("单价型限价（元/万套），未作总价比对，需人工核对")
         elif limit_value is None:
             skipped.append("未解析到最高限价金额，未作限价比对，需人工核对")
         elif facts.bid_price is None:
             return PrimitiveResult("unknown", "未提取到投标报价", need_human=True)
-        elif facts.bid_price > limit_value:
-            problems.append(
-                f"投标报价 {_money(facts.bid_price)} 超过最高限价 {_money(limit_value)}"
-            )
         else:
-            executed.append(
-                f"投标报价 {_money(facts.bid_price)} ≤ 最高限价 {_money(limit_value)}"
+            # R46-A 税口径决策表：不对称停比、双盲照比（2026-11-24 拍板）
+            aligned, ok = align_tax_basis(
+                facts.bid_price,
+                facts.bid_price_includes_tax,
+                limit_value,
+                incl,
+                rate,
             )
+            if not ok:
+                skipped.append(
+                    "含税/不含税口径不对称且无法换算，未作限价比对，需人工核对"
+                )
+            elif aligned > limit_value:
+                msg = (
+                    f"投标报价 {_money(facts.bid_price)} 超过最高限价 {_money(limit_value)}"
+                )
+                problems.append((parse_warn + "；" if parse_warn else "") + msg)
+            else:
+                shown = (
+                    _money(facts.bid_price)
+                    if aligned == facts.bid_price
+                    else f"{_money(facts.bid_price)}（口径对齐后 {_money(aligned)}）"
+                )
+                ex = f"投标报价 {shown} ≤ 最高限价 {_money(limit_value)}"
+                executed.append((parse_warn + "；" if parse_warn else "") + ex)
 
     if "arith" in scope:
         if facts.bid_price is None:

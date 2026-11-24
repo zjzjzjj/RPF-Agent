@@ -208,11 +208,13 @@ def is_external_requirement(criterion: dict) -> bool:
 
 def is_price_limit_requirement(criterion: dict) -> bool:
     params = criterion.get("params") or {}
+    from app.engine.price_limit import resolve_limit_keys
+
+    total, yearly, _incl, _rate, _kind = resolve_limit_keys(params)
     return (criterion.get("score_type") in ("veto", "match")
             and criterion.get("check_type") == "math_relation"
             and (params.get("field") == "bid_price" or bool(re.search(r"报价|投标价|限价", str(criterion.get("name") or ""))))
-            and (params.get("max_amount_yuan") is not None
-                 or bool(params.get("yearly_max_amount_yuan"))))
+            and (total is not None or yearly is not None))  # R46-A 键归一：别名 max_yuan/max 同样识别
 
 
 def resolve_price_limit_requirement(criterion: dict) -> dict:
@@ -224,12 +226,28 @@ def resolve_price_limit_requirement(criterion: dict) -> dict:
         return criterion
     from app.services.execution_version import current_execution_manifest
 
+    from app.engine.price_limit import resolve_limit_keys
+
     manifest = current_execution_manifest() or {}
     candidates = [item for item in manifest.get("criteria", []) if is_price_limit_requirement(item)]
     if not candidates:
         return criterion
-    fields = ("max_amount_yuan", "yearly_max_amount_yuan", "price_includes_tax", "tax_rate")
-    limits = [{key: item["params"][key] for key in fields if key in item["params"]} for item in candidates]
+    # R46-A：统一解析为规范键再比较/搬运（别名 max_yuan 归一到 max_amount_yuan）
+    limits = []
+    for item in candidates:
+        total, yearly, incl, rate, kind = resolve_limit_keys(item.get("params") or {})
+        d: dict = {}
+        if total is not None:
+            d["max_amount_yuan"] = str(total)
+        if yearly is not None:
+            d["yearly_max_amount_yuan"] = [str(v) for v in yearly]
+        if incl is not None:
+            d["price_includes_tax"] = incl
+        if rate is not None:
+            d["tax_rate"] = str(rate)
+        if kind is not None:
+            d["price_limit_kind"] = kind
+        limits.append(d)
     if any(value != limits[0] for value in limits):
         raise LLMError("冻结限价规则存在不同限额，须明确适用范围，不能任意选择最高限价")
     return {**criterion, "params": {**(criterion.get("params") or {}), **limits[0]},

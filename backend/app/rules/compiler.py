@@ -784,6 +784,31 @@ def enrich_extracted(
                 params["in_total"] = in_total
                 params["in_total_basis"] = basis
                 c.params = params
+        # R46-A 编译期限价烙印：math_relation 条款从细则原文确定性解析限价
+        # 写入 params（新冻结包自带可靠限价；旧包 content_hash 不变）。
+        # parse 内部有"限价语境"门控：纯算术条款返回 None 不写。
+        # 与 LLM 已填值不等 → 以原文为准并留痕 _limit_conflict。
+        if c.check_type == "math_relation":
+            from app.engine.price_limit import parse_price_limit_text
+
+            own_text = f"{c.name or ''}\n{c.description or ''}\n{c.quote or ''}"
+            parsed_limit, _lw = parse_price_limit_text(own_text)
+            if parsed_limit is None and (c.quote or "").strip() and tender_text:
+                pos = tender_text.find(c.quote.strip()[:20])
+                if pos >= 0:
+                    parsed_limit, _lw = parse_price_limit_text(
+                        tender_text[max(0, pos - 2000) : pos + 2000]
+                    )
+            if parsed_limit:
+                params = dict(c.params or {})
+                conflict = False
+                for key, val in parsed_limit.items():
+                    if params.get(key) is not None and params[key] != val:
+                        conflict = True
+                    params[key] = val
+                if conflict:
+                    params["_limit_conflict"] = "编译期以细则原文解析值覆盖模型 params"
+                c.params = params
         if c.category == "price":
             window = _price_window(c, tender_text)
             parsed = parse_price_formula_text(window)
