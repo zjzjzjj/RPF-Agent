@@ -77,3 +77,29 @@ def test_deposit_heavy_window_not_chosen_over_real_price() -> None:
 """
     facts = extract_bid_facts(text)
     assert facts.bid_price == Decimal("2000000.00"), facts.bid_price
+
+
+def test_limit_context_number_excluded_from_candidates() -> None:
+    """限价语境数字（规则值）不得当报价（R45-A 护栏）。
+
+    限价恒 ≥ 真报价，混入候选后 max() 必选限价 → 把限价当报价 →
+    后续与限价比对必超限 = 系统性误否决。护栏宁可漏抽（走其它兜底级）
+    也绝不放过。
+    """
+    text = """开标一览表
+本项目投标报价如下：1796700
+最高限价：1872000
+"""
+    facts = extract_bid_facts(text)
+    assert facts.bid_price == Decimal("1796700"), facts.bid_price
+
+
+def test_all_limit_context_returns_none() -> None:
+    """窗口候选全是限价语境 → 全剔返回 None（宁缺勿错）。"""
+    text = """开标一览表
+投标报价（含增值税，人民币元）
+最高限价：1872000
+"""
+    facts = extract_bid_facts(text)
+    # 限价值被护栏剔除后无候选；标签级"投标总价"也不存在 → 走不到报价
+    assert facts.bid_price != Decimal("1872000"), facts.bid_price

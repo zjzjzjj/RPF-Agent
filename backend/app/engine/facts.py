@@ -18,11 +18,26 @@ _RUN_UPPER = re.compile(r"[零壹贰叁肆伍陆柒捌玖拾佰仟万亿圆元�
 # 行首：前导分隔符* + 可选编号 + 后随分隔符*。
 # 兼容 "1 某项目" / "1. 某项目" / "1、某项目" / "（1）某项目" / "| 1 | 某项目"。
 _RE_PRICE_TOTAL_ROW = re.compile(
-    r"投标总价\s*[：:（(]*(?:大写|小写)?[）)]?\s*[|｜]?\s*([\d,，]+(?:\.\d+)?)"
+    r"投标总价\s*[：:（(]*(?:大写|小写)?[）)]?\s*[|｜]?\s*([\d,，]+(?:\.\d+)?)\s*(万\s*元)?"
 )
 _RE_PRICE_SYMBOL = re.compile(r"[¥￥]\s*([\d,，]+(?:\.\d+)?)")
 _RE_PRICE_TOTAL_CN = re.compile(r"投标总价人民币([零壹贰叁肆伍陆柒捌玖拾佰仟万亿圆元整]+)")
-_RE_ITEMS_TOTAL_ROW = re.compile(r"^\s*[|｜]?\s*合计\s*[|｜]?\s*([\d,，]+(?:\.\d+)?)", re.M)
+# 分项/报价表合计（2026-11-24 R45-A 锚定重做）：旧版取全文**第一个裸"合计"行**，
+# 会命中标书里其它表格的合计——测试6 实证海晟抽到 698,010、小河流 4,896.28
+# （真值≈179.67万/180万），测试2 安保 1.00（数量列）、集服 353,222.23（部分年度
+# 不含税小计），假矛盾经 _check_math 挂到"最高限价"条款升为"建议否决"（误否决）。
+# 现改为章节锚点窗口 + 行级匹配；歧义不猜 → None；无锚点退化为弱语境标签行。
+# 正则全部行级 + 有界量词（沿 _RE_ITEM_LINE 的防灾难性回溯教训，勿改回 finditer 嵌套量词）。
+_RE_ITEMS_ANCHOR = re.compile(r"分项报价表|投标分项报价表|开标一览表|报价一览表|价格一览表")
+_RE_ITEMS_TOTAL_ROW = re.compile(
+    r"^\s*[|｜]?\s*(?:合计|总计|投标总价)\s*[|｜]?\s*([\d,，]+(?:\.\d+)?)"
+)
+# 弱语境标签（无锚点时的唯一退路）：标签词自带语境，不是裸"合计"
+_RE_ITEMS_TOTAL_LABEL = re.compile(
+    r"^\s*[|｜]?\s*(?:分项合计|合计金额|总计金额)\s*[|｜]?\s*([\d,，]+(?:\.\d+)?)", re.M
+)
+# 同行出现数量/单位列头词 → 该"合计"是数量合计不是金额合计
+_RE_ITEMS_QTY_WORDS = re.compile(r"数量|单位|台|套|个")
 # 业绩行（行级匹配）：占有量词消除灾难性回溯。
 # 旧版 `[|｜、.．\s）)]* … \s*`（前缀字符类与相邻空白量词重叠）+ 全文本 finditer，
 # 在 PaddleOCR-VL 输出的长表格行上产生指数级回溯（2026-10-15 实证：单次 scan
@@ -187,10 +202,14 @@ _RE_MONEY_LIKE = re.compile(
 _PRICE_CONTEXT_WORDS = ("投标价", "投标报价", "报价", "总价", "含增值税", "含税")
 _RE_TAX_RATE = re.compile(r"(\d{1,2}(?:\.\d+)?)\s*%")
 _RE_DATE_CONTEXT = re.compile(r"\d{4}\s*年|\d{1,2}\s*月|\d{4}[-/]\d")
+# R45-A 限价护栏：窗口里"最高限价：1872000"类规则值不是报价，混入候选后
+# max() 必选限价（限价恒 ≥ 报价）→ 把限价当报价 → 与限价比对必超限 = 系统性误否决。
+# 宁可误剔（漏抽走其它兜底级）也绝不放过（误否决）。
+_RE_LIMIT_CONTEXT = re.compile(r"限价|控制价|最高投标价|最高价")
 
 
 def _money_candidates(window: str) -> list[Decimal]:
-    """窗口内金额形态候选（≥10000；排除税率/日期/小额序号）。"""
+    """窗口内金额形态候选（≥10000；排除税率/日期/小额序号/限价语境）。"""
     out: list[Decimal] = []
     for m in _RE_MONEY_LIKE.finditer(window):
         raw = m.group(1).replace(",", "")
@@ -203,6 +222,12 @@ def _money_candidates(window: str) -> list[Decimal]:
         # 日期连写（20240601 形态或紧邻年月日）
         ctx = window[max(0, m.start() - 6): m.end() + 6]
         if _RE_DATE_CONTEXT.search(ctx):
+            continue
+        # 限价/控制价语境：只看数字**前侧**（限价词总是修饰其后的数字；
+        # 后侧窗口会把"报价1796700 最高限价：1872000"里的真报价误剔）。
+        # 前 24 字符覆盖"最高限价为人民币"等常见前缀，又不至于跨短语误伤。
+        near = window[max(0, m.start() - 24) : m.start()]
+        if _RE_LIMIT_CONTEXT.search(near):
             continue
         out.append(value)
     return out
@@ -254,7 +279,9 @@ def _price_from_open_bid_section(text: str) -> Decimal | None:
             score += 2
             chosen = paired
         else:
-            # 保守回退取最大（增值税恒正 → 含税 > 不含税，与限价对比口径一致）；
+            # 保守回退取最大（增值税恒正 → 含税 > 不含税；限价语境候选已由
+            # _money_candidates 护栏剔除）。含税/不含税与限价的口径对齐由比较层
+            # align_tax_basis 负责（R46-A），抽取层不假定口径一致。
             # 候选恰为整万且窗口含"保证金" → 软降权（保证金列与真报价并列时弃它）
             def _rank(v: Decimal) -> tuple:
                 is_round_wan = v % 10_000 == 0
@@ -270,14 +297,20 @@ def _price_from_open_bid_section(text: str) -> Decimal | None:
 # （"投标总价（含税） 税率\n1 壹佰柒拾肆万玖仟元整 6% …"），同行正则够不着，
 # 必须向后看一小段；窗口取窄值以免越过表格读到别的金额（如投标保证金）。
 _PRICE_LABEL_WINDOW = 160
-# "小写：￥1,526,400.00 元" —— 真实标书常在标签与数字之间夹货币符号，必须容忍
-_RE_PRICE_LOWER_LABEL = re.compile(r"小写[：:\s]*[¥￥]?\s*([\d,，]+(?:\.\d+)?)")
+# "小写：￥1,526,400.00 元" —— 真实标书常在标签与数字之间夹货币符号，必须容忍；
+# 末尾可选捕获"万元"单位（"投标总价：179.67万元"型，命中须 ×10000）
+_RE_PRICE_LOWER_LABEL = re.compile(
+    r"小写[：:\s]*[¥￥]?\s*([\d,，]+(?:\.\d+)?)\s*(万\s*元)?"
+)
 # "投标价（含增值税,人民币元） 1749000.00" —— 分项报价表的含税合计行。
 # (?!\s*不) 必需："不含增值税"含"含增值税"子串，少了它会把不含税价当成投标报价。
 _RE_PRICE_INCL_VAT = re.compile(
     r"投标价\s*[（(](?!\s*不)[^）)\n]{0,30}含增值税[^）)\n]{0,30}[）)]\s*[|｜]?\s*([\d,，]+(?:\.\d+)?)"
 )
 _RE_TOTAL_LABEL = re.compile(r"投标总价")
+# 标签紧邻声明单位："投标总价（万元）120" → 数字裸露但单位在标签上（×10000）
+_RE_TOTAL_LABEL_WAN = re.compile(r"投标总价\s*[：:]?\s*[（(]\s*万\s*元\s*[）)]")
+_RE_WAN_NUM_AFTER = re.compile(r"[）)]\s*[|｜]?\s*([\d,，]+(?:\.\d+)?)")
 
 
 def _price_near_total_label(text: str) -> Decimal | None:
@@ -288,24 +321,85 @@ def _price_near_total_label(text: str) -> Decimal | None:
     ② 正文表格：``投标总价（含税） 税率`` 换行后 ``1 壹佰柒拾肆万玖仟元整 6%``
     ③ 分项报价表：``投标价（含增值税,人民币元） 1749000.00``
 
+    单位换算（R45-A）：数字后显式"万元"、或标签紧邻"（万元）"声明 → ×10000；
+    大写金额天然按元，不换算。
+
     大写只认 4 字以上的连续大写金额。取数只看表头**之后的前几行**并取该行首个大写：
     "投标保证金"是表头列名，出现在报价之前，按邻近字样排除会把真报价误杀、
     反而取到后面那列的保证金金额。
     """
     for m in _RE_TOTAL_LABEL.finditer(text):
+        zone_wan = bool(_RE_TOTAL_LABEL_WAN.match(text, m.start()))
         tail = text[m.end() : m.end() + _PRICE_LABEL_WINDOW]
         if lm := _RE_PRICE_LOWER_LABEL.search(tail):
             v = _money(lm.group(1))
             if v is not None:
+                if ((lm.lastindex or 0) >= 2 and lm.group(2)) or zone_wan:
+                    v *= Decimal(10_000)
                 return v
+        if zone_wan:
+            # "投标总价（万元）120" —— 单位在标签、数字裸露紧随
+            if wm := _RE_WAN_NUM_AFTER.search(tail[:40]):
+                v = _money(wm.group(1))
+                if v is not None:
+                    return v * Decimal(10_000)
         for line in tail.split("\n")[:3]:
             if lm := _RE_PRICE_LOWER_LABEL.search(line):
                 v = _money(lm.group(1))
                 if v is not None:
+                    if ((lm.lastindex or 0) >= 2 and lm.group(2)) or zone_wan:
+                        v *= Decimal(10_000)
                     return v
             if um := _RUN_UPPER.search(line):
                 if value := parse_upper_amount(um.group(0)):
                     return value
+    return None
+
+
+def _extract_items_total(text: str) -> Decimal | None:
+    """分项/报价表合计（锚定版，宁缺勿错）。
+
+    ① 章节锚点（分项报价表/开标一览表等）→ 窗口（至下一锚点或 4000 字符）内
+       行级匹配 合计/总计/投标总价 金额行；窗口内多值不等 → None（歧义不猜）；
+    ② 无锚点或锚点窗口无合计行 → 弱语境标签行（分项合计/合计金额/总计金额，
+       标签自带语境），多值不等同样 → None；
+    ③ 都没有 → None（抽不到就不比，绝不拿别的表的合计冒充）。
+    """
+    anchors = list(_RE_ITEMS_ANCHOR.finditer(text))
+    if anchors:
+        candidates: list[Decimal] = []
+        for i, m in enumerate(anchors):
+            end = (
+                anchors[i + 1].start()
+                if i + 1 < len(anchors)
+                else min(len(text), m.start() + 4000)
+            )
+            for line in text[m.start() : end].split("\n"):
+                lm = _RE_ITEMS_TOTAL_ROW.match(line)
+                if lm is None:
+                    continue
+                if _RE_ITEMS_QTY_WORDS.search(line):
+                    continue  # 数量合计不是金额合计（测试2「1.00」实证）
+                v = _money(lm.group(1))
+                if v is not None:
+                    candidates.append(v)
+        if candidates:
+            if all(c == candidates[0] for c in candidates):
+                return candidates[0]
+            return None  # 锚点窗口内多值不等（含后续无关表污染）→ 歧义不猜
+    # 弱语境退路：标签词稀有，但多值不等仍不猜
+    weak: list[Decimal] = []
+    for m in _RE_ITEMS_TOTAL_LABEL.finditer(text):
+        line = text[m.start() : text.find("\n", m.start()) if text.find("\n", m.start()) != -1 else len(text)]
+        if _RE_ITEMS_QTY_WORDS.search(line):
+            continue
+        v = _money(m.group(1))
+        if v is not None:
+            weak.append(v)
+    if weak:
+        if all(v == weak[0] for v in weak):
+            return weak[0]
+        return None
     return None
 
 
@@ -339,6 +433,8 @@ def extract_bid_facts(text: str, documents: list[str] | None = None) -> BidFacts
     price: Decimal | None = None
     if m := _RE_PRICE_TOTAL_ROW.search(text):
         price = _money(m.group(1))
+        if price is not None and m.group(2):
+            price *= Decimal(10_000)  # "投标总价：179.67万元" → 元（单位显式捕获）
     if price is None and (near := _price_near_total_label(text)) is not None:
         price = near
     if price is None and (m := _RE_PRICE_INCL_VAT.search(text)):
@@ -353,9 +449,8 @@ def extract_bid_facts(text: str, documents: list[str] | None = None) -> BidFacts
     if m := _RE_PRICE_TOTAL_CN.search(text):
         facts.bid_price_upper = m.group(1)
         facts.bid_price_upper_value = parse_upper_amount(m.group(1))
-    # 分项合计
-    if m := _RE_ITEMS_TOTAL_ROW.search(text):
-        facts.price_items_total = _money(m.group(1))
+    # 分项合计（锚定版；抽不到 → None，宁缺勿错）
+    facts.price_items_total = _extract_items_total(text)
 
     # 注册资本（阶段 2 补强，2026-10-30）：单位「元」→ 值即元不换算；
     # 「万元/万 元」→ ×10000（首个 .search 命中语义与旧版一致）

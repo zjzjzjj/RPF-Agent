@@ -394,6 +394,80 @@ def test_price_real_deposit_not_taken_as_bid_price():
     assert facts.bid_price == D("1526400")
 
 
+# ---- R45-A 分项合计锚定（2026-11-24 价格类误否决修复）--------------------------------
+# 旧版取全文第一个裸"合计"行：测试6 海晟抽到 698,010、小河流 4,896.28（真值≈179.67万
+# /180万），测试2 安保 1.00、集服 353,222.23——均来自标书其它表格的合计行。
+
+
+def test_items_total_anchored_ignores_prior_table():
+    """锚点（分项报价表）前其它表的裸合计不得污染；锚点窗口内合计才认。"""
+    text = "\n".join(
+        [
+            "业绩汇总表",
+            "| 合计 | 698,010.00 |",  # 测试6 海晟实证污染值（锚点前）
+            "投标分项报价表",
+            "| 序号 | 名称 | 金额 |",
+            "| 1 | 运维服务 | 1,796,700.00 |",
+            "| 合计 | 1,796,700.00 |",
+        ]
+    )
+    facts = extract_bid_facts(text)
+    assert facts.price_items_total == D("1796700.00")
+
+
+def test_items_total_no_anchor_bare_total_is_none():
+    """无锚点、无弱语境标签 → None（旧版会抽到裸'合计 1.00'）。"""
+    facts = extract_bid_facts("数量及构成表\n| 合计 | 1.00 |")
+    assert facts.price_items_total is None
+
+
+def test_items_total_ambiguous_window_returns_none():
+    """锚点窗口内多值不等 → 歧义不猜（None），绝不拿错值参与比对。"""
+    text = "\n".join(
+        [
+            "分项报价表",
+            "| 合计 | 1,000,000.00 |",
+            "| 合计 | 2,000,000.00 |",
+        ]
+    )
+    facts = extract_bid_facts(text)
+    assert facts.price_items_total is None
+
+
+def test_items_total_weak_label_without_anchor():
+    """无锚点但有"分项合计"弱语境标签 → 取标签值（标签自带语境）。"""
+    facts = extract_bid_facts("分项合计 1,796,700.00")
+    assert facts.price_items_total == D("1796700.00")
+
+
+def test_items_total_qty_unit_line_skipped():
+    """合计行带数量单位（"1.00 台"）→ 数量合计不是金额合计，跳过取真金额。"""
+    text = "\n".join(
+        [
+            "分项报价表",
+            "| 合计 | 1.00 台 |",
+            "| 合计 | 1,796,700.00 |",
+        ]
+    )
+    facts = extract_bid_facts(text)
+    assert facts.price_items_total == D("1796700.00")
+
+
+# ---- R45-A 报价万元换算 --------------------------------------------------------------
+
+
+def test_price_total_row_wan_yuan_unit():
+    """"投标总价：179.67万元" → 1796700（旧版抽成 179.67 → 与大写/分项冲突）。"""
+    facts = extract_bid_facts("投标总价：179.67万元")
+    assert facts.bid_price == D("1796700.00")
+
+
+def test_price_label_wan_yuan_declaration():
+    """"投标总价（万元）120" → 1200000（单位在标签、数字裸露紧随）。"""
+    facts = extract_bid_facts("投标总价（万元）120")
+    assert facts.bid_price == D("1200000")
+
+
 def test_extract_performance_wan_unit():
     """表头声明"万元"时金额要 ×10000，否则 10000 倍低估。"""
     text = "\n".join(

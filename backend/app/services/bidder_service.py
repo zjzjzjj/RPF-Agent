@@ -159,14 +159,16 @@ def _extract_price_impl(bidder: Bidder, text: str, doc_ids: list[int]) -> Bidder
     bidder_id = bidder.id
     facts = extract_bid_facts(text)
 
+    # 0.01 容差（R45-A）：分项逐行四舍五入到分、总价取整是常见财务口径，
+    # 精确 != 会把 1 分钱舍入差标成 conflict；与 math 通道/抽价互校同一容差。
     conflict = (
         facts.bid_price is not None
         and facts.bid_price_upper_value is not None
-        and facts.bid_price != facts.bid_price_upper_value
+        and abs(facts.bid_price - facts.bid_price_upper_value) > Decimal("0.01")
     ) or (
         facts.bid_price is not None
         and facts.price_items_total is not None
-        and facts.bid_price != facts.price_items_total
+        and abs(facts.bid_price - facts.price_items_total) > Decimal("0.01")
     )
 
     evidence_id = None
