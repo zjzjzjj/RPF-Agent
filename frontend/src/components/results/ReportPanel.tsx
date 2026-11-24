@@ -189,7 +189,11 @@ export default function ReportPanel({ report, error, managed = false }: Props) {
                     {g.bidders.map((b) => (
                       <div key={b.score_id}>
                         {b.bidder}
-                        {b.final_score !== null ? `（当前 ${b.final_score}）` : "（未定分）"}
+                        {b.final_score !== null
+                          ? `（当前 ${b.final_score}）`
+                          : g.is_verdict
+                            ? "（判定项，结论见评审明细）"
+                            : "（未定分）"}
                       </div>
                     ))}
                   </div>
@@ -249,7 +253,11 @@ export default function ReportPanel({ report, error, managed = false }: Props) {
                   <div>
                     <div>{REVIEW_STATUS_LABELS[q.review_status] ?? q.review_status}</div>
                     <div style={{ color: "#888", fontSize: 12 }}>
-                      {q.final_score !== null ? `当前分 ${q.final_score}` : "未定分"}
+                      {q.final_score !== null
+                        ? `当前分 ${q.final_score}`
+                        : q.is_verdict
+                          ? "判定项（结论见评审明细）"
+                          : "未定分"}
                     </div>
                   </div>
                 ),

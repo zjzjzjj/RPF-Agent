@@ -720,6 +720,8 @@ export interface OpenQuestion {
   code: string;
   criterion: string;
   category: string;
+  score_type?: string | null;
+  is_verdict?: boolean;
   max_score: string | null;
   final_score: string | null;
   machine_status: string | null;
@@ -743,6 +745,8 @@ export interface OpenByCriterion {
   code: string;
   criterion: string;
   category: string;
+  score_type?: string | null;
+  is_verdict?: boolean;
   max_score: string | null;
   kind: string;
   severity: OpenQuestion["severity"];

@@ -6,8 +6,8 @@ export function cellStyle(cell: MatrixCell | undefined, managed = false): { bg: 
   if (managed && cell.auto_review_basis === "lightweight") {
     const v3 = (cell.lightweight_schema_version ?? 0) >= 3;
     const tip = v3
-      ? "资格二值否决点筛查（确定性预检+每家一次快审）：通过=未发现确定性否决点（不等于确认符合）；存疑=发现确定性不符事实、建议否决，需人工确认。不阻断计分、排名与价格基准价"
-      : "资格轻量预检 + 每家一次快审，不构成完整资格审查；建议否决仅作报告提示，不阻断计分、排名与价格基准价";
+      ? "资格二值否决点筛查（确定性预检+每家一次快审）：通过=未发现确定性否决点（不等于确认符合）；存疑=需人工确认，不等于不合格（发现确定性不符事实、建议否决）。不阻断计分、排名与价格基准价"
+      : "资格轻量预检 + 每家一次快审，不构成完整资格审查；存疑=需人工确认，不等于不合格；建议否决仅作报告提示，不阻断计分、排名与价格基准价";
     if (cell.machine_status === "fail")
       // 二值化（决策 0017）：不写"不通过/建议否决"，显示"存疑"（建议否决依据见理由）
       return { bg: "#fff1f0", label: v3 ? "存疑" : "建议否决", tip };
@@ -22,8 +22,8 @@ export function cellStyle(cell: MatrixCell | undefined, managed = false): { bg: 
       return { bg: "#fafafa", label: "不适用", tip: "汇总或判断条目，分值已在对应计分项计算，不重复计分" };
     return {
       bg: "#fff7e6",
-      label: cell.final_score ?? "暂定",
-      tip: "模型或证据路径未完成，按暂定分兜底；已在报告中列入待复核清单",
+      label: cell.final_score != null ? `${cell.final_score}（暂定）` : "暂定",
+      tip: "模型或证据路径未完成，按兜底暂定分计入总分（非评审结论）；已列入待复核清单，人工可改分",
     };
   }
   if (managed && cell.machine_status === "execution_failed")
