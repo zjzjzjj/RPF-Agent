@@ -2367,7 +2367,7 @@ def _veto_precheck(  # noqa: ANN001
         # auto 模式下 LLM 会接手语义裁决，LLM 也定不了才 need_human
         # （2026-10-26 run 54 实证：c51/c57/c63 无 check → 7/7 恒 need_human）
         check_type = "human_only"
-    result = run_check(check_type, params, facts)
+    result = run_check(check_type, params, facts, criterion=c)
     if scan_hint and result.status == "fail" and not result.need_human:
         # 「看不见≠不存在」豁免（6b 对称化）：标书含扫描件/OCR 页时，**检索/存在性
         # 类**硬 fail 可能是文本层不可见造成——不硬否决，升级 LLM/人工裁决。
@@ -2444,7 +2444,7 @@ def _eval_veto(  # noqa: ANN001
         # auto 模式下 LLM 会接手语义裁决，LLM 也定不了才 need_human
         # （2026-10-26 run 54 实证：c51/c57/c63 无 check → 7/7 恒 need_human）
         check_type = "human_only"
-    result = run_check(check_type, params, facts)
+    result = run_check(check_type, params, facts, criterion=c)
     if scan_hint and result.status == "fail" and not result.need_human:
         # 「看不见≠不存在」豁免（6b 对称化）：标书含扫描件/OCR 页时，**检索/存在性
         # 类**硬 fail 可能是文本层不可见造成——不硬否决，升级 LLM/人工裁决。

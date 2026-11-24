@@ -81,8 +81,14 @@ def _commitment_hit(phrase: str, text: str) -> str | None:
     return None
 
 
-def run_check(check_type: str, params: dict, facts: BidFacts) -> PrimitiveResult:
-    """单一检查原语。params 来自规则包的 criterion_checks。"""
+def run_check(
+    check_type: str, params: dict, facts: BidFacts, *, criterion: dict | None = None
+) -> PrimitiveResult:
+    """单一检查原语。params 来自规则包的 criterion_checks。
+
+    criterion（R45-B）：完整条款 dict，math_relation 据其原文推断检查范围
+    （见 price_limit.infer_math_scope）；None 时退化为只按 params 推断。
+    """
     if check_type == "human_only":
         return PrimitiveResult("unknown", "该项需人工判定（如密封、签字、盖章）", need_human=True)
 
@@ -246,21 +252,109 @@ def run_check(check_type: str, params: dict, facts: BidFacts) -> PrimitiveResult
         )
 
     if check_type == "math_relation":
-        return _check_math(params, facts)
+        return _check_math(params, facts, criterion)
 
     # 存量冻结包里可能残留已下线的 check_type（如 collusion_check）——
     # fallthrough 走 unknown+need_human 优雅降级，不崩、不误判。
     return PrimitiveResult("unknown", f"未知检查类型：{check_type}", need_human=True)
 
 
-def _check_math(params: dict, facts: BidFacts) -> PrimitiveResult:
-    """报价相关算术检查：限价 / 大小写一致 / 分项合计一致。冲突（不一致）不自动选边。"""
+def _check_math(
+    params: dict, facts: BidFacts, criterion: dict | None = None
+) -> PrimitiveResult:
+    """报价相关算术检查（R45-B 范围过滤版）。
+
+    按条款原文范围（price_limit.infer_math_scope）选择检查项：
+    - scope={"limit"}：只比限价——分项合计/大小写冲突不得挂到"不得超过
+      最高限价"条款下（测试2/6 误否决的归因根因）；
+    - scope={"arith"}：只比大小写/分项合计（0.01 财务舍入容差）；
+    - scope 空：unknown（保守，交 LLM/quick 裁决，不硬查）；
+    - 范围内检查因缺输入没跑 → skipped：pass+need_human 如实文案，
+      **不虚称"未超限价"**（旧版限价缺失直接 pass+该文案的漏洞）。
+    冲突（fail）仍带 need_human：旧路径 verdict_for→conflict_flagged、
+    轻量路径 concern→fail 建议否决，语义均不变。
+    BID_EVAL_MATH_SCOPE_FILTER=0 回退旧无条件三查。
+    """
+    from app.engine.price_limit import infer_math_scope, resolve_limit_keys
+
+    scope = infer_math_scope(criterion, params)
+    if not scope:
+        if not config.math_scope_filter_enabled():
+            return _check_math_legacy(params, facts)
+        return PrimitiveResult(
+            "unknown", "无法从条款原文确定该算术条款的检查范围", need_human=True
+        )
+    if not config.math_scope_filter_enabled():
+        # 开关关闭：范围推断让位于旧行为（无条件三查），但保留 limit 键解析归一
+        return _check_math_legacy(params, facts)
+
     problems: list[str] = []
-    max_price = params.get("max_yuan") or params.get("max")
-    if max_price is not None and facts.bid_price is not None:
-        if facts.bid_price > Decimal(str(max_price)):
+    skipped: list[str] = []
+    executed: list[str] = []
+
+    if "limit" in scope:
+        total, yearly, _incl, _rate, kind = resolve_limit_keys(params)
+        limit_value = total or (sum(yearly) if yearly else None)
+        if kind == "unit_price":
+            # 单价型限价（元/万套）：无总价可比，绝不拿单价当总价比（R46-A 细化）
+            skipped.append("单价型限价（元/万套），未作总价比对，需人工核对")
+        elif limit_value is None:
+            skipped.append("未解析到最高限价金额，未作限价比对，需人工核对")
+        elif facts.bid_price is None:
+            return PrimitiveResult("unknown", "未提取到投标报价", need_human=True)
+        elif facts.bid_price > limit_value:
             problems.append(
-                f"投标报价 {_money(facts.bid_price)} 超过最高限价 {_money(Decimal(str(max_price)))}"
+                f"投标报价 {_money(facts.bid_price)} 超过最高限价 {_money(limit_value)}"
+            )
+        else:
+            executed.append(
+                f"投标报价 {_money(facts.bid_price)} ≤ 最高限价 {_money(limit_value)}"
+            )
+
+    if "arith" in scope:
+        if facts.bid_price is None:
+            return PrimitiveResult("unknown", "未提取到投标报价", need_human=True)
+        if facts.bid_price_upper_value is None:
+            skipped.append("未提取到大写金额，未比对大小写")
+        elif abs(facts.bid_price - facts.bid_price_upper_value) > Decimal("0.01"):
+            problems.append(
+                f"大写金额（{facts.bid_price_upper}＝{_money(facts.bid_price_upper_value)}）"
+                f"与小写金额（{_money(facts.bid_price)}）不一致"
+            )
+        else:
+            executed.append("大小写金额一致")
+        if facts.price_items_total is None:
+            skipped.append("未提取到分项合计，未比对分项与总价")
+        elif abs(facts.bid_price - facts.price_items_total) > Decimal("0.01"):
+            problems.append(
+                f"分项报价合计（{_money(facts.price_items_total)}）"
+                f"与投标总价（{_money(facts.bid_price)}）不一致"
+            )
+        else:
+            executed.append("分项合计与投标总价一致")
+
+    if problems:
+        return PrimitiveResult("fail", "；".join(problems), need_human=True)  # 冲突交人工
+    if skipped:
+        # pass+need_human：已比对项通过 + 未执行项如实注记（light 映射
+        # needs_human_check，不进 pending → quick 缓存键稳定）
+        return PrimitiveResult("pass", "；".join(executed + skipped), need_human=True)
+    if not executed:
+        return PrimitiveResult("unknown", "算术检查未能执行", need_human=True)
+    return PrimitiveResult("pass", "；".join(executed))
+
+
+def _check_math_legacy(params: dict, facts: BidFacts) -> PrimitiveResult:
+    """旧无条件三查（限价/大小写/分项合计全跑），仅 BID_EVAL_MATH_SCOPE_FILTER=0 回退。"""
+    problems: list[str] = []
+    from app.engine.price_limit import resolve_limit_keys
+
+    total, yearly, _incl, _rate, _kind = resolve_limit_keys(params)
+    max_price = total or (sum(yearly) if yearly else None)
+    if max_price is not None and facts.bid_price is not None:
+        if facts.bid_price > max_price:
+            problems.append(
+                f"投标报价 {_money(facts.bid_price)} 超过最高限价 {_money(max_price)}"
             )
     if facts.bid_price is not None and facts.bid_price_upper_value is not None:
         if facts.bid_price != facts.bid_price_upper_value:
@@ -278,6 +372,10 @@ def _check_math(params: dict, facts: BidFacts) -> PrimitiveResult:
         return PrimitiveResult("fail", "；".join(problems), need_human=True)  # 冲突交人工
     if facts.bid_price is None:
         return PrimitiveResult("unknown", "未提取到投标报价", need_human=True)
+    if max_price is None:
+        return PrimitiveResult(
+            "pass", "报价算术关系一致（未提供限价参数，未作限价比对）", need_human=True
+        )
     return PrimitiveResult("pass", "报价算术关系一致且未超限价")
 
 

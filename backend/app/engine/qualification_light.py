@@ -279,7 +279,9 @@ def review_bidder_qualification(criteria: list[dict], pages: list[dict], data_cl
         if check_type not in _DETERMINISTIC_CHECKS:
             check_type = "human_only"
         try:
-            primitive = run_check(check_type, criterion.get("params") or {}, facts)
+            primitive = run_check(
+                check_type, criterion.get("params") or {}, facts, criterion=criterion
+            )
         except Exception:  # noqa: BLE001 - a broken primitive must not fail the run
             primitive = None
         det = _deterministic_state(_apply_scan_hint(primitive, check_type, scan_hint)) if primitive else "unknown"
@@ -292,6 +294,10 @@ def review_bidder_qualification(criteria: list[dict], pages: list[dict], data_cl
             quick="skipped",
             quick_state="skipped",
         )
+        # R45-B：pass+need_human = 范围内检查因缺输入没跑（如限价未解析到）——
+        # 第二循环据此标 needs_human_check（"残留在通过里必须可见"），不进 pending
+        if primitive is not None and primitive.status == "pass" and primitive.need_human:
+            results[code].needs_human_check = True
         if det == "unknown" and not visual and not external:
             pending.append(criterion)
         results[code].reason = ("确定性预检：" + (primitive.message if primitive else "预检异常"))[:500]
@@ -351,16 +357,14 @@ def review_bidder_qualification(criteria: list[dict], pages: list[dict], data_cl
         external = is_external_requirement(criterion)
         # 二值化（决策 0017）：fail=发现确定性否决点（显示"存疑/建议否决"，需人工确认）；
         # 其余一律 pass=未见确定性否决点。缺证据、看不见、核验不了都不作为否决依据。
-        if result.deterministic == "fail":
-            # 提取事实与规则原文矛盾（数值门槛/有效期越窗/计数不足）→ 确定性否决点
+        if result.deterministic in ("fail", "concern"):
+            # 事实与规则原文矛盾（数值门槛/有效期越窗/计数不足/报价算术矛盾）→
+            # 确定性否决点。math 冲突（concern）经 R45-B 范围过滤后只可能来自
+            # 条款原文覆盖的检查，不再有跨条款归因的假矛盾；前缀与 ADR0017 第3条
+            # 措辞一致（原"数学关系矛盾——"对超限价场景语义不准）。
             result.status = "fail"
             result.reject_source = "deterministic"
             result.reason = "建议否决（仅建议，需人工确认，不阻断计分/排名）：事实与规则原文矛盾——" + result.reason
-        elif result.deterministic == "concern":
-            # 仅 math_relation 会走到这里：报价大小写/分项合计矛盾（不自动选边，但矛盾本身是反面事实）
-            result.status = "fail"
-            result.reject_source = "deterministic"
-            result.reason = "建议否决（仅建议，需人工确认，不阻断计分/排名）：数学关系矛盾——" + result.reason
         elif visual or external:
             # 签章/原件/视觉/外部记录事项 AI 不查验 → 未见否决点，需人工核对
             result.status = "pass"
@@ -368,7 +372,16 @@ def review_bidder_qualification(criteria: list[dict], pages: list[dict], data_cl
             result.reason = "通过（未见确定性否决点）：签章/原件/视觉/外部记录事项 AI 不查验，需人工核对"
         elif result.deterministic == "pass":
             result.status = "pass"
-            result.reason = "通过（确定性预检符合，轻量预检，不构成完整资格审查）"
+            if result.needs_human_check:
+                # R45-B：范围检查缺输入未执行（限价未解析/大写未抽到）→
+                # 如实注记预检文案，不冒充"已核对符合"
+                result.reason = (
+                    "通过（未见确定性否决点）："
+                    + result.reason.removeprefix("确定性预检：")
+                    + "（轻量预检，不构成完整资格审查）"
+                )
+            else:
+                result.reason = "通过（确定性预检符合，轻量预检，不构成完整资格审查）"
         elif quick_status == "reject":
             verified = _verified_counter_quotes(quick_evidence, pages)
             if verified:

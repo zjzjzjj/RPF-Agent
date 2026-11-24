@@ -534,3 +534,52 @@ def test_lightweight_binary_anchor_no_third_state():
         results = light.review_bidder_qualification(criteria, pages, "synthetic", gateway)
         assert all(r.status in ("pass", "fail") for r in results.values())
         assert all(r.status != "not_deeply_reviewed" for r in results.values())
+
+
+# ---- R45-B 范围过滤（2026-11-24 价格类误否决修复）------------------------------------
+
+
+def test_limit_clause_items_conflict_not_rejected():
+    """限价条款只比限价：分项合计抽错（测试6 海晟 698,010 实证）不得升"建议否决"。
+
+    旧路径：分项冲突 → concern → status=fail"存疑（建议否决）"= 误否决；
+    新路径：冲突不在该条款范围 → deterministic=pass → 整家"通过"。
+    """
+    pages = [_page("分项报价表\n| 合计 | 698,010.00 |\n投标总价：1,796,700.00")]
+    criteria = [{"code": "C13", "name": "投标报价不得超过最高限价", "score_type": "veto",
+                 "check_type": "math_relation", "params": {"max_amount_yuan": "1872000"}}]
+    gateway = FakeGateway(items=[])
+    results = light.review_bidder_qualification(criteria, pages, "synthetic", gateway)
+    assert results["C13"].deterministic == "pass"
+    assert results["C13"].status == "pass"
+    assert results["C13"].reject_source == ""
+    assert gateway.calls == 0  # det pass 不进 pending，quick 不被调用（缓存键稳定）
+
+
+def test_arith_clause_upper_mismatch_still_rejects():
+    """条款明文涉及大小写一致（arith 范围）：真矛盾仍按 ADR0017 建议否决，
+    前缀为统一后的"事实与规则原文矛盾"。"""
+    pages = [_page("投标总价人民币贰佰元整小写：100.00")]
+    criteria = [{"code": "C1", "name": "投标总价大写与小写金额应一致", "score_type": "veto",
+                 "check_type": "math_relation", "params": {}}]
+    gateway = FakeGateway(items=[])
+    results = light.review_bidder_qualification(criteria, pages, "synthetic", gateway)
+    assert results["C1"].deterministic == "concern"
+    assert results["C1"].status == "fail"
+    assert results["C1"].reject_source == "deterministic"
+    assert "事实与规则原文矛盾" in results["C1"].reason
+    assert "数学关系矛盾" not in results["C1"].reason
+
+
+def test_limit_clause_missing_amount_pass_with_human_check():
+    """限价条款未解析到限价金额：pass + 待人工核对注记（不虚称、不否决、不进 pending）。"""
+    pages = [_page("投标总价：1,796,700.00")]
+    criteria = [{"code": "C13", "name": "投标报价不得超过最高限价", "score_type": "veto",
+                 "check_type": "math_relation", "params": {}}]
+    gateway = FakeGateway(items=[])
+    results = light.review_bidder_qualification(criteria, pages, "synthetic", gateway)
+    assert results["C13"].status == "pass"
+    assert results["C13"].needs_human_check is True
+    assert "未作限价比对" in results["C13"].reason
+    assert "未超限价" not in results["C13"].reason
+    assert gateway.calls == 0

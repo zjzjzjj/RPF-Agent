@@ -856,6 +856,19 @@ def math_skip_llm_enabled() -> bool:
     )
 
 
+def math_scope_filter_enabled() -> bool:
+    """math_relation 按条款原文范围选择检查项（R45-B，默认开）。
+
+    限价条款只比限价、条款原文明文涉及算术才比大小写/分项合计——
+    消除"分项合计冲突挂到最高限价条款"的归因错（测试2/6 误否决根因）。
+    置 0（BID_EVAL_MATH_SCOPE_FILTER=0）回退旧无条件三查（限价/大小写/分项
+    合计全跑），供 A/B 对照与紧急回退。
+    """
+    return os.environ.get("BID_EVAL_MATH_SCOPE_FILTER", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
 def veto_llm_enabled() -> bool:
     """资格与符合性 AI 深评默认开启；关闭时不能宣称全自动评审完成。"""
     return os.environ.get("BID_EVAL_VETO_LLM", "1").strip().lower() not in (

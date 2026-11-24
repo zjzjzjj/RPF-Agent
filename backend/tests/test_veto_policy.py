@@ -425,6 +425,94 @@ def test_math_relation_unknown_keeps_llm(monkeypatch):
     assert out["verdict"] == "pass"
 
 
+def test_math_scope_limit_clause_ignores_items_conflict():
+    """R45-B：限价条款只比限价——分项合计冲突不得挂到"不得超过最高限价"下。
+
+    测试6 实证：海晟真实报价 1,796,700 < 限价 1,872,000，却因分项合计抽错
+    （698,010）被判"存疑（建议否决）"。范围过滤后该条款下分项冲突不可见。
+    """
+    from decimal import Decimal
+
+    from app.engine.facts import extract_bid_facts
+    from app.engine.objective import run_check
+
+    facts = extract_bid_facts("")
+    facts.bid_price = Decimal("1796700")
+    facts.price_items_total = Decimal("698010")  # 抽错的分项合计（测试6 实证值）
+    c = {
+        "code": "c13",
+        "name": "投标报价不得超过最高限价",
+        "check_type": "math_relation",
+        "params": {"max_amount_yuan": "1872000"},
+        "source_quote": "超过最高限价的投标文件将被否决。",
+    }
+    result = run_check("math_relation", c["params"], facts, criterion=c)
+    assert result.status == "pass"
+    assert "698,010" not in result.message  # 分项冲突不在该条款范围
+    assert "1,872,000" in result.message  # 限价比对确实执行了
+
+
+def test_math_scope_missing_limit_pass_needs_human():
+    """R45-B：限价条款但未解析到限价金额 → pass+need_human 如实文案，
+    不虚称"未超限价"（旧版漏洞），也不 fail（缺证据≠否决）。"""
+    from decimal import Decimal
+
+    from app.engine.facts import extract_bid_facts
+    from app.engine.objective import run_check
+
+    facts = extract_bid_facts("")
+    facts.bid_price = Decimal("1796700")
+    c = {
+        "code": "c13",
+        "name": "投标报价不得超过最高限价",
+        "check_type": "math_relation",
+        "params": {},
+    }
+    result = run_check("math_relation", {}, facts, criterion=c)
+    assert result.status == "pass"
+    assert result.need_human is True
+    assert "未作限价比对" in result.message
+    assert "未超限价" not in result.message
+
+
+def test_math_scope_unknown_when_no_signals():
+    """条款原文与 params 都推不出范围 → unknown（交 LLM/quick），不硬查。"""
+    from decimal import Decimal
+
+    from app.engine.facts import extract_bid_facts
+    from app.engine.objective import run_check
+
+    facts = extract_bid_facts("")
+    facts.bid_price = Decimal("100")
+    facts.price_items_total = Decimal("999999")  # 有冲突但范围未知 → 不硬判
+    c = {"code": "x", "name": "响应文件签署", "check_type": "math_relation", "params": {}}
+    result = run_check("math_relation", {}, facts, criterion=c)
+    assert result.status == "unknown"
+
+
+def test_math_scope_filter_off_falls_back_to_legacy(monkeypatch):
+    """BID_EVAL_MATH_SCOPE_FILTER=0 → 回退无条件三查（A/B 对照与紧急回退）。"""
+    from decimal import Decimal
+
+    from app.engine.facts import extract_bid_facts
+    from app.engine.objective import run_check
+
+    monkeypatch.setenv("BID_EVAL_MATH_SCOPE_FILTER", "0")
+    facts = extract_bid_facts("")
+    facts.bid_price = Decimal("1796700")
+    facts.price_items_total = Decimal("698010")
+    c = {
+        "code": "c13",
+        "name": "投标报价不得超过最高限价",
+        "check_type": "math_relation",
+        "params": {"max_amount_yuan": "1872000"},
+    }
+    result = run_check("math_relation", c["params"], facts, criterion=c)
+    # 旧行为：无条件三查 → 分项冲突照样 fail（用于对照，不是期望的生产行为）
+    assert result.status == "fail"
+    assert "698,010" in result.message
+
+
 def test_registered_capital_variants():
     """注册资本抽取补强（阶段 2，2026-10-30）：连接字 为/计/系/共、单位「元」
     不换算、「万 元」空格变体、「…整」后缀；中文大写宁缺勿错。"""
