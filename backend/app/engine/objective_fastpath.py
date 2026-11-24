@@ -260,9 +260,9 @@ def _missing_required_materials(
     合同件：正文合同块（source=text）本身就是投标文件提供的合同复印件；
     业绩表行（source=table）只是主张，必须另有关联合同页才认。
     三态（2026-11-24 run155 实证）：True=材料在（或合同豁免）；False=可读
-    确认缺（判 0，红线不放宽）；None=不可读/未绑上 → **计入+疑问**——绑定
-    断链把"在"误判"缺"是 c43 整列 0 的根因，绝不允许静默 0。
-    返回 (确认缺失, 未核实)。
+    确认缺（判 0，红线不放宽）；None=不可读/未绑上 → 未核实（run158 放水
+    修正：严口径不计入，交 VL 翻案/人工；BID_EVAL_CASE_UNVERIFIED_COUNT=1
+    回退旧"计入+疑问"）。返回 (确认缺失, 未核实)。
     """
     def state(kind: str) -> bool | None:
         if kind == "contract":
@@ -317,6 +317,13 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
     qualifying: list[tuple[ContractRecord, Decimal]] = []
     rejected: list[str] = []
     unverified_notes: list[str] = []
+    unverified_records: list[dict] = []
+    guard_escalated = False
+    # 严口径（2026-11-24 run158 放水修正）：未核实（不可读/未绑上）不再计入
+    # ——只按 verified 案例计分（部分分保留），未核验案例留 VL 翻案/人工复核。
+    # BID_EVAL_CASE_UNVERIFIED_COUNT=1 回退旧"未核实计入+疑问"（回滚通道）。
+    from app import config as _config
+    strict_unverified = not _config.case_unverified_count_enabled()
     for record in inventory.contracts:
         amount = record.amount_yuan
         if amount is None:
@@ -324,11 +331,12 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
             continue
         if tiers and amount < Decimal(str(tiers[0].get("min_amount_yuan", 0))):
             continue
+        record_unverified: list[str] = []
         if required_materials:
             missing, unverified = _missing_required_materials(
                 record, required_materials, or_group)
             # PR4 护栏（2026-11-24 用户口径"不允许漏评分"）：目录/索引列有该
-            # 材料页但绑定未闭合 → **禁止按缺件判 0**，计入并标疑问（护栏
+            # 材料页但绑定未闭合 → **禁止按缺件判 0**，转"未核实"（护栏
             # 报警）；目录也没有 → 真缺件判 0（红线保留）。翻转方向只升不降。
             if missing and _guard_on(inventory):
                 _kind_of_label = {"合同": "contract", "发票": "invoice",
@@ -337,19 +345,32 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
                              if (inventory.locator_index or {}).get(
                                  _kind_of_label.get(m, ""))]
                 if escalated:
-                    unverified_notes.append(
-                        f"{record.name}（{'/'.join(escalated)}目录列有材料页但绑定未闭合，"
-                        "计入并标疑问）")
+                    record_unverified.append(
+                        f"{'/'.join(escalated)}目录列有材料页但绑定未闭合")
+                    guard_escalated = True
                     missing = [m for m in missing if m not in escalated]
             if missing:
                 rejected.append(f"{record.name}（缺{'/'.join(missing)}，细则：未提供的不得分）")
                 continue
             if unverified:
-                unverified_notes.append(
-                    f"{record.name}（{'/'.join(unverified)}不可读/未绑上，计入并标疑问）")
+                record_unverified.append(f"{'/'.join(unverified)}不可读/未绑上")
         elif not _contract_material_ok(record, requires_material):
             rejected.append(f"{record.name}（缺发票/验收）")
             continue
+        if record_unverified and strict_unverified:
+            unverified_notes.append(
+                f"{record.name}（{'；'.join(record_unverified)}，严口径不计入，待视觉核验/人工）")
+            unverified_records.append({
+                "name": record.name,
+                "reason": "；".join(record_unverified),
+                "pages": list(record.pages or []),
+                "materials": {k: list(v or [])
+                              for k, v in (record.materials or {}).items()},
+            })
+            continue
+        if record_unverified:
+            unverified_notes.append(
+                f"{record.name}（{'；'.join(record_unverified)}，计入并标疑问）")
         rate = _contract_rate(tiers, amount) if tiers else Decimal(0)
         if rate <= 0:
             continue
@@ -368,7 +389,9 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
     else:
         detail = "未定位到业绩章节或合同金额"
     if unverified_notes:
-        detail += "；未核实计入：" + "；".join(unverified_notes[:6])
+        detail += (("；未核实不计入（严口径，待视觉核验/人工）："
+                    if strict_unverified and unverified_records else "；未核实计入：")
+                   + "；".join(unverified_notes[:6]))
     score = _cap(score, criterion)
     # A zero is a confirmed conclusion only when contracts were actually
     # located and every one carries a readable amount.  Otherwise let the LLM
@@ -381,8 +404,12 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
     zero_reason = None
     if score == 0:
         if unverified_notes:
-            # 护栏：目录列有材料页但绑定未闭合——0 分不是评审结论
-            zero_reason = "material_binding_conflict"
+            # 0 分不是评审结论：未核实案例剔除所致——待 VL 翻案/人工复核
+            if strict_unverified and unverified_records:
+                zero_reason = ("material_binding_conflict" if guard_escalated
+                               else "material_unverified")
+            else:
+                zero_reason = "material_binding_conflict"
         else:
             zero_reason = "confirmed_absent" if complete else "no_facts"
     warnings = []
@@ -398,7 +425,7 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
             {"name": r.name, "amount_yuan": str(r.amount_yuan), "pages": r.pages,
              "materials": r.materials, "materials_state": r.materials_state}
             for r in inventory.contracts
-        ]},
+        ], "unverified_records": unverified_records},
         pages=sorted({p for r in inventory.contracts for p in r.pages}),
         zero_reason=zero_reason,
         confidence=_confidence_from(inventory, complete),

@@ -2759,12 +2759,16 @@ def _count_zero_warn_entry(result, audit: dict | None) -> tuple[dict, bool]:
     # "未提供材料"，必须转人工核看（7.10 实证：集成/维保类案例被剔后
     # 曾伪装 confirmed_absent/pass）。cases_unverified（核验未做完/批失败）
     # 同级（2026-11-04 诚实化）：机器故障 ≠ 确认缺失。
-    unreadable_zero = zero_reason in ("unreadable", "type_gate", "cases_unverified") and score == 0
+    unreadable_zero = zero_reason in ("unreadable", "type_gate", "cases_unverified",
+                                      "material_unverified") and score == 0
     if zero_reason == "type_gate" and score == 0:
         msg = f"{result.detail}；零分理由：类型门槛剔除（type_gate），非材料缺失，建议人工核看"
     elif score == 0 and zero_reason == "cases_unverified":
         msg = (f"{result.detail}；零分理由：LLM 案例核验失败（cases_unverified），"
                "机器故障非确认缺失，建议重跑或人工核看")
+    elif score == 0 and zero_reason == "material_unverified":
+        msg = (f"{result.detail}；零分理由：材料未核验（material_unverified），"
+               "严口径不计入待视觉核验/人工复核，非确认缺失")
     elif unreadable_zero:
         msg = f"{result.detail}；零分理由：机器不可见（unreadable），非确认缺失，建议人工核看"
     elif score == 0 and zero_reason == "confirmed_absent":

@@ -953,6 +953,11 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
     zero_reason: str | None = None  # 0 分理由（见 CountResult.zero_reason）
     score_verified_only: Decimal | None = None  # 剔除未核验案例的可复算分
     unverified_counted = 0  # 未核验案例数（>0 → need_human）
+    # performance 案例闸门分支内覆盖：严口径（开关关）下 null_dropped=剔除数、
+    # _unverified_on=False → 尾部 unverified_counted 报剔除数（need_human 驱动）；
+    # 其余分支（证书链等）保持计入口径不动
+    _unverified_on = True
+    null_dropped = 0
     if person_scope:
         # 人员级项：facts.performance_amounts 是公司级业绩，按它计数会让人人封顶。
         # 强制走 verified_cases（LLM 按人核验）；无案例则 unresolved。
@@ -1388,7 +1393,12 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                     unverified_counted += 1
                     conflict = True
                 else:
-                    # 回退：None 不计（保守）
+                    # 严口径（2026-11-24 run158 放水修正）：未核验不计入——只按
+                    # verified 计分，案例留痕待 VL 翻案/人工（zero_reason=
+                    # material_unverified，绝不静默 0）
+                    c["unverified"] = True
+                    c["unverified_reason"] = _unverified_reason_of(c, required_flags)
+                    unverified_pool.append(c)
                     null_dropped += 1
                     conflict = True
             if dropped_false:
@@ -1396,7 +1406,7 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
             # 排序收紧（2026-11-02 用户确认口径，次序规则非折扣系数）：verified 在前、
             # unverified 在后——max_items 封顶先砍未核验案例，锚定且材料确认的案例
             # 优先计满（run77 c41：11 个不可读案例全计满 4 分，人工只认 3 个有效）。
-            complete = complete + unverified_pool
+            complete = complete + unverified_pool if _unverified_on else complete
             if managed_amount_tiers:
                 # Amount bands define the value of each case. A generic top-level
                 # per_item must never replace these frozen rates.
@@ -1447,7 +1457,8 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                 + (f"（{unverified_counted} 个案例材料不可读/未绑上，按未核验计入并标疑问，"
                    f"剔除后为 {score_verified_only} 分，建议人工核看）"
                    if unverified_counted else "")
-                + (f"（{null_dropped} 个案例材料页不可读未计，可能为扫描件，建议人工核看）"
+                + (f"（{null_dropped} 个案例材料不可读/未绑上，严口径不计入，"
+                   f"待视觉核验/人工，剔除口径 {score_verified_only} 分）"
                    if null_dropped else "")
                 + _type_gate_note
             )
@@ -1467,7 +1478,9 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                     conflict = True
                     detail += "；案例已计入但未算出分值（机器口径问题，非确认未提供，转人工核看）"
                 elif null_dropped:
-                    zero_reason = "unreadable"
+                    # 严口径：未核验剔除所致 0 分不是评审结论——material_unverified
+                    # 待 VL 翻案/人工复核（2026-11-24 run158 放水修正）
+                    zero_reason = "material_unverified"
                 elif dropped_false:
                     zero_reason = "confirmed_absent"
                 elif _type_dropped:
@@ -1534,7 +1547,9 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
         unresolved=unresolved,
         zero_reason=zero_reason,
         score_verified_only=score_verified_only if unverified_counted else None,
-        unverified_counted=unverified_counted,
+        # 严口径下 unverified_counted 报"未核验案例数"（need_human/审计驱动，
+        # 语义=多少未核验案例未计入）；冻结口径仍是"进了总分的未核验数"
+        unverified_counted=unverified_counted if _unverified_on else null_dropped,
     )
 
 

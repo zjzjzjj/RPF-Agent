@@ -887,7 +887,10 @@ def _verified_count(criterion: dict, decision, pages: list[dict]) -> tuple[Decim
                 result.detail + (f"；{result.unverified_counted} 个案例材料未核验，按冻结口径计入并标注"
                                  f"（剔除未核验后 {result.score_verified_only} 分）"),
                 values)
-    if result.zero_reason in ("unreadable", "cases_unverified", "gate_named_missing"):
+    if result.zero_reason in ("unreadable", "cases_unverified", "gate_named_missing",
+                              "material_unverified"):
+        # material_unverified（严口径未核验剔除）同样不是评审结论：转暂定/兜底
+        # → VL 翻案或人工，绝不把"没核实"的 0 当最终分（2026-11-24 run158 修正）
         raise LLMError("证明材料核验尚未完成，不能将暂定分作为最终分")
     # Heuristic conflict alone is discharged by the evidence-backed second pass;
     # missing factual inputs above remain execution failures.
@@ -1345,6 +1348,13 @@ def _maybe_vl_rescue(run_id: int, bid_id: int, criterion: dict,
                                             "stored_path": up.get("stored_path"),
                                             "sha256": up.get("sha256")})
                 named_keys.append(key)
+    for pn in (fallback_meta.get("material_pages") or []):
+        # 严口径未核验格（material_unverified）：案例材料页优先送审（翻案页源）
+        try:
+            pn = int(pn)
+        except (TypeError, ValueError):
+            continue
+        named_keys.extend(k for k in list(candidates) if k[1] == pn)
     crit_text = (str(criterion.get("name") or "") + str(criterion.get("description") or "")
                  + str(criterion.get("quote") or "") + str(criterion.get("required_evidence") or ""))
     # 该格自己的材料锚词（细则里出现的合同/社保/业绩/证书…）——run154 实证：
@@ -1438,13 +1448,25 @@ def _maybe_vl_rescue(run_id: int, bid_id: int, criterion: dict,
     if not evidence:
         return _vl_note(outcome, {"visual_fallback": "failed",
                                   "reason": "vl_observations_out_of_scope"}, error), error
+    vres_score = vres.score
+    trigger_kind = (fallback_meta.get("kind") if outcome is not None
+                    else type(error).__name__ if error is not None else None)
+    if trigger_kind == "material_unverified":
+        # 只升不降（2026-11-24）：VL 不得下修 verified 分（已核验案例的分），
+        # 翻案只允许加分——"误否决不可接受"的计分格镜像
+        try:
+            _base = Decimal(str(fallback_meta.get("value")))
+        except Exception:  # noqa: BLE001 —— 基准缺失时以 VL 为准
+            _base = None
+        if _base is not None and vres_score < _base:
+            vres_score = _base
     log.info("VL 兜底定分：criterion=%s score=%s pages=%d",
-             criterion.get("name"), vres.score, len(page_images))
+             criterion.get("name"), vres_score, len(page_images))
     new_outcome = CellOutcome(
         "pass", vres.reasoning or "视觉AI核验定分（页级证据）",
-        vres.score, evidence, merged, "visual_fallback", 1,
+        vres_score, evidence, merged, "visual_fallback", 1,
         {"visual_fallback": {
-            "score": str(vres.score), "reasoning": vres.reasoning,
+            "score": str(vres_score), "reasoning": vres.reasoning,
             "clues": vres.clues,
             "trigger": (fallback_meta.get("kind") if outcome is not None
                         else type(error).__name__ if error is not None else None),
@@ -2027,6 +2049,35 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
                 "zero_reason": result.zero_reason,
                 "deterministic_plan": True,
             }
+            # 严口径未核验格（2026-11-24 run158 放水修正）→ fallback 形状
+            # （basis=fallback）：自动落入 _maybe_vl_rescue 触发集——VL 看图
+            # 有据则翻案计入（页级证据），弃权/失败维持 verified 分（0 或部分
+            # 分）+疑问待人工，绝不无据计入、也不静默 0。
+            unverified_records = (result.facts or {}).get("unverified_records") or []
+            if unverified_records:
+                material_pages = sorted({
+                    int(p) for rec in unverified_records
+                    for p in (rec.get("pages") or []) if p is not None})
+                fallback = {
+                    "kind": "material_unverified",
+                    "value": result.score,
+                    "basis": "machine_fallback",
+                    "reason": "；".join(
+                        str(w.get("message") or "") for w in (result.warnings or []))
+                        or str(result.detail or "")[:300],
+                    "unverified_records": unverified_records,
+                    "material_pages": material_pages,
+                    "zero_reason": result.zero_reason,
+                    "score_type": criterion.get("score_type"),
+                }
+                raw["fallback"] = fallback
+                return CellOutcome(
+                    result.verdict, result.detail, result.score, [], pages, "fallback", 1,
+                    raw,
+                    [{"message": result.detail + "（未核实待视觉核验/人工）",
+                      "verdict_source": "deterministic",
+                      "fallback_score": fallback}],
+                )
             return CellOutcome(
                 result.verdict, result.detail, result.score, [], pages, "deterministic", 1,
                 raw, [{"message": result.detail, "verdict_source": "deterministic"}],

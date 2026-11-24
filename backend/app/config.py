@@ -468,18 +468,21 @@ def case_max_batches_ceiling() -> int:
 
 
 def case_unverified_count_enabled() -> bool:
-    """窄版材料闸门开关（2026-10-30；2026-11-02 排序收紧）。
+    """窄版材料闸门开关（2026-10-30；2026-11-02 排序收紧；2026-11-24 严口径）。
 
-    开（默认）：材料三态=None（机器看不清/没绑上/页没送审）的案例**计入分**
-    并标注"未核验"+进人工队列；只有三态=False（可读文本确认缺失）才维持 0。
-    窄版理由：机器"没找到"混着"真没有"和"管线故障"，一律扣 0 把管线故障算在
-    投标人头上（用友 c54/c55 材料在却判 0 实证）。关=回退旧闸门（None 不计）。
-    2026-11-02 排序收紧（run77 c41 反向实证）：计入的未核验案例排 verified 之后，
-    max_items 封顶先砍未核验；warnings 附"剔除后为 X 分"双分值可复算，含未核验
-    的格 machine_status=need_human。双向防线：用友（材料在不许清零）+ 德勤
-    （材料不可读不许满额）。
+    关（默认，2026-11-24 run158 放水修正）：材料三态=None（机器看不清/没绑上/
+    页没送审）的案例**严口径不计入**——只按 verified 计分，未核验案例
+    zero_reason=material_unverified + need_human，交 VL 看图翻案/人工复核
+    （run158 实证"未核实计入"=无据给分：c43 两家人工 0→AI 4 放水；人工对
+    缺/不合格材料也是严判）。
+    开（legacy 回滚通道）：未核验案例**计入分**并标注"未核验"+进人工队列；
+    只有三态=False（可读文本确认缺失）才维持 0。机器"没找到"混着"真没有"和
+    "管线故障"的双向防线（用友 材料在不许清零 + 德勤 材料不可读不许满额）
+    现由 VL 翻案承担。2026-11-02 排序收紧（run77 c41 反向实证）：计入的未核验
+    案例排 verified 之后，max_items 封顶先砍未核验；warnings 附"剔除后为 X 分"
+    双分值可复算，含未核验的格 machine_status=need_human。
     """
-    return os.environ.get("BID_EVAL_CASE_UNVERIFIED_COUNT", "1").strip().lower() not in (
+    return os.environ.get("BID_EVAL_CASE_UNVERIFIED_COUNT", "0").strip().lower() not in (
         "0", "false", "no", "off",
     )
 
