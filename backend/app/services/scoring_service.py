@@ -819,10 +819,17 @@ def execute_run(
     # （致成写"查询网址/查询截图："，旧正则只认整行"查询结果截图"且跳过
     # >300 字的页，全部漏检）；通道 B OCR 正文平台指纹（诚道的证书页图片
     # 就是认证平台查询截图；先数只有证书扫描件 → 判无，与真实评审一致）。
-    cert_sections: dict[int, tuple[bool, str]] = {}
+    # PR1（2026-11-24）：三态直传——旧 2 元组把盲态 None 压扁成 False（清零
+    # ISO，run155 咏数实证误杀）。cert_section_present = True/False/None。
+    cert_sections: dict[int, tuple[bool | None, str]] = {}
     for bid_id in bidder_ids:
         rows = bid_pages.get(bid_id) or []
-        cert_sections[bid_id] = cert_evidence_present([(src, t) for _p, t, src in rows])
+        from app.engine.objective import detect_cert_section
+
+        _det = detect_cert_section([
+            {"document_id": 0, "page_no": _p, "source": src, "text": t}
+            for _p, t, src in rows])
+        cert_sections[bid_id] = (_det.state, _det.basis)
 
     # 承诺值抽取窗口（2026-11-02 run77 c54 实证）：偏离表通用条款"8小时"首匹配
     # 抢掉承诺函"4小时"。窗口 = 索引页码指针（"服务承诺…见投标文件（342-344）页"）
@@ -1046,7 +1053,7 @@ def execute_run(
             _vw = _value_window_for(bid_id, c)
             if _vw:
                 c_scoring = {**c_scoring, "value_window_text": _vw}
-        if _engine in ("count_tier", "attribute_tier") or _field == "certificates":
+        if _engine in ("count_tier", "attribute_tier") or _field in ("certificates", "cmmi"):
             # 证书背书三态（P0-5，2026-11-03 R3-4 扩到普通 certificates 计数）：
             # count_tier/attribute_tier/证书计数的软证据闸门（逐本定位复印件页）
             from app.engine.objective import classify_cert_backing

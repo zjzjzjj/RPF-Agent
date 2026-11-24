@@ -209,7 +209,7 @@ def _score_type_for_row(row: SkeletonRow) -> tuple[str, dict]:
     # CMMI 满分 2 分整项丢失（2026-10-30 run 66 实证：四家 CMMI 2 分全丢，
     # 真实 云锦/拓扑/用友 5 = ISO3+CMMI2，系统只有 c47 ISO 的 3/3/3/1）。
     _m_cmmi = re.search(r"(?:具有|具备|通过|获得|拥有|提供)[^。；]{0,30}?(?:得|计)\s*(\d+(?:\.\d+)?)\s*分", text)
-    if "CMMI" in text and _m_cmmi:
+    if re.search(r"CMMI|CSMM|能力成熟度", text, re.I) and _m_cmmi:
         return "count", {"field": "cmmi", "per_item": str(Decimal(_m_cmmi.group(1)))}
     from app.rules.check_infer import classify_scoring_form
 

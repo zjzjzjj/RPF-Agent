@@ -207,14 +207,36 @@ def _perf_rule(description, **param_changes):
 
 
 def test_hard_sanction_rejects_case_missing_acceptance_or_invoice():
-    """细则三件套制裁句：缺验收/发票的案例不计分（表格行不豁免）。"""
+    """细则三件套制裁句：**可读确认缺**验收/发票的案例不计分（表格行不豁免）。
+
+    三态（2026-11-24）：materials_state=False 表示分类已跑且确认无材料；
+    确认缺判 0 是红线，不放宽。
+    """
     record = ContractRecord(name="某研究所维保", amount_yuan=_D("1200000"),
-                            pages=[1], materials={"contract": [1]}, source="table")
+                            pages=[1], materials={"contract": [1]}, source="table",
+                            materials_state={"contract": True, "invoice": False,
+                                             "acceptance": False})
     result = score_objective(_perf_rule(RULE10), _contract_inv([record]))
     assert result is not None
     assert result.score == Decimal("0.00")
     assert "未提供的不得分" in result.detail
     assert "缺" in result.detail
+
+
+def test_hard_sanction_unverified_materials_count_with_concern():
+    """三态：材料状态未知（分类未跑/未绑上）→ 计入+疑问，绝不静默 0。
+
+    run155 c43 实证：绑定断链把"材料在"误判"缺件"整列 0——无状态信息的
+    缺口不得判缺，必须计入并标疑问（verdict=concern + material_unverified）。
+    """
+    record = ContractRecord(name="某研究所维保", amount_yuan=_D("1200000"),
+                            pages=[1], materials={"contract": [1]}, source="table")
+    result = score_objective(_perf_rule(RULE10), _contract_inv([record]))
+    assert result is not None
+    assert result.score == Decimal("1.00"), "未核实材料必须计入（不得静默 0）"
+    assert result.verdict == "concern"
+    assert any(w.get("code") == "material_unverified" for w in result.warnings)
+    assert "未核实计入" in result.detail
 
 
 def test_hard_sanction_counts_case_with_full_three_piece_chain():

@@ -254,28 +254,39 @@ def _hard_material_requirements(text: str) -> tuple[frozenset, frozenset]:
 
 def _missing_required_materials(
     record: ContractRecord, required: frozenset, or_group: frozenset
-) -> list:
-    """逐案例必备材料核验（细则"未提供的不得分"制裁句的执行）。
+) -> tuple[list, list]:
+    """逐案例必备材料三态核验（细则"未提供的不得分"制裁句的执行）。
 
     合同件：正文合同块（source=text）本身就是投标文件提供的合同复印件；
     业绩表行（source=table）只是主张，必须另有关联合同页才认。
-    发票："至少一张发票复印件" → 关联发票页非空。
+    三态（2026-11-24 run155 实证）：True=材料在（或合同豁免）；False=可读
+    确认缺（判 0，红线不放宽）；None=不可读/未绑上 → **计入+疑问**——绑定
+    断链把"在"误判"缺"是 c43 整列 0 的根因，绝不允许静默 0。
+    返回 (确认缺失, 未核实)。
     """
-    def present(kind: str) -> bool:
+    def state(kind: str) -> bool | None:
         if kind == "contract":
-            return bool(record.materials.get("contract") or record.source == "text")
-        return bool(record.materials.get(kind))
+            if record.source == "text" or record.materials.get("contract"):
+                return True
+        st = (record.materials_state or {}).get(kind)
+        if st is not None:
+            return bool(st)
+        return True if record.materials.get(kind) else None
 
     labels = {"contract": "合同", "invoice": "发票",
               "acceptance": "验收证明", "owner_proof": "业主证明"}
-    satisfied_or = bool(or_group) and any(present(k) for k in or_group)
-    missing = []
+    satisfied_or = bool(or_group) and any(state(k) is True for k in or_group)
+    missing: list = []
+    unverified: list = []
     for kind in sorted(required):
         if kind in or_group and satisfied_or:
             continue
-        if not present(kind):
+        st = state(kind)
+        if st is False:
             missing.append(labels[kind])
-    return missing
+        elif st is None:
+            unverified.append(labels[kind])
+    return missing, unverified
 
 
 def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathResult:
@@ -294,6 +305,7 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
     required_materials, or_group = _hard_material_requirements(text)
     qualifying: list[tuple[ContractRecord, Decimal]] = []
     rejected: list[str] = []
+    unverified_notes: list[str] = []
     for record in inventory.contracts:
         amount = record.amount_yuan
         if amount is None:
@@ -302,10 +314,14 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
         if tiers and amount < Decimal(str(tiers[0].get("min_amount_yuan", 0))):
             continue
         if required_materials:
-            missing = _missing_required_materials(record, required_materials, or_group)
+            missing, unverified = _missing_required_materials(
+                record, required_materials, or_group)
             if missing:
                 rejected.append(f"{record.name}（缺{'/'.join(missing)}，细则：未提供的不得分）")
                 continue
+            if unverified:
+                unverified_notes.append(
+                    f"{record.name}（{'/'.join(unverified)}不可读/未绑上，计入并标疑问）")
         elif not _contract_material_ok(record, requires_material):
             rejected.append(f"{record.name}（缺发票/验收）")
             continue
@@ -326,6 +342,8 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
         detail = "已定位业绩章节，未检出满足金额要求的合同"
     else:
         detail = "未定位到业绩章节或合同金额"
+    if unverified_notes:
+        detail += "；未核实计入：" + "；".join(unverified_notes[:6])
     score = _cap(score, criterion)
     # A zero is a confirmed conclusion only when contracts were actually
     # located and every one carries a readable amount.  Otherwise let the LLM
@@ -333,16 +351,24 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
     unknown_amounts = any(record.amount_yuan is None for record in inventory.contracts)
     missing_materials = any("缺" in reason for reason in rejected)
     complete = (inventory.performance_section_found and bool(inventory.contracts)
-                and not unknown_amounts and not missing_materials)
+                and not unknown_amounts and not missing_materials
+                and not unverified_notes)
     zero_reason = None
     if score == 0:
         zero_reason = "confirmed_absent" if complete else "no_facts"
+    warnings = []
+    if unverified_notes:
+        warnings.append({"code": "material_unverified",
+                         "message": "；".join(unverified_notes[:6])})
     return FastPathResult(
         score=score, detail=detail + f"；合计 {score} 分",
-        verdict="pass" if score > 0 else ("fail" if complete else "concern"),
+        verdict=("concern" if unverified_notes else "pass") if score > 0
+                else ("fail" if complete else "concern"),
+        warnings=warnings,
         facts={"contracts": [
             {"name": r.name, "amount_yuan": str(r.amount_yuan), "pages": r.pages,
-             "materials": r.materials} for r in inventory.contracts
+             "materials": r.materials, "materials_state": r.materials_state}
+            for r in inventory.contracts
         ]},
         pages=sorted({p for r in inventory.contracts for p in r.pages}),
         zero_reason=zero_reason,

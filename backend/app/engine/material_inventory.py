@@ -34,6 +34,9 @@ class ContractRecord:
     period: str | None = None
     pages: list[int] = field(default_factory=list)
     materials: dict[str, list[int]] = field(default_factory=dict)
+    # 三态材料链（2026-11-24）：True=材料在 / False=可读确认缺 / None=不可读
+    # 或未绑上。None 不得判缺（run155 实证：绑定断链把"在"误判"缺"整列 0）。
+    materials_state: dict[str, bool | None] = field(default_factory=dict)
     source: str = "text"
 
 
@@ -128,9 +131,13 @@ _RE_CONTRACT_HEADING_NO_YEAR = re.compile(
     r"^\s*(?:[（(]?\d{1,3}[）)、.．]\s*)?([^\n]{2,50}?合同)\s*$", re.M,
 )
 _RE_CONTRACT_AMOUNT = re.compile(
-    r"(?:合同(?:价款|金额|总价|价格)|合同总价)[^。\n]{0,30}?"
+    r"(?:合同(?:价款|金额|总价|价格)|成交金额|中标金额|采购金额|结算金额)"
+    r"[^。\n]{0,30}?"
     r"(?:人民币|￥|¥)?\s*([0-9][0-9,，]*(?:\.[0-9]+)?)\s*(万元|元)",
 )
+# PR1（2026-11-24 run155"合同（无金额）"实证）：¥ 前缀金额兜底（保守，
+# 不做无标签裸数字——税率/日期会误命中）
+_RE_AMOUNT_LOOSE = re.compile(r"[￥¥]\s*([0-9][0-9,，]*(?:\.[0-9]+)?)\s*(万元|元)")
 _RE_DATE_CN = re.compile(r"(20\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日")
 _RE_PERIOD = re.compile(
     r"(20\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日\s*至\s*"
@@ -145,8 +152,19 @@ _MATERIAL_KEYWORDS = {
 
 def _parse_amount(text: str) -> Decimal | None:
     match = _RE_CONTRACT_AMOUNT.search(text or "")
-    if not match:
-        return None
+    if match is None:
+        # 大写金额（"柒佰陆拾万元整"）优先于 ¥ 兜底；只在"大写"邻域找，
+        # 防把投标保证金等其他大写金额当合同价。
+        from app.engine.facts import parse_upper_amount
+
+        idx = (text or "").find("大写")
+        if idx >= 0:
+            upper = parse_upper_amount(text[idx:idx + 80])
+            if upper is not None:
+                return upper
+        match = _RE_AMOUNT_LOOSE.search(text or "")
+        if match is None:
+            return None
     try:
         value = Decimal(match.group(1).replace(",", "").replace("，", ""))
     except Exception:  # noqa: BLE001
@@ -293,9 +311,32 @@ def _contracts_from_case_table(pages: list[dict], pdf_path: str | None) -> list[
         if not rows:
             return []
         blocks = link_case_blocks(rows, recs, section)
-        # Fast inventory: skip page_image_ratios/classify_materials, which scan
-        # the whole PDF.  Table rows are accepted as structured contract claims;
-        # prose blocks still supply amount/date/material pages.
+        # PR1（2026-11-24 run155 实证）：必须补跑三态分类——旧实现"跳过
+        # classify_materials"使 pages_by_material/status 恒空，材料链 AND 闸把
+        # "材料在但没绑上"误判"缺件"→ c43 整列 0。classify 失败只降级不阻塞
+        # （退回旧语义，绝不因分类异常抬走整条案例链）。
+        try:
+            from app.evidence.case_evidence import classify_materials, page_image_ratios
+
+            tag_pages = None
+            if config.material_index_enabled() and config.case_tag_prior_enabled():
+                try:
+                    from app.material_index.hints import page_material_tags
+
+                    doc_id = pages[0].get("document_id") if pages else None
+                    if doc_id is not None:
+                        tag_pages = page_material_tags(
+                            int(doc_id),
+                            {no for b in blocks for no in b.pages},
+                            {int(p.get("page_no") or 0): str(p.get("text") or "")
+                             for p in pages},
+                        )
+                except Exception:  # noqa: BLE001 —— 标签先验失败不阻塞三态
+                    tag_pages = None
+            classify_materials(blocks, recs, page_image_ratios(pdf_path),
+                                tag_pages=tag_pages)
+        except Exception:  # noqa: BLE001
+            pass
         cases = _cases_from_blocks(blocks)
     except Exception:  # noqa: BLE001
         return []
@@ -310,23 +351,36 @@ def _contracts_from_case_table(pages: list[dict], pdf_path: str | None) -> list[
         except Exception:  # noqa: BLE001
             amount_d = None
         pages_found: list[int] = []
-        for key in ("contract_pages", "invoice_pages", "acceptance_pages", "evidence_pages"):
-            for number in case.get(key) or []:
+        # 生产者（_cases_from_blocks）写的是 material_pages 键；旧契约
+        # contract_pages/invoice_pages/… 全库无写入方（run155 实证），保留
+        # 仅为历史数据 fallback。
+        mat = case.get("material_pages") or {}
+        for nums in list(mat.values()) + [case.get(k) for k in
+                                          ("contract_pages", "invoice_pages",
+                                           "acceptance_pages", "evidence_pages")]:
+            for number in nums or []:
                 try:
                     pages_found.append(int(number))
                 except Exception:  # noqa: BLE001
                     continue
-        materials = {}
-        for kind, keys in (("contract", ("contract_pages",)),
-                           ("invoice", ("invoice_pages",)),
-                           ("acceptance", ("acceptance_pages",))):
-            for key in keys:
-                if case.get(key):
-                    materials[kind] = sorted({int(n) for n in case[key]})
+        materials: dict[str, list[int]] = {}
+        for kind, nums in mat.items():
+            if nums:
+                try:
+                    materials[str(kind)] = sorted({int(n) for n in nums})
+                except Exception:  # noqa: BLE001
+                    continue
+        for kind, key in (("contract", "contract_pages"),
+                          ("invoice", "invoice_pages"),
+                          ("acceptance", "acceptance_pages")):
+            if kind not in materials and case.get(key):
+                materials[kind] = sorted({int(n) for n in case[key]})
+        materials_state = {k: case.get(k) for k in ("contract", "invoice", "acceptance")}
         out.append(ContractRecord(
             name=name, amount_yuan=amount_d,
             signed_date=str(case.get("sign_date") or "") or None,
-            pages=sorted(set(pages_found)), materials=materials, source="table",
+            pages=sorted(set(pages_found)), materials=materials,
+            materials_state=materials_state, source="table",
         ))
     return out
 
@@ -381,7 +435,7 @@ def _certs_from_pages(pages: list[dict]) -> list[CertRecord]:
         # certificate copy.  Require certificate-page signals before counting.
         cert_context = bool(re.search(
             r"认证证书|证书编号|证书号码|符合.{0,30}标准|有效期|发证日期|认证范围|"
-            r"资质类别及等级|资质证书|认证机构",
+            r"资质类别及等级|资质证书|认证机构|评估证书|成熟度|评估机构|CMMI|CSMM",
             text,
         ))
         if not cert_context:
@@ -400,7 +454,7 @@ def _certs_from_pages(pages: list[dict]) -> list[CertRecord]:
                 add(raw, number, None, valid)
         for match in _RE_SYSTEM_CERT.finditer(text):
             add(match.group(1), number, None, valid)
-        if re.search(r"\bCMMI\b|CMMI\s*[一二三四五1-5]\s*级", text):
+        if re.search(r"CMMI|CSMM|能力成熟度", text, re.I):
             add("CMMI", number, None, valid)
     return records
 

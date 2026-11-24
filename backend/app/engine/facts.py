@@ -65,12 +65,12 @@ _CERT_ZH_KEYS: tuple[tuple[str, str], ...] = (
     ("IT服务管理体系", "ISO20000"),
     ("ITSS", "ISO20000"),
 )
-_RE_CERT_CONTEXT = re.compile(r"证书|认证|体系|有效期|编号|CMMI|ISO")
+_RE_CERT_CONTEXT = re.compile(r"证书|认证|体系|有效期|编号|CMMI|CSMM|能力成熟度|评估证书|成熟度|评估机构")
 _RE_ISO_TOKEN = re.compile(r"ISO(?:\s?/?\s?IEC)?\s?(\d{4,5})")
-_RE_CMMI_TOKEN = re.compile(r"CMMI\s?[1-5]?\s?级?")
+_RE_CMMI_TOKEN = re.compile(r"CMMI\s?[1-5]?\s?级?|CSMM|能力成熟度", re.I)
 # 证书行里的证书编号/有效期（用于把名称与编号切开）
 _RE_CERT_TAIL = re.compile(r"\s+[A-Z][A-Za-z]{1,8}[-–]\d|\s+\d{4}\s*年")
-_RE_CERT_CLAIM = re.compile(r"已通过\s*((?:ISO\s?\d+|CMMI\s?\d?)[^，。；；()（）]{0,30})")
+_RE_CERT_CLAIM = re.compile(r"已通过\s*((?:ISO\s?\d+|CMMI\s?\d?|CSMM|能力成熟度)[^，。；；()（）]{0,30})")
 _RE_QUAL_CERT = re.compile(r"信息系统集成及服务资质")
 # 保证金：否定语境不算已缴纳（"未缴纳/无需缴纳"不得因含"缴纳"而命中）
 _RE_GUARANTEE = re.compile(r"(?<![未无需不予])缴纳\s*投标\s*保证金")

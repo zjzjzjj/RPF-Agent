@@ -562,12 +562,19 @@ def detect_cert_section(pages: list[dict]) -> CertSectionDetection:
                 break
     if hits:
         return CertSectionDetection(state=True, basis=hits[0]["basis"], hits=hits)
-    # 无命中：存在零文本页（纯图无 OCR 结果/不可读）→ 盲态不猜
-    blind = any(
-        not (p.get("text") or "").strip()
-        and not p.get("known_blank")
-        for p in (pages or [])
-    )
+    # 无命中：存在零文本/低文本高图页 → 盲态不猜。run155 咏数实证：截图页
+    # 是扫描图但带 OCR 噪声文本 → 旧口径（只认完全空文本）判"确认无"→ 清零
+    # ISO——机器看不见 ≠ 不存在（2026-11-24）。
+    def _blind_page(p):  # noqa: ANN001
+        t = (p.get("text") or "").strip()
+        if not t and not p.get("known_blank"):
+            return True
+        return len(t) < 300 and (
+            float(p.get("embedded_image_ratio") or 0.0) >= 0.10
+            or p.get("source") in ("ocr", "ocr_img")
+        )
+
+    blind = any(_blind_page(p) for p in (pages or []))
     if blind:
         return CertSectionDetection(state=None, basis="存在不可读页，截图节不可确认（盲态）")
     return CertSectionDetection(state=False, basis="未见查询截图标题或认证平台指纹")
@@ -597,6 +604,33 @@ def cert_evidence_present(pages: list[tuple[str, str]]) -> tuple[bool, str]:
 _RE_CERT_COPY_FP = re.compile(r"复印件|证书编号|发证|有效期|认证日期|颁证")
 
 
+def _cert_match_patterns(cert_name: str) -> list:
+    """证书名 → 容错匹配模式组（2026-11-24 ISO20000 实证：归一化尾 6 字
+    "O20000" 对页文本"ISO/IEC 20000-1:2018"零命中 → 复印件页绑不上）。
+
+    ① 数字核容错（ISO/IEC 20000-1:2018、GB/T24405）② 中文别名（_CERT_ZH_MAP
+    反查：信息技术服务管理体系/能力成熟度…）③ 原名去分隔符宽松匹配；
+    尾 6 字匹配降级为最后兜底（调用方保留）。
+    """
+    out: list = []
+    raw = str(cert_name or "").strip()
+    norm = normalize_cert(raw)
+    m = re.search(r"(ISO|GB/?T)(\d{4,5})", norm)
+    if m:
+        digits = m.group(2)
+        if m.group(1).startswith("ISO"):
+            out.append(re.compile(r"ISO\s*/?\s*(?:IEC\s*)?[-–—:]?\s*" + digits))
+        else:
+            out.append(re.compile(r"GB\s*/?\s*T\s*" + digits))
+    for zh, key in (_CERT_ZH_MAP + _CERT_GB_MAP):
+        if key == norm and zh:
+            out.append(re.compile(re.escape(zh)))
+    frag = re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", raw)
+    if len(frag) >= 6:
+        out.append(re.compile(re.escape(frag)))
+    return out
+
+
 def find_cert_copy_pages(
     pages: list[tuple[str, str]], cert_name: str
 ) -> list[tuple[str, int]]:
@@ -615,11 +649,12 @@ def find_cert_copy_pages(
     tail = norm_name[-6:] if len(norm_name) >= 6 else norm_name
     if not tail:
         return []
+    pats = _cert_match_patterns(name_raw)
     out: list[tuple[str, int]] = []
     for idx, (src, text) in enumerate(pages or []):
         t = text or ""
         nt = normalize_no_ws(t)
-        if tail not in nt and norm_name not in nt:
+        if not any(p.search(nt) for p in pats) and tail not in nt and norm_name not in nt:
             continue
         if len(t.strip()) < 30:
             out.append(("low", idx))
@@ -648,11 +683,12 @@ def find_cert_copy_pages_anchored(
     tail = norm_name[-6:] if len(norm_name) >= 6 else norm_name
     if not tail:
         return []
+    pats = _cert_match_patterns(name_raw)
     out: list[tuple[str, dict]] = []
     for p in pages or []:
         t = p.get("text") or ""
         nt = _nnw(t)
-        if tail not in nt and norm_name not in nt:
+        if not any(pat.search(nt) for pat in pats) and tail not in nt and norm_name not in nt:
             continue
         pos = t.find(name_raw.strip())
         if pos < 0:
@@ -972,8 +1008,16 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
         backing = criterion.get("cert_backing") or {}
         has_cmmi = any(normalize_cert(c) == "CMMI" and backing.get("CMMI", True) is not False
                        for c in facts.certificates)
-        count = 1 if has_cmmi else 0
-        detail = f"提供 CMMI 认证 {count} 项（{('有' if has_cmmi else '无')}有效期内 CMMI 证书）"
+        # PR1（2026-11-24 run155 c45 全 0 实证）：声称行（"已通过 CMMI…"）不是
+        # 复印件，但是必须被看到的有据线索——计入并标疑问，绝不静默 0。
+        from_claims = False
+        if not has_cmmi and facts.cert_claims:
+            from_claims = any(normalize_cert(c) == "CMMI" for c in facts.cert_claims)
+        count = 1 if (has_cmmi or from_claims) else 0
+        detail = f"提供 CMMI 认证 {count} 项（{('有' if count else '无')}有效期内 CMMI 证书）"
+        if from_claims and not has_cmmi:
+            conflict = True
+            detail += "；证书复印件未绑上，按声称线索计入并标疑问"
         if not facts.certificates and not facts.cert_claims:
             detail = "未提取到证书清单（需人工核查）"
             unresolved = "no_facts"
@@ -1101,7 +1145,8 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
         field == "certificates"
         # 材料清单解析可能只留下"证书复印件"这类实词，要求原文也要一起看
         and "截图" in (_artifact_text + _artifact_raw)
-        and not criterion.get("cert_section_present", True)
+        # PR1：仅"可读确认未见截图"（False）才清零；盲态 None → 照计+疑问
+        and criterion.get("cert_section_present") is False
     ):
         iso_count = len(iso_set)
         # 截图是点名材料：未按要求提供 → ISO 系全项计 0；CMMI 类仅需证书
@@ -1465,6 +1510,15 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
             else:
                 zero_reason = "confirmed_absent"
 
+    # PR1 盲态疑问（2026-11-24 run155 咏数实证）：截图节不可读（None）≠确认
+    # 未提供——ISO 照计并标疑问，绝不因"机器看不见"清零。
+    if (field == "certificates"
+            and "截图" in (str(criterion.get("required_artifacts") or "")
+                          + str(criterion.get("required_artifacts_raw") or ""))
+            and criterion.get("cert_section_present") is None and score > 0):
+        conflict = True
+        detail += "；截图节不可读，未核验计入并标疑问"
+
     return CountResult(
         score=score, detail=f"{detail}，得 {score} 分{inferred}", conflict=conflict,
         unresolved=unresolved,
@@ -1535,13 +1589,15 @@ _CERT_ZH_MAP: tuple[tuple[str, str], ...] = (
     ("质量管理体系", "ISO9001"),
     ("信息安全管理体系", "ISO27001"),
     ("信息技术服务管理体系", "ISO20000"),
+    ("能力成熟度", "CMMI"),
+    ("CSMM", "CMMI"),
 )
 _CERT_GB_MAP: tuple[tuple[str, str], ...] = (
     ("GB/T19001", "ISO9001"), ("GB/T22080", "ISO27001"), ("GB/T24405", "ISO20000"),
 )
 _RE_ISO_NUM = re.compile(r"ISO(?:/?IEC)?(\d{4,5})")
 _RE_GB_STD = re.compile(r"GB/?T(\d{4,5})")
-_RE_CMMI = re.compile(r"CMMI")
+_RE_CMMI = re.compile(r"CMMI|CSMM|能力成熟度")
 
 
 def normalize_cert(name: str) -> str:
