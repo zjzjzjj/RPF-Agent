@@ -302,8 +302,15 @@ def _document_offset(doc_pages: list[dict]) -> int:
     return int(value) if count / total >= 0.5 else 0
 
 
-def _toc_entries(doc_pages: list[dict], offset: int) -> list[tuple[int, str, int]]:
-    """目录条目 → [(toc_physical_page, title, target_physical_page)]。"""
+def _toc_entries(
+    doc_pages: list[dict], offset: int,
+    plain_keywords: tuple[str, ...] | None = None,
+) -> list[tuple[int, str, int]]:
+    """目录条目 → [(toc_physical_page, title, target_physical_page)]。
+
+    plain_keywords：无点线目录行的词表（默认 _TOC_KEYWORDS）。2026-11-24
+    material_locator 借道时传扩充词表（业绩/合同/发票/证书…），既有调用零变化。
+    """
     entries: list[tuple[int, str, int]] = []
     for page in doc_pages:
         text = _text(page)
@@ -321,7 +328,7 @@ def _toc_entries(doc_pages: list[dict], offset: int) -> list[tuple[int, str, int
                 if not match:
                     continue
                 title = match.group("title").strip()
-                if not any(keyword in title for keyword in _TOC_KEYWORDS):
+                if not any(keyword in title for keyword in (plain_keywords or _TOC_KEYWORDS)):
                     continue
             try:
                 printed = int(match.group("page"))

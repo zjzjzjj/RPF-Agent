@@ -962,6 +962,16 @@ def vl_timeout_s() -> float:
         return 90.0
 
 
+def material_locator_mode() -> str:
+    """目录驱动材料页定位（2026-11-24 PR2）：shadow=只写审计 / on=生效 / off=关。
+
+    定位结果只用于存在性信号与护栏（材料页必须被核验到），不做内容判定；
+    目录失败不阻断（关键词+material_tags 兜底）。
+    """
+    raw = os.environ.get("BID_EVAL_MATERIAL_LOCATOR", "shadow").strip().lower()
+    return raw if raw in ("shadow", "on", "off") else "shadow"
+
+
 # ---------------------------------------------------------------------------
 # 模型目录（硅基流动，OpenAI 兼容）
 # ---------------------------------------------------------------------------

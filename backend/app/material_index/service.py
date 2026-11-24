@@ -25,7 +25,7 @@ from app.material_index.catalog import MATERIAL_CATEGORIES
 log = logging.getLogger("bid_eval.material_index")
 
 # 版本戳：规则层词表/判定口径变更时递增，落 classifier_version 供审计
-RULES_VER = 1
+RULES_VER = 2
 LLM_VER = 0  # PR2 起启用 LLM 兜底时置 1
 
 
