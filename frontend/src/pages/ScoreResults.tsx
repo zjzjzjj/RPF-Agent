@@ -526,8 +526,7 @@ export default function ScoreResults() {
                                   {bucket.score ?? "—"}
                                   {bucket.max ? ` / ${bucket.max}` : ""}
                                   {`　${bucket.item_count} 项`}
-                                  {`（主 ${bucket.subjective_count}·客 ${bucket.objective_count}·— ${bucket.unlabeled_count ?? 0}` +
-                                    `｜方式：AI ${bucket.ai_count ?? 0}·规则 ${bucket.rule_count ?? 0}·混合 ${bucket.mixed_count ?? 0}）`}
+                                  {`（AI ${bucket.ai_count ?? 0}·规则 ${bucket.rule_count ?? 0}·混合 ${bucket.mixed_count ?? 0}）`}
                                   {bucket.missing_count > 0 ? `（${bucket.missing_count} 项未定分）` : ""}
                                 </Typography.Text>
                               ) : (
