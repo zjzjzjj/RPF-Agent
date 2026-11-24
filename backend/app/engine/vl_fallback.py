@@ -43,6 +43,7 @@ TRIGGER_KINDS = frozenset({
     "value_extraction_unresolved",
     "presence_unverified",
     "sample_volume_unverified",
+    "material_unverified",      # 严口径未核验格（2026-11-24 run158 修正）：VL 翻案
 })
 
 VERDICT_SCORE_TYPES = ("veto", "match")
@@ -118,7 +119,7 @@ SYSTEM_PROMPT = (
     "以及一条评标细则原文。\n"
     "必须遵守：\n"
     "1. 只依据图中实际所见与细则原文判断，不得使用图外知识、不得猜测；\n"
-    "2. 输出严格 JSON（不要多余文字），结构：\n"
+    "2. 输出严格 JSON：**单个 JSON 对象**（不要 markdown 代码块、不要多余文字），结构：\n"
     '{"verdict":"pass|fail|unverifiable","score":<数字或null>,"level":<档位标签或null>,'
     '"observations":[{"document_id":<编号或null>,"page_no":<页码或null>,'
     '"observation":"客观描述所见"}],"reasoning":"按细则逐条对照的依据",'
@@ -205,10 +206,14 @@ def rescue(
     user_prompt = build_user_prompt(criterion, is_verdict=is_verdict,
                                     page_images=page_images)
     images = [pi["data_url"] for pi in page_images]
-    try:
+
+    def _chat() -> str:
         result = gateway.chat(SYSTEM_PROMPT, user_prompt, images=images,
                               data_class=data_class or "synthetic")
-        text = getattr(result, "content", None) or str(result)
+        return getattr(result, "content", None) or str(result)
+
+    try:
+        text = _chat()
     except Exception as exc:  # noqa: BLE001 —— 网络/涉密闸门/模型故障=维持暂定
         log.warning("VL 兜底调用失败：%s", exc)
         if getattr(exc, "transient", True) is False:
@@ -216,12 +221,29 @@ def rescue(
             return VlResult("failed", reason="vl_call_rejected")
         return VlResult("failed", reason=f"vl_call_failed:{type(exc).__name__}")
 
-    try:
-        data = _extract_json(text)
-        parsed = VlVerdict.model_validate(data)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("VL 输出契约校验失败：%s", exc)
-        return VlResult("failed", reason=f"vl_contract_invalid:{type(exc).__name__}")
+    # 契约解析加固（2026-11-24 run155 c45 JSONDecodeError 白白放弃）：解析/
+    # 校验失败重试一次完整调用（同预算名额内，不额外扣预算）；仍失败才放弃。
+    parsed = None
+    last_exc: Exception | None = None
+    for attempt in (1, 2):
+        try:
+            parsed = VlVerdict.model_validate(_extract_json(text))
+            break
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt == 2:
+                break
+            log.warning("VL 输出契约校验失败（重试 1 次）：%s", exc)
+            try:
+                text = _chat()
+            except Exception as exc2:  # noqa: BLE001
+                log.warning("VL 兜底重试调用失败：%s", exc2)
+                if getattr(exc2, "transient", True) is False:
+                    return VlResult("failed", reason="vl_call_rejected")
+                return VlResult("failed", reason=f"vl_call_failed:{type(exc2).__name__}")
+    if parsed is None:
+        log.warning("VL 输出契约校验失败：%s", last_exc)
+        return VlResult("failed", reason=f"vl_contract_invalid:{type(last_exc).__name__}")
 
     observations = [o.model_dump() for o in parsed.observations]
     if not observations:
@@ -250,14 +272,12 @@ def rescue(
 
 
 def _extract_json(text: str) -> dict:
-    """从模型输出提取首个 JSON 对象（容忍代码块围栏/前后杂文）。"""
-    t = text.strip()
-    if t.startswith("```"):
-        t = t.strip("`")
-        if t.startswith("json"):
-            t = t[4:]
-    start = t.find("{")
-    end = t.rfind("}")
-    if start < 0 or end <= start:
-        raise ValueError("no json object in output")
-    return json.loads(t[start:end + 1])
+    """从模型输出提取 JSON 对象。
+
+    2026-11-24 加固：复用 gateway.extract_json 的分级容错解析（围栏/前后杂文/
+    尾逗号/非法转义/缺失逗号全修，平衡括号扫描取首个对象；截断才失败）——
+    run155 c45 一次 JSONDecodeError 让整格白放弃是病灶。
+    """
+    from app.llm.gateway import extract_json as _robust_extract
+
+    return _robust_extract(text)
