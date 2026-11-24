@@ -217,7 +217,7 @@ QUESTION_KINDS: dict[str, dict[str, str]] = {
     "machine_fallback": {
         "severity": "high",
         "label": "兜底分（非评审结论）",
-        "action": "机器故障/无有效输出，按最低档或 0 分暂定计入（零未定分政策）。"
+        "action": "机器故障/无有效输出，已按零未定分政策给定兜底暂定分并计入总分。"
                   "兜底分不是评审结论——请人工核看原件后改分，或重跑该格。",
     },
     "batch_confirmable": {
@@ -439,6 +439,8 @@ def _build_open_questions(rows: list, run_id: int) -> tuple[list[dict], dict, li
                 "code": crit.code,
                 "criterion": crit.name,
                 "category": CATEGORY_LABELS.get(crit.category, crit.category),
+                "score_type": crit.score_type,
+                "is_verdict": crit.score_type in ("veto", "match"),
                 "max_score": str(crit.max_score) if crit.max_score else None,
                 "final_score": str(score.final_score) if score.final_score is not None else None,
                 "machine_status": score.machine_status,
@@ -465,6 +467,8 @@ def _build_open_questions(rows: list, run_id: int) -> tuple[list[dict], dict, li
                 "code": q["code"],
                 "criterion": q["criterion"],
                 "category": q["category"],
+                "score_type": q.get("score_type"),
+                "is_verdict": q.get("is_verdict", False),
                 "max_score": q["max_score"],
                 "kind": q["kind"],
                 "severity": q["severity"],
@@ -520,6 +524,8 @@ def _build_automatic_questions(run, rows: list, automation: dict, completed: set
                 "bidder_id": key[0], "score_id": score.id if score else None,
                 "code": crit.get("code"), "criterion": crit.get("name"),
                 "category": CATEGORY_LABELS.get(crit.get("category"), crit.get("category")),
+                "score_type": crit.get("score_type"),
+                "is_verdict": crit.get("score_type") in ("veto", "match"),
                 "max_score": crit.get("max_score"),
                 "final_score": str(score.final_score) if score and score.final_score is not None else None,
                 "machine_status": score.machine_status if score else None,
@@ -531,7 +537,8 @@ def _build_automatic_questions(run, rows: list, automation: dict, completed: set
             questions.append(question)
             group = grouped.setdefault(key[1], {
                 **{field: question[field] for field in (
-                    "code", "criterion", "category", "max_score", "kind", "severity", "label", "action", "blocks_final"
+                    "code", "criterion", "category", "score_type", "is_verdict",
+                    "max_score", "kind", "severity", "label", "action", "blocks_final"
                 )},
                 "bidders": [],
             })
@@ -981,9 +988,10 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
             "price_no_tax": str(_no_tax(effective_prices[bidder.id])) if not automated and effective_prices[bidder.id] is not None else None,
             "judge_totals": per_judge_totals,
             "final": str(rk.get("total")) if rk.get("total") is not None else None,
-            # P0-1 双分值：final=已定分合计；provisional_total=含故障兜底暂定分合计。
+            # 零未定分口径（2026-11-24）：暂定分已计入 total；provisional_total=总分
+            # （字段兼容保留）。incomplete 只由 missing_final 驱动（防御性）。
             "provisional_total": rk.get("provisional_total"),
-            "incomplete": bool(rk.get("missing_final")) or bool(rk.get("fallback")),
+            "incomplete": bool(rk.get("missing_final")),
             "rank": rk.get("rank"),
             # 包B：正式名次（rank）为 None 时的原排序位次——仅供人工定位，
             # 不构成评审结论；完整运行时 reference_rank == rank。
@@ -1360,8 +1368,8 @@ def render_docx(report: dict) -> bytes:
         )
     table(headers, rows)
     if any(r.get("incomplete") for r in report["summary_rows"]):
-        para("注：以上「最终得分」仅合计已定分格；带「不完整」标注的投标人尚有未定分或故障兜底暂定分格"
-             "（见下方兜底分清单），暂定分不是评审结论，不发布最终名次。")
+        para("注：带「不完整」标注的投标人尚有未定分格（零未定分政策下的异常态）；"
+             "兜底暂定分格已计入总分（非评审结论，见下方兜底分清单），人工改分后可重新汇总。")
     if any(r.get("rank") is None and r.get("reference_rank") is not None
            for r in report["summary_rows"]):
         # 包B：正式名次未发布时的参考名次口径声明（陈列序≠发布名次）。
@@ -1382,8 +1390,10 @@ def render_docx(report: dict) -> bytes:
              "0 分，已按零未定分政策计入总分，请人工核看原件后改分或重跑：")
         for f in report["fallback_scores"]:
             if f["kind"] == "reading_incomplete":
-                # P0-3：读取故障待补读——未定分，既不是 0 分也不是材料缺失。
-                para(f"　· {f['bidder']}：{f['criterion']}（读取故障待补读，未定分；"
+                # P0-3：读取故障待补读——既不是评审结论也不是材料缺失；
+                # 零未定分（2026-11-24）：按兜底暂定分计入总分待补读翻案。
+                para(f"　· {f['bidder']}：{f['criterion']}（读取故障待补读，"
+                     f"按兜底暂定 {f.get('final_score')} 分计入总分；"
                      f"{f.get('machine_message') or '须补读原页图像后重评'}）")
             elif f.get("final_score") is None:
                 # 已定格未定分族（reading_incomplete 之外：presence_unverified /
@@ -1411,10 +1421,9 @@ def render_docx(report: dict) -> bytes:
              if report["run"].get("automation") is not None else
              "以上排序为 AI 辅助评审结果，须评标委员会确认后生效。")
     elif any(r.get("incomplete") for r in report["summary_rows"]):
-        # P0-1：含故障兜底暂定格时不出中标候选人推荐——暂定分不是评审结论，
-        # 按其排序会误导（测试10 run113：15 个暂定格把人工末位顶成 AI 第 1）。
-        para("因存在未定分或故障兜底暂定分格（非评审结论，见兜底分清单），"
-             "总分不构成完整评审结论，暂不推荐中标候选人；补评或人工改分后重新汇总排名。")
+        # 零未定分（2026-11-24 拍板）后仅 missing_final（异常态）才会走到这里。
+        para("因存在未定分格（零未定分政策下的异常态，见兜底分清单），"
+             "总分不完整，暂不推荐中标候选人；补评或人工改分后重新汇总排名。")
     doc.add_page_break()
 
     # 附表 A1 资格 / A2 符合性

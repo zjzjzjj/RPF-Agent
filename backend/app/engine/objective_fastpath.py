@@ -16,7 +16,9 @@ from typing import Any
 from app.engine.material_inventory import (
     CertRecord, ContractRecord, MaterialInventory, PersonRecord,
 )
-from app.engine.objective import normalize_cert
+from app.engine.objective import (
+    date_gate_state, date_window_from_rule, normalize_cert, type_gate_state,
+)
 from app.rules.check_infer import infer_count_params, infer_objective_route
 
 
@@ -314,11 +316,17 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
     # P0-5：细则有硬制裁句（"以上资料未提供的不得分"）+ 点名材料 → 逐案例
     # AND 核验（"至少一张发票"、业主证明不单独替代验收证明）；表格行不豁免。
     required_materials, or_group = _hard_material_requirements(text)
+    # 三闸（2026-11-24 run159 对账）：时间窗/类型按细则明示条件剔除（剔除=不计分，
+    # 非否决）；无法确认→保留+疑问。盖章：文本路无法核验≠未盖章，只记疑问。
+    date_window = date_window_from_rule(text)
+    seal_required = any(w in text for w in ("盖章", "公章", "签章"))
     qualifying: list[tuple[ContractRecord, Decimal]] = []
     rejected: list[str] = []
     unverified_notes: list[str] = []
     unverified_records: list[dict] = []
     guard_escalated = False
+    date_dropped = type_dropped = 0
+    date_unsure = type_unsure = seal_unverified = 0
     # 严口径（2026-11-24 run158 放水修正）：未核实（不可读/未绑上）不再计入
     # ——只按 verified 案例计分（部分分保留），未核验案例留 VL 翻案/人工复核。
     # BID_EVAL_CASE_UNVERIFIED_COUNT=1 回退旧"未核实计入+疑问"（回滚通道）。
@@ -331,6 +339,22 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
             continue
         if tiers and amount < Decimal(str(tiers[0].get("min_amount_yuan", 0))):
             continue
+        d_state = date_gate_state(record.signed_date, date_window)
+        if d_state is False:
+            rejected.append(
+                f"{record.name}（签订时间 {record.signed_date} 不在细则时间窗内）")
+            date_dropped += 1
+            continue
+        t_state = type_gate_state(
+            f"{record.name or ''} {record.project_type or ''}", text)
+        if t_state is False:
+            rejected.append(f"{record.name}（明确非细则要求类型，按类型门槛剔除）")
+            type_dropped += 1
+            continue
+        if t_state is None and "运维" in text:
+            type_unsure += 1
+        if d_state is None and (date_window[0] or date_window[1]):
+            date_unsure += 1
         record_unverified: list[str] = []
         if required_materials:
             missing, unverified = _missing_required_materials(
@@ -371,6 +395,10 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
         if record_unverified:
             unverified_notes.append(
                 f"{record.name}（{'；'.join(record_unverified)}，计入并标疑问）")
+        if seal_required and (record.materials_state or {}).get("seal") is not True:
+            # 盖章三态：VL has_seal=true→True；其余→None。文本路无法核验盖章
+            # ≠未盖章——不阻计，记疑问（确认缺判 0 仅对可读确认缺）
+            seal_unverified += 1
         rate = _contract_rate(tiers, amount) if tiers else Decimal(0)
         if rate <= 0:
             continue
@@ -383,7 +411,7 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
             for record, rate in qualifying
         )
     elif rejected:
-        detail = "未找到满足金额/材料要求的业绩：" + "；".join(rejected[:6])
+        detail = "未找到满足金额/材料/时间/类型要求的业绩：" + "；".join(rejected[:6])
     elif inventory.performance_section_found:
         detail = "已定位业绩章节，未检出满足金额要求的合同"
     else:
@@ -392,6 +420,16 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
         detail += (("；未核实不计入（严口径，待视觉核验/人工）："
                     if strict_unverified and unverified_records else "；未核实计入：")
                    + "；".join(unverified_notes[:6]))
+    if type_dropped:
+        detail += f"（按'类似运维项目'类型门槛剔除 {type_dropped} 个明确非运维类案例）"
+    if date_dropped:
+        detail += f"（按细则时间窗剔除 {date_dropped} 个签订时间窗外案例）"
+    if type_unsure:
+        detail += f"（{type_unsure} 个案例类型无法机器确认，保留计分并标疑问）"
+    if date_unsure:
+        detail += f"（{date_unsure} 个案例签订时间无法确认，保留计分并标疑问）"
+    if seal_unverified:
+        detail += f"（{seal_unverified} 个案例盖章未核验，计入并标疑问）"
     score = _cap(score, criterion)
     # A zero is a confirmed conclusion only when contracts were actually
     # located and every one carries a readable amount.  Otherwise let the LLM
@@ -410,14 +448,30 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
                                else "material_unverified")
             else:
                 zero_reason = "material_binding_conflict"
+        elif type_dropped:
+            # 类型门槛剔空：0 分是类型判断结论而非"未提供材料"
+            zero_reason = "type_gate"
         else:
             zero_reason = "confirmed_absent" if complete else "no_facts"
     warnings = []
     if unverified_notes:
         warnings.append({"code": "material_unverified",
                          "message": "；".join(unverified_notes[:6])})
+    gate_concern = bool(type_unsure or date_unsure or seal_unverified)
+    if gate_concern:
+        _gate_msgs = []
+        if type_unsure:
+            _gate_msgs.append(f"{type_unsure} 个案例类型无法机器确认")
+        if date_unsure:
+            _gate_msgs.append(f"{date_unsure} 个案例签订时间无法确认")
+        if seal_unverified:
+            _gate_msgs.append(f"{seal_unverified} 个案例盖章未核验")
+        warnings.append({"code": "gate_unverified",
+                         "message": "、".join(_gate_msgs) + "（保留计分并标疑问）"})
     return FastPathResult(
         score=score, detail=detail + f"；合计 {score} 分",
+        # 三闸"无法确认"（类型/日期/盖章）只落 warnings+detail 注记（机器局限
+        # ≠材料问题，不翻 verdict 免淹没复核队列）；材料未核实才 concern
         verdict=("concern" if unverified_notes else "pass") if score > 0
                 else ("fail" if complete else "concern"),
         warnings=warnings,

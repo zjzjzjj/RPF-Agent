@@ -55,13 +55,20 @@ def test_budget_per_cell_and_bidder() -> None:
     assert not ok and why == "bidder_budget_exhausted"
 
 
-def test_rescue_scored_happy_path_page_images() -> None:
+def test_rescue_facts_happy_path_page_images() -> None:
+    """VL 报事实、代码算分（2026-11-24）：计分格输出面=facts，禁止给分。"""
     gw = FakeGateway(
-        '{"verdict":"pass","score":4,"observations":[{"document_id":1,"page_no":2,'
-        '"observation":"第2页供货合同一份，金额80万"}],"reasoning":"2个案例各2分"}')
+        '{"verdict":"pass","facts":[{"kind":"contract","name":"供货合同A",'
+        '"amount_yuan":"800000","sign_date":"2024-03-01","has_contract":true,'
+        '"has_invoice":null,"has_acceptance":null,'
+        '"evidence":[{"document_id":1,"page_no":2,"observation":"第2页供货合同一份，金额80万"}]}],'
+        '"observations":[{"document_id":1,"page_no":2,"observation":"第2页供货合同"}],'
+        '"reasoning":"见合同原件"}')
     res = vl_fallback.rescue(CRIT, PAGE_IMAGES, gateway=gw)
-    assert res.kind == "scored"
-    assert res.score == Decimal("4")
+    assert res.kind == "facts"
+    assert res.facts and res.facts[0]["amount_yuan"] == "800000"
+    assert res.facts[0]["has_invoice"] is None
+    assert not hasattr(res, "score") or getattr(res, "score", None) is None, "模型不再定分"
     assert gw.calls[0]["images"] == [p["data_url"] for p in PAGE_IMAGES]
     # 页码对照必须进提示词（VL 看到的是页图，页码靠映射告知）
     assert "第1张图=文档1第1页" in gw.calls[0]["user"]
@@ -86,27 +93,44 @@ def test_rescue_verdict_clue_only() -> None:
         '"observation":"投标函上有红色印章痕迹"}],"reasoning":"已见签章"}')
     res = vl_fallback.rescue(VERDICT_CRIT, PAGE_IMAGES, is_verdict=True, gateway=gw)
     assert res.kind == "clue_only"
-    assert res.score is None
 
 
-def test_rescue_score_out_of_range_rejected() -> None:
-    for bad in ("8", "-1", "null"):
-        gw = FakeGateway(
-            f'{{"verdict":"pass","score":{bad},"observations":[{{"document_id":1,'
-            '"page_no":1,"observation":"x"}],"reasoning":"r"}')
-        res = vl_fallback.rescue(CRIT, PAGE_IMAGES, gateway=gw)
-        assert res.kind == "failed" and res.reason == "vl_no_valid_score", bad
-    # 非数字 score → 契约校验拒收（同样维持暂定）
-    gw = FakeGateway('{"verdict":"pass","score":"many","observations":[{"document_id":1,'
-                     '"page_no":1,"observation":"x"}],"reasoning":"r"}')
+def test_rescue_facts_sanitize_rejects_bad_cases() -> None:
+    """自洽性拒收——拒案例不拒整格（2026-11-24）。"""
+    # 金额非法的 contract 案例丢弃；全部被丢 → vl_no_facts
+    gw = FakeGateway(
+        '{"verdict":"pass","facts":[{"kind":"contract","name":"A","amount_yuan":"many",'
+        '"evidence":[{"document_id":1,"page_no":1,"observation":"x"}]}],"reasoning":"r"}')
     res = vl_fallback.rescue(CRIT, PAGE_IMAGES, gateway=gw)
-    assert res.kind == "failed" and res.reason.startswith("vl_contract_invalid")
+    assert res.kind == "failed" and res.reason == "vl_no_facts"
+    # 矛盾回退：观察说"未见发票"却 has_invoice=true → 回退 null（案例保留）
+    gw2 = FakeGateway(
+        '{"verdict":"pass","facts":[{"kind":"contract","name":"A","amount_yuan":"800000",'
+        '"has_invoice":true,'
+        '"evidence":[{"document_id":1,"page_no":1,"observation":"合同一份，未见发票"}]}],'
+        '"reasoning":"r"}')
+    res2 = vl_fallback.rescue(CRIT, PAGE_IMAGES, gateway=gw2)
+    assert res2.kind == "facts"
+    assert res2.facts[0]["has_invoice"] is None, "矛盾回退 null"
+    # 证据页越界且清空 → 丢案
+    gw3 = FakeGateway(
+        '{"verdict":"pass","facts":[{"kind":"contract","name":"A","amount_yuan":"800000",'
+        '"evidence":[{"document_id":99,"page_no":999,"observation":"x"}]}],"reasoning":"r"}')
+    res3 = vl_fallback.rescue(CRIT, PAGE_IMAGES, gateway=gw3)
+    assert res3.kind == "failed" and res3.reason == "vl_no_facts"
+    # false 归一 None（未见≠没有，防 VL 误杀）
+    gw4 = FakeGateway(
+        '{"verdict":"pass","facts":[{"kind":"contract","name":"A","amount_yuan":"800000",'
+        '"has_acceptance":false,'
+        '"evidence":[{"document_id":1,"page_no":1,"observation":"合同"}]}],"reasoning":"r"}')
+    res4 = vl_fallback.rescue(CRIT, PAGE_IMAGES, gateway=gw4)
+    assert res4.facts[0]["has_acceptance"] is None
 
 
 def test_rescue_contract_invalid() -> None:
-    gw = FakeGateway('{"verdict":"pass"}')  # 无 observations
+    gw = FakeGateway('{"verdict":"pass"}')  # 计分格无 facts
     res = vl_fallback.rescue(CRIT, PAGE_IMAGES, gateway=gw)
-    assert res.kind == "failed" and res.reason == "vl_no_observations"
+    assert res.kind == "failed" and res.reason == "vl_no_facts"
     gw2 = FakeGateway('随便说点什么')
     res2 = vl_fallback.rescue(CRIT, PAGE_IMAGES, gateway=gw2)
     assert res2.kind == "failed" and res2.reason.startswith("vl_contract_invalid")
@@ -221,26 +245,53 @@ def test_maybe_vl_rescue_page_cap_and_named_first(tmp_path, monkeypatch) -> None
     assert rendered[0] == 7
 
 
-def test_maybe_vl_rescue_scored_outcome_shape(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+def _perf_criterion() -> dict:
+    return {
+        "code": "c25", "name": "投标产品业绩", "score_type": "count", "max_score": "2",
+        "description": ("投标产品业绩：同类产品业绩，合同金额100万及以上，每个得1分，"
+                        "最高得2分。【证明材料】须提供业绩合同、验收证明材料及合同配套的"
+                        "至少一张发票复印件并加盖投标人公章，以上资料未提供的不得分。"),
+        "params": {"field": "performance", "per_item": "1",
+                   "min_amount_yuan": "1000000"},
+    }
+
+
+def _empty_inv():
+    from app.engine.facts import BidFacts
+    from app.engine.material_inventory import MaterialInventory
+
+    return MaterialInventory(bidder_id=2, pages=[], full_text="", facts=BidFacts(text=""),
+                             contracts=[], performance_section_found=True)
+
+
+def _fact_case(name: str, amount: str, page: int) -> dict:
+    return {"kind": "contract", "name": name, "amount_yuan": amount,
+            "has_contract": True, "has_invoice": True, "has_acceptance": True,
+            "evidence": [{"document_id": 9, "page_no": page, "observation": "三件套齐"}]}
+
+
+def test_maybe_vl_rescue_facts_rescore_outcome(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """VL 报事实、代码算分：facts → 派生 inventory → 确定性算分定格。"""
     from app.services import automatic_scoring_service as asv
     from app.services.automatic_scoring_service import CellOutcome
 
     _png_env(tmp_path, monkeypatch)
     monkeypatch.setattr(vl_fallback, "rescue", lambda *a, **k: vl_fallback.VlResult(
-        "scored", score=Decimal("4"),
-        observations=[{"document_id": 9, "page_no": 1, "observation": "合同一份"}],
-        reasoning="按细则 2 案例"))
-    fb = CellOutcome("concern", "暂定", None, [], [], "fallback", 1,
-                     {"fallback": {"kind": "value_extraction_unresolved"}})
+        "facts", facts=[_fact_case("运维项目A", "1200000", 1)],
+        observations=[], reasoning="图上见三件套"))
+    fb = CellOutcome("concern", "未核实", Decimal("0"), [], [], "fallback", 1,
+                     {"fallback": {"kind": "material_unverified", "value": Decimal("0"),
+                                   "unverified_records": [], "material_pages": []}})
     pages = [{"document_id": 9, "page_no": 1, "stored_path": "x.pdf", "sha256": "s"}]
-    out, err = asv._maybe_vl_rescue(1, 2, CRIT, fb, None,
-                                   {2: (pages, "synthetic")}, vl_fallback.Budget())
+    out, err = asv._maybe_vl_rescue(1, 2, _perf_criterion(), fb, None,
+                                   {2: (pages, "synthetic")}, vl_fallback.Budget(),
+                                   inventory_factory=lambda bid: _empty_inv())
     assert err is None
     assert out.basis == "visual_fallback"
-    assert out.score == Decimal("4")
+    assert out.score == Decimal("1.00"), "1 个过闸案例 × 1 分（代码算分，非模型给分）"
     assert out.evidence and out.evidence[0]["kind"] == "visual"
     assert out.pages[0]["image_url"].startswith("data:image/png;base64,"), "页级 image_url 已就位"
-    assert out.raw["visual_fallback"]["score"] == "4"
+    assert out.raw["visual_fallback"]["facts"], "事实留痕"
 
 
 def test_vision_gateway_timeout_passed(monkeypatch) -> None:  # noqa: ANN001
@@ -253,12 +304,13 @@ def test_vision_gateway_timeout_passed(monkeypatch) -> None:  # noqa: ANN001
     def fake_gateway(timeout=None):  # noqa: ANN001, ANN202
         seen["timeout"] = timeout
         return FakeGateway(
-            '{"verdict":"pass","score":2,"observations":[{"document_id":1,"page_no":1,'
-            '"observation":"x"}],"reasoning":"r"}')
+            '{"verdict":"pass","facts":[{"kind":"contract","name":"A","amount_yuan":"800000",'
+            '"has_contract":true,'
+            '"evidence":[{"document_id":1,"page_no":1,"observation":"x"}]}],"reasoning":"r"}')
 
     monkeypatch.setattr(auto_review, "get_vision_gateway", fake_gateway)
     res = vl_fallback.rescue(CRIT, PAGE_IMAGES)
-    assert res.kind == "scored"
+    assert res.kind == "facts"
     assert seen["timeout"] == config.vl_timeout_s() == 90.0
 
 
@@ -403,7 +455,7 @@ def test_rescue_contract_invalid_retries_once_then_gives_up() -> None:
 
 
 def test_rescue_contract_retry_recovers() -> None:
-    """首次输出坏 JSON、重试输出好 JSON → 定分成功（run155 c45 型恢复）。"""
+    """首次输出坏 JSON、重试输出好 JSON → 事实收取（run155 c45 型恢复）。"""
 
     class SeqGateway:
         def __init__(self, contents):  # noqa: ANN001, ANN202
@@ -414,36 +466,48 @@ def test_rescue_contract_retry_recovers() -> None:
             self.calls.append({})
             return FakeResult(self._contents.pop(0))
 
-    good = ('{"verdict":"pass","score":"3","observations":[{"document_id":1,'
-            '"page_no":1,"observation":"发票一份"}],"reasoning":"三件套齐"}')
+    good = ('{"verdict":"pass","facts":[{"kind":"contract","name":"B","amount_yuan":"300000",'
+            '"has_contract":true,'
+            '"evidence":[{"document_id":1,"page_no":1,"observation":"发票一份"}]}],'
+            '"reasoning":"三件套齐"}')
     gw = SeqGateway(['坏掉的输出{', good])
     res = vl_fallback.rescue(CRIT, PAGE_IMAGES, gateway=gw)
-    assert res.kind == "scored" and res.score == Decimal("3")
+    assert res.kind == "facts" and res.facts[0]["amount_yuan"] == "300000"
     assert len(gw.calls) == 2
 
 
-def test_maybe_vl_rescue_material_unverified_never_downgrades(tmp_path, monkeypatch) -> None:  # noqa: ANN001
-    """严口径翻案只升不降：VL 分低于 verified 分时取高（"误否决不可接受"镜像）。"""
+def test_maybe_vl_rescue_facts_never_downgrades(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """翻案只升不降（2026-11-24）：VL 事实重算 ≤ 基准 → 维持原 fallback 格；
+    高于基准才升级 visual_fallback（"误否决不可接受"镜像）。"""
     from app.services import automatic_scoring_service as asv
     from app.services.automatic_scoring_service import CellOutcome
 
     _png_env(tmp_path, monkeypatch)
-    monkeypatch.setattr(vl_fallback, "rescue", lambda *a, **k: vl_fallback.VlResult(
-        "scored", score=Decimal("1"),
-        observations=[{"document_id": 9, "page_no": 1, "observation": "材料"}],
-        reasoning="只见到 1 个案例"))
-    fb = CellOutcome("concern", "未核实", Decimal("2"), [], [], "fallback", 1,
-                     {"fallback": {"kind": "material_unverified",
-                                   "value": Decimal("2")}})
+    criterion = dict(_perf_criterion(), max_score="6")
     pages = [{"document_id": 9, "page_no": 1, "stored_path": "x.pdf", "sha256": "s"}]
-    out, err = asv._maybe_vl_rescue(1, 2, CRIT, fb, None,
-                                    {2: (pages, "synthetic")}, vl_fallback.Budget())
-    assert err is None
-    assert out.score == Decimal("2"), "VL 不得下修已核验分（只升不降）"
+
+    def _fb():
+        return CellOutcome("concern", "未核实", Decimal("2"), [], [], "fallback", 1,
+                           {"fallback": {"kind": "material_unverified",
+                                         "value": Decimal("2")}})
+
+    # 事实重算 1 < 基准 2 → 不下修、不换格
     monkeypatch.setattr(vl_fallback, "rescue", lambda *a, **k: vl_fallback.VlResult(
-        "scored", score=Decimal("5"),
-        observations=[{"document_id": 9, "page_no": 1, "observation": "材料"}],
-        reasoning="翻案：材料齐备"))
-    out2, _ = asv._maybe_vl_rescue(1, 2, CRIT, fb, None,
-                                   {2: (pages, "synthetic")}, vl_fallback.Budget())
-    assert out2.score == Decimal("5"), "VL 更高则取 VL（翻案计入）"
+        "facts", facts=[_fact_case("运维项目A", "1200000", 1)], reasoning="只见 1 例"))
+    out, err = asv._maybe_vl_rescue(1, 2, criterion, _fb(), None,
+                                    {2: (pages, "synthetic")}, vl_fallback.Budget(),
+                                    inventory_factory=lambda bid: _empty_inv())
+    assert err is None
+    assert out.score == Decimal("2"), "VL 事实重算不得下修基准分（只升不降）"
+    assert out.raw.get("visual_fallback_note", {}).get("visual_fallback") == "facts_no_improvement"
+    # 事实重算 3 > 基准 2 → 升级翻案
+    monkeypatch.setattr(vl_fallback, "rescue", lambda *a, **k: vl_fallback.VlResult(
+        "facts", facts=[_fact_case(f"运维项目{c}", a, i + 1)
+                        for i, (c, a) in enumerate(
+                            [("A", "1200000"), ("B", "1300000"), ("C", "1400000")])],
+        reasoning="翻案：3 例三件套齐"))
+    out2, _ = asv._maybe_vl_rescue(1, 2, criterion, _fb(), None,
+                                   {2: (pages, "synthetic")}, vl_fallback.Budget(),
+                                   inventory_factory=lambda bid: _empty_inv())
+    assert out2.basis == "visual_fallback"
+    assert out2.score == Decimal("3.00"), "VL 事实重算更高则翻案计入"

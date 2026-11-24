@@ -272,9 +272,10 @@ def test_hard_sanction_partial_credit_keeps_verified_cases():
 
 
 def test_hard_sanction_counts_case_with_full_three_piece_chain():
-    """三件套齐全（合同+验收+发票≥1）的案例照计。"""
+    """三件套齐全（合同+验收+发票≥1）+签订时间在窗内的案例照计（三闸全过）。"""
     record = ContractRecord(
-        name="某研究所维保", amount_yuan=_D("1200000"), pages=[1, 2, 3],
+        name="某研究所维保", amount_yuan=_D("1200000"), signed_date="2024-01-25",
+        pages=[1, 2, 3],
         materials={"contract": [1], "acceptance": [2], "invoice": [3]}, source="table")
     result = score_objective(_perf_rule(RULE10), _contract_inv([record]))
     assert result is not None

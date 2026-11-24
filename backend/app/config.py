@@ -925,6 +925,17 @@ def vl_fallback_enabled() -> bool:
     )
 
 
+def vl_facts_enabled() -> bool:
+    """VL facts 通道（2026-11-24「VL 报事实、代码算分」）安全阀。
+
+    关（置 0）：计分格 VL 通道降级失败（维持严口径分+疑问），一键止血；
+    开（默认）：VL 只报逐案例结构化事实，算分由确定性代码执行。
+    """
+    return os.environ.get("BID_EVAL_VL_FACTS", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
 def vl_fallback_max_per_cell() -> int:
     """每格 VL 调用次数上限（默认 2）。"""
     try:

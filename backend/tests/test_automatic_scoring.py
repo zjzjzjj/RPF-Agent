@@ -165,7 +165,8 @@ def test_failed_cell_preserves_success_and_resume_only_runs_unfinished(managed_r
         rows = list(s.execute(select(ScoreRecord).where(ScoreRecord.run_id == managed_run["id"])).scalars())
         assert len(rows) == 2
         failed = next(row for row in rows if row.machine_status == "execution_failed")
-        assert failed.final_score is None
+        assert failed.final_score is not None, "零未定分：故障格带兜底暂定分（非结论）"
+        assert (failed.ai_raw_json or {}).get("auto_review", {}).get("basis") == "fallback"
         successful_id = next(row.id for row in rows if row.review_status == "auto_confirmed")
 
     def recovered(criterion, pages, data_class, gateway_factory):
@@ -443,13 +444,20 @@ def test_create_run_never_drops_bidder_with_missing_price(managed_run):
         assert cfg["automation_manifest"]["bidders"][0]["bid_price"] is None
 
 
-def test_per_cell_failure_does_not_write_default_zero(managed_run):
+def test_per_cell_failure_writes_labeled_fallback_score(managed_run):
+    """零未定分（2026-11-24 用户拍板）：故障格带兜底暂定分——但
+    execution_failed/fallback 标记保留，兜底分绝不冒充评审结论（P0 教训
+    "技术故障不得伪装 0 分结论"的标签化传承）。"""
     scoring._persist_cell(managed_run["id"], managed_run["bidder"], managed_run["criteria"][1], None,
                           LLMError("timeout"))
     with session_scope() as s:
         row = s.execute(select(ScoreRecord)).scalar_one()
         assert row.machine_status == "execution_failed"
-        assert row.final_score is None and row.machine_score is None
+        assert row.final_score is not None
+        # subjective 格机器分走 ai_suggested_score（machine_score 恒 None）
+        assert row.ai_suggested_score is not None
+        assert row.ai_raw_json["auto_review"]["basis"] == "fallback"
+        assert row.warnings_json[0].get("execution_failed") is True
     assert automation.progress(managed_run["id"])["failed"] == 1
 
 
@@ -1140,8 +1148,9 @@ def test_delayed_job_retry_returns_completed_result_without_loading_or_reviewing
         assert len(list(s.execute(select(EvidenceCitation)).scalars())) == citations
 
 
-def test_closure_reading_gap_keeps_unscored(managed_run, monkeypatch):
-    """P0-3：读取故障的闭合定格是"未定分"——不写暂定 0 分冒充材料缺失/评审结论。"""
+def test_closure_reading_gap_writes_fallback_score(managed_run, monkeypatch):
+    """P0-3 + 零未定分（2026-11-24 用户拍板）：读取故障闭合定格写兜底暂定分
+    （计分项一律有结果），kind=reading_incomplete 保留待补读翻案语义。"""
     monkeypatch.setenv("BID_EVAL_SCORE_CLOSURE", "1")
     criterion = managed_run["criteria"][1]
     err = LLMError("关联材料仍有未完成 OCR 或原页视觉核验的不可读页面：doc1第7页；须补读")
@@ -1150,12 +1159,12 @@ def test_closure_reading_gap_keeps_unscored(managed_run, monkeypatch):
     scoring._persist_cell(managed_run["id"], managed_run["bidder"], criterion, None, err)
     with session_scope() as s:
         row = s.execute(select(ScoreRecord)).scalar_one()
-        assert row.final_score is None                       # 未定分，不是 0
+        assert row.final_score is not None, "零未定分：计分项必有兜底分"
         assert row.ai_raw_json["auto_review"]["basis"] == "fallback"
         fb = row.ai_raw_json["auto_review"]["fallback"]
         assert fb["kind"] == "reading_incomplete"
         assert fb["unreadable_pages"] == [{"document_id": 1, "page_no": 7}]
-        assert "读取故障未定分" in (row.ai_reasoning or "")
+        assert "读取故障按兜底暂定" in (row.ai_reasoning or "")
     state = automation.progress(managed_run["id"])
     assert state["completed"] == 1                           # 计完成（运行可收口）
     assert state["fallback"] == 1
@@ -1199,11 +1208,14 @@ def test_presence_cell_settles_without_gateway():
 
 
 def test_presence_unverified_is_fallback_not_zero():
+    """零未定分（2026-11-24）：unverified 带兜底暂定分——0 是暂定非评审结论
+    （basis=fallback+疑问标记），不再是"无分"也绝非硬 0 结论。"""
     pages = [{"document_id": 7, "page_no": 1, "text": "无关内容",
               "source": "text", "embedded_image_ratio": 0.0}]
     outcome = scoring._assess_cell(_presence_criterion(), pages, "synthetic", lambda: None)
     assert outcome.basis == "fallback"
-    assert outcome.score is None
+    assert outcome.score is not None, "零未定分：带兜底暂定分"
+    assert outcome.verdict == "concern", "暂定非评审结论"
     assert outcome.raw["fallback"]["kind"] == "presence_unverified"
     assert outcome.warnings[0]["fallback_score"]["kind"] == "presence_unverified"
 
@@ -1222,11 +1234,12 @@ def test_presence_guard_error_converts_to_fallback_outcome():
     outcome = scoring._assess_cell(
         criterion, pages, "synthetic", lambda: None, reviewer=_reviewer)
     assert outcome.basis == "fallback"
-    assert outcome.score is None
+    assert outcome.score is not None, "零未定分：presence_unverified 带兜底暂定分"
     assert outcome.raw["fallback"]["kind"] == "presence_unverified"
 
 
-def test_closure_presence_unverified_keeps_unscored(managed_run):
+def test_closure_presence_unverified_writes_fallback_score(managed_run):
+    """零未定分（2026-11-24）：presence_unverified 写兜底暂定分，不再未定分。"""
     from app.engine.presence import PresenceResult
 
     criterion = managed_run["criteria"][1]
@@ -1234,10 +1247,11 @@ def test_closure_presence_unverified_keeps_unscored(managed_run):
         PresenceResult("unverified", None, "材料页无法判定；需人工复核"),
         criterion, [],
     )
+    assert outcome.score is not None, "零未定分：presence_unverified 带兜底分"
     scoring._persist_cell(managed_run["id"], managed_run["bidder"], criterion, outcome)
     with session_scope() as s:
         row = s.execute(select(ScoreRecord)).scalar_one()
-        assert row.final_score is None
+        assert row.final_score is not None
         assert row.ai_raw_json["auto_review"]["basis"] == "fallback"
         assert row.ai_raw_json["auto_review"]["fallback"]["kind"] == "presence_unverified"
         assert row.warnings_json[0]["fallback_score"]["kind"] == "presence_unverified"

@@ -121,7 +121,7 @@
     <td>{{ item.name }}{% if item.is_veto %}<span class="bad tag">{{ "符合性判定" if run.automation else "否决项" }}</span>{% endif %}</td>
     <td>{{ item.category }}</td>
     <td>
-      {% if item.is_veto or (run.automation and item.is_verdict) %}
+      {% if item.is_verdict %}
         {{ (item.verdict if item.auto_completed else "自动评审未完成") if run.automation else item.machine_status or "—" }}
       {% else %}
         {{ item.final_score if item.final_score is not none else "未定分" }}
@@ -215,6 +215,7 @@
     <td>
       {{ q.review_status }}
       {% if q.final_score is not none %}<div class="muted">当前分 {{ q.final_score }}</div>
+      {% elif q.is_verdict %}<div class="muted">判定项（结论见评审明细）</div>
       {% else %}<div class="muted">未定分</div>{% endif %}
       {% if q.evidence_status != "verified" %}<div class="muted">证据：{{ q.evidence_status }}</div>{% endif %}
     </td>
@@ -232,9 +233,9 @@
 <h2>三（附）、兜底分清单（非评审结论）</h2>
 <div class="notice" style="background:#fff7e6;border-color:#ffd591">
   {% if run.automation %}
-  以下记录含故障兜底标记，不构成有效最终分。运行不能成功或发布最终排名，恢复后继续自动评审。
+  以下记录含故障兜底标记，已按零未定分政策计入总分但<b>非评审结论</b>；请人工复核改分，或恢复后重跑该格。
   {% else %}
-  以下格的分数是全自动模式的<b>最低档兜底 0 分</b>或「机器没抽到事实」的 0 分——
+  以下格的分数是全自动模式的<b>兜底暂定分</b>（最低档或 0 分）或「机器没抽到事实」的兜底分——
   已按零未定分政策计入总分，但<b>非评审结论</b>。请人工核看原件后改分，或重跑该格。
   {% endif %}
 </div>

@@ -39,11 +39,11 @@
     <td class="left">{{ r.bidder }}{% if run.automation %}{% if r.has_noncompliance %} <span class="veto">〔存在不符合结论〕</span>{% endif %}{% if r.has_external_boundary %} <span class="note">〔外部事实无法证实〕</span>{% endif %}{% if r.qualification_suggestion %} <span class="{% if r.qualification_suggestion.code == 'reject' %}veto{% else %}note{% endif %}">〔资格建议：{{ r.qualification_suggestion.label }}〕</span>{% endif %}{% elif r.veto_flag %} <span class="veto">〔有否决建议〕</span>{% endif %}</td>
     <td>{{ r.bid_price or "-" }}</td><td>{{ r.price_no_tax or "-" }}</td>
     {% for j in r.judge_totals %}<td>{{ j.total }}{% if j.missing %}*</td>{% else %}</td>{% endif %}{% endfor %}
-    <td><strong>{{ r.final or "-" }}</strong>{% if r.incomplete and r.provisional_total %} <span class="note">（不完整；含暂定 {{ r.provisional_total }}）</span>{% endif %}</td><td>{{ r.rank or "-" }}</td>
+    <td><strong>{{ r.final or "-" }}</strong>{% if r.incomplete %} <span class="note">（不完整，尚有未定分格）</span>{% endif %}</td><td>{{ r.rank or "-" }}</td>
   </tr>
   {% endfor %}
 </table>
-{% if summary_rows | selectattr("incomplete") | list %}<p class="note">注：以上「最终得分」仅合计已定分格；带「不完整」标注的投标人尚有未定分或故障兜底暂定分格（见兜底分清单），暂定分不是评审结论，不发布最终名次。</p>{% endif %}
+{% if summary_rows | selectattr("incomplete") | list %}<p class="note">注：带「不完整」标注的投标人尚有未定分格（零未定分政策下的异常态）；兜底暂定分格已计入总分（非评审结论，见兜底分清单），人工改分后可重新汇总。</p>{% endif %}
 {% if run.automation %}
 <p class="note">{{ method_note }} 各项实际分值、理由及证据列于附表；仅展示本次运行实际留存的评审明细。</p>
 {% else %}
@@ -73,7 +73,7 @@
 {% for r in ordered[:2] %}<li><strong>{{ r.bidder }}</strong>（最终得分 {{ r.final }}）</li>{% endfor %}
 </ol>
 <p>{% if run.automation %}以上为系统完成全部评审后的评分排序；资格与符合性风险另见审查表。{% else %}以上排序为 AI 辅助评审结果，须经评标委员会确认后生效。{% endif %}</p>
-{% elif summary_rows | selectattr("incomplete") | list %}<p>因存在未定分或故障兜底暂定分格（非评审结论，见兜底分清单），总分不构成完整评审结论，暂不推荐中标候选人；补评或人工改分后重新汇总排名。</p>
+{% elif summary_rows | selectattr("incomplete") | list %}<p>因存在未定分格（零未定分政策下的异常态，见兜底分清单），总分不完整，暂不推荐中标候选人；补评或人工改分后重新汇总排名。</p>
 {% else %}<p>暂无可排序的评分结果。</p>{% endif %}
 
 <h2>附表 A1 资格性审查表</h2>

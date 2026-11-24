@@ -37,6 +37,8 @@ class ContractRecord:
     # 三态材料链（2026-11-24）：True=材料在 / False=可读确认缺 / None=不可读
     # 或未绑上。None 不得判缺（run155 实证：绑定断链把"在"误判"缺"整列 0）。
     materials_state: dict[str, bool | None] = field(default_factory=dict)
+    # 图上/文本所见项目类型原词（"运维""系统集成"…，只转述不归类）——类型闸输入
+    project_type: str | None = None
     source: str = "text"
 
 

@@ -1079,6 +1079,89 @@ def _amount_tier_rate(tiers: list[dict], amount: Decimal) -> Decimal:
     return Decimal(0)
 
 
+# ---- 时间窗/类型三态闸（2026-11-24 抽共用：_score_contracts 与 score_count 共用）----
+
+_RE_OPS_TYPE = re.compile(r"运维|维护|技术服务|保障服务")
+_RE_NON_OPS_TYPE = re.compile(
+    r"设备维保|硬件维保|网络(?:系统)?建设|系统集成|"
+    r"软件开发|系统开发|开发(?:项目|工程)"
+)
+_RE_DATE_START = re.compile(
+    r"(?:自|从)?(20\d{2})年(\d{1,2})月(\d{1,2})日"
+    r"[^。；]{0,16}(?:起|以来|以后|之后|为准|至今|至|后)")
+_RE_DATE_END = re.compile(r"至(?:少)?(20\d{2})年(\d{1,2})月(\d{1,2})日")
+_RE_SIGN_DATE = re.compile(
+    r"(20\d{2})\s*[-./年]\s*(\d{1,2})\s*[-./月]\s*(\d{1,2})?")
+
+
+def date_window_from_rule(text: str) -> tuple[str | None, str | None]:
+    """从细则文本解析业绩时间窗（(start, end) ISO；解析不出→(None,None) 不启用）。
+
+    "自2022年1月1日（合同签订时间为准）至今" → ("2022-01-01", None)；
+    "2022年1月1日起签订" → 同上；"…至2024年12月31日" → 补终点。
+    只认细则明示日期（不对项目答案拟合）。
+    """
+    m = _RE_DATE_START.search(text or "")
+    if not m:
+        return None, None
+    start = f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+    m2 = _RE_DATE_END.search(text or "")
+    end = (f"{int(m2.group(1)):04d}-{int(m2.group(2)):02d}-{int(m2.group(3)):02d}"
+           if m2 else None)
+    return start, end
+
+
+def _norm_sign_date(value: str | None) -> str | None:
+    """签订日期归一到 ISO（YYYY-MM→当月 1 日）；解析不出→None。"""
+    if not value:
+        return None
+    m = _RE_SIGN_DATE.search(str(value))
+    if not m:
+        return None
+    year, month = int(m.group(1)), int(m.group(2))
+    day = int(m.group(3)) if m.group(3) else 1
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return None
+    return f"{year:04d}-{month:02d}-{day:02d}"
+
+
+def date_gate_state(signed_date: str | None,
+                    window: tuple[str | None, str | None]) -> bool | None:
+    """时间窗三态闸：True=窗口内；False=明确窗外（剔除留痕，非否决）；
+    None=日期缺失/解析失败/窗未启用→不判（疑问标注由调用方做）。"""
+    start, end = window
+    if not start and not end:
+        return None
+    ds = _norm_sign_date(signed_date)
+    if ds is None:
+        return None
+    if start and ds < start:
+        return False
+    if end and ds > end:
+        return False
+    return True
+
+
+def type_gate_state(type_text: str | None, rule_text: str) -> bool | None:
+    """"类似运维项目"类型三态闸（2026-10-29 三态语义抽共用）。
+
+    细则文本含"运维"类触发词才启用；True=运维词命中；False=明确非运维单一
+    形态（细则点名排除的设备维保/网络建设/系统集成/软件开发）；None=无法确认
+    → 保留+疑问（机器无法确认≠确认不符——run64"二维码综合管理平台项目"运维
+    案例被名称正则系统性误杀的教训，7.10 实证）。
+    """
+    if "运维" not in (rule_text or ""):
+        return None
+    text = type_text or ""
+    if not text.strip():
+        return None
+    if _RE_OPS_TYPE.search(text):
+        return True
+    if _RE_NON_OPS_TYPE.search(text):
+        return False
+    return None
+
+
 def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
     """count 类评分项。
 
@@ -1442,11 +1525,6 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                         + str(criterion.get("description") or "")
                     )
                     if "运维" in _factor_text:
-                        _RE_OPS_TYPE = re.compile(r"运维|维护|技术服务|保障服务")
-                        _RE_NON_OPS_TYPE = re.compile(
-                            r"设备维保|硬件维保|网络(?:系统)?建设|系统集成|"
-                            r"软件开发|系统开发|开发(?:项目|工程)"
-                        )
                         kept: list[dict] = []
                         _ntype = 0
                         _nsure = 0
@@ -1462,10 +1540,10 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                                 else:
                                     raise ValueError("已核验案例缺少明确的项目类型结论")
                                 continue
-                            _nm = str(_c.get("name") or "")
-                            if _RE_OPS_TYPE.search(_nm):
+                            st = type_gate_state(str(_c.get("name") or ""), _factor_text)
+                            if st is True:
                                 kept.append(_c)
-                            elif _RE_NON_OPS_TYPE.search(_nm):
+                            elif st is False:
                                 _ntype += 1  # 明确非运维单一形态 → 剔除
                             else:
                                 kept.append(_c)

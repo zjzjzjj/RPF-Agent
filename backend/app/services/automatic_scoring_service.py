@@ -81,9 +81,12 @@ def _presence_outcome(result, criterion: dict, pages: list[dict]) -> CellOutcome
         "zero_reason": "confirmed_absent" if getattr(result, "state", "") == "absent" else None,
     }
     if getattr(result, "state", "") == "unverified":
+        # 零未定分（2026-11-24 用户拍板：计分项一律有结果）：写兜底暂定分
+        # （非评审结论，疑问待人工，可改分重汇总）；判定项仍无分数语义（None）
+        value = _fallback_score_for(criterion)
         fallback = {
             "kind": "presence_unverified",
-            "value": None,
+            "value": str(value) if value is not None else None,
             "basis": "machine_fallback",
             "reason": detail,
             "windows": presence_raw["windows"],
@@ -93,9 +96,10 @@ def _presence_outcome(result, criterion: dict, pages: list[dict]) -> CellOutcome
         }
         raw["fallback"] = fallback
         return CellOutcome(
-            "concern", detail, None, [], pages, "fallback", 1, raw,
+            "concern", detail, value, [], pages, "fallback", 1, raw,
             [{
-                "message": detail + "（需人工抽核）",
+                "message": detail + f"（兜底暂定 {_fallback_score_for(criterion)} 分，"
+                                    "非评审结论，需人工抽核）",
                 "verdict_source": "deterministic",
                 "fallback_score": fallback,
             }],
@@ -130,12 +134,14 @@ def _value_extraction_unresolved_outcome(
     供 _valid_cell 计完成、报告按兜底清单渲染——"抽取失败"绝不冒充"不符合 0 分"
     结论；确认缺失（confirmed_absent+制裁句）的 0 分结论仍走 _verified_count 原通道。
     """
+    # 零未定分（2026-11-24）：写兜底暂定分（非评审结论），计分项一律有结果
+    value = _fallback_score_for(criterion)
     reason = (
-        f"承诺值抽取未果，暂定待人工核对（非不符合结论、非 0 分）：{detail}"
+        f"承诺值抽取未果，按兜底暂定 {value} 分（非不符合结论、非评审结论）：{detail}"
     )
     fallback = {
         "kind": "value_extraction_unresolved",
-        "value": None,
+        "value": str(value) if value is not None else None,
         "basis": "machine_fallback",
         "reason": str(detail or "").strip()[:500],
         "score_type": criterion.get("score_type"),
@@ -147,7 +153,7 @@ def _value_extraction_unresolved_outcome(
         "fallback": fallback,
     }
     return CellOutcome(
-        "concern", reason, None, [], pages, "fallback", 1, raw,
+        "concern", reason, value, [], pages, "fallback", 1, raw,
         [{
             "message": reason,
             "verdict_source": "deterministic",
@@ -1163,8 +1169,7 @@ def _fallback_score_for(criterion: dict) -> Decimal | None:
             if minimums:
                 return max(Decimal(0), min(minimums))
         return Decimal(0)
-    if score_type == "match" and maximum is not None:
-        return Decimal(0)
+    # 判定项（veto/match）：结论而非数值分——恒 None（零未定分只管计分项）
     return None
 
 
@@ -1172,15 +1177,18 @@ def _write_closure_fallback(s, row: ScoreRecord, criterion: dict, error: BaseExc
     score_type = criterion.get("score_type")
     reading_gap = bool(getattr(error, "reading_incomplete", False))
     if reading_gap:
-        # P0-3（测试10 run113）：读取故障既不是评审结论也不是材料缺失——
-        # 保持未定分（不写暂定 0），kind=reading_incomplete 供报告标注
-        # "读取故障待补读"；补读完成后可经续评重跑该格。
-        value = None
+        # P0-3（测试10 run113）：读取故障既不是评审结论也不是材料缺失。
+        # 零未定分（2026-11-24 用户拍板：计分项一律有结果）：写兜底暂定分，
+        # kind=reading_incomplete 供报告标注"读取故障待补读"；补读完成后可经
+        # 续评重跑该格翻案，人工可改分重汇总。判定项仍存疑结项（无分数语义）。
+        value = _fallback_score_for(criterion)
         kind = "reading_incomplete"
         detail = str(error).strip()[:500] or type(error).__name__
         reason = (
-            f"读取故障未定分（非评审结论、非材料缺失结论）：{detail}"
-            "；须补读上述原页图像并视觉核验后再评，不得按 0 分或缺失计入"
+            f"读取故障按兜底暂定 {value} 分（非评审结论、非材料缺失结论）：{detail}"
+            "；须补读上述原页图像并视觉核验后重评，人工可改分"
+            if value is not None else
+            f"读取故障存疑结项（判定项无分数语义）：{detail}"
         )
     else:
         value = _fallback_score_for(criterion)
@@ -1306,7 +1314,8 @@ def _vl_note(outcome: CellOutcome | None, note: dict,
 
 def _maybe_vl_rescue(run_id: int, bid_id: int, criterion: dict,
                      outcome: CellOutcome | None, error: BaseException | None,
-                     pages_by_bidder: dict, budget) -> tuple[CellOutcome | None, BaseException | None]:
+                     pages_by_bidder: dict, budget,
+                     inventory_factory=None) -> tuple[CellOutcome | None, BaseException | None]:
     """材料审核视觉大模型兜底（2026-11-23 优化②，run151 后改一页一图）。
 
     触发集=暂定族 fallback（provisional_zero/reading_incomplete/value_extraction_
@@ -1422,10 +1431,12 @@ def _maybe_vl_rescue(run_id: int, bid_id: int, criterion: dict,
                                   "clues": vres.clues,
                                   "reasoning": (vres.reasoning or "")[:500],
                                   "observations": len(vres.observations)}, error), error
-    # 页级视觉证据：观察页落到候选页（严格匹配，同文档页码最近兜底）
+    # 页级视觉证据：观察/事实证据页落到候选页（严格匹配，同文档页码最近兜底）
     merged = list(candidates.values())
+    obs_all = list(vres.observations) + [
+        e for f in (vres.facts or []) for e in (f.get("evidence") or [])]
     evidence: list[dict] = []
-    for ob in vres.observations:
+    for ob in obs_all:
         try:
             doc_key = ob.get("document_id")
             page_no = int(ob.get("page_no"))
@@ -1449,34 +1460,65 @@ def _maybe_vl_rescue(run_id: int, bid_id: int, criterion: dict,
         return _vl_note(outcome, {"visual_fallback": "clue_only",
                                   "clues": vres.clues,
                                   "reasoning": (vres.reasoning or "")[:500]}, error), error
-    if not evidence:
-        return _vl_note(outcome, {"visual_fallback": "failed",
-                                  "reason": "vl_observations_out_of_scope"}, error), error
-    vres_score = vres.score
     trigger_kind = (fallback_meta.get("kind") if outcome is not None
                     else type(error).__name__ if error is not None else None)
-    if trigger_kind == "material_unverified":
-        # 只升不降（2026-11-24）：VL 不得下修 verified 分（已核验案例的分），
-        # 翻案只允许加分——"误否决不可接受"的计分格镜像
+    if vres.kind != "facts":
+        return _vl_note(outcome, {"visual_fallback": "failed",
+                                  "reason": vres.reason or "vl_unknown_kind"}, error), error
+    # ---- VL 报事实、代码算分（2026-11-24 run159 实证）----
+    # facts → 派生 inventory 合并 → 确定性重算（三件套 AND/金额/时间/类型闸都在
+    # 代码里）；基准只升不降；"看了没改善"绝不洗成"已核验"。
+    inv = None
+    try:
+        if inventory_factory is not None:
+            inv = inventory_factory(bid_id)
+    except Exception:  # noqa: BLE001
+        inv = None
+    res = None
+    if inv is not None:
         try:
-            _base = Decimal(str(fallback_meta.get("value")))
-        except Exception:  # noqa: BLE001 —— 基准缺失时以 VL 为准
-            _base = None
-        if _base is not None and vres_score < _base:
-            vres_score = _base
-    log.info("VL 兜底定分：criterion=%s score=%s pages=%d",
-             criterion.get("name"), vres_score, len(page_images))
+            from app.engine.objective_fastpath import score_objective
+            from app.engine.vl_facts import merge_vl_facts
+
+            res = score_objective(criterion, merge_vl_facts(inv, vres.facts))
+        except Exception:  # noqa: BLE001 —— 算分失败=维持原暂定
+            log.exception("VL facts 确定性重算失败 criterion=%s", criterion.get("name"))
+            res = None
+    if res is None:
+        return _vl_note(outcome, {"visual_fallback": "facts_only",
+                                  "reason": "no_deterministic_rescore",
+                                  "facts": vres.facts,
+                                  "reasoning": (vres.reasoning or "")[:500]}, error), error
+    base = None
+    try:
+        if fallback_meta.get("value") is not None:
+            base = Decimal(str(fallback_meta.get("value")))
+    except Exception:  # noqa: BLE001
+        base = None
+    final = res.score
+    if base is not None and (final is None or final < base):
+        final = base  # 只升不降：翻案只允许加分/维持——"误否决不可接受"镜像
+    improved = final is not None and (
+        (base is None and final > 0) or (base is not None and final > base))
+    if not improved and res.zero_reason != "confirmed_absent":
+        return _vl_note(outcome, {"visual_fallback": "facts_no_improvement",
+                                  "facts": vres.facts,
+                                  "calculation": str(res.detail or "")[:500],
+                                  "reasoning": (vres.reasoning or "")[:500]}, error), error
+    log.info("VL 事实翻案定分：criterion=%s score=%s（基准 %s）facts=%d",
+             criterion.get("name"), final, base, len(vres.facts))
     new_outcome = CellOutcome(
-        "pass", vres.reasoning or "视觉AI核验定分（页级证据）",
-        vres_score, evidence, merged, "visual_fallback", 1,
+        "pass", f"{res.detail or '视觉AI事实+确定性算分'}（视觉AI报事实、代码算分）",
+        final, evidence, merged, "visual_fallback", 1,
         {"visual_fallback": {
-            "score": str(vres_score), "reasoning": vres.reasoning,
-            "clues": vres.clues,
-            "trigger": (fallback_meta.get("kind") if outcome is not None
-                        else type(error).__name__ if error is not None else None),
+            "score": str(final), "reasoning": vres.reasoning,
+            "facts": vres.facts,
+            "calculation": str(res.detail or "")[:800],
+            "zero_reason": res.zero_reason,
+            "clues": vres.clues, "trigger": trigger_kind,
         }},
         [{"verdict_source": "visual",
-          "message": "视觉AI核验定分（页级证据，非逐字引文）"}],
+          "message": "视觉AI报事实、代码算分（页级证据，非逐字引文）"}],
     )
     return new_outcome, None
 
@@ -1509,17 +1551,33 @@ def _persist_cell(run_id: int, bidder_id: int, criterion: dict, outcome: CellOut
             if config.score_closure_enabled():
                 _write_closure_fallback(s, row, criterion, error)
             else:
-                row.final_score = None
-                row.machine_score = None
+                # 零未定分（2026-11-24 用户拍板）：写兜底暂定分（计分项一律有
+                # 结果）；execution_failed 可恢复语义保留（state=failed、
+                # review_status=pending、failed_keys 识别），fallback 留痕
+                _fb_val = _fallback_score_for(criterion)
+                _fb_meta = {"kind": "execution_failed",
+                            "value": str(_fb_val) if _fb_val is not None else None,
+                            "basis": "machine_fallback",
+                            "reason": str(error)[:500],
+                            "score_type": criterion.get("score_type")}
+                row.final_score = _fb_val
+                row.machine_score = (_fb_val
+                                     if criterion.get("score_type") != "subjective" else None)
+                row.ai_suggested_score = (_fb_val
+                                          if criterion.get("score_type") == "subjective" else None)
                 row.machine_status = "execution_failed"
                 row.review_status = "pending"
                 row.evidence_status = "none"
                 row.ai_raw_json = {"attempt_history": getattr(error, "attempt_history", []),
                     "validation_history": list(getattr(error, "validation_history", [])), "auto_review": {
-                    "state": "failed", "error_code": getattr(error, "code", type(error).__name__),
+                    "state": "failed", "basis": "fallback",
+                    "error_code": getattr(error, "code", type(error).__name__),
                     "error": str(error)[:1500],
+                    "fallback": _fb_meta,
                 }}
-                row.warnings_json = [{"message": f"自动评审执行失败：{error}", "execution_failed": True}]
+                row.warnings_json = [{"message": f"自动评审执行失败，按兜底暂定 {_fb_val} 分"
+                                                 f"（非评审结论）：{error}",
+                                      "execution_failed": True, "fallback_score": _fb_meta}]
         else:
             page_map = {(p["document_id"], p["page_no"]): p for p in outcome.pages}
             visual_evidence = []
@@ -2064,7 +2122,7 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
                     for p in (rec.get("pages") or []) if p is not None})
                 fallback = {
                     "kind": "material_unverified",
-                    "value": result.score,
+                    "value": str(result.score) if result.score is not None else None,
                     "basis": "machine_fallback",
                     "reason": "；".join(
                         str(w.get("message") or "") for w in (result.warnings or []))
@@ -2367,13 +2425,15 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
             raise
         except Exception as exc:  # noqa: BLE001
             rescued, err = _maybe_vl_rescue(
-                run_id, bid_id, criterion, None, exc, pages_by_bidder, vl_budget)
+                run_id, bid_id, criterion, None, exc, pages_by_bidder, vl_budget,
+                inventory_factory=get_inventory)
             if rescued is not None:
                 return rescued
             raise err
         if outcome is not None:
             outcome, _ = _maybe_vl_rescue(
-                run_id, bid_id, criterion, outcome, None, pages_by_bidder, vl_budget)
+                run_id, bid_id, criterion, outcome, None, pages_by_bidder, vl_budget,
+                inventory_factory=get_inventory)
         return outcome
     workers = min(config.llm_concurrency_ceiling(), len(cells) or 1, max(1, config.llm_max_concurrency()))
     cancelled = False

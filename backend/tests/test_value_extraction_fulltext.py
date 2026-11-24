@@ -181,12 +181,12 @@ def test_extraction_failure_settles_as_provisional_not_noncompliance():
     outcome = scoring._value_extraction_unresolved_outcome(criterion, pages, detail)
     assert outcome.basis == "fallback"
     assert outcome.verdict == "concern"  # 不是 "fail"（不符合）
-    assert outcome.score is None          # 不进 final_score 定格
+    assert outcome.score is not None, "零未定分（2026-11-24）：带兜底暂定分"
     assert outcome.raw["fallback"]["kind"] == "value_extraction_unresolved"
     assert outcome.warnings[0]["fallback_score"]["kind"] == "value_extraction_unresolved"
     assert "暂定待人工" in outcome.reasoning
 
-    # _persist_cell 同构落库形态 → _valid_cell 认它（已定格未定分，计完成）
+    # _persist_cell 同构落库形态 → _valid_cell 认它（已定格兜底暂定分，计完成）
     row = SimpleNamespace(
         ai_raw_json={**outcome.raw, "auto_review": {
             "state": "completed", "attempts": 1, "basis": outcome.basis,
@@ -201,7 +201,7 @@ def test_extraction_failure_settles_as_provisional_not_noncompliance():
         warnings_json=outcome.warnings,
     )
     assert automation._valid_cell(row, criterion, []) is True
-    assert row.final_score is None
+    assert row.final_score is not None
 
 
 # ---- d) 反向锁：确认缺失 + 制裁句仍按 0 分结论 -----------------------------

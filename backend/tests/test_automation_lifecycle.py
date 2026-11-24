@@ -615,8 +615,9 @@ def _fallback_meta(kind="provisional_zero", value="0"):
     }
 
 
-def test_fallback_cell_excluded_from_total_and_rank(managed):
-    """故障兜底暂定分不是评审结论：不进总分、不发名次，双分值留审计。"""
+def test_fallback_cell_in_total_and_ranked(managed):
+    """零未定分口径（2026-11-24 用户拍板，覆盖 P0-1 旧口径）：兜底暂定分
+    计入总分、直接排名——fallback 清单+warnings 疑问标记保底，人工可改分重汇总。"""
     from app.services.ranking_service import compute_ranking
 
     _cell(managed, managed["veto_id"])
@@ -626,22 +627,17 @@ def test_fallback_cell_excluded_from_total_and_rank(managed):
     auto.finish_run(managed["run_id"])
     out = compute_ranking("auto-test", managed["run_id"])
     row = out["rows"][0]
-    # 已定分合计不含暂定 0 分格的分值（该格 max 10、暂定 0 → 两口径同为 0，
-    # 但 fallback 计数与名次抑制必须生效）
     assert row["total"] == "0.00"
     assert row["provisional_total"] == "0.00"
     assert row["fallback"] == ["商务分"]
-    assert row["rank"] is None
-    # 包B：兜底分支抑制正式名次，但参考名次（原排序位次）照发
-    assert row["reference_rank"] == 1
+    assert row["rank"] == 1, "暂定分计入总分、直接排名（不再抑制名次）"
     assert out["has_fallback"] is True
     assert any("暂定分" in w for w in out["warnings"])
-    assert any("不发布最终排名" in w for w in out["warnings"])
-    assert any("参考名次" in w and "不构成评审结论" in w for w in out["warnings"])
+    assert any("人工复核" in w for w in out["warnings"])
 
 
-def test_fallback_provisional_value_shown_in_dual_total(managed):
-    """暂定值非 0 时双分值可分辨：total=已定分、provisional_total=含暂定。"""
+def test_fallback_value_in_total_with_provisional_sum(managed):
+    """兜底暂定分计入总分；provisional_total=总分、provisional=其中暂定合计。"""
     from app.services.ranking_service import compute_ranking
 
     _cell(managed, managed["veto_id"])
@@ -651,13 +647,13 @@ def test_fallback_provisional_value_shown_in_dual_total(managed):
               "kind": "min_level_floor", "value": "4"}}])
     auto.finish_run(managed["run_id"])
     row = compute_ranking("auto-test", managed["run_id"])["rows"][0]
-    assert row["total"] == "0.00"
+    assert row["total"] == "4.00", "暂定分计入总分"
     assert row["provisional_total"] == "4.00"
-    assert row["rank"] is None
+    assert row["rank"] == 1
 
 
-def test_fallback_blocks_candidate_recommendation(managed):
-    """含暂定格的正式报告不出中标候选人推荐，汇总表标注不完整。"""
+def test_fallback_run_still_recommends(managed):
+    """零未定分口径：含暂定格照常出名次与中标候选人推荐（疑问清单保底）。"""
     from io import BytesIO
 
     from docx import Document as DocxDocument
@@ -670,17 +666,14 @@ def test_fallback_blocks_candidate_recommendation(managed):
               "kind": "provisional_zero", "value": "0"}}])
     auto.finish_run(managed["run_id"])
     report = build_formal_report("auto-test", managed["run_id"])
-    assert report["summary_rows"][0]["incomplete"] is True
-    assert report["summary_rows"][0]["rank"] is None
-    assert report["summary_rows"][0]["provisional_total"] == "7.00"
+    assert report["summary_rows"][0]["incomplete"] is False, "零未定分后无未定分格"
+    assert report["summary_rows"][0]["rank"] == 1
     html = render_formal_html(report)
-    assert "暂不推荐中标候选人" in html
-    assert "不完整" in html
-    assert "中标候选人：" not in html
+    assert "暂不推荐中标候选人" not in html
+    assert "推荐中标候选人为" in html
     doc = DocxDocument(BytesIO(render_docx(report)))
     text = "\n".join(p.text for p in doc.paragraphs)
-    assert "暂不推荐中标候选人" in text
-    assert "第1中标候选人" not in text
+    assert "第1中标候选人" in text
 
 
 def test_settled_run_without_fallback_still_ranks_and_recommends(managed):
@@ -718,33 +711,33 @@ def _reading_gap_meta(pages=None):
     }
 
 
-def test_reading_gap_cell_is_settled_but_unscored(managed):
-    """读取故障格：计完成（运行可收口），但未定分——不进总分、不发名次。"""
+def test_reading_gap_cell_settled_with_fallback_score(managed):
+    """读取故障格：计完成 + 兜底暂定分计入总分、直接排名（零未定分口径，
+    2026-11-24 用户拍板）——非评审结论，疑问清单保底，人工可改分重汇总。"""
     from app.services.ranking_service import compute_ranking
 
     _cell(managed, managed["veto_id"])
-    _cell(managed, managed["score_id"], score=None, meta=_reading_gap_meta(),
+    _cell(managed, managed["score_id"], score=Decimal("0"), meta=_reading_gap_meta(),
           warnings=[{"message": "读取故障", "fallback_score": {
-              "kind": "reading_incomplete", "value": None}}])
+              "kind": "reading_incomplete", "value": "0"}}])
     with session_scope() as s:
         s.get(EvaluationRun, managed["run_id"]).status = "succeeded"
     out = compute_ranking("auto-test", managed["run_id"])
     row = out["rows"][0]
     assert row["total"] == "0.00"
     assert row["fallback"] == ["商务分"]
-    assert row["missing_final"] == []          # 不重复挂未定分清单
-    assert row["rank"] is None                  # 总分不完整不发名次
-    assert row["reference_rank"] == 1           # 包B：参考名次照发（仅供定位）
+    assert row["missing_final"] == []
+    assert row["rank"] == 1, "暂定分计入总分、直接排名（不再抑制名次）"
     assert out["has_fallback"] is True
-    # 只加锁：不可读格（reading_incomplete）是"未定分"，永不写成暂定 0——
-    # ① 评分格本身 final_score 为 None；② 报告明细格不出现 0 分。
+    # 零未定分加锁：reading_incomplete 格必有兜底分（暂定语义由 basis=fallback
+    # 与疑问清单表达，不再是"无分"）。
     with session_scope() as s:
         gap = s.execute(
             select(ScoreRecord).where(ScoreRecord.run_id == managed["run_id"],
                                       ScoreRecord.criterion_id == managed["score_id"])
         ).scalar_one()
-        assert gap.final_score is None
-    assert [b for b in row["breakdown"] if b["code"] == "S1"][0]["final_score"] is None
+        assert gap.final_score is not None
+    assert [b for b in row["breakdown"] if b["code"] == "S1"][0]["final_score"] is not None
 
 
 def test_reading_gap_run_can_resume_and_reruns_only_gap_cells(managed):
@@ -780,7 +773,7 @@ def test_succeeded_run_without_reading_gap_still_rejects_resume(managed):
 
 
 def test_reading_gap_report_labels_gap_not_zero(managed):
-    """报告把读取故障格标为"待补读，未定分"，不写成 0 分结论。"""
+    """报告把读取故障格标为"待补读，按兜底暂定分计入总分"——非 0 分结论。"""
     from io import BytesIO
 
     from docx import Document as DocxDocument
@@ -788,22 +781,24 @@ def test_reading_gap_report_labels_gap_not_zero(managed):
     from app.services.report_service import build_formal_report, render_docx
 
     _cell(managed, managed["veto_id"])
-    _cell(managed, managed["score_id"], score=None, meta=_reading_gap_meta(),
+    _cell(managed, managed["score_id"], score=Decimal("0"), meta=_reading_gap_meta(),
           warnings=[{"message": "读取故障", "fallback_score": {
-              "kind": "reading_incomplete", "value": None}}])
+              "kind": "reading_incomplete", "value": "0"}}])
     auto.finish_run(managed["run_id"])
     report = build_formal_report("auto-test", managed["run_id"])
-    assert report["summary_rows"][0]["incomplete"] is True
+    assert report["summary_rows"][0]["incomplete"] is False
     doc = DocxDocument(BytesIO(render_docx(report)))
     text = "\n".join(p.text for p in doc.paragraphs)
-    assert "读取故障待补读，未定分" in text
+    assert "读取故障待补读" in text
+    assert "按兜底暂定" in text and "计入总分" in text
     assert "当前 None 分" not in text
 
 
 # ==== 包B：参考名次（正式名次抑制时的原排序位次，仅供人工定位） ====
 
-def test_reference_rank_shown_in_report_when_rank_suppressed(managed):
-    """正式名次不发布时，报告透传并展示「参考第N名」，且声明非评审结论。"""
+def test_fallback_no_longer_suppresses_rank(managed):
+    """零未定分口径（2026-11-24）：含暂定格不再抑制名次——正式名次照发，
+    无「参考名次」告警（参考名次机制保留给自动评审未完成态）。"""
     from io import BytesIO
 
     from docx import Document as DocxDocument
@@ -817,18 +812,12 @@ def test_reference_rank_shown_in_report_when_rank_suppressed(managed):
               "kind": "provisional_zero", "value": "0"}}])
     auto.finish_run(managed["run_id"])
     out = compute_ranking("auto-test", managed["run_id"])
-    assert out["rows"][0]["rank"] is None           # 发布语义零改动
-    assert out["rows"][0]["reference_rank"] == 1    # 参考名次=原排序位次
-    assert any("参考名次" in w for w in out["warnings"])
+    assert out["rows"][0]["rank"] == 1
+    assert out["rows"][0]["reference_rank"] == 1
+    assert not any("参考名次" in w for w in out["warnings"])
 
     report = build_formal_report("auto-test", managed["run_id"])
-    assert report["summary_rows"][0]["rank"] is None
-    assert report["summary_rows"][0]["reference_rank"] == 1
+    assert report["summary_rows"][0]["rank"] == 1
     doc = DocxDocument(BytesIO(render_docx(report)))
-    cells = [c.text for t in doc.tables for r in t.rows for c in r.cells]
-    assert any("参考第1名" in c for c in cells)
     paras = "\n".join(p.text for p in doc.paragraphs)
-    assert "仅供人工定位" in paras and "不构成评审结论" in paras
-    # 参考名次不参与中标候选人推荐（发布语义零改动）
-    assert "第1中标候选人" not in paras
-    assert "暂不推荐中标候选人" in paras
+    assert "第1中标候选人" in paras
