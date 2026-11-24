@@ -239,3 +239,62 @@ def test_check_math_unit_price_kind_skips_total_compare():
     result = run_check("math_relation", c["params"], facts, criterion=c)
     assert result.status == "pass"
     assert "单价型限价" in result.message
+
+
+# ---------------------------------------------------------------------------
+# 税口径抽取可信度（海晟实证回归）
+# ---------------------------------------------------------------------------
+def test_tax_basis_follows_actual_price_label_position():
+    """口径必须跟随实际取数的 label 位置（海晟实证回归）。
+
+    海晟开标一览表"投标总价（含税）(元)"取数，但全文别处（主 PDF）另有
+    "投标总价"邻近"不含税"字样——旧逻辑按全文第一个 label 判口径，
+    含税 1,796,700 被标成不含税 → ×1.06=1,904,502 → 误判超限（误否决）。
+    """
+    from app.engine.facts import extract_bid_facts
+
+    text = "\n".join([
+        "开标一览表",
+        "投标总价（含税）(元) 税率 项目负责人 投标保证金 备注",
+        "大写:壹佰柒拾玖万陆仟柒佰元 6% 高文强 10000元 无",
+        "整",
+        "小写：1796700",
+        # 主 PDF 片段：另一个"投标总价"邻近"不含税"（污染源）
+        "投标总价（不含增值税）与开标一览表一致",
+    ])
+    facts = extract_bid_facts(text)
+    assert facts.bid_price == D("1796700")
+    assert facts.bid_price_includes_tax is True  # 跟随（含税）label，不被后文污染
+
+
+def test_tax_zone_ambiguous_marks_blind():
+    """含税/不含税并存且无括号/勾选声明 → 盲态 None（不猜，停比安全）。"""
+    from app.engine.facts import _tax_zone
+
+    incl, _rate = _tax_zone("本表列示含税与不含税两种口径 100 50", 40, 60)
+    assert incl is None
+
+
+def test_misbasis_no_longer_creates_false_exceeded():
+    """海晟场景端到端：含税报价 + 含税限价 → 直接比不换算，不再误判超限。"""
+    from app.engine.facts import extract_bid_facts
+    from app.engine.objective import run_check
+
+    text = "\n".join([
+        "开标一览表",
+        "投标总价（含税）(元) 税率 项目负责人",
+        "小写：1796700",
+    ])
+    facts = extract_bid_facts(text)
+    assert facts.bid_price == D("1796700") and facts.bid_price_includes_tax is True
+    c = {
+        "code": "c13",
+        "name": "投标报价不得超过最高限价",
+        "check_type": "math_relation",
+        "params": {},
+        "source_quote": "最高限价为：187.2 万元（人民币，□不含税 ☑含税，税率 6 %）超过最高限价的投标文件将被否决。",
+    }
+    result = run_check("math_relation", {}, facts, criterion=c)
+    assert result.status == "pass"
+    assert "1,904" not in result.message  # 不再有 ×1.06 错误换算
+    assert "1,872,000" in result.message

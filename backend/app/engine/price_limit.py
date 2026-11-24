@@ -149,22 +149,20 @@ def _yuan_str(v: Decimal) -> str:
 
 def _fill_tax_basis(text: str, out: dict) -> None:
     """从原文提取含税口径与税率（勾选框形态优先）。"""
-    if re.search(r"[☑✓√]\s*不含税", text):
+    if re.search(r"[☑✓√]\s*不含(?:增值)?税", text):
         out["price_includes_tax"] = False
-    elif re.search(r"[☑✓√]\s*含税", text):
+    elif re.search(r"[☑✓√]\s*含(?:增值)?税", text):
         out["price_includes_tax"] = True
     else:
-        pos_excl = text.find("不含税")
-        pos_incl = text.find("含税")
-        # "含税"是"不含税"的子串：跳过落在"不含税"内部的命中
-        while pos_incl != -1 and pos_excl != -1 and pos_incl == pos_excl + 1:
-            pos_incl = text.find("含税", pos_incl + 2)
-        if pos_excl == -1 and pos_incl != -1:
+        m_excl = re.search(r"不含(?:增值)?税", text)
+        # (?<!不) 排除"不含税/不含增值税"内部的"含税"命中
+        m_incl = re.search(r"(?<!不)含(?:增值)?税", text)
+        if m_excl is None and m_incl is not None:
             out["price_includes_tax"] = True
-        elif pos_excl != -1 and pos_incl == -1:
+        elif m_excl is not None and m_incl is None:
             out["price_includes_tax"] = False
-        elif pos_excl != -1 and pos_incl != -1:
-            out["price_includes_tax"] = pos_incl < pos_excl
+        elif m_excl is not None and m_incl is not None:
+            out["price_includes_tax"] = m_incl.start() < m_excl.start()
     rm = _RE_RATE.search(text) or _RE_RATE_AFTER_TAX.search(text)
     if rm:
         try:

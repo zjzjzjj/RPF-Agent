@@ -313,6 +313,42 @@ _RE_TOTAL_LABEL_WAN = re.compile(r"投标总价\s*[：:]?\s*[（(]\s*万\s*元\s
 _RE_WAN_NUM_AFTER = re.compile(r"[）)]\s*[|｜]?\s*([\d,，]+(?:\.\d+)?)")
 
 
+def _price_near_total_label_ex(text: str) -> tuple[Decimal | None, bool | None, Decimal | None]:
+    """_price_near_total_label 的带口径版：返回 (报价, 含税口径, 税率)。
+
+    口径必须跟随**实际取数的 label 位置**（R46-A 修正：取全文第一个
+    "投标总价"的 zone 会与实际取数错位——海晟实证被主 PDF 里的另一个
+    label 的"不含税"污染，含税 179.67 万被 ×1.06 换算成 190.45 万误判超限）。
+    """
+    for m in _RE_TOTAL_LABEL.finditer(text):
+        zone_wan = bool(_RE_TOTAL_LABEL_WAN.match(text, m.start()))
+        tail = text[m.end() : m.end() + _PRICE_LABEL_WINDOW]
+        basis = _tax_zone(text, m.start(), _PRICE_LABEL_WINDOW + 20)
+        if lm := _RE_PRICE_LOWER_LABEL.search(tail):
+            v = _money(lm.group(1))
+            if v is not None:
+                if ((lm.lastindex or 0) >= 2 and lm.group(2)) or zone_wan:
+                    v *= Decimal(10_000)
+                return v, basis[0], basis[1]
+        if zone_wan:
+            # "投标总价（万元）120" —— 单位在标签、数字裸露紧随
+            if wm := _RE_WAN_NUM_AFTER.search(tail[:40]):
+                v = _money(wm.group(1))
+                if v is not None:
+                    return v * Decimal(10_000), basis[0], basis[1]
+        for line in tail.split("\n")[:3]:
+            if lm := _RE_PRICE_LOWER_LABEL.search(line):
+                v = _money(lm.group(1))
+                if v is not None:
+                    if ((lm.lastindex or 0) >= 2 and lm.group(2)) or zone_wan:
+                        v *= Decimal(10_000)
+                    return v, basis[0], basis[1]
+            if um := _RUN_UPPER.search(line):
+                if value := parse_upper_amount(um.group(0)):
+                    return value, basis[0], basis[1]
+    return None, None, None
+
+
 def _price_near_total_label(text: str) -> Decimal | None:
     """在"投标总价"标签之后的窗口里找金额（先小写、再大写）。
 
@@ -328,32 +364,7 @@ def _price_near_total_label(text: str) -> Decimal | None:
     "投标保证金"是表头列名，出现在报价之前，按邻近字样排除会把真报价误杀、
     反而取到后面那列的保证金金额。
     """
-    for m in _RE_TOTAL_LABEL.finditer(text):
-        zone_wan = bool(_RE_TOTAL_LABEL_WAN.match(text, m.start()))
-        tail = text[m.end() : m.end() + _PRICE_LABEL_WINDOW]
-        if lm := _RE_PRICE_LOWER_LABEL.search(tail):
-            v = _money(lm.group(1))
-            if v is not None:
-                if ((lm.lastindex or 0) >= 2 and lm.group(2)) or zone_wan:
-                    v *= Decimal(10_000)
-                return v
-        if zone_wan:
-            # "投标总价（万元）120" —— 单位在标签、数字裸露紧随
-            if wm := _RE_WAN_NUM_AFTER.search(tail[:40]):
-                v = _money(wm.group(1))
-                if v is not None:
-                    return v * Decimal(10_000)
-        for line in tail.split("\n")[:3]:
-            if lm := _RE_PRICE_LOWER_LABEL.search(line):
-                v = _money(lm.group(1))
-                if v is not None:
-                    if ((lm.lastindex or 0) >= 2 and lm.group(2)) or zone_wan:
-                        v *= Decimal(10_000)
-                    return v
-            if um := _RUN_UPPER.search(line):
-                if value := parse_upper_amount(um.group(0)):
-                    return value
-    return None
+    return _price_near_total_label_ex(text)[0]
 
 
 def _extract_items_total(text: str) -> Decimal | None:
@@ -427,18 +438,44 @@ class BidFacts:
     person_attributes: list[dict] = field(default_factory=list)
 
 
+# 口径 label 强声明（_tax_zone 用 match 锚定取数 label，勿改 search）
+_RE_TAX_LABEL_EXCL = re.compile(r"投标总价\s*[（(][^）)\n]{0,12}不含(?:增值)?税")
+_RE_TAX_LABEL_INCL = re.compile(r"投标总价\s*[（(][^）)\n]{0,12}含(?:增值)?税")
+
+
 def _tax_zone(text: str, pos: int, span: int = 60) -> tuple[bool | None, Decimal | None]:
-    """pos 邻域的含税口径与税率（勾选框形态优先；None=盲态）。"""
+    """pos 邻域的含税口径与税率（None=盲态，宁可停比不误标）。
+
+    R46-A 修正（海晟实证）：
+    ① label 括号强声明"投标总价（含税）/（不含税）"优先——它是表格列头的
+      直接口径，比邻近字样可信（"含税"是"不含税"的子串，先查不含税）；
+    ② 勾选框 ☑ 含税/☑ 不含税 次之；
+    ③ 独占词信号才判；含税与不含税**并存**（双列表头/正文提及）→ None 不猜
+      ——错标口径会被 align_tax_basis 换算放大（×1.06 误判超限=误否决）。
+    """
     zone = text[max(0, pos - 10) : pos + span]
-    incl: bool | None = None
-    if re.search(r"[☑✓√]\s*不含税", zone):
+    incl: bool | None
+    # ① label 括号强声明：锚定 pos 处的 label 本身（match，不扫邻域——
+    #   zone 内可能还有其它"投标总价（不含税）"，search 会错位命中）
+    if _RE_TAX_LABEL_EXCL.match(text, pos):
         incl = False
-    elif re.search(r"[☑✓√]\s*含税", zone):
+    elif _RE_TAX_LABEL_INCL.match(text, pos):
         incl = True
-    elif "不含增值税" in zone or "不含税" in zone:
+    elif re.search(r"[☑✓√]\s*不含(?:增值)?税", zone):
         incl = False
-    elif "含增值税" in zone or "含税" in zone:
+    elif re.search(r"[☑✓√]\s*含(?:增值)?税", zone):
         incl = True
+    else:
+        has_excl = bool(re.search(r"不含(?:增值)?税", zone))
+        has_incl = bool(re.search(r"(?<!不)含(?:增值)?税", zone))
+        if has_excl and has_incl:
+            incl = None  # 并存不猜
+        elif has_excl:
+            incl = False
+        elif has_incl:
+            incl = True
+        else:
+            incl = None
     rate: Decimal | None = None
     if rm := re.search(r"税率?\s*[：:]?\s*(\d{1,2}(?:\.\d+)?)\s*%", zone):
         try:
@@ -465,18 +502,15 @@ def extract_bid_facts(text: str, documents: list[str] | None = None) -> BidFacts
             price *= Decimal(10_000)  # "投标总价：179.67万元" → 元（单位显式捕获）
         if price is not None:
             price_incl, price_rate = _tax_zone(text, m.start(), 60)
-    if price is None and (near := _price_near_total_label(text)) is not None:
-        price = near
-        if lm := _RE_TOTAL_LABEL.search(text):
-            price_incl, price_rate = _tax_zone(text, lm.start(), _PRICE_LABEL_WINDOW + 20)
+    if price is None and (near := _price_near_total_label_ex(text))[0] is not None:
+        price, price_incl, price_rate = near  # 口径跟随实际取数 label（R46-A）
     if price is None and (m := _RE_PRICE_INCL_VAT.search(text)):
         price = _money(m.group(1))
         price_incl, price_rate = True, None  # "投标价（含增值税…）"明确含税
     if price is None and (ob := _price_from_open_bid_section(text)) is not None:
-        # ⑤ 结构锚点兜底（强于④的全局弱启发）：开标一览表跨行断裂表单
+        # ⑤ 结构锚点兜底（强于④的全局弱启发）：开标一览表跨行断裂表单。
+        # 口径盲态（None）：窗口取数位置不外传，近似 zone 不如不猜（停比安全）
         price = ob
-        if am := _RE_OPEN_BID_HEADING.search(text):
-            price_incl, price_rate = _tax_zone(text, am.start(), 400)
     if price is None:
         price = _contextual_price(text)
         # 弱语境回退：口径盲态（None），交决策表按"单边不对称→停比"处理
