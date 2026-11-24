@@ -382,3 +382,68 @@ def test_maybe_vl_rescue_material_pages_first(tmp_path, monkeypatch) -> None:  #
     assert order[:2] == [4, 5], f"该格锚词命中页应最前：{order}"
     assert order[2:4] == [2, 3], f"零命中时有标签先于无标签：{order}"
     assert order[4:] == [1, 6], f"噪声页垫底且保页序：{order}"
+
+
+# ---- 2026-11-24 契约加固 + 严口径翻案（run158 放水修正）-----------------------
+
+def test_extract_json_lenient_fenced_and_trailing_comma() -> None:
+    """JSON 容错：围栏/尾逗号/前后杂文不再整格白放弃（run155 c45 JSONDecodeError）。"""
+    data = vl_fallback._extract_json(
+        '结论如下：\n```json\n{"verdict":"pass","score":2,}\n```\n以上。')
+    assert data["verdict"] == "pass"
+    assert data["score"] == 2
+
+
+def test_rescue_contract_invalid_retries_once_then_gives_up() -> None:
+    """契约解析失败重试一次完整调用（同预算名额内，不额外扣预算）；仍败才放弃。"""
+    gw = FakeGateway('完全不是 JSON')
+    res = vl_fallback.rescue(CRIT, PAGE_IMAGES, gateway=gw)
+    assert res.kind == "failed" and res.reason.startswith("vl_contract_invalid")
+    assert len(gw.calls) == 2, "契约失败只重试一次"
+
+
+def test_rescue_contract_retry_recovers() -> None:
+    """首次输出坏 JSON、重试输出好 JSON → 定分成功（run155 c45 型恢复）。"""
+
+    class SeqGateway:
+        def __init__(self, contents):  # noqa: ANN001, ANN202
+            self._contents = list(contents)
+            self.calls: list[dict] = []
+
+        def chat(self, system, user, *, images=None, data_class="synthetic", **kw):  # noqa: ANN001, ANN202
+            self.calls.append({})
+            return FakeResult(self._contents.pop(0))
+
+    good = ('{"verdict":"pass","score":"3","observations":[{"document_id":1,'
+            '"page_no":1,"observation":"发票一份"}],"reasoning":"三件套齐"}')
+    gw = SeqGateway(['坏掉的输出{', good])
+    res = vl_fallback.rescue(CRIT, PAGE_IMAGES, gateway=gw)
+    assert res.kind == "scored" and res.score == Decimal("3")
+    assert len(gw.calls) == 2
+
+
+def test_maybe_vl_rescue_material_unverified_never_downgrades(tmp_path, monkeypatch) -> None:  # noqa: ANN001
+    """严口径翻案只升不降：VL 分低于 verified 分时取高（"误否决不可接受"镜像）。"""
+    from app.services import automatic_scoring_service as asv
+    from app.services.automatic_scoring_service import CellOutcome
+
+    _png_env(tmp_path, monkeypatch)
+    monkeypatch.setattr(vl_fallback, "rescue", lambda *a, **k: vl_fallback.VlResult(
+        "scored", score=Decimal("1"),
+        observations=[{"document_id": 9, "page_no": 1, "observation": "材料"}],
+        reasoning="只见到 1 个案例"))
+    fb = CellOutcome("concern", "未核实", Decimal("2"), [], [], "fallback", 1,
+                     {"fallback": {"kind": "material_unverified",
+                                   "value": Decimal("2")}})
+    pages = [{"document_id": 9, "page_no": 1, "stored_path": "x.pdf", "sha256": "s"}]
+    out, err = asv._maybe_vl_rescue(1, 2, CRIT, fb, None,
+                                    {2: (pages, "synthetic")}, vl_fallback.Budget())
+    assert err is None
+    assert out.score == Decimal("2"), "VL 不得下修已核验分（只升不降）"
+    monkeypatch.setattr(vl_fallback, "rescue", lambda *a, **k: vl_fallback.VlResult(
+        "scored", score=Decimal("5"),
+        observations=[{"document_id": 9, "page_no": 1, "observation": "材料"}],
+        reasoning="翻案：材料齐备"))
+    out2, _ = asv._maybe_vl_rescue(1, 2, CRIT, fb, None,
+                                   {2: (pages, "synthetic")}, vl_fallback.Budget())
+    assert out2.score == Decimal("5"), "VL 更高则取 VL（翻案计入）"

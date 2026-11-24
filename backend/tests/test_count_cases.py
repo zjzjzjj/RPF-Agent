@@ -143,14 +143,18 @@ def test_score_count_legit_case_missing_material_scores_zero(monkeypatch) -> Non
 
 
 def test_score_count_unverified_none_counted_and_marked(monkeypatch) -> None:  # noqa: ANN001
-    """窄版（默认开）：材料 None（不可读/未绑上）→ 计入 + unverified 标注 + conflict。
+    """窄版（legacy 回滚通道 BID_EVAL_CASE_UNVERIFIED_COUNT=1）：材料 None
+    （不可读/未绑上）→ 计入 + unverified 标注 + conflict。
 
     2026-10-30 用友 c54/c55 实证：材料在、机器核不上却判 0，人工给 4。窄版把
     管线故障（OCR 没读出/没绑上/页没送审）与"确认缺失"区分开——None 计入+标注，
     只有 False（可读文本确认缺失）才维持 0。
+    2026-11-24 起默认关（严口径：未核验不计入，run158 放水修正）；本用例钉死
+    回滚通道语义不漂移。
     """
     from app.engine.objective import score_count
 
+    monkeypatch.setenv("BID_EVAL_CASE_UNVERIFIED_COUNT", "1")
     crit = _perf_crit(verified_cases=[
         {"name": "A", "contract": True, "invoice": None, "acceptance": None,
          "sanitized": "ok"},
@@ -175,16 +179,18 @@ def test_score_count_false_stays_zero_in_narrow() -> None:
     assert res.zero_reason == "confirmed_absent"
 
 
-def test_score_count_max_items_cuts_unverified_first() -> None:
+def test_score_count_max_items_cuts_unverified_first(monkeypatch) -> None:  # noqa: ANN001
     """排序收紧（2026-11-02 run77 c41）：max_items 封顶先砍未核验案例——
     verified（材料全 True）优先计满，unverified（材料 None）排尾被截。
 
     run77 实证：德勤 11 个不可读案例全部计入被 max_score 封顶得 4/4 满分，
     人工只认 3 个有效业绩。双防（用友/德勤）：verified 案例不受影响，未核验
     案例不再挤占 verified 的名额。
+    （legacy 回滚通道语义——2026-11-24 起默认严口径。）
     """
     from app.engine.objective import score_count
 
+    monkeypatch.setenv("BID_EVAL_CASE_UNVERIFIED_COUNT", "1")
     cases = (
         # 3 个未核验（排尾）
         [{"name": f"U{i}", "contract": True, "invoice": None, "acceptance": None,
@@ -202,10 +208,12 @@ def test_score_count_max_items_cuts_unverified_first() -> None:
     assert "剔除后为 4.00 分" in res.detail
 
 
-def test_score_count_unverified_dual_score_recomputable() -> None:
-    """双分值可复算：score（含未核验）与 score_verified_only（剔除后）并存。"""
+def test_score_count_unverified_dual_score_recomputable(monkeypatch) -> None:  # noqa: ANN001
+    """双分值可复算：score（含未核验）与 score_verified_only（剔除后）并存。
+    （legacy 回滚通道语义——2026-11-24 起默认严口径。）"""
     from app.engine.objective import score_count
 
+    monkeypatch.setenv("BID_EVAL_CASE_UNVERIFIED_COUNT", "1")
     crit = _perf_crit(verified_cases=[
         {"name": "V", "contract": True, "invoice": True, "acceptance": True,
          "sanitized": "ok"},
@@ -862,14 +870,17 @@ def _perf_crit(**kw) -> dict:
     return base
 
 
-def test_score_count_null_with_contract_counts_and_flags() -> None:
+def test_score_count_null_with_contract_counts_and_flags(monkeypatch) -> None:  # noqa: ANN001
     """发票不可读(None) + 有业主证明/验收 → 计分并标疑问（2026-10-27 语义变更）。
 
     训练集测试2 人工口径实证：有业主证明/验收的案例照计（发票 OCR 不可见≠缺失），
     旧「发票 null 硬闸门不计」把 5 家业绩几乎清零。确认缺失（False）仍硬不计。
+    （legacy 回滚通道语义——2026-11-24 起默认严口径剔除，VL 翻案承担“在就
+    要被看到+有据判定”。）
     """
     from app.engine.objective import score_count
 
+    monkeypatch.setenv("BID_EVAL_CASE_UNVERIFIED_COUNT", "1")
     crit = _perf_crit(verified_cases=[
         {"name": "A", "contract": True, "invoice": None, "acceptance": True,
          "case_source": "table", "sanitized": "ok"},
@@ -1059,11 +1070,11 @@ def test_sanitize_explicit_scope_wins_over_null_keys():
 # run 60 实证："5 个案例材料页不可读未计"仍记 0——分数维持规则硬口径（不改分
 # 避免拟合），但 0 的性质必须可区分：机器看不见 ≠ 确认不符合。
 def test_score_count_unreadable_drop_zero_reason(monkeypatch) -> None:  # noqa: ANN001
-    """回退模式：点名材料页不可读(None)丢弃 → score=0 + zero_reason="unreadable"。
+    """严口径（默认）：点名材料页不可读(None)丢弃 → score=0 +
+    zero_reason="material_unverified"（run158 放水修正）。
 
     与 confirmed_absent 分离：不可读可能是扫描件（机器看不见），
-    不是"确认未提供"；落库侧强制 need_human + conflict_flagged。
-    窄版默认开时 None 计入+标注；此用例验证关闭开关的回退路径。
+    不是"确认未提供"；落库侧强制 need_human + conflict_flagged，交 VL 翻案/人工。
     """
     from app.engine.objective import score_count
 
@@ -1074,9 +1085,9 @@ def test_score_count_unreadable_drop_zero_reason(monkeypatch) -> None:  # noqa: 
     ])
     res = score_count(crit, crit["params"], BidFacts(text=""))
     assert res.score == Decimal("0")
-    assert res.zero_reason == "unreadable"
+    assert res.zero_reason == "material_unverified"
     assert res.conflict is True
-    assert "可能为扫描件" in res.detail
+    assert "严口径不计入" in res.detail
 
 
 def test_score_count_confirmed_absent_zero_reason_no_doubt_forcing() -> None:
@@ -1371,8 +1382,8 @@ def test_count_zero_warn_entry_confirmed_absent文案区分() -> None:
 
 # ---- 闸门丢弃分账（D1，2026-10-29）------------------------------------------
 def test_score_count_null_drop_without_strict_marks_unreadable(monkeypatch) -> None:  # noqa: ANN001
-    """回退模式：非严格键（未点名验收）上的 None 丢弃 → unreadable（旧口径混进
-    incomplete → confirmed_absent/pass，OCR 没看见伪装成确认缺失）。"""
+    """严口径（默认）：非严格键（未点名验收）上的 None 丢弃 → material_unverified
+    （旧口径混进 incomplete → confirmed_absent/pass，OCR 没看见伪装成确认缺失）。"""
     from app.engine.objective import score_count
 
     monkeypatch.setenv("BID_EVAL_CASE_UNVERIFIED_COUNT", "0")
@@ -1385,7 +1396,7 @@ def test_score_count_null_drop_without_strict_marks_unreadable(monkeypatch) -> N
     )
     res = score_count(crit, crit["params"], BidFacts(text=""))
     assert res.score == Decimal("0")
-    assert res.zero_reason == "unreadable"
+    assert res.zero_reason == "material_unverified"
     assert "不可读" in res.detail
 
 
@@ -1404,7 +1415,8 @@ def test_score_count_false_drop_stays_confirmed_absent() -> None:
 
 
 def test_score_count_mixed_drop_reasons_prefers_unreadable(monkeypatch) -> None:  # noqa: ANN001
-    """回退模式：False 与 None 混合丢弃且总分 0 → 优先 unreadable（不可读丢弃存在即转人工）。"""
+    """严口径（默认）：False 与 None 混合丢弃且总分 0 → 优先 material_unverified
+    （未核验丢弃存在即转人工/VL，不伪装确认缺失）。"""
     from app.engine.objective import score_count
 
     monkeypatch.setenv("BID_EVAL_CASE_UNVERIFIED_COUNT", "0")
@@ -1426,8 +1438,8 @@ def test_score_count_mixed_drop_reasons_prefers_unreadable(monkeypatch) -> None:
     ])
     res2 = score_count(crit2, crit2["params"], BidFacts(text=""))
     assert res2.score == Decimal("0")
-    assert res2.zero_reason == "unreadable"
-    assert "1 个缺证明材料" in res2.detail and "1 个案例材料页不可读" in res2.detail
+    assert res2.zero_reason == "material_unverified"
+    assert "1 个缺证明材料" in res2.detail and "1 个案例材料不可读/未绑上" in res2.detail
 
 
 def test_score_count_type_gate_zero_reason() -> None:
@@ -1565,10 +1577,12 @@ def test_score_count_person_tiers_by_min_count() -> None:
     assert r1.score == Decimal("0")  # 1 个不满足任何档
 
 
-def test_score_count_person_tiers_unverified_double_value() -> None:
-    """德勤式：案例材料不可读（None）→ 计入+疑问+双分值（剔除后口径可复算）。"""
+def test_score_count_person_tiers_unverified_double_value(monkeypatch) -> None:  # noqa: ANN001
+    """德勤式：案例材料不可读（None）→ 计入+疑问+双分值（剔除后口径可复算）。
+    （legacy 回滚通道语义——2026-11-24 起默认严口径。）"""
     from app.engine.objective import score_count
 
+    monkeypatch.setenv("BID_EVAL_CASE_UNVERIFIED_COUNT", "1")
     cases = [
         {"name": "A", "role": "leader", "work_proof": True,
          "experience_proof": None, "social_security": True,
@@ -1623,11 +1637,13 @@ def test_material_count_prompt_cert_proof_contract() -> None:
 
 # --- A1 tier 形状守卫 + A2 零分诚实化（2026-11-04 run79 业绩回归） ------------
 
-def test_score_count_amount_tiers_fall_back_to_per_item() -> None:
+def test_score_count_amount_tiers_fall_back_to_per_item(monkeypatch) -> None:  # noqa: ANN001
     """run79 回归钉死：金额档 tiers（min_amount_yuan 形状）不是计数档——
-    查表无命中强制 0 分曾让 4 家「投标人业绩」4→0；必须回退 per_item 线性。"""
+    查表无命中强制 0 分曾让 4 家「投标人业绩」4→0；必须回退 per_item 线性。
+    （unlinked 计入口径=legacy 回滚通道——2026-11-24 起默认严口径剔除。）"""
     from app.engine.objective import score_count
 
+    monkeypatch.setenv("BID_EVAL_CASE_UNVERIFIED_COUNT", "1")
     crit = _perf_crit(
         per_item="1",
         max_items="4",

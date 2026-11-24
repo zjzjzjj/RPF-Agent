@@ -223,20 +223,52 @@ def test_hard_sanction_rejects_case_missing_acceptance_or_invoice():
     assert "缺" in result.detail
 
 
-def test_hard_sanction_unverified_materials_count_with_concern():
-    """三态：材料状态未知（分类未跑/未绑上）→ 计入+疑问，绝不静默 0。
+def test_hard_sanction_unverified_materials_strict_drops():
+    """三态：材料状态未知（分类未跑/未绑上）→ 严口径不计入（run158 放水修正）。
 
-    run155 c43 实证：绑定断链把"材料在"误判"缺件"整列 0——无状态信息的
-    缺口不得判缺，必须计入并标疑问（verdict=concern + material_unverified）。
+    run158 实证："未核实计入"=无据给分（c43 两家人工 0→AI 4）。案例级严口径：
+    含 None 的案例剔除（verified-only 计分）+ zero_reason=material_unverified
+    + 疑问标记（绝不静默 0），交 VL 翻案/人工复核。
     """
     record = ContractRecord(name="某研究所维保", amount_yuan=_D("1200000"),
                             pages=[1], materials={"contract": [1]}, source="table")
     result = score_objective(_perf_rule(RULE10), _contract_inv([record]))
     assert result is not None
-    assert result.score == Decimal("1.00"), "未核实材料必须计入（不得静默 0）"
+    assert result.score == Decimal("0.00"), "未核实不得计入（run158 放水红线）"
+    assert result.zero_reason == "material_unverified"
+    assert result.verdict == "concern"
+    assert any(w.get("code") == "material_unverified" for w in result.warnings)
+    assert "严口径不计入" in result.detail
+    assert (result.facts or {}).get("unverified_records"), "留 VL 翻案页源"
+
+
+def test_hard_sanction_unverified_legacy_count_rollback(monkeypatch):  # noqa: ANN001
+    """回滚通道：BID_EVAL_CASE_UNVERIFIED_COUNT=1 → 旧"未核实计入+疑问"语义。"""
+    monkeypatch.setenv("BID_EVAL_CASE_UNVERIFIED_COUNT", "1")
+    record = ContractRecord(name="某研究所维保", amount_yuan=_D("1200000"),
+                            pages=[1], materials={"contract": [1]}, source="table")
+    result = score_objective(_perf_rule(RULE10), _contract_inv([record]))
+    assert result is not None
+    assert result.score == Decimal("1.00"), "旧口径：未核实材料计入"
     assert result.verdict == "concern"
     assert any(w.get("code") == "material_unverified" for w in result.warnings)
     assert "未核实计入" in result.detail
+
+
+def test_hard_sanction_partial_credit_keeps_verified_cases():
+    """部分计分保留：全 True 案例照计，含 None 案例剔除（创联 c43 形态）。"""
+    ok = ContractRecord(name="某研究所维保", amount_yuan=_D("1200000"), pages=[1, 2, 3],
+                        materials={"contract": [1], "acceptance": [2], "invoice": [3]},
+                        source="table")
+    bad = ContractRecord(name="某局运维", amount_yuan=_D("1500000"), pages=[4],
+                         materials={"contract": [4]}, source="table")
+    result = score_objective(_perf_rule(RULE10), _contract_inv([ok, bad]))
+    assert result is not None
+    assert result.score == Decimal("1.00"), "verified 案例保留，unverified 案例剔除"
+    assert result.zero_reason is None
+    assert any(w.get("code") == "material_unverified" for w in result.warnings)
+    assert [r["name"] for r in ((result.facts or {}).get("unverified_records") or [])] \
+        == ["某局运维"]
 
 
 def test_hard_sanction_counts_case_with_full_three_piece_chain():

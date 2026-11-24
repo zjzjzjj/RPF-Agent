@@ -2,7 +2,9 @@
 """PR1 材料链绑定修复契约测试（2026-11-24 run155 实证）。
 
 三病灶：①业绩材料绑定断链（键名+三态）②证书↔查询截图断链（盲态/ISO20000）
-③CMMI 四层识别失败。红线：确认缺判 0 保留；未核实计入+疑问；绝不静默 0。
+③CMMI 四层识别失败。红线：确认缺判 0 保留；未核实不计入→VL 翻案/人工
+（run158 放水修正，BID_EVAL_CASE_UNVERIFIED_COUNT=1 回退旧"计入+疑问"）；
+绝不静默 0（zero_reason+疑问标记）。证书链盲态"计入+疑问"不动（对齐人工实证）。
 """
 from __future__ import annotations
 
@@ -189,7 +191,12 @@ def _perf_rule(description=None, **param_changes):  # noqa: ANN001, ANN202
 
 
 def test_guard_escalates_missing_to_unverified(monkeypatch) -> None:  # noqa: ANN001
-    """护栏：目录列有材料页但绑定未闭合 -> 禁止按缺件判 0（计入+疑问）。"""
+    """护栏：目录列有材料页但绑定未闭合 → 不按缺件判 0，转"未核实"（护栏报警）。
+
+    严口径（run158 放水修正）：未核实案例不计入（verified-only 计分），zero_reason=
+    material_binding_conflict + 疑问标记，交 VL 翻案/人工——禁止无据给分，也
+    禁止静默 0。
+    """
     from app.engine.facts import BidFacts
     from app.engine.material_inventory import ContractRecord, MaterialInventory
     from app.engine.objective_fastpath import _score_contracts
@@ -206,10 +213,13 @@ def test_guard_escalates_missing_to_unverified(monkeypatch) -> None:  # noqa: AN
     inv.contracts = [record]
     monkeypatch.setenv("BID_EVAL_MATERIAL_LOCATOR", "on")
     monkeypatch.setenv("BID_EVAL_MATERIAL_GUARD", "1")
+    monkeypatch.setenv("BID_EVAL_CASE_UNVERIFIED_COUNT", "0")
     result = _score_contracts(_perf_rule(RULE10), inv)
-    assert result.score > 0, "目录列有材料页 -> 禁止按缺件判 0"
+    assert result.score == 0, "严口径：未核实不计入（禁止放水）"
+    assert result.zero_reason == "material_binding_conflict", result.zero_reason
     assert any("目录列有材料页" in (w.get("message") or "") for w in result.warnings)
     assert result.verdict == "concern"
+    assert (result.facts or {}).get("unverified_records"), "留 VL 翻案页源"
 
 
 def test_guard_zero_reason_material_binding_conflict(monkeypatch) -> None:  # noqa: ANN001
@@ -229,6 +239,7 @@ def test_guard_zero_reason_material_binding_conflict(monkeypatch) -> None:  # no
         materials_state={"contract": True, "invoice": False})]
     monkeypatch.setenv("BID_EVAL_MATERIAL_LOCATOR", "on")
     monkeypatch.setenv("BID_EVAL_MATERIAL_GUARD", "1")
+    monkeypatch.setenv("BID_EVAL_CASE_UNVERIFIED_COUNT", "0")
     # 无档位细则 + per_item=0：护栏升级留痕但计分 0 → 零因必须是
     # binding_conflict（0 分不是评审结论）
     no_tier_rule = ("投标产品业绩：每个得1分，最高得2分。【证明材料】须提供"
