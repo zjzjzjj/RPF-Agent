@@ -39,6 +39,12 @@ class ContractRecord:
     materials_state: dict[str, bool | None] = field(default_factory=dict)
     # 图上/文本所见项目类型原词（"运维""系统集成"…，只转述不归类）——类型闸输入
     project_type: str | None = None
+    # VL 人员归属/人员材料（2026-11-25 翻案通道收口）：person_names=材料上出现的
+    # 评分人员姓名并集；person_states 四键三态（work_proof/experience_proof/
+    # social_security/cert_proof），只升不降（VL True 可翻案）
+    person_names: list[str] = field(default_factory=list)
+    person_states: dict[str, bool | None] = field(default_factory=dict)
+    amount_corrected: bool = False   # 金额伪迹补正留痕（文本<1000 且 VL≥1000）
     source: str = "text"
 
 

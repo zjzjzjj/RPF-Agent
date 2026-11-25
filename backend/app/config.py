@@ -945,11 +945,12 @@ def vl_fallback_max_per_cell() -> int:
 
 
 def vl_fallback_max_per_bidder() -> int:
-    """每家 VL 调用总次数上限（默认 10）。"""
+    """每家 VL 调用总次数上限（默认 30，2026-11-25 翻案通道收口 10→30：
+    run160 每家 5+ 翻案格恰打满 10；30=15 格×2 封顶余量，每格 2 不变）。"""
     try:
-        return max(1, int(os.environ.get("BID_EVAL_VL_FALLBACK_MAX_PER_BIDDER", "10")))
+        return max(1, int(os.environ.get("BID_EVAL_VL_FALLBACK_MAX_PER_BIDDER", "30")))
     except ValueError:
-        return 10
+        return 30
 
 
 def vl_fallback_max_pages_per_segment() -> int:

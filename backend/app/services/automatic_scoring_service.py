@@ -1368,6 +1368,23 @@ def _maybe_vl_rescue(run_id: int, bid_id: int, criterion: dict,
         except (TypeError, ValueError):
             continue
         named_keys.extend(k for k in list(candidates) if k[1] == pn)
+    # 翻案通道收口（2026-11-25）：person_scope 格的人员/材料页优先送审
+    # （run160 实证：8 图窗口漏经验证明/社保页 → facts 报 null → 误杀）
+    if inventory_factory is not None and (
+            (criterion.get("params") or {}).get("person_scope")):
+        try:
+            _inv = inventory_factory(bid_id)
+            extra: set[int] = set()
+            for person in (getattr(_inv, "persons", None) or []):
+                extra.update(int(p) for p in (person.pages or []) if p is not None)
+                extra.update(int(p) for p in (person.experience_pages or [])
+                             if p is not None)
+            for rec in (getattr(_inv, "contracts", None) or []):
+                for lst in (rec.materials or {}).values():
+                    extra.update(int(p) for p in (lst or []) if p is not None)
+            named_keys.extend(k for k in list(candidates) if k[1] in extra)
+        except Exception:  # noqa: BLE001 —— 页源增强失败不阻断 VL
+            pass
     crit_text = (str(criterion.get("name") or "") + str(criterion.get("description") or "")
                  + str(criterion.get("quote") or "") + str(criterion.get("required_evidence") or ""))
     # 该格自己的材料锚词（细则里出现的合同/社保/业绩/证书…）——run154 实证：
@@ -1480,7 +1497,14 @@ def _maybe_vl_rescue(run_id: int, bid_id: int, criterion: dict,
             from app.engine.objective_fastpath import score_objective
             from app.engine.vl_facts import merge_vl_facts
 
-            res = score_objective(criterion, merge_vl_facts(inv, vres.facts))
+            merged_inv = merge_vl_facts(inv, vres.facts)
+            res = score_objective(criterion, merged_inv)
+            if res is None:
+                # 翻案通道收口（2026-11-25 run160）：证书格/person 业绩格无
+                # fastpath plan 覆盖——facts→score_count 适配器重算
+                from app.engine.vl_rescore import rescore_from_merged_facts
+
+                res = rescore_from_merged_facts(criterion, merged_inv)
         except Exception:  # noqa: BLE001 —— 算分失败=维持原暂定
             log.exception("VL facts 确定性重算失败 criterion=%s", criterion.get("name"))
             res = None
@@ -2119,7 +2143,10 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
             if unverified_records:
                 material_pages = sorted({
                     int(p) for rec in unverified_records
-                    for p in (rec.get("pages") or []) if p is not None})
+                    for p in (list(rec.get("pages") or [])
+                              + [q for v in (rec.get("materials") or {}).values()
+                                 for q in (v or [])])
+                    if p is not None})
                 fallback = {
                     "kind": "material_unverified",
                     "value": str(result.score) if result.score is not None else None,

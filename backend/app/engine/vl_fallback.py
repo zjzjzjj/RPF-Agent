@@ -90,6 +90,12 @@ class VlFact(BaseModel):
     has_invoice: bool | None = None
     has_acceptance: bool | None = None
     has_seal: bool | None = None       # 合同/发票等材料上的盖章有无
+    # —— 人员归属与人员材料（contract 事实：材料上出现的评分人员姓名）——
+    person_names: list[str] = Field(default_factory=list)   # 图上所见评分人员姓名，空=未见
+    has_work_proof: bool | None = None       # 业绩证明材料上有其姓名（业主证明/用户证明/社保页不算业绩证明）
+    has_experience_proof: bool | None = None # 个人工作经验证明上有其姓名
+    has_social_security: bool | None = None  # 社保/参保证明上有其姓名
+    has_cert_proof: bool | None = None       # 细则点名的人员证书/培训证书
     # —— 证书 ——
     cert_level: str | None = None
     valid_until: str | None = None
@@ -163,6 +169,9 @@ SYSTEM_PROMPT = (
     '"project_type":"图上所见项目类型原词或null",'
     '"has_contract":true|null|false,"has_invoice":true|null|false,'
     '"has_acceptance":true|null|false,"has_seal":true|null|false,'
+    '"person_names":["图上所见评分人员姓名，未见=空数组"],'
+    '"has_work_proof":true|null|false,"has_experience_proof":true|null|false,'
+    '"has_social_security":true|null|false,"has_cert_proof":true|null|false,'
     '"cert_level":"等级或null","valid_until":"有效期至或null",'
     '"has_query_screenshot":true|null|false,'
     '"person_title":"职称或null","person_years":"年限或null",'
@@ -183,6 +192,13 @@ SYSTEM_PROMPT = (
     "5. observation 必须是页级客观描述（看到了什么材料/文字/印章），不得复述细则。\n"
     "6. 业绩汇总表/一览表是投标人的主张不是证明材料——合同/发票/验收必须见其原件"
     "（复印件/扫描件）才算 true。\n"
+    "7. 人员归属与人员材料：合同/案例事实若图上确实看清材料上出现评分人员"
+    "（项目负责人/团队成员）姓名，填 person_names；has_work_proof=该人员姓名出现在"
+    "**业绩证明材料（合同/中标通知书/发票/验收材料）**上——业主证明/用户证明/"
+    "身份证明/社保页**不算**业绩证明材料；has_experience_proof=个人工作经验证明"
+    "（年限/经历证明）上有其姓名；has_social_security=社保/参保证明上有其姓名；"
+    "has_cert_proof=细则点名的人员证书/培训证书。三态含义同 has_contract"
+    "（true=确认、null=未见或看不清、false=确认无）。\n"
 )
 
 
@@ -228,7 +244,8 @@ def _sanitize_facts(
         data = f.model_dump()
         # ④ false → None（归一未核实，只作线索）
         for key in ("has_contract", "has_invoice", "has_acceptance", "has_seal",
-                    "has_query_screenshot"):
+                    "has_query_screenshot", "has_work_proof", "has_experience_proof",
+                    "has_social_security", "has_cert_proof"):
             if data.get(key) is False:
                 data[key] = None
         # ① 证据页越界剔除
@@ -248,11 +265,20 @@ def _sanitize_facts(
         for word, key in (("发票", "has_invoice"), ("验收", "has_acceptance"),
                           ("合同", "has_contract"), ("盖章", "has_seal"),
                           ("公章", "has_seal"), ("签章", "has_seal"),
-                          ("截图", "has_query_screenshot")):
+                          ("截图", "has_query_screenshot"),
+                          ("业绩证明", "has_work_proof"),
+                          ("工作经验证明", "has_experience_proof"),
+                          ("经验证明", "has_experience_proof"),
+                          ("社保证明", "has_social_security"),
+                          ("社保", "has_social_security")):
             if data.get(key) is True and any(w in hay for w in (
                     f"未见{word}", f"无{word}", f"没有{word}", f"未提供{word}",
                     f"未附{word}", f"{word}缺失", f"{word}未见")):
                 data[key] = None
+        # ②' 归属自洽：has_work_proof=true 但 person_names 空 → 回退 null
+        # （不知道为谁开的证明不能当归属证据）
+        if data.get("has_work_proof") is True and not (data.get("person_names") or []):
+            data["has_work_proof"] = None
         # ③ contract 金额/名称硬要求
         if data.get("kind") == "contract":
             try:

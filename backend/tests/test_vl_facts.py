@@ -96,6 +96,64 @@ def test_merge_cert_and_screenshot_flag() -> None:
     assert out.persons and out.persons[0].years == Decimal("6")
 
 
+# ---- 金额伪迹补正（2026-11-25 翻案通道收口）---------------------------------
+
+def test_merge_corrects_artifact_amount() -> None:
+    """文本 0.01 元伪迹 + VL 大额 → 补正并并成一条（run160 创联 −2 根因）。"""
+    rec = ContractRecord(name="浙江中烟一体化数字化仓储系统运维服务合同",
+                         amount_yuan=Decimal("0.01"), pages=[117])
+    out = merge_vl_facts(_inv([rec]), [{
+        "kind": "contract", "name": "浙江中烟一体化数字化仓储系统运维服务合同",
+        "amount_yuan": "742800", "has_contract": True,
+        "evidence": [{"document_id": 1, "page_no": 118,
+                      "observation": "合同金额柒拾肆万贰仟捌佰元"}],
+    }])
+    assert len(out.contracts) == 1, "伪迹同案并成一条（防双计）"
+    assert out.contracts[0].amount_yuan == Decimal("742800")
+    assert out.contracts[0].amount_corrected is True
+
+
+def test_merge_amount_text_priority_when_plausible() -> None:
+    rec = ContractRecord(name="项目A", amount_yuan=Decimal("700000"))
+    out = merge_vl_facts(_inv([rec]), [{
+        "kind": "contract", "name": "项目A", "amount_yuan": "50",
+        "has_contract": True,
+        "evidence": [{"document_id": 1, "page_no": 7, "observation": "合同"}],
+    }])
+    assert out.contracts[0].amount_yuan == Decimal("700000"), "文本可信额优先"
+    assert out.contracts[0].amount_corrected is False
+
+
+def test_merge_both_artifact_amounts_merge_without_correction() -> None:
+    rec = ContractRecord(name="项目B", amount_yuan=Decimal("500"))
+    out = merge_vl_facts(_inv([rec]), [{
+        "kind": "contract", "name": "项目B", "amount_yuan": "800",
+        "has_contract": True,
+        "evidence": [{"document_id": 1, "page_no": 7, "observation": "合同"}],
+    }])
+    assert len(out.contracts) == 1
+    assert out.contracts[0].amount_yuan == Decimal("500"), "两值皆伪迹只并案不改值"
+
+
+# ---- person 归属/材料三态并集（只升不降）-----------------------------------
+
+def test_merge_person_states_only_up() -> None:
+    rec = ContractRecord(name="项目A", amount_yuan=Decimal("700000"),
+                         person_names=["张三"],
+                         person_states={"work_proof": False, "experience_proof": None})
+    out = merge_vl_facts(_inv([rec]), [{
+        "kind": "contract", "name": "项目A", "amount_yuan": "700000",
+        "person_names": ["张三", "李四"], "has_work_proof": True,
+        "evidence": [{"document_id": 1, "page_no": 7,
+                      "observation": "业绩证明载明张三姓名"}],
+    }])
+    t = out.contracts[0]
+    assert t.person_names == ["张三", "李四"], "归属并集"
+    assert t.person_states["work_proof"] is True, "VL True 翻案 False→True（只升不降）"
+    assert t.person_states["experience_proof"] is None
+    assert rec.person_states["work_proof"] is False, "派生副本不污染共享记录"
+
+
 # ---- 三闸 -----------------------------------------------------------------
 
 def test_date_window_from_rule_forms() -> None:

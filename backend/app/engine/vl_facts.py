@@ -35,19 +35,40 @@ def _amount_val(value) -> Decimal | None:
         return None
 
 
-def _same_case(rec: ContractRecord, name: str, amount: Decimal | None) -> bool:
-    if amount is None or _amount_val(rec.amount_yuan) != amount:
+def _names_match(left: str, right: str) -> bool:
+    if not _norm_name(left) or not _norm_name(right):
         return False
-    if not _norm_name(rec.name) or not _norm_name(name):
-        return False
-    if _norm_name(rec.name) == _norm_name(name):
+    if _norm_name(left) == _norm_name(right):
         return True
     try:
         from app.engine.material_inventory import _contract_name_overlap
 
-        return bool(_contract_name_overlap(rec.name, name))
+        return bool(_contract_name_overlap(left, right))
     except Exception:  # noqa: BLE001
         return False
+
+
+def _same_case(rec: ContractRecord, name: str, amount: Decimal | None) -> bool:
+    if amount is None or _amount_val(rec.amount_yuan) != amount:
+        return False
+    return _names_match(rec.name, name)
+
+
+_ARTIFACT_AMOUNT_MAX = Decimal("1000")  # 显系伪迹的文本金额上限（0.01 元等误抽）
+_PERSON_STATE_MAP = (("has_work_proof", "work_proof"),
+                     ("has_experience_proof", "experience_proof"),
+                     ("has_social_security", "social_security"),
+                     ("has_cert_proof", "cert_proof"))
+
+
+def _artifact_amount(text_amount: Decimal | None, vl_amount: Decimal | None) -> bool:
+    """文本金额 <1000 元（小数点/OCR 误抽伪迹）且 VL 图上金额 ≥1000 → 可补正。
+
+    单向：文本 ≥1000 一律文本优先；两值皆伪迹不动。2026-11-25 run160 实证：
+    创联第二案例金额误抽 0.01 元被门槛砍掉（人工计满）。
+    """
+    return (text_amount is not None and text_amount < _ARTIFACT_AMOUNT_MAX
+            and vl_amount is not None and vl_amount >= _ARTIFACT_AMOUNT_MAX)
 
 
 def _merge_contract(contracts: list[ContractRecord], fact: dict,
@@ -58,11 +79,25 @@ def _merge_contract(contracts: list[ContractRecord], fact: dict,
         return  # sanitize 已拦；防御
     state_map = (("has_contract", "contract"), ("has_invoice", "invoice"),
                  ("has_acceptance", "acceptance"), ("has_seal", "seal"))
+    person_names = [str(n).strip() for n in (fact.get("person_names") or [])
+                    if str(n).strip()]
     target = None
     for rec in contracts:
         if _same_case(rec, name, amount):
             target = rec
             break
+    if target is None:
+        # 伪迹同案匹配：同名/名称重叠 + 文本伪迹额（或两值皆伪迹）——0.01 记录
+        # 与 VL 大额事实并成一条，防双计/漏计；两值皆伪迹只并案不改值
+        for rec in contracts:
+            rec_amt = _amount_val(rec.amount_yuan)
+            if not _names_match(rec.name, name):
+                continue
+            if _artifact_amount(rec_amt, amount) or (
+                    rec_amt is not None and rec_amt < _ARTIFACT_AMOUNT_MAX
+                    and amount is not None and amount < _ARTIFACT_AMOUNT_MAX):
+                target = rec
+                break
     if target is None:
         state = {key: (True if fact.get(src) is True else None)
                  for src, key in state_map}
@@ -70,17 +105,24 @@ def _merge_contract(contracts: list[ContractRecord], fact: dict,
         for key in ("contract", "invoice", "acceptance"):
             if state.get(key) is True and ev_pages:
                 materials[key] = list(ev_pages)
+        pstate = {key: (True if fact.get(src) is True else None)
+                  for src, key in _PERSON_STATE_MAP}
         contracts.append(ContractRecord(
             name=name, amount_yuan=amount,
             signed_date=str(fact.get("sign_date") or "").strip() or None,
             pages=list(ev_pages), materials=materials, materials_state=state,
             project_type=str(fact.get("project_type") or "").strip() or None,
+            person_names=person_names, person_states=pstate,
             source="vl",
         ))
         return
-    # 并集：金额/日期文本非空优先、VL 补空；pages/materials 取并；state 只升不降
+    # 并集：金额/日期文本非空优先、VL 补空（伪迹例外补正）；pages/materials 取并；
+    # state 只升不降
     if target.amount_yuan is None:
         target.amount_yuan = amount
+    elif _artifact_amount(_amount_val(target.amount_yuan), amount):
+        target.amount_yuan = amount          # VL 补正伪迹金额
+        target.amount_corrected = True       # 留痕（审计可见）
     if not target.signed_date and fact.get("sign_date"):
         target.signed_date = str(fact["sign_date"]).strip()
     if not target.project_type and fact.get("project_type"):
@@ -97,6 +139,12 @@ def _merge_contract(contracts: list[ContractRecord], fact: dict,
                 for p in ev_pages:
                     if p not in lst:
                         lst.append(p)
+    for n in person_names:
+        if n not in target.person_names:
+            target.person_names.append(n)
+    for src, key in _PERSON_STATE_MAP:
+        if fact.get(src) is True:
+            target.person_states[key] = True   # 只升不降
 
 
 def _merge_cert(certs: list[CertRecord], fact: dict, ev_pages: list[int]) -> None:
@@ -168,6 +216,8 @@ def merge_vl_facts(inventory: MaterialInventory,
         pages=list(r.pages or []),
         materials={k: list(v or []) for k, v in (r.materials or {}).items()},
         materials_state=dict(r.materials_state or {}),
+        person_names=list(r.person_names or []),
+        person_states=dict(r.person_states or {}),
     ) for r in inventory.contracts]
     certs = [replace(c, pages=list(c.pages or [])) for c in inventory.certs]
     persons = [replace(

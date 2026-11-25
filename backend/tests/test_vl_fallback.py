@@ -511,3 +511,48 @@ def test_maybe_vl_rescue_facts_never_downgrades(tmp_path, monkeypatch) -> None: 
                                    inventory_factory=lambda bid: _empty_inv())
     assert out2.basis == "visual_fallback"
     assert out2.score == Decimal("3.00"), "VL 事实重算更高则翻案计入"
+
+
+# ---- 2026-11-25 翻案通道收口：person 归属/材料三态契约 -----------------------
+
+def test_facts_person_keys_and_sanitize() -> None:
+    # person_names + 人员材料三态解析；false 归一 None
+    gw = FakeGateway(
+        '{"verdict":"pass","facts":[{"kind":"contract","name":"A","amount_yuan":"800000",'
+        '"person_names":["张三"],"has_work_proof":true,"has_social_security":false,'
+        '"evidence":[{"document_id":1,"page_no":1,"observation":"业绩证明载明张三"}]}],'
+        '"reasoning":"r"}')
+    res = vl_fallback.rescue(CRIT, PAGE_IMAGES, gateway=gw)
+    assert res.kind == "facts"
+    f = res.facts[0]
+    assert f["person_names"] == ["张三"]
+    assert f["has_work_proof"] is True
+    assert f["has_social_security"] is None, "false 归一 None（防 VL 误杀）"
+    # ②' 归属自洽：person_names 空 → has_work_proof=true 回退 null
+    gw2 = FakeGateway(
+        '{"verdict":"pass","facts":[{"kind":"contract","name":"B","amount_yuan":"800000",'
+        '"person_names":[],"has_work_proof":true,'
+        '"evidence":[{"document_id":1,"page_no":1,"observation":"x"}]}],"reasoning":"r"}')
+    res2 = vl_fallback.rescue(CRIT, PAGE_IMAGES, gateway=gw2)
+    assert res2.facts[0]["has_work_proof"] is None, "不知为谁开的证明不算归属证据"
+    # ② 矛盾回退：观察"未见社保"却 has_social_security=true
+    gw3 = FakeGateway(
+        '{"verdict":"pass","facts":[{"kind":"contract","name":"C","amount_yuan":"800000",'
+        '"has_social_security":true,'
+        '"evidence":[{"document_id":1,"page_no":1,"observation":"合同一份，未见社保"}]}],'
+        '"reasoning":"r"}')
+    res3 = vl_fallback.rescue(CRIT, PAGE_IMAGES, gateway=gw3)
+    assert res3.facts[0]["has_social_security"] is None
+
+
+def test_prompt_owner_proof_red_line() -> None:
+    """prompt 必须写死 work_proof 红线与新键（业主证明≠业绩证明）。"""
+    assert "person_names" in vl_fallback.SYSTEM_PROMPT
+    assert "has_work_proof" in vl_fallback.SYSTEM_PROMPT
+    assert "业主证明" in vl_fallback.SYSTEM_PROMPT and "不算" in vl_fallback.SYSTEM_PROMPT
+
+
+def test_vl_budget_default_30_per_bidder() -> None:
+    from app import config
+
+    assert config.vl_fallback_max_per_bidder() == 30
