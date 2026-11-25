@@ -30,6 +30,9 @@ _RE_MAX_ITEMS = re.compile(r"最多\s*(\d+)\s*(?:个|项|人|条|家|份)")
 # 计数对象关键词（与 reconcile._score_type_for_row 同口径）
 CERT_KW = re.compile(r"证书|认证|资质|职称|操作证|上岗证|执业证|许可证|登记证")
 PERF_KW = re.compile(r"业绩|案例|合同|项目经验|类似项目|服务经验|实施经验")
+# CMMI/CSMM/能力成熟度是具体证书名（cmmi 专属计数分支），优先于通用"认证"词
+# ——"CMMI/CSMM 认证"落到 certificates 会给任何证书计分（2026-11-25 c45 实证）
+CMMI_KW = re.compile(r"CMMI|CSMM|能力成熟度", re.I)
 # 人员级范围
 _LEADER_KW = re.compile(r"项目负责人|项目经理|负责人|拟派负责人|项目总监|技术负责人")
 _MEMBER_KW = re.compile(r"团队成员|成员|团队|驻场人员|人员名单|拟派人员|技术人员")
@@ -627,7 +630,8 @@ def classify_scoring_form(text: str) -> tuple[str, dict[str, Any]] | None:
     # ④ per_item 线性："每提供1个案例得1分，最高2分"
     m = _RE_PER_ITEM.search(text)
     if m:
-        field = ("certificates" if CERT_KW.search(text)
+        field = ("cmmi" if CMMI_KW.search(text)
+                 else "certificates" if CERT_KW.search(text)
                  else "performance" if PERF_KW.search(text) else "items")
         params: dict[str, Any] = {"field": field, "per_item": m.group(1)}
         cap = _RE_CAP.search(text)
@@ -642,7 +646,8 @@ def classify_scoring_form(text: str) -> tuple[str, dict[str, Any]] | None:
     # ⑤ 二值存在性："提供…得N分，未提供得0分"——单件存在即得 N 分（per_item=N，max_items=1）
     m = _RE_EXIST_SCORE.search(text)
     if m:
-        field = "certificates" if CERT_KW.search(text) else "items"
+        field = ("cmmi" if CMMI_KW.search(text)
+                 else "certificates" if CERT_KW.search(text) else "items")
         return "existence", {"field": field, "per_item": m.group(1), "max_items": "1"}
     return None
 

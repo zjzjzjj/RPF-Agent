@@ -161,6 +161,19 @@ def test_rescore_person_confirmed_missing_still_blocks() -> None:
     assert res.score == 0, f"确认缺（False）必须阻计：{res.detail}"
 
 
+def test_cmmi_field_inference_beats_generic_cert_kw() -> None:
+    """CMMI/CSMM 是具体证书名（cmmi 专属分支），不得落到 certificates
+    （否则任何证书都给分——2026-11-25 c45 实证的放水面）。"""
+    from app.engine.objective import _infer_count_field
+    from app.rules.check_infer import classify_scoring_form
+
+    crit = {"name": "投标人认证及资质情况—CMMI/CSMM 认证",
+            "description": "具有有效期内CMMI认证二级或CSMM认证二级及以上得2分。"}
+    assert _infer_count_field(crit) == "cmmi"
+    form = classify_scoring_form(crit["name"] + "\n" + crit["description"])
+    assert form is not None and form[1].get("field") == "cmmi", form
+
+
 def test_rescore_person_type_eligible_never_none() -> None:
     """type_eligible 恒 bool（None→True 保留+疑问）——managed raise 不触发。"""
     inv = _person_case_inv(project_type=None)  # 名称含"运维服务"→True

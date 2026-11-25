@@ -530,6 +530,10 @@ def _infer_count_field(criterion: dict) -> str | None:
     # 先判业绩可避免把业绩误算成证书。
     if any(k in name for k in ("业绩", "案例", "合同")):
         return "performance"
+    # CMMI/CSMM 是具体证书名（cmmi 专属计数分支），优先于通用"认证"词——
+    # "CMMI/CSMM 认证"落到 certificates 会给任何证书计分（2026-11-25 c45 实证）
+    if any(k in name for k in ("CMMI", "CSMM", "能力成熟度")):
+        return "cmmi"
     if any(k in name for k in ("认证", "资质", "证书", "体系")):
         return "certificates"
     return None
