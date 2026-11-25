@@ -1368,23 +1368,44 @@ def _maybe_vl_rescue(run_id: int, bid_id: int, criterion: dict,
         except (TypeError, ValueError):
             continue
         named_keys.extend(k for k in list(candidates) if k[1] == pn)
-    # 翻案通道收口（2026-11-25）：person_scope 格的人员/材料页优先送审
-    # （run160 实证：8 图窗口漏经验证明/社保页 → facts 报 null → 误杀）
-    if inventory_factory is not None and (
-            (criterion.get("params") or {}).get("person_scope")):
+    # 翻案通道收口（2026-11-25）：材料页/人员页/目录窗口/案例邻域（±2）优先
+    # 送审（run160/161 实证：8 图窗口漏发票/验收/经验证明页 → facts 报 null → 误杀）
+    if inventory_factory is not None:
         try:
             _inv = inventory_factory(bid_id)
-            extra: set[int] = set()
-            for person in (getattr(_inv, "persons", None) or []):
-                extra.update(int(p) for p in (person.pages or []) if p is not None)
-                extra.update(int(p) for p in (person.experience_pages or [])
-                             if p is not None)
+            ordered_extra: list[int] = []
+            seen_extra: set[int] = set()
+
+            def _push(pages_iter) -> None:  # noqa: ANN001, ANN202
+                for p in pages_iter:
+                    try:
+                        p = int(p)
+                    except (TypeError, ValueError):
+                        continue
+                    if p not in seen_extra:
+                        seen_extra.add(p)
+                        ordered_extra.append(p)
+
+            rec_pages: set[int] = set()
             for rec in (getattr(_inv, "contracts", None) or []):
+                rpages = [int(p) for p in (rec.pages or []) if p is not None]
+                rec_pages.update(rpages)
                 for lst in (rec.materials or {}).values():
-                    extra.update(int(p) for p in (lst or []) if p is not None)
-            named_keys.extend(k for k in list(candidates) if k[1] in extra)
+                    _push(lst or [])
+            for person in (getattr(_inv, "persons", None) or []):
+                _push(person.pages or [])
+                _push(person.experience_pages or [])
+            # locator 目录窗口（材料章节页）：每类取最靠近案例页的 6 页
+            for pageset in (getattr(_inv, "locator_index", None) or {}).values():
+                ranked = sorted(pageset, key=lambda q: min(
+                    (abs(int(q) - rp) for rp in rec_pages), default=10 ** 6))
+                _push(ranked[:6])
+            # 案例页邻域 ±2（材料页常紧邻案例块）——垫底优先级
+            for rp in sorted(rec_pages):
+                _push(range(max(1, rp - 2), rp + 3))
+            named_keys.extend(k for k in list(candidates) if k[1] in seen_extra)
         except Exception:  # noqa: BLE001 —— 页源增强失败不阻断 VL
-            pass
+            log.exception("VL 页源增强失败 bid=%s", bid_id)
     crit_text = (str(criterion.get("name") or "") + str(criterion.get("description") or "")
                  + str(criterion.get("quote") or "") + str(criterion.get("required_evidence") or ""))
     # 该格自己的材料锚词（细则里出现的合同/社保/业绩/证书…）——run154 实证：

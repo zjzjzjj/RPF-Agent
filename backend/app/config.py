@@ -798,8 +798,9 @@ def llm_prompt_version() -> str:
     利群 7 条实证）+ 权重表禁抽 + 主/客观列最终依据声明，升版作废旧缓存。
     2026-11-19：新增承诺值残差抽取 prompt（VALUE_EXTRACT_*，包A 抽取失败≠结论0），
     升版作废旧缓存（新 prompt 不与旧键共享命中）。
+    2026-11-25：主观判档增"区分度校准（防挤中间档）"条款，升版作废旧缓存。
     """
-    return os.environ.get("BID_EVAL_PROMPT_VERSION", "2026-11-19.1")
+    return os.environ.get("BID_EVAL_PROMPT_VERSION", "2026-11-25.1")
 
 
 def value_extract_llm_enabled() -> bool:

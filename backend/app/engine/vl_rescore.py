@@ -259,6 +259,22 @@ def _apply_overlays(cases: list[dict], inventory: MaterialInventory,
     _reconcile_person_states(cases, prior)
 
 
+def _relax_person_states(cases: list[dict]) -> int:
+    """人员材料放宽口径（2026-11-25 用户拍板）：业绩证明可见（work_proof=True，
+    其本身已要求人名归属）即计分；经验证明/社保有线索即计入+标疑问——
+    None 补 True（线索=归属+业绩证明），**False（可读确认缺）保持阻计**（红线：
+    确认缺判 0 不放宽）。返回放宽条数。"""
+    relaxed = 0
+    for case in cases:
+        if case.get("work_proof") is not True:
+            continue
+        for key in ("experience_proof", "social_security", "name_reflected"):
+            if case.get(key) is None:
+                case[key] = True
+                relaxed += 1
+    return relaxed
+
+
 def _rescore_person_cases(criterion: dict, inventory: MaterialInventory,
                           params: dict) -> FastPathResult | None:
     scope = str(params.get("person_scope") or "")
@@ -270,11 +286,15 @@ def _rescore_person_cases(criterion: dict, inventory: MaterialInventory,
     if not cases:
         return None
     _apply_overlays(cases, inventory, scope)
+    relaxed = _relax_person_states(cases)
     # 金额档预滤（managed 金额档要求每案例有已核验金额，否则 raise）
     tiers = params.get("tiers") or []
     amount_tier = bool(tiers) and any(
         isinstance(t, dict) and t.get("min_amount_yuan") is not None for t in tiers)
     note = ""
+    if relaxed:
+        note += (f"（{relaxed} 项经验证明/社保证明按放宽口径以线索计入并标疑问"
+                 "（业绩证明可见+归属成立），需人工复核）")
     if amount_tier or _decimal_or_none(params.get("min_amount_yuan")):
         kept = [c for c in cases if c.get("amount_yuan") not in (None, "")]
         if len(kept) != len(cases):

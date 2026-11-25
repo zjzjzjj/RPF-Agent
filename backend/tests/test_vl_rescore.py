@@ -139,6 +139,28 @@ def test_rescore_person_missing_work_proof_zero() -> None:
     assert res.score == 0, f"work_proof 无正向证据不得计分：{res.detail}"
 
 
+def test_rescore_person_relaxed_partial_chain() -> None:
+    """放宽口径（2026-11-25 用户拍板）：业绩证明可见+归属 → 经验证明/社保
+    以线索计入并标疑问。"""
+    inv = _person_case_inv(person_states={"work_proof": True,
+                                          "experience_proof": None,
+                                          "social_security": None})
+    res = rescore_from_merged_facts(CRIT_PERSON, inv)
+    assert res is not None
+    assert res.score == Decimal("2.00"), res.detail
+    assert "放宽口径" in (res.detail or "")
+
+
+def test_rescore_person_confirmed_missing_still_blocks() -> None:
+    """红线：可读确认缺（False）不放宽——确认缺判 0 不放宽。"""
+    inv = _person_case_inv(person_states={"work_proof": True,
+                                          "experience_proof": True,
+                                          "social_security": False})
+    res = rescore_from_merged_facts(CRIT_PERSON, inv)
+    assert res is not None
+    assert res.score == 0, f"确认缺（False）必须阻计：{res.detail}"
+
+
 def test_rescore_person_type_eligible_never_none() -> None:
     """type_eligible 恒 bool（None→True 保留+疑问）——managed raise 不触发。"""
     inv = _person_case_inv(project_type=None)  # 名称含"运维服务"→True

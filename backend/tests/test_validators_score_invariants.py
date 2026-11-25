@@ -91,7 +91,7 @@ def test_prompt_match_wording_fixed_and_version_bumped() -> None:
     assert "match（满足条件得分）" not in p, "误导措辞必须移除（把计分行推向 match 的病根）"
     assert "match" in p and "不计分" in p
     assert "权重表" in p and "禁止抽成 criterion" in p
-    assert config.llm_prompt_version() == "2026-11-19.1"
+    assert config.llm_prompt_version() == "2026-11-25.1"
 
 
 # --- ⑬ 分部覆盖（P2-11 类别缺项防线，测试12 样品整类缺失实证） ---------------
