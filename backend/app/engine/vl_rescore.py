@@ -415,7 +415,7 @@ def _rescore_person_cases(criterion: dict, inventory: MaterialInventory,
     elif scope == "member":
         people = {
             person_key(person.name): person for person in inventory.persons
-            if re.search(r"驻场|驻点|工程师|成员|团队", str(person.role or ""))
+            if re.search(r"驻场|驻点|工程师|成员|团队|现场运维|现场支持|运维人员", str(person.role or ""))
             and person_key(person.name) not in leader_people
         }
     else:
