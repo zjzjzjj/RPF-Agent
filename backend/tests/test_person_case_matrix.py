@@ -5,7 +5,7 @@ from pathlib import Path
 from app.engine.facts import BidFacts
 from app.engine.material_inventory import (
     ContractRecord, MaterialInventory, PersonRecord, _attach_person_case_proofs,
-    _person_case_records_from_pages,
+    _person_case_records_from_pages, build_inventory,
 )
 from app.engine.vl_rescore import rescore_from_merged_facts
 
@@ -86,3 +86,4 @@ def test_expected_person_targets_match_manual_fixture():
     expected = json.loads(FIXTURE.read_text(encoding="utf-8"))["expected_objective"]
     assert expected["c48"] == ["0", "4", "0", "2", "4"]
     assert expected["c49"] == ["0", "6", "0", "3", "6"]
+

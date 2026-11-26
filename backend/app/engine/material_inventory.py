@@ -1711,9 +1711,12 @@ def build_inventory(bidder_id: int, pages: list[dict]) -> MaterialInventory:
         else:
             persons.append(leader)
             by_name[leader.name] = leader
-    contracts.extend(_person_case_records_from_pages(pages, persons))
     _overlay_personnel_years(persons, pages)
     _overlay_social_security(persons, pages)
+    # Build person proof cases only after identity, work-year and social overlays
+    # are complete, so their required-material flags describe the same immutable
+    # person record that the scorer consumes.
+    contracts.extend(_person_case_records_from_pages(pages, persons))
     _attach_person_case_proofs(contracts, persons, pages)
     value_items, value_found = _value_items_from_pages(pages)
     performance_found = any(
