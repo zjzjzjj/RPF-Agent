@@ -782,17 +782,28 @@ def reconcile_with_skeleton(
     # （4+4+2），两条都计分 → Σ 超出细则权威值（run 54 pkg22 Σ=109≠100 实证）。
     # 骨架行是权威：一条计分 criterion 覆盖的行集若被更细的计分条目完整平铺
     # 且分值之和相等 → 丢粗粒度保细粒度（评分粒度更有用），report 留痕。
+    # 2026-11-26：父项候选放宽到「match 带分值」（c38 形态）——LLM 违约把组行
+    # 抽成 match 父项时，旧口径把父排除在候选外，子项又因 match 不算覆盖走缺口
+    # 补齐，父子并存进 UI（测试2 c38 vs c61/c62）。match 父不计分，Σ子<=父满分
+    # 即可丢父保子；计分父保持严格相等（丢父会减总分）。
     dropped_idx: set[int] = set()
     scoring_idx = [
         i for i, c in enumerate(criteria)
-        if c.score_type in SCORING_TYPES and not c.is_veto
+        if not c.is_veto and (
+            c.score_type in SCORING_TYPES
+            or (c.score_type == "match" and c.max_score is not None)
+        )
     ]
     rows_of = {i: {ri for ri, lst in covered_by.items() if i in lst} for i in scoring_idx}
     for i in scoring_idx:
         rows_i = rows_of[i]
         if len(rows_i) < 2:
             continue
-        children = [j for j in scoring_idx if j != i and rows_of[j] and rows_of[j] < rows_i]
+        children = [
+            j for j in scoring_idx
+            if j != i and rows_of[j] and rows_of[j] < rows_i
+            and criteria[j].score_type in SCORING_TYPES
+        ]
         remain = set(rows_i)
         chosen: list[int] = []
         for j in sorted(children, key=lambda j: len(rows_of[j]), reverse=True):
@@ -801,7 +812,12 @@ def reconcile_with_skeleton(
                 remain -= rows_of[j]
         if not remain and chosen:
             sum_children = sum((criteria[j].max_score or Decimal(0)) for j in chosen)
-            if sum_children == (criteria[i].max_score or Decimal(0)):
+            parent_max = criteria[i].max_score or Decimal(0)
+            if criteria[i].score_type == "match":
+                prunable = sum_children <= parent_max
+            else:
+                prunable = sum_children == parent_max
+            if prunable:
                 dropped_idx.add(i)
                 report.setdefault("overcoverage_pruned", []).append(
                     {"name": criteria[i].name,
@@ -821,15 +837,59 @@ def reconcile_with_skeleton(
         index=index, report=report,
     )
 
-    out = [c for i, c in enumerate(criteria) if i not in dropped_idx]
+    row_gen: dict[int, ExtractedCriterion] = {}
     for ri, row in enumerate(skeleton.rows):
         if _scoring_covered(ri):
             continue
         category = ((_category_for_row(row, index) if index is not None else None)
                     or _category_for_group(row.group, pages_by_no))
         gen = _generate_for_row(row, pages_by_no, category)
-        out.append(gen)
+        row_gen[ri] = gen
         report["generated"].append(gen.name)
+
+    # 二次裁剪（match 带分值父项，2026-11-26）：首轮裁剪在缺口补齐之前跑，
+    # 看不到这里刚生成的子项；补齐后父项覆盖行已被计分子/生成项平铺 → 丢父保子。
+    # 这是 c38（match 父）vs c61/c62（补齐子）在编译期的根治口径。
+    for i, c in enumerate(criteria):
+        if (i in dropped_idx or c.is_veto or c.score_type != "match"
+                or c.max_score is None):
+            continue
+        rows_i = rows_of.get(i) or set()
+        if not rows_i:
+            continue
+        child_idx: set[int] = set()
+        gen_idx: set[int] = set()
+        for ri in rows_i:
+            scoring_js = [
+                j for j in covered_by[ri]
+                if j != i and j not in dropped_idx
+                and criteria[j].score_type in SCORING_TYPES
+            ]
+            if scoring_js:
+                child_idx.update(scoring_js)
+            elif ri in row_gen:
+                gen_idx.add(ri)
+            else:
+                child_idx = set()
+                gen_idx = set()
+                break  # 仍有行无计分覆盖 → 父项保留
+        if not child_idx and not gen_idx:
+            continue
+        sum_children = (
+            sum((criteria[j].max_score or Decimal(0)) for j in child_idx)
+            + sum((row_gen[ri].max_score or Decimal(0)) for ri in gen_idx)
+        )
+        if sum_children <= (c.max_score or Decimal(0)):
+            dropped_idx.add(i)
+            kept = [criteria[j].name for j in sorted(child_idx)]
+            kept += [row_gen[ri].name for ri in sorted(gen_idx)]
+            report.setdefault("overcoverage_pruned", []).append(
+                {"name": c.name, "kept": kept,
+                 "max_score": float(c.max_score or 0)}
+            )
+
+    out = [c for i, c in enumerate(criteria) if i not in dropped_idx]
+    out += [row_gen[ri] for ri in sorted(row_gen)]
 
     # 表外报价段（「商务报价部分」等复合组名用包含判定，不只看行首）
     for entry in skeleton.ledger:

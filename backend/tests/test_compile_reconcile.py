@@ -299,6 +299,66 @@ def test_reconcile_prunes_parent_child_double_count():
     assert total == Decimal("100")
 
 
+def test_reconcile_prunes_match_parent_with_scoring_children():
+    """B1：match 带分值父项 + 计分子项同时抽出 → 丢父保子（c38 形态编译期根治）。
+
+    旧口径父项候选只认计分类型，match 父被排除 → 父子并存进 UI
+    （测试2 商务分 c38 满分4 vs c61/c62 各2）。
+    """
+    sk, pages = _skeleton_and_pages()
+    group_rows = [r for r in sk.rows if r.group == "投标方案评析"]
+    assert len(group_rows) == 3
+    parent = ExtractedCriterion(
+        name="投标方案评析", category="technical", score_type="match",
+        max_score=Decimal("10"),
+        description="对招标人运维需求、运维服务的重点、难点进行科学、合理、准确地分析描述 "
+                    "有全面完整的服务质量管理体系，服务规范 提供应急预案及处理方案切实可行",
+    )
+    children = [
+        ExtractedCriterion(
+            name=f"投标方案评析（{i}）", category="technical", score_type="subjective",
+            max_score=r.max_score, description=r.text, page_hint=r.page_no,
+        )
+        for i, r in enumerate(group_rows, 1)
+    ]
+    out, report = reconcile_with_skeleton(
+        [parent] + children, document_id=1, pages=pages, skeleton=sk)
+    names = [c.name for c in out]
+    assert "投标方案评析" not in names  # match 父项被裁掉
+    assert sum(1 for n in names if "投标方案评析" in n) == 3
+    assert report["overcoverage_pruned"]
+    # 裁父不减总分：match 本就不计分，Σ 仍闭合 100
+    total = sum((c.max_score or Decimal(0)) for c in out
+                if c.score_type in ("formula", "count", "subjective"))
+    assert total == Decimal("100")
+    assert not [c for c in out if c.score_type == "match" and c.max_score]
+
+
+def test_reconcile_prunes_match_parent_after_gap_fill():
+    """B2：LLM 只抽 match 父项 → 缺口补齐生成子项后再裁（首轮看不到生成项）。
+
+    测试2 实证路径：父 match 覆盖整组但 match 不算计分覆盖 → 每行走缺口补齐
+    生成 c61/c62 → 父必须在补齐后被第二轮裁掉，否则仍双份进 UI。
+    """
+    sk, pages = _skeleton_and_pages()
+    parent = ExtractedCriterion(
+        name="投标方案评析", category="technical", score_type="match",
+        max_score=Decimal("10"),
+        description="对招标人运维需求、运维服务的重点、难点进行科学、合理、准确地分析描述 "
+                    "有全面完整的服务质量管理体系，服务规范 提供应急预案及处理方案切实可行",
+    )
+    out, report = reconcile_with_skeleton(
+        [parent], document_id=1, pages=pages, skeleton=sk)
+    names = [c.name for c in out]
+    assert "投标方案评析" not in names  # 补齐后第二轮裁掉 match 父
+    assert any("投标方案评析" in n for n in names)  # 子项保留
+    assert report["overcoverage_pruned"]
+    assert not [c for c in out if c.score_type == "match" and c.max_score]
+    total = sum((c.max_score or Decimal(0)) for c in out
+                if c.score_type in ("formula", "count", "subjective"))
+    assert total == Decimal("100")
+
+
 def test_reconcile_generates_price_from_business_quote_ledger():
     """台账组名「商务报价部分」（复合名，行首非「报价/价格」）也要能生成价格项。"""
     from decimal import Decimal as D

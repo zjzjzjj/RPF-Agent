@@ -26,6 +26,7 @@ from app.db.models import (
 )
 from app.db.session import session_scope
 from app.errors import NotFound, ValidationFailed
+from app.services.duplicate_summary import duplicate_summary_ids
 from app.services.public_output import sanitize_public_object, sanitize_public_text
 from app.services.automation_service import (
     completed_keys as automatic_completed_keys,
@@ -1119,6 +1120,9 @@ def _build_formal_report_unsafe(project_id: str, run_id: int | None = None) -> d
     # 不进本表。技术/商务保持原顺序在前，其余按首现顺序追加。
     _A3_LABELS = {"technical": "技术评审", "commercial": "商务评审"}
     _A3_SKIP = {"qualification", "compliance", "price"}
+    # 重复汇总父项（c38 类）与 score-summary 同口径隐藏，防止报告分项表
+    # 与 UI 列表不一致（2026-11-26 用户口径：项目中不要出现重复计分项）。
+    _hidden_ids = duplicate_summary_ids(criteria)
     _cats: list[str] = []
     for c in criteria:
         cat = c.category or ""
@@ -1129,7 +1133,8 @@ def _build_formal_report_unsafe(project_id: str, run_id: int | None = None) -> d
     score_groups = []
     for cat in _ordered:
         label = _A3_LABELS.get(cat, cat)
-        crits = [c for c in criteria if c.category == cat]
+        crits = [c for c in criteria
+                 if c.category == cat and int(c.id) not in _hidden_ids]
         if not crits:
             continue
         items = []

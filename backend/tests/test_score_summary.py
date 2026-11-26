@@ -562,3 +562,65 @@ def test_verdict_source_in_score_summary(client, summary_chain):  # noqa: ANN001
     assert item["verdict_source"] == "llm"
     assert item["evidence"]["total_count"] == 1
     assert "自动裁决（通过）" in item["reason"]["machine_reason"]
+
+
+def test_duplicate_summary_parent_hidden_from_buckets(client, summary_chain):  # noqa: ANN001
+    """重复汇总父项（c38 形态）不进商务分桶列表，子项与正常项保留。
+
+    测试2 实证：match 带分值父项（满分4）+ 同 source_node_id 两个计分子项
+    （各2分）同时列出 = 用户看到的「重复计分项」。隐藏只动展示层：
+    桶满分不累计 match，总分/名次不变。
+    """
+    from decimal import Decimal as D
+
+    from app.db.models import Criterion
+    from app.db.session import session_scope
+
+    node = "dup:test:SEC6:I5:N1"
+    with session_scope() as s:
+        parent = Criterion(
+            package_id=summary_chain["package_id"], code="dup-c38",
+            category="commercial", name="投标人资质实力",
+            max_score=D("4"), score_type="match", is_veto=False,
+            source_node_id=node, status="verified", sort_order=9000,
+            description="（1）投标人具有ISO9001质量管理体系认证证书并附证书"
+                        "扫描件得2分（2）有效期内的电子与智能化专业承包资质"
+                        "得0.5分且具有建筑智能化工程得1分",
+        )
+        child1 = Criterion(
+            package_id=summary_chain["package_id"], code="dup-c61",
+            category="commercial", name="投标人资质实力（1）投标人具有ISO9001",
+            max_score=D("2"), score_type="count", is_veto=False,
+            source_node_id=node, status="verified", sort_order=9001,
+            description="（1）投标人具有ISO9001质量管理体系认证证书并附证书"
+                        "扫描件得2分",
+        )
+        child2 = Criterion(
+            package_id=summary_chain["package_id"], code="dup-c62",
+            category="commercial", name="投标人资质实力（2）有效期内的电子与智能化",
+            max_score=D("2"), score_type="count", is_veto=False,
+            source_node_id=node, status="verified", sort_order=9002,
+            description="（2）有效期内的电子与智能化专业承包资质得0.5分且具有"
+                        "建筑智能化工程得1分",
+        )
+        normal = Criterion(
+            package_id=summary_chain["package_id"], code="dup-m1",
+            category="commercial", name="报价一致性判断",
+            max_score=None, score_type="match", is_veto=False,
+            source_node_id="dup:test:other", status="verified", sort_order=9003,
+            description="投标文件报价出现前后不一致的按开标一览表为准",
+        )
+        s.add_all([parent, child1, child2, normal])
+
+    d = _get(client, summary_chain).json()
+    for b in d["bidders"]:
+        if b["state"] != "scored":
+            continue
+        codes = {i["code"] for bucket in b["buckets"] for i in bucket["items"]}
+        assert "dup-c38" not in codes, "重复汇总父项必须隐藏"
+        assert "dup-c61" in codes and "dup-c62" in codes, "计分子项必须保留"
+        assert "dup-m1" in codes, "正常判断项（无分值 match）不得误杀"
+        commercial = next(x for x in b["buckets"] if x["key"] == "commercial")
+        assert commercial["item_count"] == len(commercial["items"])
+        # 桶满分只累计计分类型：隐藏 match 父不改变满分口径
+        assert all(i["code"] != "dup-c38" for i in commercial["items"])

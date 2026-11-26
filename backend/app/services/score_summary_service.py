@@ -36,6 +36,7 @@ from app.db.models import (
 )
 from app.db.session import session_scope
 from app.errors import NotFound
+from app.services.duplicate_summary import duplicate_summary_ids
 from app.services.ranking_service import compute_ranking
 
 # 分桶定义：key → category 映射。kind=score 的桶有分值；kind=verdict 的桶只统计判定。
@@ -642,6 +643,12 @@ def build_score_summary(
         )
         params_by_crit = {c.criterion_id: (c.params_json or {}) for c in check_rows}
 
+        # 重复汇总父项（c38 类 match 带分值 + 同 node 计分子项平铺）展示层隐藏：
+        # 分数层已有 duplicate_summary 兜底不给分，但条目仍进列表会让用户看到
+        # 「重复计分项」（2026-11-26 用户口径：项目中不要出现）。桶满分只累计
+        # 计分类型，隐藏不改 max/总分/排名。
+        hidden_crit_ids = duplicate_summary_ids(criteria)
+
         config = run.config_json if isinstance(run.config_json, dict) else {}
         participant_ids = [int(x) for x in config.get("bidder_ids") or []]
         auto_dropped = [str(x) for x in config.get("auto_dropped_bidders") or []]
@@ -791,6 +798,8 @@ def build_score_summary(
             max_parts: list[Decimal] = []
             for crit in criteria:
                 if crit.category not in bdef["categories"]:
+                    continue
+                if crit.id in hidden_crit_ids:
                     continue
                 score = score_by_key.get((bidder.id, crit.id))
                 items.append(
