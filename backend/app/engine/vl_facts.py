@@ -236,6 +236,20 @@ _CERT_EXPIRY = re.compile(r"(?:有效期(?:至|到)|到期日期)\s*[:：]?\s*20
 _COPY_NEGATION = re.compile(r"(?:未见|未提供|缺少)(?:[^，。；]{0,12})(?:证书|公章)|未加盖|无公章|须提供|不得分")
 
 
+def _cert_number_key(value) -> str:
+    return re.sub(r"[^A-Z0-9]", "", str(value or "").upper())
+
+
+def _cert_number_matches(expected: str, observed: str) -> bool:
+    left = _cert_number_key(expected)
+    right = _cert_number_key(observed)
+    if not left or not right:
+        return False
+    return left == right or (len(left) >= 6 and right.endswith(left)) or (
+        len(right) >= 6 and left.endswith(right)
+    )
+
+
 def _merge_certificate_observations(certs: list[CertRecord], fact: dict) -> list[tuple]:
     """Read ISO copy and platform observations independently of optional model flags."""
     normalized = normalize_cert(str(fact.get("name") or ""))
@@ -259,7 +273,8 @@ def _merge_certificate_observations(certs: list[CertRecord], fact: dict) -> list
             continue
         numbers = certificate_numbers(observation)
         if (ref.get("document_id") and len(numbers) == 1
-                and (not expected_number or expected_number in numbers)
+                and (not expected_number
+                     or any(_cert_number_matches(expected_number, number) for number in numbers))
                 and certificate_families(observation) == {normalized}
                 and _CERT_COPY.search(observation)
                 and (_CERT_SEAL.search(observation) or fact.get("has_seal") is True)
@@ -355,15 +370,22 @@ def merge_vl_facts(inventory: MaterialInventory,
             _merge_person(persons, fact, ev_pages)
     for name, families, numbers, document_id in observations_of_queries:
         numbered = {normalize_cert(cert.name) for cert in certs
-                    if cert.backing is True and cert.certificate_number in numbers
+                    if cert.backing is True and _cert_number_key(cert.certificate_number) in {_cert_number_key(n) for n in numbers}
                     and cert.document_id == document_id}
         # An explicit certificate-number match carries identity across pages.
         # A conflicting known number must never fall back to a broad family match.
-        known_numbers = {cert.certificate_number for cert in certs if normalize_cert(cert.name) == name
+        known_numbers = {_cert_number_key(cert.certificate_number) for cert in certs if normalize_cert(cert.name) == name
                          and cert.backing is True and cert.certificate_number}
+        same_document = document_id is None or all(
+            cert.document_id == document_id for cert in certs
+            if normalize_cert(cert.name) == name and cert.backing is True
+        )
+        number_compatible = not numbers or not known_numbers or not (
+            {_cert_number_key(n) for n in numbers}.isdisjoint(known_numbers)
+        )
         if len(numbered) == 1 and (not families or numbered <= families):
             query_families.update(numbered)
-        elif name in families and len(families) == 1 and not (numbers and known_numbers):
+        elif name in families and len(families) == 1 and same_document and number_compatible:
             query_families.add(name)
     cert_section_present = cert_section_present or bool(query_families)
     return replace(inventory, contracts=contracts, certs=certs, persons=persons,

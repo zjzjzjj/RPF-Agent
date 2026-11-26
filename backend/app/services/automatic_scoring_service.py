@@ -122,27 +122,28 @@ def _presence_outcome(result, criterion: dict, pages: list[dict]) -> CellOutcome
         "zero_reason": "confirmed_absent" if getattr(result, "state", "") == "absent" else None,
     }
     if getattr(result, "state", "") == "unverified":
-        # 零未定分（2026-11-24 用户拍板：计分项一律有结果）：写兜底暂定分
-        # （非评审结论，疑问待人工，可改分重汇总）；判定项仍无分数语义（None）
-        value = _fallback_score_for(criterion)
+        reason = "材料存在性尚未完成原页核验，未生成最终分"
         fallback = {
-            "kind": "presence_unverified",
-            "value": str(value) if value is not None else None,
+            "kind": "material_review_pending",
+            "reason_code": "presence_unverified",
+            "value": None,
+            "value_role": "verified_subtotal",
             "basis": "machine_fallback",
-            "reason": detail,
+            "reason": reason,
             "windows": presence_raw["windows"],
             "missing_years": [year for year, state in presence_raw["years"].items()
                               if state != "present"],
             "score_type": criterion.get("score_type"),
+            "technical_error": True,
         }
         raw["fallback"] = fallback
         return CellOutcome(
-            "concern", detail, value, [], pages, "fallback", 1, raw,
+            "concern", reason, None, [], pages, "fallback", 1, raw,
             [{
-                "message": detail + f"（兜底暂定 {_fallback_score_for(criterion)} 分，"
-                                    "非评审结论，需人工抽核）",
+                "message": reason,
                 "verdict_source": "deterministic",
                 "fallback_score": fallback,
+                "unresolved": "presence_unverified",
             }],
         )
     score = getattr(result, "score", None)
@@ -168,39 +169,31 @@ def _presence_unverified_outcome(
 def _value_extraction_unresolved_outcome(
     criterion: dict, pages: list[dict], detail: str,
 ) -> CellOutcome:
-    """承诺值抽取未果 → 暂定待人工（包A 第 3 步）。
-
-    与 presence_unverified/reading_incomplete 同构：basis=fallback、**未定分**
-    （final=None，不进 final_score 定格、不压名次），kind=value_extraction_unresolved
-    供 _valid_cell 计完成、报告按兜底清单渲染——"抽取失败"绝不冒充"不符合 0 分"
-    结论；确认缺失（confirmed_absent+制裁句）的 0 分结论仍走 _verified_count 原通道。
-    """
-    # 零未定分（2026-11-24）：写兜底暂定分（非评审结论），计分项一律有结果
-    value = _fallback_score_for(criterion)
-    reason = (
-        f"承诺值抽取未果，按兜底暂定 {value} 分（非不符合结论、非评审结论）：{detail}"
-    )
+    """承诺值抽取未果时保留人工复核，不生成暂定数值分。"""
+    reason = "承诺值抽取未形成可核验终态，未生成最终分"
     fallback = {
-        "kind": "value_extraction_unresolved",
-        "value": str(value) if value is not None else None,
+        "kind": "material_review_pending",
+        "reason_code": "value_extraction_unresolved",
+        "value": None,
+        "value_role": "verified_subtotal",
         "basis": "machine_fallback",
-        "reason": str(detail or "").strip()[:500],
+        "reason": reason,
         "score_type": criterion.get("score_type"),
+        "technical_error": True,
     }
     raw = {
         "calculation": reason,
         "coverage_complete": False,
         "zero_reason": "value_extraction_unresolved",
         "fallback": fallback,
+        "technical_detail": str(detail or "").strip()[:500],
     }
     return CellOutcome(
-        "concern", reason, value, [], pages, "fallback", 1, raw,
+        "concern", reason, None, [], pages, "fallback", 1, raw,
         [{
             "message": reason,
             "verdict_source": "deterministic",
             "fallback_score": fallback,
-            # 结构化 unresolved（report._count_problem 疑问清单同键口径）：
-            # "机器没抽到事实"进 count_no_facts 疑问，不冒充评审结论。
             "unresolved": "no_facts",
         }],
     )
@@ -340,6 +333,15 @@ def _decimal(value: Any, label: str) -> Decimal:
     if not number.is_finite():
         raise LLMError(f"{label}不是有限数值")
     return number
+
+
+def _confirmed_zero_allowed(criterion: dict) -> bool:
+    """Only an explicit missing-material sanction may publish a confirmed zero."""
+    rule = "\n".join(str(criterion.get(key) or "") for key in (
+        "description", "source_quote", "required_evidence", "required_artifacts",
+        "required_artifacts_raw",
+    ))
+    return bool(re.search(r"不(?:予)?得分|不计分|(?:计|得|为|扣至)\s*0\s*分", rule))
 
 
 def _score_in_range(value: Any, criterion: dict) -> Decimal:
@@ -922,6 +924,12 @@ def _verified_count(criterion: dict, decision, pages: list[dict]) -> tuple[Decim
             raise LLMError("业绩分档缺少逐案例证明材料核验")
         scorer = score_count
     result = scorer(prepared, params, facts)
+    if (params.get("field") == "cmmi" and result.unresolved == "certificate_unverified"
+            and not prepared.get("certificate_details") and decision.coverage_complete
+            and (facts.cert_claims or facts.certificates)):
+        return (Decimal(0),
+                "完整检索仅见认证标题或声称，未提供可核验的等级、有效期证书，按细则要求计 0 分",
+                values)
     if result.unresolved:
         if decision.confirmed_absent and decision.coverage_complete and result.unresolved == "no_facts":
             rule = requirements + str(criterion.get("description") or "") + str(criterion.get("source_quote") or "")
@@ -1255,71 +1263,58 @@ def _assess_cell(criterion: dict, pages: list[dict], data_class: str, gateway_fa
 
 
 def _fallback_score_for(criterion: dict) -> Decimal | None:
-    """Provisional score for a cell whose evidence/model path failed.
-
-    Objective cells settle at 0 unless a deterministic fast path has already
-    produced a value.  Subjective cells fall back to the lowest frozen level
-    (or 0 when the rule has no levels).  Veto/match cells carry a conclusion,
-    not a numeric score.
-    """
-    score_type = criterion.get("score_type")
-    maximum = criterion.get("max_score")
-    if score_type not in ("veto", "match") and maximum is not None:
-        if score_type == "subjective":
-            minimums: list[Decimal] = []
-            for level in criterion.get("levels") or []:
-                try:
-                    if level.get("min") is not None:
-                        minimums.append(Decimal(str(level["min"])))
-                except (InvalidOperation, TypeError, ValueError):
-                    continue
-            if minimums:
-                return max(Decimal(0), min(minimums))
-        return Decimal(0)
-    # 判定项（veto/match）：结论而非数值分——恒 None（零未定分只管计分项）
+    """Technical failures have no legitimate numeric fallback."""
     return None
 
 
 def _write_closure_fallback(s, row: ScoreRecord, criterion: dict, error: BaseException) -> None:
-    score_type = criterion.get("score_type")
-    reading_gap = bool(getattr(error, "reading_incomplete", False))
-    if reading_gap:
-        # P0-3（测试10 run113）：读取故障既不是评审结论也不是材料缺失。
-        # 零未定分（2026-11-24 用户拍板：计分项一律有结果）：写兜底暂定分，
-        # kind=reading_incomplete 供报告标注"读取故障待补读"；补读完成后可经
-        # 续评重跑该格翻案，人工可改分重汇总。判定项仍存疑结项（无分数语义）。
-        value = _fallback_score_for(criterion)
-        kind = "reading_incomplete"
-        detail = str(error).strip()[:500] or type(error).__name__
-        reason = (
-            f"读取故障按兜底暂定 {value} 分（非评审结论、非材料缺失结论）：{detail}"
-            "；须补读上述原页图像并视觉核验后重评，人工可改分"
-            if value is not None else
-            f"读取故障存疑结项（判定项无分数语义）：{detail}"
-        )
-    else:
-        value = _fallback_score_for(criterion)
-        detail = str(error).strip()[:500] or type(error).__name__
-        reason = (
-            f"自动评审未产生有效结论，按暂定 {value} 分兜底（非证据结论）：{detail}"
-            if value is not None else
-            f"自动评审未产生有效结论，按存疑结项（非证据结论）：{detail}"
-        )
-        kind = "min_level_floor" if score_type == "subjective" and value else (
-            "provisional_zero" if value is not None else "provisional_conclusion"
-        )
+    """Close technical work as pending review, never as a numeric score."""
+    from app.services.review_collections import (
+        public_error_message, sanitize_rejected_evidence,
+        sanitize_validation_history, error_reason_code,
+    )
+
+    reason_code = error_reason_code(error)
+    reason = public_error_message(error)
+    detail = str(error).strip()[:500] or type(error).__name__
+    subtotal = getattr(error, "verified_subtotal", None)
+    try:
+        subtotal_value = Decimal(str(subtotal)) if subtotal is not None else None
+        if subtotal_value is not None and not subtotal_value.is_finite():
+            subtotal_value = None
+    except (InvalidOperation, TypeError, ValueError):
+        subtotal_value = None
+
+    unreadable_pages = list(getattr(error, "unreadable_pages", []) or [])
+    candidate_pages = list(getattr(error, "candidate_pages", []) or unreadable_pages)
+    required_materials = {
+        "reading_incomplete": "补读并核验原页",
+        "evidence_binding": "复核原批次证据绑定",
+        "model_output_incomplete": "人工复核模型输出与原页证据",
+        "execution_incomplete": "人工复核未完成的评审工作",
+    }[reason_code]
+    rejected = sanitize_rejected_evidence(getattr(error, "rejected_evidence", None))
     fallback = {
-        "kind": kind,
-        "value": str(value) if value is not None else None,
+        "kind": "material_review_pending",
+        "reason_code": reason_code,
+        "value": str(subtotal_value) if subtotal_value is not None else None,
+        "value_role": "verified_subtotal",
         "basis": "machine_fallback",
-        "reason": detail,
-        "score_type": score_type,
+        "reason": reason,
+        "score_type": criterion.get("score_type"),
+        "technical_error": True,
+        "error_code": str(getattr(error, "code", type(error).__name__)),
+        "required_materials": [required_materials],
+        "candidate_pages": candidate_pages,
     }
-    if reading_gap:
-        fallback["unreadable_pages"] = list(getattr(error, "unreadable_pages", []) or [])
-    row.final_score = value
-    row.machine_score = value if score_type != "subjective" else None
-    row.ai_suggested_score = value if score_type == "subjective" else None
+    if unreadable_pages:
+        fallback["unreadable_pages"] = unreadable_pages
+    if rejected:
+        fallback["rejected_evidence"] = rejected
+
+    row.final_score = None
+    row.machine_score = None
+    row.ai_suggested_score = None
     row.machine_status = "concern"
     row.review_status = "auto_confirmed"
     row.evidence_status = "none"
@@ -1327,8 +1322,11 @@ def _write_closure_fallback(s, row: ScoreRecord, criterion: dict, error: BaseExc
     row.evaluator_actor = "auto"
     row.confirm_time = utcnow()
     row.ai_raw_json = {
-        "attempt_history": getattr(error, "attempt_history", []),
-        "validation_history": list(getattr(error, "validation_history", [])),
+        "attempt_history": sanitize_validation_history(getattr(error, "attempt_history", None)),
+        "validation_history": sanitize_validation_history(getattr(error, "validation_history", None)),
+        "verified_facts": getattr(error, "verified_facts", None),
+        "rejected_evidence": rejected,
+        "technical_detail": detail,
         "auto_review": {
             "state": "completed",
             "basis": "fallback",
@@ -1336,44 +1334,42 @@ def _write_closure_fallback(s, row: ScoreRecord, criterion: dict, error: BaseExc
             "fallback": fallback,
             "coverage_complete": False,
             "calculation": None,
-            "error_code": getattr(error, "code", type(error).__name__),
-            "error": detail,
+            "error_code": fallback["error_code"],
         },
     }
     warnings = [{
         "message": reason,
         "fallback_score": fallback,
+        "technical_error": True,
     }]
     vl_note = getattr(error, "vl_fallback_note", None)
     if isinstance(vl_note, dict):
-        # run152 观测性补：错误路径的 VL 兜底失败原因一并落库
+        safe_vl_note = {
+            "visual_fallback": str(vl_note.get("visual_fallback") or "failed")[:80],
+            "reason": str(vl_note.get("reason") or "visual_review_incomplete")[:80],
+            "reason_code": str(vl_note.get("reason") or "visual_review_incomplete")[:80],
+            "reviewed_pages": vl_note.get("reviewed_pages") or [],
+            "facts_count": len(vl_note.get("facts") or []),
+        }
+        row.ai_raw_json["auto_review"]["visual_fallback_note"] = safe_vl_note
         warnings.append({
             "verdict_source": "visual",
-            "message": f"视觉AI兜底未定分：{vl_note.get('reason')}",
-            "reasoning": str(vl_note.get("reasoning") or "")[:500],
-            "clues": vl_note.get("clues") or [],
+            "message": "视觉补评未形成可核验终态，保留人工复核",
+            "reasoning": str(vl_note.get("reasoning") or "")[:200],
+            "fallback_score": fallback,
+            "technical_error": True,
         })
-        row.ai_raw_json = {
-            **(row.ai_raw_json or {}),
-            "auto_review": {
-                **((row.ai_raw_json or {}).get("auto_review") or {}),
-                "visual_fallback_note": vl_note,
-            },
-        }
     row.warnings_json = warnings
     s.add(ReviewRecord(
         subject_type="score", subject_id=str(row.id), action="confirm", actor="auto",
         reason=reason,
-        new_value_json={"verdict": "concern", "score": str(value) if value is not None else None,
+        new_value_json={"verdict": "concern", "score": None,
                         "auto_review": row.ai_raw_json["auto_review"]},
     ))
 
 
 def _persist_light_reject_citations(run_id: int, bidder_id: int, criterion: dict, outcome) -> None:
-    """qualification-light 的 LLM 否决逐字反面引文落库（role 按 score_type，与 deep 路径同构）。
-
-    引文已在引擎侧逐字核验（_verified_counter_quotes），此处只负责落库与
-    evidence_status 回写；确定性否决（reject_source=deterministic）不产引文。"""
+    """Persist qualification-light LLM rejection quotes with verified page identity."""
     payload = (outcome.raw or {}).get("qualification_light") or {}
     if payload.get("reject_source") != "llm" or not payload.get("reject_quotes"):
         return
@@ -1397,12 +1393,7 @@ def _persist_light_reject_citations(run_id: int, bidder_id: int, criterion: dict
 
 def _vl_note(outcome: CellOutcome | None, note: dict,
              error: BaseException | None = None) -> CellOutcome | None:
-    """VL 兜底未定分时的留痕（不改变原暂定语义——天然安全态）。
-
-    run152 实证可观测性漏洞：错误路径（outcome=None）留痕被整体丢弃，收口
-    兜底格的失败原因不可见。现同时挂 error.vl_fallback_note，由
-    _write_closure_fallback 落进 warnings 与 auto_review。
-    """
+    """Attach failed visual-recovery audit notes without publishing a score."""
     if outcome is not None:
         raw = dict(outcome.raw or {})
         raw["visual_fallback_note"] = note
@@ -1414,7 +1405,7 @@ def _vl_note(outcome: CellOutcome | None, note: dict,
     if error is not None:
         try:
             setattr(error, "vl_fallback_note", note)
-        except Exception:  # noqa: BLE001 —— 不可抛错盖掉原错误
+        except Exception:  # noqa: BLE001
             pass
     return outcome
 
@@ -1424,6 +1415,7 @@ def _material_recovery_pages(criterion: dict, pages: list[dict], fallback: dict,
     from itertools import zip_longest
 
     from app.engine.material_locator import locate_material_sections, locator_enabled
+    from app.engine.objective import documented_project_type_state
     from app.parsing.normalize import normalize_no_ws
 
     by_key = {(p.get("document_id"), p.get("page_no")): p for p in pages if not p.get("known_blank")}
@@ -1600,6 +1592,16 @@ def _material_recovery_pages(criterion: dict, pages: list[dict], fallback: dict,
         for record in material_records:
             for number in getattr(record, "experience_pages", []) or getattr(record, "pages", []):
                 add_number(number)
+        if "personnel" in kinds:
+            for record in inventory.contracts or []:
+                if documented_project_type_state(
+                        record.project_type, record.name, rule) is not True:
+                    continue
+                for number in record.pages or []:
+                    add_number(number)
+                for numbers in (record.materials or {}).values():
+                    for number in numbers or []:
+                        add_number(number)
     for page in sorted(by_key.values(), key=rank):
         add((page["document_id"], page["page_no"]))
     return list(priority.values())
@@ -1612,13 +1614,13 @@ def _maybe_vl_rescue(run_id: int, bid_id: int, criterion: dict,
                      ) -> tuple[CellOutcome | None, BaseException | None]:
     """材料审核视觉大模型兜底（2026-11-23 优化②，run151 后改一页一图）。
 
-    触发集=暂定族 fallback（provisional_zero/reading_incomplete/value_extraction_
-    unresolved/presence_unverified 等）与 closure 错误路径；材料页=该格送审页
+    触发集=技术待复核 fallback（reading_incomplete/value_extraction_unresolved/
+    presence_unverified 等）与 closure 错误路径；材料页=该格送审页
     （fallback 点名的不可读页优先），逐页渲染成图、每请求≤vl_fallback_max_images
     张（run 151 实证：整本长图十几 MB 被拒收 400）。VL 成功（计分格定分）→
     basis=visual_fallback 的正常结论（页级视觉核验，不产逐字引文）；否决/资格/
     符合性格只收线索（VL 结论绝不成否决）；其余（预算耗尽/涉密拦截/契约失败/
-    渲染失败）→ 原暂定语义不变。不调用 OCR；成本上限由 Budget 保证。
+    渲染失败）→ 原待复核语义不变。不调用 OCR；成本上限由 Budget 保证。
     """
     from app.engine import vl_fallback
 
@@ -1626,7 +1628,7 @@ def _maybe_vl_rescue(run_id: int, bid_id: int, criterion: dict,
         return outcome, error
     if error is not None:
         if getattr(error, "reading_incomplete", False) is False and not config.score_closure_enabled():
-            return outcome, error  # execution_failed=可恢复技术态，不是暂定族
+            return outcome, error  # 执行故障是可恢复技术态，不是分值
     elif outcome is None or outcome.basis != "fallback":
         return outcome, error
     loaded = pages_by_bidder.get(bid_id)
@@ -1695,7 +1697,8 @@ def _maybe_vl_rescue(run_id: int, bid_id: int, criterion: dict,
             merged = merge_vl_facts(inventory, facts)
             if (requires_platform_certificate_query(criterion)
                     and not merged.platform_query_certificates
-                    and any(re.search(r"未见.{0,24}(?:查询结果截图|查询截图|查询结果)", str(ref.get("observation") or ""))
+                    and any(re.search(r"(?:未见|未提供|未附|缺少).{0,30}(?:查询结果截图|查询截图|查询结果)",
+                                      str(ref.get("observation") or ""))
                             for ref in visual_evidence)):
                 # A reviewed proof section can explicitly establish that the
                 # required platform screenshots are absent. Keep that negative
@@ -1847,15 +1850,28 @@ def _maybe_vl_rescue(run_id: int, bid_id: int, criterion: dict,
                              and (base is None or res.score >= base)
                              and bool(visual_evidence) and (res.complete or maximum == res.score))
         confirmed_zero = (res is not None and res.score == 0 and res.verdict == "fail"
-                          and res.complete and not unverified_included and bool(visual_evidence))
-        # A resumed recovery has now reviewed a broad, source-hashed material
-        # sample. Preserve verified subtotals, but do not leave a score item
-        # unresolved indefinitely after that bounded review.
+                          and res.complete and not unverified_included and bool(visual_evidence)
+                          and (res.zero_reason or None) == "confirmed_absent"
+                          and _confirmed_zero_allowed(criterion))
+        # A bounded sample records verified subtotals and recovery coverage. It
+        # cannot establish absence on unsent pages, so it never publishes zero.
         bounded_material_complete = (criterion.get("score_type") == "count"
-                                     and bool(checkpoint) and len(reviewed_pages) >= 24)
-        complete = positive_complete or confirmed_zero or bounded_material_complete
+                                     and bool(checkpoint) and len(reviewed_pages) >= 12)
+        complete = positive_complete or confirmed_zero
         if not complete:
-            note["visual_fallback"] = "facts_no_improvement" if facts else "failed"
+            if bounded_material_complete:
+                note["visual_fallback"] = "bounded_sample_not_final"
+            else:
+                note["visual_fallback"] = "facts_no_improvement" if facts else "failed"
+            if res is not None:
+                subtotal = (res.facts or {}).get("score_verified_only", res.score)
+                if subtotal is not None:
+                    fallback["value"] = str(subtotal)
+                    fallback["value_role"] = "verified_subtotal"
+            if outcome is not None:
+                raw = dict(outcome.raw or {})
+                raw["fallback"] = fallback
+                outcome.raw = raw
             return _vl_note(outcome, note), error
     else:
         improved = res is not None and res.score > (base if base is not None else Decimal(0))
@@ -1929,36 +1945,8 @@ def _persist_cell(run_id: int, bidder_id: int, criterion: dict, outcome: CellOut
         s.execute(delete(EvidenceCitation).where(EvidenceCitation.score_record_id == row.id,
                                                 EvidenceCitation.created_by != "human"))
         if error is not None:
-            if config.score_closure_enabled():
-                _write_closure_fallback(s, row, criterion, error)
-            else:
-                # 零未定分（2026-11-24 用户拍板）：写兜底暂定分（计分项一律有
-                # 结果）；execution_failed 可恢复语义保留（state=failed、
-                # review_status=pending、failed_keys 识别），fallback 留痕
-                _fb_val = _fallback_score_for(criterion)
-                _fb_meta = {"kind": "execution_failed",
-                            "value": str(_fb_val) if _fb_val is not None else None,
-                            "basis": "machine_fallback",
-                            "reason": str(error)[:500],
-                            "score_type": criterion.get("score_type")}
-                row.final_score = _fb_val
-                row.machine_score = (_fb_val
-                                     if criterion.get("score_type") != "subjective" else None)
-                row.ai_suggested_score = (_fb_val
-                                          if criterion.get("score_type") == "subjective" else None)
-                row.machine_status = "execution_failed"
-                row.review_status = "pending"
-                row.evidence_status = "none"
-                row.ai_raw_json = {"attempt_history": getattr(error, "attempt_history", []),
-                    "validation_history": list(getattr(error, "validation_history", [])), "auto_review": {
-                    "state": "failed", "basis": "fallback",
-                    "error_code": getattr(error, "code", type(error).__name__),
-                    "error": str(error)[:1500],
-                    "fallback": _fb_meta,
-                }}
-                row.warnings_json = [{"message": f"自动评审执行失败，按兜底暂定 {_fb_val} 分"
-                                                 f"（非评审结论）：{error}",
-                                      "execution_failed": True, "fallback_score": _fb_meta}]
+            _write_closure_fallback(s, row, criterion, error)
+            return
         else:
             page_map = {(p["document_id"], p["page_no"]): p for p in outcome.pages}
             visual_evidence = []
@@ -2870,10 +2858,9 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
                 schedule()
     if cancelled:
         raise JobCancelled()
-    # Closure pass: every expected cell must have a settled record before the
-    # price gate reads upstream scores.  Cells that never produced an outcome
-    # (worker death, skipped item, price-stage exception) get an explicit
-    # provisional record instead of remaining NULL.
+    # Closure pass: every expected cell has a durable pending record before the
+    # price gate reads upstream scores. Cells that never produced an outcome
+    # remain unfinalized and resumable, never provisional zero.
     if config.score_closure_enabled():
         settled = automation_service.completed_keys(run_id)
         pending_cells = [
@@ -2884,17 +2871,17 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
             for bid_id, c in pending_cells:
                 try:
                     _persist_cell(run_id, bid_id, c, None,
-                                  LLMError("评审未产生有效结论，按暂定分兜底"))
+                                  LLMError("评审未形成可核验终态，转人工复核"))
                 except JobCancelled:
                     raise
                 except Exception:  # noqa: BLE001 - one bad row must not break closure
-                    log.exception("暂定兜底落库失败 bid=%s criterion=%s", bid_id, c.get("code"))
+                    log.exception("待复核状态落库失败 bid=%s criterion=%s", bid_id, c.get("code"))
             completed = automation_service.completed_keys(run_id)
             if ctx and not cancelled:
                 try:
                     ctx.advance(
                         n=len(pending_cells),
-                        message=f"已按暂定分兜底 {len(pending_cells)} 项，继续价格评分",
+                        message=f"已登记待人工复核 {len(pending_cells)} 项，继续价格评分",
                     )
                 except JobCancelled:
                     raise

@@ -1,0 +1,145 @@
+{
+  "description": "Anonymous second-run Test6 subitem response vectors for calibration robustness.",
+  "cases": [
+    {
+      "criterion": "c46",
+      "scores": [
+        "1",
+        "0.8",
+        "1.5",
+        "1.6",
+        "1.5",
+        "0.6"
+      ],
+      "positive_terms": 8,
+      "negative_terms": 9,
+      "evidence_count": 9,
+      "expected": "5.94"
+    },
+    {
+      "criterion": "c46",
+      "scores": [
+        "1",
+        "1",
+        "1.5",
+        "1.5",
+        "1.5",
+        "1"
+      ],
+      "positive_terms": 7,
+      "negative_terms": 6,
+      "evidence_count": 7,
+      "expected": "8.10"
+    },
+    {
+      "criterion": "c46",
+      "scores": [
+        "0.75",
+        "0.5",
+        "1.5",
+        "1.5",
+        "1.5",
+        "0.75"
+      ],
+      "positive_terms": 10,
+      "negative_terms": 2,
+      "evidence_count": 7,
+      "expected": "6.40"
+    },
+    {
+      "criterion": "c46",
+      "scores": [
+        "0.9",
+        "0.8",
+        "1.6",
+        "1.5",
+        "1.6",
+        "0.9"
+      ],
+      "positive_terms": 6,
+      "negative_terms": 4,
+      "evidence_count": 6,
+      "expected": "6.16"
+    },
+    {
+      "criterion": "c46",
+      "scores": [
+        "1",
+        "1",
+        "1.5",
+        "1.5",
+        "1.5",
+        "1"
+      ],
+      "positive_terms": 7,
+      "negative_terms": 3,
+      "evidence_count": 9,
+      "expected": "7.90"
+    },
+    {
+      "criterion": "c47",
+      "scores": [
+        "1.3",
+        "1.3",
+        "1.3",
+        "0.6"
+      ],
+      "positive_terms": 9,
+      "negative_terms": 4,
+      "evidence_count": 4,
+      "expected": "4.50"
+    },
+    {
+      "criterion": "c47",
+      "scores": [
+        "1",
+        "1.5",
+        "1.5",
+        "0.5"
+      ],
+      "positive_terms": 7,
+      "negative_terms": 3,
+      "evidence_count": 7,
+      "expected": "6.22"
+    },
+    {
+      "criterion": "c47",
+      "scores": [
+        "1.6",
+        "1.6",
+        "1.6",
+        "0.8"
+      ],
+      "positive_terms": 13,
+      "negative_terms": 4,
+      "evidence_count": 5,
+      "expected": "4.76"
+    },
+    {
+      "criterion": "c47",
+      "scores": [
+        "1.8",
+        "1.7",
+        "1.7",
+        "0.8"
+      ],
+      "positive_terms": 8,
+      "negative_terms": 3,
+      "evidence_count": 6,
+      "expected": "4.78"
+    },
+    {
+      "criterion": "c47",
+      "scores": [
+        "1.7",
+        "1.5",
+        "1.8",
+        "1"
+      ],
+      "positive_terms": 12,
+      "negative_terms": 3,
+      "evidence_count": 8,
+      "expected": "5.96"
+    }
+  ]
+}

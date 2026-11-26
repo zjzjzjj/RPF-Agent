@@ -68,11 +68,11 @@ def test_source_id_selects_actual_original_without_model_retyping():
     assert got.evidence[0]["page_no"] == 3
 
 
-def test_typo_id_is_rebound_only_by_unique_exact_source_quote():
+def test_unknown_source_id_is_rejected_even_with_exact_quote():
     gateway = Gateway(result(evidence=[{"source_id": "mistyped", "document_id": 75,
                                         "page_no": 3, "quote": QUOTE}]))
-    got = review_criterion(gateway, RULE, [PAGE])
-    assert got.evidence[0]["quote"] == QUOTE
+    with pytest.raises(LLMError, match="原ID未知"):
+        review_criterion(gateway, RULE, [PAGE])
     assert gateway.payloads[0]["allowed_source_ids"] == [p["source_id"] for p in gateway.payloads[0]["pages"]]
     assert gateway.payloads[0]["allowed_evidence_ids"] == []
 
@@ -85,7 +85,7 @@ def test_typo_id_is_rebound_only_by_unique_exact_source_quote():
     {"source_id": "mistyped", "document_id": 75, "page_no": 3, "quote": QUOTE.replace("有效", "无效")},
 ])
 def test_typo_id_never_recovers_an_ambiguous_wrong_or_invented_source(reference):
-    with pytest.raises(LLMError, match="原文范围"):
+    with pytest.raises(LLMError, match="原ID未知"):
         review_criterion(Gateway(result(evidence=[reference])), RULE, [PAGE, {**PAGE, "page_no": 4}])
 
 
@@ -143,7 +143,7 @@ def test_unknown_synthesis_evidence_id_is_rejected(monkeypatch):
     def reply(payload):
         ref = {"evidence_id": "not-reviewed"} if payload["batch_results"] else {"source_id": payload["pages"][0]["source_id"]}
         return result(evidence=[ref])
-    with pytest.raises(LLMError, match="原文范围"):
+    with pytest.raises(LLMError, match="原ID未知"):
         review_criterion(Gateway(reply), {**RULE, "score_type": "count"}, pages)
 
 

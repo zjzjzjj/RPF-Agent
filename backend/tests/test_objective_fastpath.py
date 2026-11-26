@@ -61,7 +61,7 @@ def test_material_inventory_reads_contracts_personnel_certificates_and_services(
     assert len(inventory.contracts) == 3
     assert {str(c.amount_yuan) for c in inventory.contracts} == {"570000"}
     assert len(inventory.persons) == 7
-    assert len(inventory.value_items) == 3
+    assert len(inventory.value_items) == 1
     assert {c.normalized for c in inventory.certs} >= {"ISO9001", "ISO14001", "ISO45001"}
     assert any(c.level == "二级" for c in inventory.certs)
 
@@ -158,7 +158,7 @@ def test_objective_fastpath_scores_all_supported_plans():
             "具有音视频集成工程能力证书贰级得0.5 分，壹级得1 分。"),
     }
     expected = {"c39": "6.00", "c52": "3.00", "c53": "2.00", "c54": "2.00",
-                "c55": "2.00", "c57": "3.00", "c61": "2.00", "c62": "0.50"}
+                "c55": "2.00", "c57": "1.00", "c61": "2.00", "c62": "0.50"}
     for code, criterion in criteria.items():
         assert build_objective_plan(criterion) is not None, code
         result = score_objective(criterion, inventory)
@@ -175,6 +175,34 @@ def test_objective_fastpath_reports_zero_with_reason_when_absent():
     assert result is not None
     assert result.score == Decimal("0.00")
     assert result.zero_reason in ("no_facts", "confirmed_absent")
+
+
+def test_documented_operations_scope_beats_generic_development_label() -> None:
+    from app.engine.objective import documented_project_type_state
+
+    rule = "类似信息系统运维项目实施/服务经验"
+    assert documented_project_type_state(
+        "软件开发", "数据工厂数据审计功能开发及数据工厂运维服务项目", rule,
+    ) is True
+    assert documented_project_type_state(
+        "软件开发", "中通服创立公司关于承揽2024年AI能力运维系统开发业务外包采购项目", rule,
+    ) is True
+    assert documented_project_type_state(
+        "软件开发", "某软件开发项目", rule,
+    ) is False
+
+
+def test_value_added_service_whitelist_excludes_ordinary_commitments() -> None:
+    from app.engine.material_inventory import _value_item_category
+
+    assert _value_item_category("驻场服务及驻场人员餐饮") is None
+    assert _value_item_category("运维服 户需求书 服务团队 离") is None
+    assert _value_item_category("电话支持及远程服务") is None
+    assert _value_item_category("应急服务") is None
+    assert _value_item_category("系统性能优化专项服务") is None
+    assert _value_item_category("增值服务") is None
+    assert _value_item_category("数据安全加固") == "security"
+    assert _value_item_category("再增加1名远程支持技术人员") == "extra_staff"
 
 
 # ==== P0-5（测试10 run113）：三件套材料链（细则"未提供的不得分"制裁句）====

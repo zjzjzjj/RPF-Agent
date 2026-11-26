@@ -93,14 +93,31 @@ def test_model_repeated_supply_is_popped_not_retried() -> None:
     assert len(replies.calls) == 1
 
 
-def test_blind_pages_no_supply_keeps_old_failure_path() -> None:
-    """盲态（零文本页）不供给不否定：模型无引文口供照旧被拦（旧病灶行为保留）。"""
-    replies = Replies(*[decision(facts={
+def test_blind_pages_drop_unsourced_model_boolean() -> None:
+    """盲态不猜；模型自行填写且无原页来源的布尔值丢弃，不打挂整批。"""
+    replies = Replies(decision(facts={
         "certificates": [], "cert_section_present": True,
         "fact_evidence": {},
-    }) for _ in range(3)])
-    with pytest.raises(LLMError, match="缺少对应原页证据"):
-        review_criterion(replies, RULE_COUNT, [PAGE_MODEL, PAGE_BLIND])
+    }))
+    other = {"document_id": 7, "page_no": 10, "text": "认证材料图片页", "source": "ocr",
+             "embedded_image_ratio": 0.5}
+    got = review_criterion(replies, RULE_COUNT, [PAGE_MODEL, other])
+    assert "cert_section_present" not in got.facts
+    assert len(replies.calls) == 1
+
+
+def test_cert_detail_page_supplies_query_presence() -> None:
+    from app.engine.objective import detect_cert_section
+
+    page = {
+        "document_id": 7, "page_no": 52, "source": "ocr",
+        "text": ("当前位置：认证结果\n证书详情\n证书信息\n证书编号 0123456789\n"
+                 "认证项目 管理体系认证\n机构批准号 CNCA-123\n有效期 2027-01-01"),
+    }
+    got = detect_cert_section([page])
+    assert got.state is True
+    assert got.hits[0]["document_id"] == 7 and got.hits[0]["page_no"] == 52
+    assert "认证详情页" in got.hits[0]["basis"]
 
 
 def test_tampered_anchor_is_dropped_never_passed() -> None:

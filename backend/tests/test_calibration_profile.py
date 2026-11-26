@@ -27,7 +27,7 @@ def test_calibration_profile_default_file_loads(app_env):  # noqa: ANN001
 def test_calibration_profile_missing_file_returns_empty(app_env, monkeypatch):  # noqa: ANN001
     monkeypatch.setenv("BID_EVAL_CALIBRATION_PROFILE", "nonexistent-profile")
     p = config.calibration_profile()
-    assert p == {"version": "", "scale_text": ""}
+    assert p == {"version": "", "scale_text": "", "subjective_models": []}
 
 
 def test_calibration_profile_bad_json_returns_empty(app_env, tmp_path, monkeypatch):  # noqa: ANN001
@@ -39,4 +39,4 @@ def test_calibration_profile_bad_json_returns_empty(app_env, tmp_path, monkeypat
     monkeypatch.setenv("BID_EVAL_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("BID_EVAL_CALIBRATION_PROFILE", "bad")
     p = config.calibration_profile()
-    assert p == {"version": "", "scale_text": ""}
+    assert p == {"version": "", "scale_text": "", "subjective_models": []}

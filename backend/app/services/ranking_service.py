@@ -110,6 +110,11 @@ def compute_ranking(project_id: str, run_id: int | None = None) -> dict:
             )
             if _is_fallback_cell:
                 entry["fallback"].append(criterion_name)
+                from app.services.automation_service import technical_fallback_kind
+                if technical_fallback_kind(score):
+                    # Technical fallback values are audit subtotals only. They
+                    # never enter totals, provisional totals or published rank.
+                    final = None
             # match 判断项按设计不打分（final 恒 None）：不进 missing_final、不计总分，
             # 但照常落 breakdown（否则法律包的 8 条检查在评分矩阵里彻底消失）。
             if score_type not in ("veto", "match"):
@@ -162,8 +167,7 @@ def compute_ranking(project_id: str, run_id: int | None = None) -> dict:
         out_rows = []
         for r in ranked:
             e = bidders[r.bidder_id]
-            # 零未定分口径：暂定分已计入 total——含暂定合计=总分（字段保留兼容，
-            # provisional=其中暂定分合计）
+            # 技术待复核格不计分；此字段仅为旧版非技术兜底兼容展示。
             provisional_total = e["total"]
             out_rows.append(
                 {
@@ -205,7 +209,7 @@ def compute_ranking(project_id: str, run_id: int | None = None) -> dict:
         elif any(row["fallback"] for row in out_rows):
             # 零未定分口径（2026-11-24 用户拍板，覆盖 P0-1 旧口径）：兜底暂定分
             # 计入总分、直接排名——只发疑问提示（人工改分后可重汇总），不抑制名次
-            warnings.append("存在兜底暂定分格（非评审结论，已计入总分），请人工复核改分后重算")
+            warnings.append("存在待人工复核格，未计入总分或正式排名")
         if rank_suppressed and any(row.get("reference_rank") is not None for row in out_rows):
             warnings.append("已提供参考名次（含暂定分/未完成项，仅供人工定位，不构成评审结论）")
         for row in out_rows:
@@ -216,8 +220,8 @@ def compute_ranking(project_id: str, run_id: int | None = None) -> dict:
                 )
             if row.get("fallback"):
                 warnings.append(
-                    f"{row['bidder_name']} 有 {len(row['fallback'])} 项暂定分"
-                    f"（{('、'.join(row['fallback'][:5]))}），需人工复核"
+                    f"{row['bidder_name']} 有 {len(row['fallback'])} 项待复核"
+                    f"（{('、'.join(row['fallback'][:5]))}），未计入排名"
                 )
         return {
             "run_id": run_id,

@@ -149,9 +149,15 @@ def test_failed_second_image_does_not_publish_partial_page_and_first_image_survi
 
 
 def test_truncated_segment_is_never_accepted_by_strict_client(monkeypatch):
+    from itertools import cycle
+
     from app.parsing import paddle_client
 
-    responses = iter([
+    # Recursive segmentation may ask for more child crops than the three
+    # representative responses.  Replaying them keeps the strict contract
+    # focused: every truncated leaf must still fail instead of exhausting the
+    # mock and masking the assertion with StopIteration.
+    responses = cycle([
         {"choices": [{"finish_reason": "length", "message": {"content": "partial whole"}}]},
         {"choices": [{"finish_reason": "stop", "message": {"content": "complete first"}}]},
         {"choices": [{"finish_reason": "length", "message": {"content": "partial second"}}]},

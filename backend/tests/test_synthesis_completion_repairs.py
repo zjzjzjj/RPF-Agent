@@ -515,3 +515,72 @@ def test_material_batches_split_before_dispatch_when_repairs_would_exceed_contex
     result = review.review_criterion(Gateway(), {"name": "响应条款", "score_type": "match"}, pages)
     assert len(calls) == 3 and result.coverage_complete
     assert {p["page_no"] for p in result.reviewed_pages} == {1, 2}
+
+
+def _source_decision(evidence):
+    return review.AutoReviewDecision(
+        verdict="pass", reasoning="原批次证据已经逐条核验", evidence=evidence)
+
+
+def test_synthesis_unknown_id_is_rejected_even_when_quote_matches():
+    source = {
+        "evidence_id": "b15e0", "document_id": 70, "page_no": 206, "kind": "text",
+        "quote": "唯一原文连续出现，可识别原批次不可变证据，但不能接受伪造编号。",
+    }
+    forged = {
+        "evidence_id": "b99e9", "document_id": 70, "page_no": 206, "kind": "text",
+        "quote": source["quote"],
+    }
+    decision = review.AutoReviewDecision(
+        verdict="pass", reasoning="综合结论引用了伪造编号", evidence=[forged])
+    with pytest.raises(review.EvidenceBindingError) as failure:
+        review._validate_synthesis_sources(decision, [_source_decision([source])])
+    assert failure.value.synthesis_evidence_rejected is True
+    rejected = failure.value.rejected_evidence[0]
+    assert rejected["reference"] == "b99e9"
+    assert rejected["candidates"] == ["b15e0"]
+
+
+def test_synthesis_exact_id_restores_immutable_source_content():
+    source = {
+        "evidence_id": "b15e0", "document_id": 70, "page_no": 206, "kind": "text",
+        "quote": "项目负责人姓名及类似系统运维项目经验已经在原页中完整连续出现。",
+    }
+    changed = {
+        "evidence_id": "b15e0", "document_id": 70, "page_no": 206, "kind": "text",
+        "quote": "模型改写后的引文不属于原批次不可变台账。",
+    }
+    decision = review.AutoReviewDecision(
+        verdict="pass", reasoning="综合结论仅引用原批次证据", evidence=[changed])
+    review._validate_synthesis_sources(decision, [_source_decision([source])])
+    assert decision.evidence == [source]
+
+
+def test_synthesis_unique_quote_recovers_missing_evidence_id():
+    source = {
+        "evidence_id": "b15e1", "document_id": 70, "page_no": 206, "kind": "text",
+        "quote": "该段原文只在一个原批次证据中连续出现，可用于唯一恢复来源编号。",
+    }
+    decision = review.AutoReviewDecision(
+        verdict="pass", reasoning="综合结论未携带编号但原文唯一",
+        evidence=[{"document_id": 70, "page_no": 206, "kind": "text", "quote": source["quote"]}])
+    review._validate_synthesis_sources(decision, [_source_decision([source])])
+    assert decision.evidence[0]["evidence_id"] == "b15e1"
+    assert decision.evidence[0]["quote"] == source["quote"]
+
+
+def test_synthesis_new_evidence_is_rejected_with_sanitized_audit_metadata():
+    approved = _source_decision([{
+        "evidence_id": "b15e0", "document_id": 70, "page_no": 206, "kind": "text",
+        "quote": "原批次已经核验的完整连续文字内容用于证据绑定。",
+    }])
+    decision = review.AutoReviewDecision(
+        verdict="pass", reasoning="模型新增了原批次不存在的证据",
+        evidence=[{"document_id": 70, "page_no": 206, "kind": "text",
+                   "quote": "这一段从未出现在原批次不可变证据台账中，不能进入最终结论。"}])
+    with pytest.raises(review.EvidenceBindingError) as failure:
+        review._validate_synthesis_sources(decision, [approved])
+    assert failure.value.synthesis_evidence_rejected is True
+    rejected = failure.value.rejected_evidence[0]
+    assert rejected["document_id"] == 70 and rejected["page_no"] == 206
+    assert len(rejected["summary"]) <= 80

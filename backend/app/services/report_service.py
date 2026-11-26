@@ -26,12 +26,14 @@ from app.db.models import (
 )
 from app.db.session import session_scope
 from app.errors import NotFound, ValidationFailed
+from app.services.public_output import sanitize_public_object, sanitize_public_text
 from app.services.automation_service import (
     completed_keys as automatic_completed_keys,
     progress as automation_progress,
     public_auto_review,
 )
 from app.services.ranking_service import compute_ranking
+from app.services.public_output import sanitize_public_object, sanitize_public_text
 from app.services.score_summary_service import (
     METHOD_AI,
     SCORE_TYPE_LABELS,
@@ -150,8 +152,10 @@ def _is_lightweight(score) -> bool:
 
 def _report_reasoning(score, automated: bool) -> str:
     if automated:
-        return score.ai_reasoning or (public_auto_review(score) or {}).get("reasoning") or ""
-    return score.ai_reasoning or ""
+        value = score.ai_reasoning or (public_auto_review(score) or {}).get("reasoning") or ""
+    else:
+        value = score.ai_reasoning or ""
+    return sanitize_public_text(value)
 
 # 疑问分类：报告"先出草稿、把疑问标出"的核心。每条待复核记录归入唯一一类，
 # 按严重度排序，让人一眼看到"哪几条真的需要现在裁决"。
@@ -237,7 +241,7 @@ def _machine_message(score) -> str:
         if isinstance(w, dict):
             msg = str(w.get("message") or w.get("formula_explanation") or "")
             if msg:
-                return msg
+                return sanitize_public_text(msg)
     return ""
 
 
@@ -579,7 +583,7 @@ def _doc_name(document_id: int | None) -> str | None:
         return None
 
 
-def build_report(project_id: str, run_id: int | None = None) -> dict:
+def _build_report_unsafe(project_id: str, run_id: int | None = None) -> dict:
     with session_scope() as s:
         project = s.get(Project, project_id)
         if project is None:
@@ -776,6 +780,10 @@ def build_report(project_id: str, run_id: int | None = None) -> dict:
         }
 
 
+def build_report(project_id: str, run_id: int | None = None) -> dict:
+    return sanitize_public_object(_build_report_unsafe(project_id, run_id))
+
+
 def render_html(report: dict) -> str:
     from jinja2 import Environment, FileSystemLoader, select_autoescape
 
@@ -784,7 +792,7 @@ def render_html(report: dict) -> str:
         autoescape=select_autoescape(["html"]),
     )
     template = env.get_template("report.html.j2")
-    return template.render(**report)
+    return sanitize_public_text(template.render(**report))
 
 
 # ---------------------------------------------------------------------------
@@ -817,7 +825,7 @@ def _committee_of(score) -> list[dict]:
     return raw.get("committee") or []
 
 
-def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
+def _build_formal_report_unsafe(project_id: str, run_id: int | None = None) -> dict:
     """组装正式评审报告数据：正文四段 + 评审结果汇总（评委矩阵）+ 附表。
 
     形态对齐真实评审资料（如浙江中烟项目）：正文（项目简介/过程/程序/结论）
@@ -1292,6 +1300,10 @@ def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
     }
 
 
+def build_formal_report(project_id: str, run_id: int | None = None) -> dict:
+    return sanitize_public_object(_build_formal_report_unsafe(project_id, run_id))
+
+
 def render_formal_html(report: dict) -> str:
     from jinja2 import Environment, FileSystemLoader, select_autoescape
 
@@ -1300,7 +1312,7 @@ def render_formal_html(report: dict) -> str:
         autoescape=select_autoescape(["html"]),
     )
     template = env.get_template("formal_report.html.j2")
-    return template.render(**report)
+    return sanitize_public_text(template.render(**report))
 
 
 def render_docx(report: dict) -> bytes:
@@ -1318,20 +1330,20 @@ def render_docx(report: dict) -> bytes:
     style.font.size = Pt(11)
 
     def heading(text: str, level: int = 1) -> None:
-        doc.add_heading(text, level=level)
+        doc.add_heading(sanitize_public_text(text), level=level)
 
     def para(text: str) -> None:
-        doc.add_paragraph(text)
+        doc.add_paragraph(sanitize_public_text(text))
 
     def table(headers: list[str], rows: list[list[str]]) -> None:
         t = doc.add_table(rows=1, cols=len(headers))
         t.style = "Table Grid"
         for i, h in enumerate(headers):
-            t.rows[0].cells[i].text = h
+            t.rows[0].cells[i].text = sanitize_public_text(h)
         for r in rows:
             cells = t.add_row().cells
             for i, v in enumerate(r):
-                cells[i].text = str(v)
+                cells[i].text = sanitize_public_text(str(v))
 
     # 封面
     title = doc.add_paragraph()

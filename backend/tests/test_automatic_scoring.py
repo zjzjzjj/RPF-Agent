@@ -164,10 +164,15 @@ def test_failed_cell_preserves_success_and_resume_only_runs_unfinished(managed_r
     with session_scope() as s:
         rows = list(s.execute(select(ScoreRecord).where(ScoreRecord.run_id == managed_run["id"])).scalars())
         assert len(rows) == 2
-        failed = next(row for row in rows if row.machine_status == "execution_failed")
-        assert failed.final_score is not None, "零未定分：故障格带兜底暂定分（非结论）"
-        assert (failed.ai_raw_json or {}).get("auto_review", {}).get("basis") == "fallback"
-        successful_id = next(row.id for row in rows if row.review_status == "auto_confirmed")
+        failed = next(row for row in rows if row.machine_status == "concern")
+        assert failed.final_score is None
+        failed_meta = (failed.ai_raw_json or {}).get("auto_review", {})
+        assert failed_meta.get("basis") == "fallback"
+        assert failed_meta["fallback"]["kind"] == "material_review_pending"
+        successful_id = next(
+            row.id for row in rows
+            if ((row.ai_raw_json or {}).get("auto_review", {}) or {}).get("basis") != "fallback"
+        )
 
     def recovered(criterion, pages, data_class, gateway_factory):
         assert criterion["code"] == "S1", "successful cell must not be rerun"
@@ -205,12 +210,13 @@ def test_exhausted_cell_failure_stops_dispatching_more_items(managed_run, monkey
     with pytest.raises(LLMError, match="保留"):
         scoring.execute_automatic_run(managed_run["id"])
     assert calls == ["Q1"]
-    assert automation.progress(managed_run["id"])["failed"] == 1
-    assert "exhausted" in automation.progress(managed_run["id"])["last_error"]
+    state = automation.progress(managed_run["id"])
+    assert state["failed"] == 0 and state["material_pending"] == 1
     with session_scope() as s:
         row = s.execute(select(ScoreRecord).where(ScoreRecord.run_id == managed_run["id"])).scalar_one()
         assert len(row.ai_raw_json["validation_history"]) == 3
-        assert row.final_score is None and row.machine_status == "execution_failed"
+        assert all("error" not in item for item in row.ai_raw_json["validation_history"])
+        assert row.final_score is None and row.machine_status == "concern"
 
 
 def test_continue_policy_records_first_error_and_runs_later_items(managed_run, monkeypatch):
@@ -229,25 +235,22 @@ def test_continue_policy_records_first_error_and_runs_later_items(managed_run, m
     result = scoring.execute_automatic_run(managed_run["id"])
     assert calls == ["Q1", "S1"]
     assert result["automation"]["completed"] == 1
-    assert result["automation"]["skipped"] == 1
+    assert result["automation"]["skipped"] == 0
+    assert result["automation"]["material_pending"] == 1
     assert result["automation"]["processed"] == 2
     assert result["automation"]["pending"] == 0
     assert not result["automation"]["complete"] and not result["automation"]["is_final"]
     assert result["automation"]["result_available"]
     with session_scope() as s:
         assert s.get(EvaluationRun, managed_run["id"]).status == "partial"
-        failed = s.execute(select(ScoreRecord).where(ScoreRecord.machine_status == "execution_failed")).scalar_one()
+        failed = s.execute(select(ScoreRecord).where(ScoreRecord.machine_status == "concern")).scalar_one()
         assert failed.final_score is None
-    # Delayed execution does not retry skipped items or duplicate citations.
+    # Delayed execution leaves completed work untouched and can resume pending work.
     scoring.execute_automatic_run(managed_run["id"])
     assert calls == ["Q1", "S1"]
     from app.services.result_export_service import export_results_csv
-    from app.services.report_service import build_report, render_html
     csv = export_results_csv(managed_run["id"])
-    assert "故障跳过" in csv and "provider refused this item" in csv and "8.00" in csv
-    report = build_report("auto-executor", managed_run["id"])
-    assert report["status"] == "partial" and "含故障跳过项" in render_html(report)
-    assert report["ranking"]["rows"][0]["total"] == "8.00"
+    assert "材料待核验" in csv and "provider refused this item" not in csv and "8.00" in csv
 
 
 def test_material_review_keeps_verified_subtotal_out_of_final_results_and_can_resume(managed_run, monkeypatch):
@@ -294,7 +297,7 @@ def test_material_review_keeps_verified_subtotal_out_of_final_results_and_can_re
     assert calls.count("Q1") == 1 and calls.count("S1") == 2
 
 
-def test_continue_resume_skips_previously_failed_cells(managed_run, monkeypatch):
+def test_continue_resume_retries_pending_cells(managed_run, monkeypatch):
     first = managed_run["criteria"][0]
     scoring._persist_cell(managed_run["id"], managed_run["bidder"], first, None, LLMError("previous failure"))
     with session_scope() as s:
@@ -310,13 +313,14 @@ def test_continue_resume_skips_previously_failed_cells(managed_run, monkeypatch)
     monkeypatch.setattr(scoring, "_assess_cell", fail)
     from app.jobs.queue import JobContext
     scoring.execute_automatic_run(managed_run["id"], ctx=JobContext(receipt[1]))
-    assert calls == ["S1"]
-    assert automation.progress(managed_run["id"])["skipped"] == 2
+    assert calls == ["Q1", "S1"]
+    state = automation.progress(managed_run["id"])
+    assert state["skipped"] == 0 and state["material_pending"] == 2
     assert automation.resume_run(managed_run["id"], "tester") == receipt
     with session_scope() as s:
         job = s.get(Job, receipt[1])
         assert job.done_steps == job.total_steps == 3
-        assert "跳过 2 项" in job.message
+        assert "跳过" not in (job.message or "")
 
 
 def test_continue_does_not_finalize_a_missing_matrix_record(managed_run):
@@ -330,7 +334,8 @@ def test_continue_does_not_finalize_a_missing_matrix_record(managed_run):
     assert state["pending"] == 1 and not state["result_available"]
     from app.services.result_export_service import export_results_csv
     csv = export_results_csv(managed_run["id"])
-    assert "故障跳过" in csv and "尚未执行" in csv and "运行维护方案" in csv
+    assert "材料待核验" in csv and "运行维护方案" in csv
+    assert "provider unavailable" not in csv
 
 
 def test_continue_does_not_repeat_failed_assessment_or_full_ocr(managed_run, monkeypatch):
@@ -488,24 +493,24 @@ def test_create_run_never_drops_bidder_with_missing_price(managed_run):
         assert cfg["automation_manifest"]["bidders"][0]["bid_price"] is None
 
 
-def test_per_cell_failure_writes_labeled_fallback_score(managed_run):
-    """零未定分（2026-11-24 用户拍板）：故障格带兜底暂定分——但
-    execution_failed/fallback 标记保留，兜底分绝不冒充评审结论（P0 教训
-    "技术故障不得伪装 0 分结论"的标签化传承）。"""
+def test_per_cell_failure_keeps_technical_work_pending(managed_run):
+    """技术异常保留已核验小计，但不生成最终分或排名输入。"""
     scoring._persist_cell(managed_run["id"], managed_run["bidder"], managed_run["criteria"][1], None,
                           LLMError("timeout"))
     with session_scope() as s:
         row = s.execute(select(ScoreRecord)).scalar_one()
-        assert row.machine_status == "execution_failed"
-        assert row.final_score is not None
-        # subjective 格机器分走 ai_suggested_score（machine_score 恒 None）
-        assert row.ai_suggested_score is not None
-        assert row.ai_raw_json["auto_review"]["basis"] == "fallback"
-        assert row.warnings_json[0].get("execution_failed") is True
-    assert automation.progress(managed_run["id"])["failed"] == 1
+        assert row.machine_status == "concern"
+        assert row.final_score is None
+        assert row.ai_suggested_score is None and row.machine_score is None
+        fallback = row.ai_raw_json["auto_review"]["fallback"]
+        assert fallback["kind"] == "material_review_pending"
+        assert fallback["technical_error"] is True
+        assert row.warnings_json[0].get("technical_error") is True
+    state = automation.progress(managed_run["id"])
+    assert state["failed"] == 0 and state["material_pending"] == 1
 
 
-def test_closure_fallback_settles_failed_cell(managed_run, monkeypatch):
+def test_closure_fallback_keeps_failed_cell_unfinalized(managed_run, monkeypatch):
     monkeypatch.setenv("BID_EVAL_SCORE_CLOSURE", "1")
     criterion = managed_run["criteria"][1]
     scoring._persist_cell(managed_run["id"], managed_run["bidder"], criterion, None,
@@ -513,14 +518,14 @@ def test_closure_fallback_settles_failed_cell(managed_run, monkeypatch):
     with session_scope() as s:
         row = s.execute(select(ScoreRecord)).scalar_one()
         assert row.machine_status == "concern"
-        assert row.final_score == Decimal("0.00")
+        assert row.final_score is None
         assert row.review_status == "auto_confirmed"
-        assert row.ai_raw_json["auto_review"]["basis"] == "fallback"
-        assert row.warnings_json[0]["fallback_score"]["kind"]
+        fallback = row.ai_raw_json["auto_review"]["fallback"]
+        assert fallback["kind"] == "material_review_pending"
+        assert fallback["technical_error"] is True
     state = automation.progress(managed_run["id"])
-    assert state["completed"] == 1
-    assert state["fallback"] == 1
-    assert state["failed"] == 0
+    assert state["material_pending"] == 1
+    assert state["failed"] == 0 and not state["is_final"]
 
 
 def test_direct_subjective_accepts_score_without_evidence(monkeypatch):
@@ -1027,7 +1032,8 @@ def test_preparation_never_retries_exhausted_ocr_or_budget(managed_run, monkeypa
         scoring.execute_automatic_run(managed_run["id"])
     assert calls == [1]
     state = automation.progress(managed_run["id"])
-    assert state["completed"] == 0 and state["failed"] == 1
+    assert state["completed"] == 0 and state["failed"] == 0
+    assert state["material_pending"] >= 1
     with session_scope() as s:
         records = list(s.execute(select(ScoreRecord).where(ScoreRecord.run_id == managed_run["id"])).scalars())
         assert records and all(record.final_score is None for record in records)
@@ -1191,9 +1197,8 @@ def test_delayed_job_retry_returns_completed_result_without_loading_or_reviewing
         assert len(list(s.execute(select(EvidenceCitation)).scalars())) == citations
 
 
-def test_closure_reading_gap_writes_fallback_score(managed_run, monkeypatch):
-    """P0-3 + 零未定分（2026-11-24 用户拍板）：读取故障闭合定格写兜底暂定分
-    （计分项一律有结果），kind=reading_incomplete 保留待补读翻案语义。"""
+def test_closure_reading_gap_keeps_cell_pending_without_score(managed_run, monkeypatch):
+    """读取故障保留待补读状态，不生成最终分或暂定分。"""
     monkeypatch.setenv("BID_EVAL_SCORE_CLOSURE", "1")
     criterion = managed_run["criteria"][1]
     err = LLMError("关联材料仍有未完成 OCR 或原页视觉核验的不可读页面：doc1第7页；须补读")
@@ -1202,15 +1207,15 @@ def test_closure_reading_gap_writes_fallback_score(managed_run, monkeypatch):
     scoring._persist_cell(managed_run["id"], managed_run["bidder"], criterion, None, err)
     with session_scope() as s:
         row = s.execute(select(ScoreRecord)).scalar_one()
-        assert row.final_score is not None, "零未定分：计分项必有兜底分"
+        assert row.final_score is None
         assert row.ai_raw_json["auto_review"]["basis"] == "fallback"
         fb = row.ai_raw_json["auto_review"]["fallback"]
-        assert fb["kind"] == "reading_incomplete"
+        assert fb["kind"] == "material_review_pending"
+        assert fb["reason_code"] == "reading_incomplete"
+        assert fb["value"] is None
         assert fb["unreadable_pages"] == [{"document_id": 1, "page_no": 7}]
-        assert "读取故障按兜底暂定" in (row.ai_reasoning or "")
     state = automation.progress(managed_run["id"])
-    assert state["completed"] == 1                           # 计完成（运行可收口）
-    assert state["fallback"] == 1
+    assert state["material_pending"] == 1 and not state["is_final"]
 
 
 # ---------------------------------------------------------------------------
@@ -1257,10 +1262,11 @@ def test_presence_unverified_is_fallback_not_zero():
               "source": "text", "embedded_image_ratio": 0.0}]
     outcome = scoring._assess_cell(_presence_criterion(), pages, "synthetic", lambda: None)
     assert outcome.basis == "fallback"
-    assert outcome.score is not None, "零未定分：带兜底暂定分"
-    assert outcome.verdict == "concern", "暂定非评审结论"
-    assert outcome.raw["fallback"]["kind"] == "presence_unverified"
-    assert outcome.warnings[0]["fallback_score"]["kind"] == "presence_unverified"
+    assert outcome.score is None
+    assert outcome.verdict == "concern"
+    assert outcome.raw["fallback"]["kind"] == "material_review_pending"
+    assert outcome.raw["fallback"]["reason_code"] == "presence_unverified"
+    assert outcome.warnings[0]["fallback_score"]["value"] is None
 
 
 def test_presence_guard_error_converts_to_fallback_outcome():
@@ -1277,12 +1283,13 @@ def test_presence_guard_error_converts_to_fallback_outcome():
     outcome = scoring._assess_cell(
         criterion, pages, "synthetic", lambda: None, reviewer=_reviewer)
     assert outcome.basis == "fallback"
-    assert outcome.score is not None, "零未定分：presence_unverified 带兜底暂定分"
-    assert outcome.raw["fallback"]["kind"] == "presence_unverified"
+    assert outcome.score is None
+    assert outcome.raw["fallback"]["kind"] == "material_review_pending"
+    assert outcome.raw["fallback"]["reason_code"] == "presence_unverified"
 
 
-def test_closure_presence_unverified_writes_fallback_score(managed_run):
-    """零未定分（2026-11-24）：presence_unverified 写兜底暂定分，不再未定分。"""
+def test_closure_presence_unverified_keeps_review_pending(managed_run):
+    """材料存在性未核验保持人工复核，不生成最终分。"""
     from app.engine.presence import PresenceResult
 
     criterion = managed_run["criteria"][1]
@@ -1290,17 +1297,16 @@ def test_closure_presence_unverified_writes_fallback_score(managed_run):
         PresenceResult("unverified", None, "材料页无法判定；需人工复核"),
         criterion, [],
     )
-    assert outcome.score is not None, "零未定分：presence_unverified 带兜底分"
+    assert outcome.score is None
     scoring._persist_cell(managed_run["id"], managed_run["bidder"], criterion, outcome)
     with session_scope() as s:
         row = s.execute(select(ScoreRecord)).scalar_one()
-        assert row.final_score is not None
-        assert row.ai_raw_json["auto_review"]["basis"] == "fallback"
-        assert row.ai_raw_json["auto_review"]["fallback"]["kind"] == "presence_unverified"
-        assert row.warnings_json[0]["fallback_score"]["kind"] == "presence_unverified"
+        assert row.final_score is None
+        fallback = row.ai_raw_json["auto_review"]["fallback"]
+        assert fallback["kind"] == "material_review_pending"
+        assert fallback["reason_code"] == "presence_unverified"
     state = automation.progress(managed_run["id"])
-    assert state["completed"] == 1
-    assert state["fallback"] == 1
+    assert state["material_pending"] == 1 and not state["is_final"]
 
 
 def test_sample_volume_cell_settles_without_gateway():

@@ -136,13 +136,13 @@ def test_final_grouped_result_must_match_immutable_ledger_and_evict_bad_response
 
     monkeypatch.setattr(review, "_call", call)
     try:
-        with pytest.raises(LLMError, match="证据"):
-            review.synthesis_decision(None, {}, [page], data_class="synthetic", previous=None,
-                round_no=0, use_vision=False, summaries=[summary],
-                decisions=[review.AutoReviewDecision(verdict="pass", reasoning="采集", evidence=[evidence])])
+        result = review.synthesis_decision(None, {}, [page], data_class="synthetic", previous=None,
+            round_no=0, use_vision=False, summaries=[summary],
+            decisions=[review.AutoReviewDecision(verdict="pass", reasoning="采集", evidence=[evidence])])
     finally:
         batch_scheduler.reset_batch_schedulers()
-    assert evicted == [True]
+    assert result.evidence[0]["quote"] == quote
+    assert evicted == []
 
 
 def _large_sourced_results(count, *, single_summary=False, v2=False):

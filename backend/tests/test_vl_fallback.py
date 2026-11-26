@@ -425,7 +425,7 @@ def test_material_resume_reuses_evidence_and_moves_to_unread_pages(tmp_path, mon
         assert {entry["page_no"] for entry in result.evidence} == {1, 2}
 
 
-def test_resumed_bounded_material_review_closes_verified_zero(tmp_path, monkeypatch):
+def test_resumed_bounded_material_review_keeps_verified_subtotal_pending(tmp_path, monkeypatch):
     from app.services import automatic_scoring_service as scoring
 
     _png_env(tmp_path, monkeypatch)
@@ -451,9 +451,9 @@ def test_resumed_bounded_material_review_closes_verified_zero(tmp_path, monkeypa
         inventory_factory=lambda _: _empty_inv(), checkpoint=checkpoint,
     )
     assert error is None
-    assert result.score == 0
-    assert result.verdict == "fail"
-    assert result.basis == "visual_fallback"
+    assert result.score is None
+    assert result.verdict == "concern"
+    assert result.raw["fallback"]["kind"] == "material_review_pending"
 
 def test_material_resume_rechecks_omitted_certificate_page_once(tmp_path, monkeypatch):
     from app.services import automatic_scoring_service as scoring
@@ -491,7 +491,8 @@ def test_confirmed_missing_platform_query_finalizes_zero(tmp_path, monkeypatch):
     criterion = {
         "code": "c44", "name": "管理体系认证", "score_type": "count", "max_score": "3",
         "description": ("ISO9001、ISO27001、ISO20000 每项1分；须提供有效证书复印件并加盖公章，"
-                        "并提供全国认证认可信息公共服务平台 cx.cnca.cn 查询结果截图。"),
+                        "并提供全国认证认可信息公共服务平台 cx.cnca.cn 查询结果截图；"
+                        "未按要求提供的不得分。"),
         "required_evidence": "证书复印件及 cx.cnca.cn 查询结果截图",
         "params": {"field": "certificates", "per_item": "1", "max_items": "3"},
     }
@@ -506,7 +507,7 @@ def test_confirmed_missing_platform_query_finalizes_zero(tmp_path, monkeypatch):
     monkeypatch.setattr(vl_fallback, "rescue", lambda *a, **k: vl_fallback.VlResult(
         "facts", facts=[fact],
         observations=[{"document_id": 9, "page_no": 1,
-                       "observation": "认证章节复核完毕，未见认证认可信息公共服务平台查询结果截图"}],
+                       "observation": "认证章节复核完毕，未提供认证认可信息公共服务平台查询结果截图"}],
         reasoning="证书已核验，查询截图缺失"))
     pending = scoring._material_review_pending(criterion, pages, "补核查询结果截图")
     result, error = scoring._maybe_vl_rescue(

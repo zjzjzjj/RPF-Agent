@@ -40,7 +40,10 @@ def _is_invoice_page(text: str) -> bool:
 
 _RE_INVOICE = _RE_INVOICE_STRONG  # 兼容旧引用
 _RE_ACCEPTANCE = re.compile(
-    r"验收报告|验收结论|验收意见|验收日期|验收合格|验收单|业主证明|用户证明|使用证明|项目评价"
+    r"验收报告|验收结论|验收意见|验收日期|验收合格|验收单|终验证书|业主证明|用户证明"
+)
+_RE_ACCEPTANCE_HEADING = re.compile(
+    r"验收报告|验收证明|验收单|终验证书|业主证明|用户证明"
 )
 _RE_MATERIAL_HEADING = re.compile(r"发票|验收|业主证明|用户证明|合同|证书|扫描件")
 
@@ -221,8 +224,10 @@ _RE_HDR_THIRD = re.compile(r"序号|编号|时间|签订|日期")
 
 def _is_case_header_text(t: str) -> bool:
     """通用业绩表表头判定：三元组词全命中（任意顺序、任意单元格）。"""
+    compact = re.sub(r"\s+", "", t or "")
     return bool(
-        _RE_HDR_NAME.search(t) and _RE_HDR_AMOUNT.search(t) and _RE_HDR_THIRD.search(t)
+        _RE_HDR_NAME.search(compact) and _RE_HDR_AMOUNT.search(compact)
+        and _RE_HDR_THIRD.search(compact)
     )
 
 
@@ -564,7 +569,75 @@ def parse_case_table(
     ]
     for i, r in enumerate(cleaned, start=1):
         r.index = i
+        if r.amount_yuan is None:
+            r.amount_yuan = _amount_from_raw(r.raw)
     return cleaned
+
+
+
+
+def _amount_from_raw(raw: str) -> Decimal | None:
+    compact = re.sub(r"\s+", "", raw or "")
+    match = re.search(r"(?:合同金额|中标金额|金额)?(\d+(?:\.\d+)?)(万元|万|元)", compact)
+    if not match:
+        return None
+    value = Decimal(match.group(1))
+    return value * Decimal(10000) if match.group(2) in ("万", "万元") else value
+
+
+def _case_rows_from_text(
+    pages: list[PageRec], start: int, end: int, max_pages: int = 4,
+) -> list[CaseRow]:
+    """Fallback for case tables exposed only as reading-order text."""
+    if start <= 0 or end < start:
+        return []
+    selected = sorted(
+        (page for page in pages
+         if start <= page.page_no <= min(end, start + max(1, max_pages) - 1)),
+        key=lambda page: page.page_no,
+    )
+    lines: list[tuple[int, str]] = []
+    for page in selected:
+        lines.extend((page.page_no, line.strip())
+                     for line in (page.text or "").splitlines() if line.strip())
+    header = next((
+        index for index, (_page_no, line) in enumerate(lines)
+        if _RE_HDR_NAME.search(line)
+        and any(_RE_HDR_AMOUNT.search(other) for _p, other in lines[index:index + 8])
+    ), None)
+    if header is None:
+        return []
+    blocks: list[tuple[int, list[str]]] = []
+    current: list[str] = []
+    current_page = start
+    expected = 1
+    for page_no, line in lines[header + 1:]:
+        if re.match(r"^(?:注[:：]|投标人[:：]|日期[:：])", line):
+            if current:
+                blocks.append((current_page, current))
+            break
+        if re.fullmatch(r"\d{1,2}", line) and int(line) == expected:
+            if current:
+                blocks.append((current_page, current))
+            current, current_page = [], page_no
+            expected += 1
+            continue
+        if current:
+            current.append(line)
+    if current:
+        blocks.append((current_page, current))
+    rows: list[CaseRow] = []
+    for page_no, raw_lines in blocks:
+        raw = " | ".join(raw_lines)
+        date_value = _cell_date(raw)
+        amount = _amount_from_raw(raw)
+        name = re.sub(r"\s+", " ", " ".join(raw_lines[:4])).strip(" |：:")
+        if len(name) < 4:
+            name = re.sub(r"\s+", " ", raw)[:80]
+        if name and amount:
+            rows.append(CaseRow(len(rows) + 1, name[:200], amount,
+                                date_value, page_no, raw))
+    return rows
 
 
 def parse_case_table_at_section(
@@ -581,7 +654,8 @@ def parse_case_table_at_section(
     scoring_service 与 ingest_service 共用此入口（保留函数签名，便于将来有
     真实命中的结构性修法时再接）。
     """
-    return parse_case_table(pdf_path, section.start, section.end, scan_pages)
+    rows = parse_case_table(pdf_path, section.start, section.end, scan_pages)
+    return rows or _case_rows_from_text(pages, section.start, section.end, scan_pages)
 
 
 # ---------------------------------------------------------------------------
@@ -623,6 +697,40 @@ def link_case_blocks(
     table_end = max((r.page or 0) for r in rows) if rows else section.start
     search_from = max(section.start + 1, table_end + 1)
     starts: dict[int, int] = {}
+    heading_candidates: list[tuple[int, str]] = []
+    heading_pattern = re.compile(
+        r"2\.8\.\d+(?!\.\d)[.、]?\s*(?:业绩\s*\d+\s*[:：]\s*)?(.{4,120})"
+    )
+    for page in ordered_pages:
+        if page.page_no <= table_end:
+            continue
+        lines = [line.strip() for line in (page.text or "").splitlines() if line.strip()]
+        for index, line in enumerate(lines):
+            match = heading_pattern.match(line)
+            if not match:
+                continue
+            title = match.group(1)
+            if len(re.sub(r"\s+", "", title)) < 4 and index + 1 < len(lines):
+                title += lines[index + 1]
+            title = re.sub(r"[.。…\s]+$", "", title)
+            material_title = re.sub(r"^[\d.、\s]+", "", title.strip())
+            if (title and "投标文件" not in title
+                    and not re.fullmatch(
+                        r"(?:合同(?:原件)?复印件(?:（含项目成员）)?|合同扫描件|合同执行中发票|"
+                        r"发票|发票(?:原件)?复印件|发票扫描件|验收报告|验收证明|验收单|"
+                        r"终验证书|业主证明|用户证明)",
+                        material_title)):
+                heading_candidates.append((page.page_no, title[:200]))
+            break
+    if heading_candidates and len(heading_candidates) == len(rows):
+        for row, (page_no, title) in zip(rows, heading_candidates):
+            starts[row.index], row.name = page_no, title
+    else:
+        for row, (page_no, title) in zip(rows, heading_candidates):
+            if any(prefix in _norm_text(title) for prefix in _name_prefixes(row.name)):
+                starts[row.index], row.name = page_no, title
+    if len(starts) != len(rows):
+        starts = {}
     for r in rows:
         prefixes = _name_prefixes(r.name)
         if not prefixes:
@@ -636,7 +744,21 @@ def link_case_blocks(
             if any(pref and pref in pn for pref in prefixes):
                 starts[r.index] = p.page_no
                 break
-    known = sorted(starts.values())
+    # OCR often loses the project title but preserves the contract amount.
+    # Use the first later page containing that exact amount as the case start.
+    for r in rows:
+        if r.index in starts or r.amount_yuan is None:
+            continue
+        amount_key = re.sub(r"\D", "", str(r.amount_yuan))
+        if len(amount_key) < 5:
+            continue
+        for p in ordered_pages:
+            if p.page_no < search_from or p.page_no > section.end:
+                continue
+            if amount_key in re.sub(r"\D", "", p.text or ""):
+                starts[r.index] = p.page_no
+                break
+    known = sorted(set(starts.values()))
     blocks: list[CaseBlock] = []
     for r in rows:
         st = starts.get(r.index)
@@ -703,11 +825,52 @@ def classify_materials(
             if ratios.get(no, 0.0) >= 0.35
             or (by_no.get(no) is not None and (by_no.get(no).source or "text") != "text")
         ]
+        declared: set[str] = set()
+        for no in b.pages:
+            text = str((by_no.get(no).text if by_no.get(no) else "") or "")
+            if re.search(r"合同(?:原件)?复印件|合同扫描件|合同发票", text):
+                declared.add("contract")
+            if re.search(r"发票(?:原件)?复印件|发票扫描件|合同发票", text):
+                declared.add("invoice")
+            if _RE_ACCEPTANCE_HEADING.search(text):
+                declared.add("acceptance")
         for mat, pat in (
             ("contract", None),
             ("invoice", _RE_INVOICE),
             ("acceptance", _RE_ACCEPTANCE),
         ):
+            if declared and mat == "acceptance" and mat not in declared:
+                b.status[mat] = False
+                b.reasons[mat] = "material_heading_absent"
+                continue
+            heading_hits: list[int] = []
+            for no in b.pages:
+                page = by_no.get(no)
+                text = str(page.text if page else "")
+                if mat == "contract" and re.search(r"合同(?:原件)?复印件|合同扫描件", text):
+                    heading_hits.append(no)
+                elif mat == "invoice" and re.search(
+                        r"发票(?:原件)?复印件|发票扫描件|^\s*(?:\d+(?:\.\d+)+\s*)?发票\s*$",
+                        text, re.M):
+                    heading_hits.append(no)
+                elif mat == "acceptance" and _RE_ACCEPTANCE_HEADING.search(text):
+                    heading_hits.append(no)
+            def heading_only(no: int) -> bool:
+                text = str(by_no[no].text) if no in by_no else ""
+                patterns = {
+                    "contract": r"(?:合同(?:原件)?复印件|合同扫描件)",
+                    "invoice": r"(?:发票(?:原件)?复印件|发票扫描件|(?:^|\n)\s*(?:\d+(?:\.\d+)+\s*)?发票\s*$)",
+                    "acceptance": r"(?:验收报告|验收证明|验收单|终验证书|业主证明|用户证明)",
+                }
+                match = re.search(patterns[mat], text, re.M)
+                return bool(match and len(text[:match.start()].strip()) <= 120
+                            and len(text[match.end():].strip()) <= 80)
+
+            if heading_hits and all(heading_only(no) for no in heading_hits):
+                b.status[mat] = True
+                b.pages_by_material[mat] = heading_hits[:3]
+                b.reasons[mat] = "material_heading"
+                continue
             hit_pages: list[int] = []
             for no in b.pages:
                 p = by_no.get(no)

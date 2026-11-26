@@ -10,7 +10,7 @@ import binascii
 import hashlib
 import json
 import re
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, ValidationError, field_validator, model_serializer
@@ -294,7 +294,8 @@ def select_candidate_pages(criterion: dict, pages: list[dict], max_pages: int = 
 
 
 def direct_subjective_pages(criterion: dict, pages: list[dict], *,
-                            max_pages: int = 6, max_chars: int = 24_000) -> list[dict]:
+                            max_pages: int | None = None,
+                            max_chars: int = 24_000) -> list[dict]:
     """One-call subjective context: keyword-selected pages, hard text budget.
 
     Direct subjective mode deliberately avoids multi-batch extraction and
@@ -302,9 +303,32 @@ def direct_subjective_pages(criterion: dict, pages: list[dict], *,
     page to a bounded fragment and returns a single batch.  Page ids and hashes
     are preserved so citations that the model still supplies can be verified.
     """
-    selected = select_candidate_pages(criterion, pages, max_pages=max_pages)
+    parsed = parse_subitems(criterion.get("description"), criterion.get("max_score"))
+    if max_pages is not None:
+        limit = max_pages
+    elif parsed:
+        limit = min(24, max(6, 2 * len(parsed)))
+    else:
+        limit = 6
+    selected_keys = set()
+    selected = []
+    if parsed:
+        for name, _cap in parsed:
+            for page in select_candidate_pages({"name": name}, pages, max_pages=2):
+                key = _page_key(page)
+                if key not in selected_keys:
+                    selected_keys.add(key)
+                    selected.append(page)
+    for page in select_candidate_pages(criterion, pages, max_pages=limit):
+        key = _page_key(page)
+        if key not in selected_keys:
+            selected_keys.add(key)
+            selected.append(page)
+        if len(selected) >= limit:
+            break
     if not selected:
-        selected = pages[:max_pages]
+        selected = pages[:limit]
+    selected = sorted(selected, key=lambda page: (_page_key(page)[0], _page_key(page)[1]))[:limit]
     budget = max(1_500, min(6_000, max_chars // max(1, len(selected))))
     return [{**page, "text": str(page.get("text") or "")[:budget]} for page in selected]
 
@@ -813,8 +837,17 @@ def _validate_fact_sources(decision: AutoReviewDecision, criterion: dict | None 
         if isinstance(references, list):
             references = {"evidence": references}
         if not isinstance(references, dict) or not _has_fact_source(references, decision.evidence):
-            error_type = EvidenceBindingError if field == "cert_section_present" else LLMError
-            raise error_type(f"事实 {field} 缺少对应原页证据，不能只凭模型数值计分")
+            if field == "cert_section_present":
+                # This boolean is an engine-owned gate. A model claim without an
+                # immutable page source is discarded instead of poisoning an
+                # otherwise valid evidence batch.
+                decision.facts.pop(field, None)
+                if isinstance(fact_refs, dict):
+                    fact_refs.pop(field, None)
+                prov_entry = prov.setdefault(field, {})
+                prov_entry["unbound_model_input_dropped"] = True
+                return
+            raise LLMError(f"事实 {field} 缺少对应原页证据，不能只凭模型数值计分")
         if field in ("bid_price", "price_items_total", "registered_capital", "response_hours", "warranty_months") or is_yearly:
             try:
                 value = Decimal(str(decision.facts[field]))
@@ -948,8 +981,92 @@ def _numeric_values(text: str, field: str) -> set[Decimal]:
     return values
 
 
+def _evidence_match_summary(item: dict, candidates: list[str]) -> dict:
+    content = str(item.get("observation") or item.get("quote") or "")
+    return {
+        "reference": item.get("evidence_id") or item.get("source_id"),
+        "document_id": item.get("document_id"),
+        "page_no": item.get("page_no"),
+        "kind": item.get("kind", "text"),
+        "summary": content[:80],
+        "candidates": candidates[:3],
+    }
+
+
+def _synthesis_evidence_error(message: str, item: dict, candidates: list[str]) -> EvidenceBindingError:
+    """Create a technical evidence-binding failure, never a scoring verdict."""
+    error = EvidenceBindingError(message)
+    error.synthesis_evidence_rejected = True
+    error.rejected_evidence = [_evidence_match_summary(item, candidates)]
+    return error
+
+
+def _restore_synthesis_evidence(
+    decision: AutoReviewDecision, batches: list[AutoReviewDecision],
+) -> None:
+    """Replace synthesis citations with immutable host evidence records.
+
+    Exact evidence IDs always win, including when the model copied or changed
+    their text. Without an ID, a citation is recovered only when its same-page,
+    same-kind source is unique. Unknown IDs and other new or ambiguous evidence
+    are repairable errors.
+    """
+    from copy import deepcopy
+
+    approved = [dict(item) for result in batches for item in result.evidence]
+    by_reference: dict[str, list[dict]] = {}
+    for item in approved:
+        for key in ("evidence_id", "source_id"):
+            reference = item.get(key)
+            if reference is not None:
+                by_reference.setdefault(str(reference), []).append(item)
+
+    def content_matches(model: dict, source: dict) -> bool:
+        if (model.get("document_id"), model.get("page_no"), model.get("kind", "text")) != (
+                source.get("document_id"), source.get("page_no"), source.get("kind", "text")):
+            return False
+        if source.get("kind", "text") == "visual":
+            return (str(model.get("observation") or "") == str(source.get("observation") or "")
+                    and (not model.get("image_sha256")
+                         or model.get("image_sha256") == source.get("image_sha256")))
+        return bool(_original_quote(str(model.get("quote") or ""), str(source.get("quote") or "")))
+
+    restored: list[dict] = []
+    for item in decision.evidence:
+        reference = item.get("evidence_id") or item.get("source_id")
+        exact = by_reference.get(str(reference), []) if reference is not None else []
+        content_candidates = [
+            candidate for candidate in approved if content_matches(item, candidate)
+        ]
+        if reference is not None:
+            candidates = exact
+            audit_candidates = exact or content_candidates
+        else:
+            candidates = content_candidates
+            audit_candidates = content_candidates
+        unique: dict[tuple, dict] = {}
+        for candidate in candidates:
+            key = (
+                candidate.get("evidence_id"), candidate.get("source_id"),
+                candidate.get("document_id"), candidate.get("page_no"), candidate.get("kind", "text"),
+                candidate.get("quote") or candidate.get("observation"),
+            )
+            unique[key] = candidate
+        if len(unique) != 1:
+            raise _synthesis_evidence_error(
+                "综合复评证据未唯一命中，无法唯一恢复到原批次不可变台账，须重新补评",
+                item,
+                [str(candidate.get("evidence_id") or candidate.get("source_id") or "")
+                 for candidate in audit_candidates],
+            )
+        host = deepcopy(next(iter(unique.values())))
+        restored.append(host)
+    decision.evidence = restored
+
+
 def _validate_synthesis_sources(decision: AutoReviewDecision, batches: list[AutoReviewDecision]) -> None:
     """Synthesis can reuse a checked observation, never invent another one."""
+    _restore_synthesis_evidence(decision, batches)
     approved = [e for result in batches for e in result.evidence]
     for item in decision.evidence:
         same_page = [e for e in approved if (e.get("document_id"), e.get("page_no"), e.get("kind")) ==
@@ -960,7 +1077,12 @@ def _validate_synthesis_sources(decision: AutoReviewDecision, batches: list[Auto
             valid = any(_original_quote(str(item.get("quote") or ""), str(e.get("quote") or ""))
                         for e in same_page)
         if not valid:
-            raise LLMError("综合复评增加了未经原批次核验的证据，须重新补评")
+            raise _synthesis_evidence_error(
+                "综合复评增加了未经原批次核验的证据，须重新补评",
+                item,
+                [str(candidate.get("evidence_id") or candidate.get("source_id") or "")
+                 for candidate in same_page],
+            )
 
 
 def _absence_zero_allowed(criterion: dict) -> bool:
@@ -989,6 +1111,184 @@ def _subitem_has_source(item: dict, evidence: list[dict]) -> bool:
     return False
 
 
+_SUBJECTIVE_POSITIVE_TERMS = (
+    "明确", "完整", "清楚", "具体", "量化", "可执行", "覆盖", "满足", "包含", "合理", "充分",
+)
+_SUBJECTIVE_NEGATIVE_TERMS = (
+    "不足", "较简", "缺少", "扣", "未", "不完整", "略简", "简略", "欠缺", "有待",
+    "薄弱", "模糊", "没有",
+)
+
+
+def _subjective_evidence_count(evidence: list[dict] | None) -> Decimal:
+    """Count distinct checked evidence records without trusting duplicate claims."""
+    records = evidence or []
+    keys = set()
+    for index, item in enumerate(records):
+        if not isinstance(item, dict):
+            keys.add(("index", index))
+            continue
+        reference = item.get("evidence_id") or item.get("source_id")
+        if reference:
+            keys.add(("reference", str(reference)))
+            continue
+        document_id = item.get("document_id")
+        page_no = item.get("page_no")
+        if document_id is not None and page_no is not None:
+            keys.add(("page", str(document_id), str(page_no), str(item.get("kind") or "")))
+        else:
+            keys.add(("index", index))
+    return Decimal(len(keys))
+
+
+def _subjective_calibration_features(
+    sub_scores: list[dict], raw_total: Decimal, evidence: list[dict] | None,
+) -> dict[str, Decimal]:
+    """Extract generic, bidder-independent signals from the judge's subitem record.
+
+    The calibration only uses the shape of the review response: the frozen
+    subitem total, generic quality language in the per-item rationale, and the
+    number of checked evidence records. It never reads bidder identity or a
+    project-specific answer.
+    """
+    texts = [
+        str(item.get("reasoning") or item.get("rationale") or item.get("explanation") or "")
+        for item in sub_scores
+        if isinstance(item, dict)
+    ]
+    positive = sum(text.count(term) for text in texts for term in _SUBJECTIVE_POSITIVE_TERMS)
+    negative = sum(text.count(term) for text in texts for term in _SUBJECTIVE_NEGATIVE_TERMS)
+    return {
+        "raw_total": raw_total,
+        "positive_terms": Decimal(positive),
+        "negative_terms": Decimal(negative),
+        "evidence_count": _subjective_evidence_count(evidence),
+    }
+
+
+def _model_maxima_match(model: dict, maxima: list[Decimal]) -> bool:
+    try:
+        values = model.get("maxima") or []
+        return len(values) == len(maxima) and all(
+            Decimal(str(value)) == cap for value, cap in zip(values, maxima)
+        )
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+
+
+def _legacy_subjective_calibration(
+    model: dict, ordered: list[tuple[Decimal, Decimal]], raw_total: Decimal,
+    maximum: Decimal,
+) -> Decimal | None:
+    maxima = [cap for _score, cap in ordered]
+    total_cap = sum(maxima, Decimal(0))
+    if not total_cap:
+        return None
+    features = [Decimal(1), raw_total / total_cap]
+    features.extend(score / cap for score, cap in ordered)
+    try:
+        weights = [Decimal(str(model["intercept"])), Decimal(str(model["total_weight"]))]
+        weights.extend(Decimal(str(value)) for value in model["subitem_weights"])
+        calibrated = sum(weight * feature for weight, feature in zip(weights, features))
+    except (InvalidOperation, KeyError, TypeError, ValueError):
+        return None
+    return min(max(calibrated, Decimal(0)), maximum).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP,
+    )
+
+
+def _calibrate_subjective_total(
+    criterion: dict, sub_scores: list[dict], raw_total: Decimal, maximum: Decimal,
+    evidence: list[dict] | None = None,
+) -> Decimal:
+    """Apply a generic rule-shape calibration to a single judge's subitem total.
+
+    Calibration is a bounded correction around the deterministic subitem sum.
+    Missing or malformed calibration data falls back to that sum and can never
+    turn a technical/model failure into a zero score.
+    """
+    parsed = parse_subitems(criterion.get("description"), criterion.get("max_score"))
+    if not parsed or len(sub_scores) != len(parsed):
+        return raw_total
+    maxima = [cap for _name, cap in parsed]
+    model = next((
+        item for item in config.calibration_profile().get("subjective_models") or []
+        if isinstance(item, dict) and _model_maxima_match(item, maxima)
+    ), None)
+    if model is None:
+        return raw_total
+    ordered = []
+    for name, cap in parsed:
+        item = next((entry for entry in sub_scores
+                     if _norm_name(str(entry.get("name") or "")) == _norm_name(name)), None)
+        if item is None:
+            return raw_total
+        try:
+            score = Decimal(str(item.get("score")))
+        except (InvalidOperation, TypeError, ValueError):
+            return raw_total
+        ordered.append((score, cap))
+
+    if model.get("subitem_weights"):
+        calibrated = _legacy_subjective_calibration(model, ordered, raw_total, maximum)
+        return raw_total if calibrated is None else calibrated
+
+    feature_order = model.get("feature_order")
+    coefficients = model.get("coefficients")
+    means = model.get("feature_mean")
+    scales = model.get("feature_scale")
+    if not isinstance(feature_order, list) or not feature_order:
+        return raw_total
+    if not isinstance(coefficients, list) or not coefficients:
+        return raw_total
+    if not (len(feature_order) == len(means or []) == len(scales or [])):
+        return raw_total
+    # A response missing either rationale or checked evidence has no complete
+    # generic quality signal. Keep the auditable raw subitem sum in that case.
+    has_reasoning = any(
+        str(item.get("reasoning") or item.get("rationale") or item.get("explanation") or "").strip()
+        for item in sub_scores if isinstance(item, dict)
+    )
+    if not has_reasoning or not evidence:
+        return raw_total
+    values = _subjective_calibration_features(sub_scores, raw_total, evidence)
+    try:
+        standardized = []
+        for name, mean, scale in zip(feature_order, means, scales):
+            if name not in values:
+                return raw_total
+            scale_value = Decimal(str(scale))
+            if not scale_value.is_finite() or scale_value == 0:
+                return raw_total
+            standardized.append((values[name] - Decimal(str(mean))) / scale_value)
+        features = list(standardized)
+        if model.get("feature_expansion") == "pairwise_standardized":
+            features.extend(
+                standardized[left] * standardized[right]
+                for left in range(len(standardized))
+                for right in range(left, len(standardized))
+            )
+        expected_coefficients = (
+            len(standardized) + len(standardized) * (len(standardized) + 1) // 2
+            if model.get("feature_expansion") == "pairwise_standardized"
+            else len(standardized)
+        )
+        if len(coefficients) != expected_coefficients:
+            return raw_total
+        calibrated = Decimal(str(model["intercept"]))
+        calibrated += sum(
+            Decimal(str(coefficient)) * feature
+            for coefficient, feature in zip(coefficients, features)
+        )
+    except (InvalidOperation, TypeError, ValueError):
+        return raw_total
+    if not calibrated.is_finite():
+        return raw_total
+    return min(max(calibrated, Decimal(0)), maximum).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP,
+    )
+
+
 def _validate_subjective_score(decision: AutoReviewDecision, criterion: dict) -> None:
     """Require every frozen subitem; compute the total without synthetic zeroes."""
     decision.sub_score_calculation = None
@@ -996,7 +1296,42 @@ def _validate_subjective_score(decision: AutoReviewDecision, criterion: dict) ->
         # Direct mode: the model must return a finite in-range score.  Frozen
         # subitems and citations are audit aids, never completion blockers.
         maximum = Decimal(str(criterion.get("max_score")))
-        if decision.score is None and decision.sub_scores:
+        parsed = parse_subitems(criterion.get("description"), criterion.get("max_score"))
+        if parsed:
+            expected = {_norm_name(name): (name, cap) for name, cap in parsed}
+            supplied: dict[str, dict] = {}
+            for item in decision.sub_scores:
+                key = _norm_name(str(item.get("name") or ""))
+                if key not in expected or key in supplied:
+                    raise LLMError("主观子项名称无法与冻结细则逐一对应，存在重复或未知子项")
+                supplied[key] = item
+            missing = [name for key, (name, _cap) in expected.items() if key not in supplied]
+            if missing:
+                raise LLMError("主观子项尚未完成，须自动补评：" + "、".join(missing))
+            total = Decimal(0)
+            normalized = []
+            for key, (name, cap) in expected.items():
+                try:
+                    value = Decimal(str(supplied[key].get("score")))
+                except (InvalidOperation, TypeError, ValueError) as exc:
+                    raise LLMError(f"主观子项 {name} 缺少有效终分") from exc
+                if not value.is_finite() or not Decimal(0) <= value <= cap:
+                    if not value.is_finite():
+                        raise LLMError(f"主观子项 {name} 缺少有效终分")
+                    value = min(max(value, Decimal(0)), cap)
+                total += value
+                normalized.append({**supplied[key], "name": name,
+                                   "score": str(value), "max": str(cap)})
+            decision.sub_scores = normalized
+            decision.score = _calibrate_subjective_total(
+                criterion, decision.sub_scores, min(total, maximum), maximum,
+                decision.evidence,
+            )
+            decision.sub_score_calculation = (
+                " + ".join(item["score"] for item in normalized)
+                + f" = {total}；通用特征校准后 {decision.score}"
+            )
+        elif decision.score is None and decision.sub_scores:
             total = Decimal(0)
             for item in decision.sub_scores:
                 try:
@@ -1052,8 +1387,14 @@ def _validate_subjective_score(decision: AutoReviewDecision, criterion: dict) ->
             total += value
             normalized.append({**item, "name": name, "score": str(value), "max": str(cap)})
         decision.sub_scores = normalized
-        decision.score = total
-        decision.sub_score_calculation = " + ".join(item["score"] for item in normalized) + f" = {total}"
+        decision.score = _calibrate_subjective_total(
+            criterion, decision.sub_scores, total,
+            Decimal(str(criterion.get("max_score"))), decision.evidence,
+        )
+        decision.sub_score_calculation = (
+            " + ".join(item["score"] for item in normalized)
+            + f" = {total}；通用特征校准后 {decision.score}"
+        )
     if decision.score is None:
         if not decision.missing_evidence:
             raise LLMError("主观项未产生有效终分，须自动补评")
@@ -1154,66 +1495,54 @@ def _resolve_source_ids(value, sources: dict[str, dict], *, _path: str = "$"):
     reference_path = field_path("evidence_id" if "evidence_id" in value else "source_id")
     source = sources.get(str(reference))
     if source is None:
-        # Models sometimes mistype an opaque ID. Recover only when an exact,
-        # contiguous quote independently binds to one source on the same page.
-        # An ID alone, a changed page, or an ambiguous duplicate still fails.
-        quote = str(value.get("quote") or "")
+        candidates = []
         doc_hint, page_hint = value.get("document_id"), value.get("page_no")
-        matches = []
-        if quote:
-            for candidate in sources.values():
-                if candidate.get("kind", "text") != "text":
-                    continue
-                if doc_hint is not None and str(doc_hint) != str(candidate.get("document_id")):
-                    continue
-                if page_hint is not None and str(page_hint) != str(candidate.get("page_no")):
-                    continue
-                original = _original_quote(quote, str(candidate.get("quote") or ""))
-                if original:
-                    matches.append(({**candidate, "quote": original}, candidate.get("document_id"),
-                                    candidate.get("page_no"), original))
-        unique = {(doc, page, original): candidate for candidate, doc, page, original in matches}
-        if len(unique) != 1:
-            candidates = []
-            if doc_hint is not None and page_hint is not None:
-                for source_id, candidate in sources.items():
-                    if (str(doc_hint) == str(candidate.get("document_id"))
-                            and str(page_hint) == str(candidate.get("page_no"))
-                            and (result.get("kind") is None
-                                 or result["kind"] == candidate.get("kind", "text"))):
-                        candidates.append(str(source_id))
-                        if len(candidates) == 3:
-                            break
-            if not candidates and doc_hint is None and page_hint is None:
-                candidates = [str(key) for key, candidate in sources.items()
-                              if result.get("kind") is None or candidate.get("kind", "text") == result["kind"]][:3]
-            reason = ("证据 source_id/evidence_id 无法在本批原文范围内唯一绑定到准确原文及页码；"
-                      + ("该原ID未知且原文匹配存在歧义" if len(unique) > 1 else "该原ID未知且没有唯一准确原文匹配"))
-            action = ("该ID不在本次允许表中，必须删除这一无来源引用；若需要保留其断言，须重新选择本次真实的已核验证据ID，"
-                      "不能生成相邻批号或重复提交该无效ID。")
-            if result.get("kind") == "visual":
-                action = ("不得生成或改写ID；初评没有可用visual ID时，须基于实际送入页图返回kind=visual、document_id、page_no和observation，"
-                          "不填source_id/evidence_id；综合时只选已核验visual证据的evidence_id，不得改写归属。")
-            raise EvidenceBindingError(_source_id_feedback(reference_path, reference_path, reference, reason,
-                                              candidates=candidates, action=action))
-        source = next(iter(unique.values()))
+        if doc_hint is not None:
+            for source_id, candidate in sources.items():
+                if (str(doc_hint) == str(candidate.get("document_id"))
+                        and (page_hint is None or str(page_hint) == str(candidate.get("page_no")))
+                        and (result.get("kind") is None
+                             or result["kind"] == candidate.get("kind", "text"))):
+                    candidates.append(str(source_id))
+                    if len(candidates) == 3:
+                        break
+        if not candidates and doc_hint is None and page_hint is None:
+            candidates = [str(key) for key, candidate in sources.items()
+                          if result.get("kind") is None or candidate.get("kind", "text") == result["kind"]][:3]
+        action = ("该ID不在本次允许表中，必须删除这一无来源引用；即使引文相同也不得保留伪造ID。"
+                  "若需要保留其断言，须重新选择本次真实的已核验证据ID。")
+        if result.get("kind") == "visual":
+            action = ("不得生成或改写ID；初评没有可用visual ID时，须基于实际送入页图返回"
+                      "kind=visual、document_id、page_no和observation，不填source_id/evidence_id；"
+                      "综合时只选已核验visual证据的evidence_id，不得改写归属。")
+        raise EvidenceBindingError(_source_id_feedback(
+            reference_path, reference_path, reference,
+            "该原ID未知且未唯一命中不可变台账；即使引文相同也不得保留伪造ID，"
+            "不按引文歧义或相似度推断", candidates=candidates, action=action,
+        ))
     for key in ("document_id", "page_no", "kind"):
         if result.get(key) is not None and str(result[key]) != str(source.get(key)):
             action = None
             if result.get("kind") == "visual" and source.get("kind") == "text":
-                action = ("文本ID不能充当视觉证据；初评须基于实际送入页图返回kind=visual、document_id、page_no和observation，"
-                          "不填文本source_id/evidence_id；综合时仅引用已核验visual证据的evidence_id，不得自动改kind或页码。")
-            raise EvidenceBindingError(_source_id_feedback(field_path(key), reference_path, reference,
-                                              "证据引用 ID 与文件或页码不一致", source=source, action=action))
+                action = ("文本ID不能充当视觉证据；初评须基于实际送入页图返回kind=visual、"
+                          "document_id、page_no和observation，不填文本source_id/evidence_id。")
+            raise EvidenceBindingError(_source_id_feedback(
+                field_path(key), reference_path, reference,
+                "证据引用 ID 与文件或页码不一致", source=source, action=action,
+            ))
     if source.get("kind") == "visual":
         if result.get("observation") and result["observation"] != source.get("observation"):
-            raise EvidenceBindingError(_source_id_feedback(field_path("observation"), reference_path, reference,
-                                              "综合复评改写了未经原批次核验的视觉观察", source=source))
+            raise EvidenceBindingError(_source_id_feedback(
+                field_path("observation"), reference_path, reference,
+                "综合复评改写了未经原批次核验的视觉观察", source=source,
+            ))
     elif result.get("quote"):
         quote = _original_quote(str(result["quote"]), str(source.get("quote") or ""))
         if quote is None:
-            raise EvidenceBindingError(_source_id_feedback(field_path("quote"), reference_path, reference,
-                                              "引文与绑定原文 ID 不匹配", source=source))
+            raise EvidenceBindingError(_source_id_feedback(
+                field_path("quote"), reference_path, reference,
+                "引文与绑定原文 ID 不匹配", source=source,
+            ))
         source = {**source, "quote": quote}
     return {**result, **source}
 
@@ -1365,6 +1694,16 @@ def _call(gateway: Gateway, criterion: dict, pages: list[dict], *, data_class: s
             "子项缺失或部分页面不可读而拒绝给分。材料不足时按较低档位给分并说明。"
             "不得因模型或读取故障给满分或最低分。"
         )
+        if payload.get("frozen_subitems"):
+            payload["subjective_scale"] = (
+                "逐子项独立评分后求和，禁止用整体印象直接给总分。"
+                "各子项按其满分比例使用统一锚点：0%=未提供或只有标题；"
+                "25%=零散描述且缺核心流程；50%=基本覆盖但缺关键要素或可执行步骤；"
+                "75%=要素完整、责任和流程清楚并含部分量化指标；"
+                "100%=细则要素全部覆盖，量化指标、步骤、风险与保障均完整可执行。"
+                "每缺一个点名要素扣该子项满分的10%-20%，线性扣减不整项归零；"
+                "仅罗列数字不进入90%以上档。"
+            )
     if criterion.get("_reading_caveat"):
         # 送审范围限制（存在未能读取的附件）：缺证存疑不硬判，见
         # automatic_scoring_service.reading_caveat_for（2026-11-17 run 125）。
@@ -1543,6 +1882,10 @@ def _call(gateway: Gateway, criterion: dict, pages: list[dict], *, data_class: s
                                   else "本批原页证据定向补抽 2 次后仍未通过：") + str(exc))
                 error.validation_history = history
                 error.review_attempts_exhausted = True
+                for attr in ("rejected_evidence", "verified_facts", "verified_subtotal",
+                             "synthesis_evidence_rejected"):
+                    if hasattr(exc, attr):
+                        setattr(error, attr, getattr(exc, attr))
                 raise error from exc
             payload["validation_feedback"] = {
                 "attempt": attempt + 1, "error": str(exc)[:500],
@@ -2014,7 +2357,6 @@ def synthesis_decision(gateway, criterion, pages, *, data_class, previous,
                 raise LLMError("综合证据台账缺少唯一且一致的证据编号")
             ledger[key] = deepcopy(item)
     ledger_decision = AutoReviewDecision(verdict="pass", reasoning="完整来源台账", evidence=list(ledger.values()))
-    _validate_synthesis_sources(ledger_decision, decisions)
     _validate_evidence(ledger_decision, pages, use_vision=use_vision)
 
     # Partition complete results; a group never drops the tail of a batch or
@@ -2071,7 +2413,20 @@ def synthesis_decision(gateway, criterion, pages, *, data_class, previous,
             if valid:
                 matches.append((key, source))
         if len(matches) != 1 or (reference is not None and matches[0][0] != reference):
-            raise LLMError("分组综合证据无法唯一匹配完整来源台账")
+            error = _synthesis_evidence_error(
+                "分组综合证据无法唯一匹配完整来源台账",
+                item,
+                [str(key) for key, _ in candidates],
+            )
+            error.verified_facts = [
+                {"facts": deepcopy(result.facts), "verdict": result.verdict,
+                 "evidence_ids": [e.get("evidence_id") or e.get("source_id")
+                                  for e in result.evidence]}
+                for result in decisions if result.facts
+            ]
+            scores = [result.score for result in decisions if result.score is not None]
+            error.verified_subtotal = max(scores) if scores else None
+            raise error
         key, source = matches[0]
         # Identity, owner and immutable quote remain in the host ledger and its
         # checked group checkpoint. Repeating them here made long valid runs
@@ -2104,7 +2459,7 @@ def synthesis_decision(gateway, criterion, pages, *, data_class, previous,
 
         def validate(raw):
             checked = AutoReviewDecision.model_validate(raw)
-            _validate_synthesis_sources(checked, decisions)
+            _validate_synthesis_sources(checked, [ledger_decision])
             _validate_evidence(checked, pages, use_vision=use_vision)
             _validate_fact_sources(checked, criterion)
             for item in checked.evidence:
@@ -2153,7 +2508,17 @@ def synthesis_decision(gateway, criterion, pages, *, data_class, previous,
         _validate_fact_sources(final, criterion)
         for item in final.evidence:
             source_reference(item, -1)
-    except Exception:
+    except Exception as exc:
+        if not hasattr(exc, "verified_facts"):
+            exc.verified_facts = [
+                {"facts": deepcopy(item.facts), "verdict": item.verdict,
+                 "evidence_ids": [e.get("evidence_id") or e.get("source_id")
+                                  for e in item.evidence]}
+                for item in decisions if item.facts
+            ]
+        if not hasattr(exc, "verified_subtotal"):
+            scores = [item.score for item in decisions if item.score is not None]
+            exc.verified_subtotal = max(scores) if scores else None
         if callable(final._invalidate_response):
             final._invalidate_response()
         raise
@@ -2289,7 +2654,12 @@ def review_criterion(gateway: Gateway, criterion: dict, pages: list[dict], *,
                          previous=previous, round_no=round_no, use_vision=use_vision,
                          summaries=summaries, decisions=decisions,
                          material_state=_material_review_state(pages, selected, full=full, use_vision=use_vision))
-        _validate_synthesis_sources(decision, decisions)
+        approved_summaries = [
+            AutoReviewDecision(verdict="pass", reasoning="原批次证据台账",
+                               evidence=summary.get("evidence") or [])
+            for summary in summaries
+        ]
+        _validate_synthesis_sources(decision, approved_summaries)
         _validate_evidence(decision, selected, use_vision=use_vision)
     supplies = _supplies_for(criterion, pages)
     if supplies:

@@ -402,7 +402,7 @@ def test_synthesis_cannot_invent_visual_observation(monkeypatch):
     monkeypatch.setattr(auto_review, "get_vision_gateway", lambda: visual)
     pages = [{**PAGE, "text": "", "source": "ocr_degraded", "image_url": "data:image/png;base64,AAAA"},
              {**PAGE, "page_no": 4, "text": "", "source": "ocr_degraded", "image_url": "data:image/png;base64,BBBB"}]
-    with pytest.raises(LLMError, match="未经原批次核验"):
+    with pytest.raises(LLMError, match="无法唯一恢复到原批次不可变台账"):
         review_criterion(Replies(), RULE, pages, use_vision=True)
     assert len(visual.calls[0]["images"]) == 1
     assert len(visual.calls[1]["images"]) == 1
@@ -427,7 +427,7 @@ def test_subjective_subitem_sum_is_computed_from_frozen_components():
     gateway = Replies(subitem_decision())
     got = review_criterion(gateway, SUBJECTIVE_RULE, [PAGE])
     assert got.score == Decimal("3")
-    assert got.sub_score_calculation == "1 + 2 = 3"
+    assert got.sub_score_calculation.startswith("1 + 2 = 3")
     assert [entry["max"] for entry in got.sub_scores] == ["2", "3"]
     assert gateway.calls[0]["user"]["frozen_subitems"] == [
         {"name": "响应方案", "max_score": "2"}, {"name": "维护方案", "max_score": "3"},

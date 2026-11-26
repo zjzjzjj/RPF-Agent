@@ -173,7 +173,7 @@ def test_residual_rejects_quote_missing_from_bid_text():
 
 # ---- c) 全文也抽不到 → 暂定兜底（未定分，非不符合） ------------------------
 
-def test_extraction_failure_settles_as_provisional_not_noncompliance():
+def test_extraction_failure_remains_pending_not_noncompliance():
     pages = [{"document_id": 1, "page_no": 2, "source": "text", "text": "无关材料，没有承诺值。"}]
     criterion = _criterion()
     detail = ("未在投标文件中抽取到 response_hours 的承诺值"
@@ -181,10 +181,11 @@ def test_extraction_failure_settles_as_provisional_not_noncompliance():
     outcome = scoring._value_extraction_unresolved_outcome(criterion, pages, detail)
     assert outcome.basis == "fallback"
     assert outcome.verdict == "concern"  # 不是 "fail"（不符合）
-    assert outcome.score is not None, "零未定分（2026-11-24）：带兜底暂定分"
-    assert outcome.raw["fallback"]["kind"] == "value_extraction_unresolved"
-    assert outcome.warnings[0]["fallback_score"]["kind"] == "value_extraction_unresolved"
-    assert "暂定待人工" in outcome.reasoning
+    assert outcome.score is None
+    assert outcome.raw["fallback"]["kind"] == "material_review_pending"
+    assert outcome.raw["fallback"]["reason_code"] == "value_extraction_unresolved"
+    assert outcome.raw["fallback"]["value"] is None
+    assert "未生成最终分" in outcome.reasoning
 
     # _persist_cell 同构落库形态 → _valid_cell 认它（已定格兜底暂定分，计完成）
     row = SimpleNamespace(
@@ -201,7 +202,8 @@ def test_extraction_failure_settles_as_provisional_not_noncompliance():
         warnings_json=outcome.warnings,
     )
     assert automation._valid_cell(row, criterion, []) is True
-    assert row.final_score is not None
+    assert automation.material_review_pending(row) is not None
+    assert row.final_score is None
 
 
 # ---- d) 反向锁：确认缺失 + 制裁句仍按 0 分结论 -----------------------------

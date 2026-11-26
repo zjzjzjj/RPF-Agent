@@ -106,7 +106,7 @@ def test_all_unreadable_marks_reading_incomplete(app_env) -> None:  # noqa: ANN0
     assert excinfo.value.reading_incomplete is True
     assert "未能读取" in str(excinfo.value)
     # 收尾闭合按读取故障定格：未定分，不写暂定 0
-    assert scoring._fallback_score_for({"score_type": "count", "max_score": "3"}) is not None  # sanity
+    assert scoring._fallback_score_for({"score_type": "count", "max_score": "3"}) is None
 
 
 def test_reading_caveat_mentions_attachment(app_env) -> None:  # noqa: ANN001

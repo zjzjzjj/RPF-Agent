@@ -1794,6 +1794,7 @@ def _cases_from_blocks(blocks: list) -> list[dict]:
                 "quote_source": "table_row",
                 "case_source": "table",
                 "table_page": r.page,
+                "block_pages": list(b.pages or []),
                 "material_pages": b.pages_by_material,
                 "material_reasons": b.reasons,
                 "sanitized": "ok",
@@ -2257,7 +2258,8 @@ def _overlay_leader_table_proof(cases: list[dict], pages: list[tuple[int, str, s
         person = str(c.get("person_name") or c.get("person") or "").strip()
         if len(person) < 2:
             continue
-        if any(person in t for t in table_pages):
+        case_name = re.sub(r"\s+", "", str(c.get("name") or ""))
+        if any(person in t and case_name in re.sub(r"\s+", "", t) for t in table_pages):
             c["work_proof"] = True
 
 

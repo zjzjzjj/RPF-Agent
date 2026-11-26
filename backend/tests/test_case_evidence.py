@@ -374,6 +374,33 @@ def test_classify_unreadable_is_null() -> None:
     assert b.reasons["invoice"] == "unreadable"
 
 
+def test_exact_material_heading_wins_on_low_evidence_page() -> None:
+    pages = [
+        PageRec(10, "2.8.1.1 合同复印件", "text"),
+        PageRec(11, "2.8.1.3 发票", "text"),
+        PageRec(12, "2.8.1.2 验收报告", "text"),
+    ]
+    b = _run_classify(pages, {10: 0.9, 11: 0.9, 12: 0.9}, [10, 11, 12])
+    assert b.status == {"contract": True, "invoice": True, "acceptance": True}
+    assert b.reasons == {"contract": "material_heading",
+                         "invoice": "material_heading",
+                         "acceptance": "material_heading"}
+
+
+def test_classify_owner_or_user_proof_heading_as_acceptance() -> None:
+    """业主/用户证明可作为案例验收证明材料的标题级证据。"""
+    for heading in ("业主证明", "用户证明"):
+        pages = [
+            PageRec(10, "2.8.1.1 合同复印件", "text"),
+            PageRec(11, "2.8.1.2 发票", "text"),
+            PageRec(12, f"2.8.1.3 {heading}", "text"),
+        ]
+        b = _run_classify(pages, {10: 0.9, 11: 0.9, 12: 0.9}, [10, 11, 12])
+        assert b.status["acceptance"] is True
+        assert b.reasons["acceptance"] == "material_heading"
+        assert b.pages_by_material["acceptance"] == [12]
+
+
 def test_classify_absent_on_readable_page_is_false() -> None:
     pages = [
         PageRec(10, "甲方 乙方 项目合同", "text"),

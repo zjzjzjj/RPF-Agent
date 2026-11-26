@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """Deterministic objective scoring from a page-bound material inventory.
 
 These plans are derived from the frozen rule text (name/description/quote and
@@ -333,6 +333,14 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
     from app import config as _config
     strict_unverified = not _config.case_unverified_count_enabled()
     for record in inventory.contracts:
+        if record.source == "person_proof":
+            continue
+        if (record.materials_state or {}).get("_case_block_complete"):
+            for kind in ("contract", "invoice", "acceptance"):
+                if (record.materials_state or {}).get(kind) is None:
+                    record.materials_state[kind] = bool(
+                        (record.materials or {}).get(kind)
+                    )
         amount = record.amount_yuan
         if amount is None:
             rejected.append(f"{record.name}（无金额）")
@@ -361,7 +369,8 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
             # PR4 护栏（2026-11-24 用户口径"不允许漏评分"）：目录/索引列有该
             # 材料页但绑定未闭合 → **禁止按缺件判 0**，转"未核实"（护栏
             # 报警）；目录也没有 → 真缺件判 0（红线保留）。翻转方向只升不降。
-            if missing and _guard_on(inventory):
+            if (missing and _guard_on(inventory)
+                    and not (record.materials_state or {}).get("_case_block_complete")):
                 _kind_of_label = {"合同": "contract", "发票": "invoice",
                                   "验收证明": "acceptance", "业主证明": "acceptance"}
                 escalated = [m for m in missing
@@ -634,7 +643,7 @@ def _value_items_score(criterion: dict, inventory: MaterialInventory) -> FastPat
         if inventory.value_items else "未在增值服务章节检出清单条目"
     )
     score = _cap(score, criterion)
-    complete = inventory.value_section_found and bool(inventory.value_items)
+    complete = inventory.value_section_found
     zero_reason = None if score > 0 else ("confirmed_absent" if complete else "no_facts")
     return FastPathResult(
         score=score, detail=detail + f"；合计 {score} 分",

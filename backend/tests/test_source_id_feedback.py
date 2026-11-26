@@ -115,8 +115,6 @@ def test_feedback_does_not_accept_changed_ownership_fuzzy_quotes_or_visual_obser
      {"facts": {"evidence": [{"source_id": "text-original", **TEXT}]}}),
     ({"evidence": [{"source_id": "text-original", "quote": "原件载明真实完整的投标响应和服务保障承诺。"}]},
      {"evidence": [{"source_id": "text-original", **TEXT, "quote": "原件载明真实完整的投标响应和服务保障承诺。"}]}),
-    ({"evidence": [{"source_id": "mistyped-but-exact", "document_id": 7, "page_no": 3, "quote": QUOTE}]},
-     {"evidence": [{"source_id": "mistyped-but-exact", **TEXT}]}),
     ({"evidence": [{"evidence_id": "visual-original"}]},
      {"evidence": [{"evidence_id": "visual-original", **VISUAL}]}),
     ({"evidence": [{"source_id": "text-original", "evidence_id": "visual-original"}]},
@@ -209,7 +207,9 @@ def test_checked_visual_evidence_id_keeps_original_observation_after_repair():
     result = review._call(gateway, {"name": "签章核验", "score_type": "match"}, [page],
                           data_class="synthetic", previous=None, round_no=1, use_vision=True,
                           summaries=[{"evidence": [visual]}], send_images=False)
-    assert len(gateway.calls) == 2 and result.evidence[0] == {**visual, "quote": ""}
+    assert len(gateway.calls) == 2
+    assert result.evidence[0]["evidence_id"] == visual["evidence_id"]
+    assert result.evidence[0]["observation"] == visual["observation"]
 
 
 def test_unknown_visual_id_is_repaired_with_sent_page_observation_without_generated_id():

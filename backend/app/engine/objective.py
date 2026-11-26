@@ -603,13 +603,17 @@ def _parse_artifact_segment(seg: str) -> list[str]:
 #   ② 排除证书免责声明（"可在官方网站查询"）
 #   ③ 平台 URL（cx.cnca.cn）强信号，在行长度检查之前命中
 _CERT_TITLE_RE = re.compile(r"查询(?:结果)?截图|查询网址|查询地址|证书查询|认证结果查询")
+_CERT_DETAIL_RE = re.compile(r"当前位置\s*[：:]\s*认证结果|证书详情|认证结果\s+证书详情")
+_CERT_DETAIL_FIELDS = (
+    "证书信息", "证书编号", "认证项目", "机构批准号", "有效期",
+)
 _CERT_EXCLUDE = re.compile(r"行贿|犯罪记录|信用中国|无犯罪")
 _CERT_DISCLAIMER = re.compile(r"官方网站上?查询|可查询")
 _CERT_PLATFORM_URL = re.compile(r"cx\.cnca\.cn|cnca\.cn")
 # 通道 B：OCR 正文的**平台专有**指纹。"证书编号"这类词证书扫描件也有，不能单独用。
 _CERT_STRONG_FINGERPRINTS = ("认证认可信息公共服务平台", "认证行政监管", "证书查询结果")
 _CERT_WEAK_FINGERPRINTS = (
-    "国家市场监督管理总局", "认证结果", "公共服务平台", "证书状态",
+    "国家市场监督管理总局", "国家市场监管总局", "认证结果", "公共服务平台", "证书状态",
 )
 
 
@@ -658,6 +662,19 @@ def _cert_line_basis(s: str) -> str | None:
     return None
 
 
+def _cert_detail_basis(text: str) -> str | None:
+    """认证详情页专用信号，避免把普通证书或要求句当查询截图。"""
+    normalized = re.sub(r"\s+", "", text or "")
+    if not _CERT_DETAIL_RE.search(normalized):
+        return None
+    fields = [field for field in _CERT_DETAIL_FIELDS if field in normalized]
+    if len(fields) < 2:
+        return None
+    if re.search(r"须提供|应提供|需提供|未按要求提供|不得分", normalized):
+        return None
+    return f"认证详情页：{'、'.join(fields[:4])}"
+
+
 def _anchor_window(text: str, pos: int, width: int = 60) -> dict:
     """命中位置 → 页文本逐字窗口（quote 供原页证据合成；宿主侧再逐字复核）。"""
     t = text or ""
@@ -680,6 +697,14 @@ def detect_cert_section(
     hits: list[dict] = []
     for p in pages or []:
         text = p.get("text") or ""
+        detail_basis = _cert_detail_basis(text)
+        if detail_basis:
+            positions = [text.find(field) for field in _CERT_DETAIL_FIELDS if text.find(field) >= 0]
+            pos = min(positions) if positions else 0
+            win = _anchor_window(text, pos)
+            hits.append({"document_id": p.get("document_id"), "page_no": p.get("page_no"),
+                         "quote": win["quote"], "basis": detail_basis, "source": p.get("source")})
+            continue
         for line in text.split("\n"):
             s = line.strip()
             basis = _cert_line_basis(s)
@@ -1086,7 +1111,7 @@ def _amount_tier_rate(tiers: list[dict], amount: Decimal) -> Decimal:
 
 # ---- 时间窗/类型三态闸（2026-11-24 抽共用：_score_contracts 与 score_count 共用）----
 
-_RE_OPS_TYPE = re.compile(r"运维|维护|技术服务|保障服务")
+_RE_OPS_TYPE = re.compile(r"运维|维护|维保|技术服务|保障服务")
 _RE_NON_OPS_TYPE = re.compile(
     r"设备维保|硬件维保|网络(?:系统)?建设|系统集成|"
     r"软件开发|系统开发|开发(?:项目|工程)"
@@ -1160,6 +1185,8 @@ def type_gate_state(type_text: str | None, rule_text: str) -> bool | None:
     text = type_text or ""
     if not text.strip():
         return None
+    if re.search(r"设备(?:运维|维保)|硬件维保|机房搬迁|网络建设|网络系统建设|系统集成", text):
+        return False
     if _RE_OPS_TYPE.search(text):
         return True
     if _RE_NON_OPS_TYPE.search(text):
@@ -1169,7 +1196,12 @@ def type_gate_state(type_text: str | None, rule_text: str) -> bool | None:
 
 def documented_project_type_state(project_type: str | None, name: str, rule_text: str) -> bool | None:
     explicit = type_gate_state(project_type, rule_text)
-    return explicit if explicit is not None else type_gate_state(name, rule_text)
+    named = type_gate_state(name, rule_text)
+    if (named is True and explicit is False
+            and re.search(r"软件开发|系统开发|应用软件开发", project_type or "")
+            and _RE_OPS_TYPE.search(name or "")):
+        return True
+    return explicit if explicit is not None else named
 
 
 _RE_MATURITY_CERT_LEVEL = re.compile(
@@ -1192,10 +1224,17 @@ def _certificate_date(value: object) -> date | None:
 
 
 def _maturity_level(value: object) -> int | None:
-    match = _RE_MATURITY_CERT_LEVEL.fullmatch(normalize_no_ws(str(value or "")))
+    raw = normalize_no_ws(str(value or ""))
+    match = _RE_MATURITY_CERT_LEVEL.fullmatch(raw)
+    if match is not None:
+        level = match["level"]
+        return int(_MATURITY_ROMAN_LEVELS.get(level, _CN_NUM.get(level, level)))
+    if not re.search(r"CMMI|CSMM|Maturity|ML", raw, re.I):
+        return None
+    match = re.search(r"(?:MaturityLevel|ML|Level|成熟度等级?)\s*([1-5一二三四五])", raw, re.I)
     if match is None:
         return None
-    level = match["level"]
+    level = match.group(1)
     return int(_MATURITY_ROMAN_LEVELS.get(level, _CN_NUM.get(level, level)))
 
 
@@ -1215,6 +1254,8 @@ def _score_maturity_certificate(
     reference_date = _certificate_date(params.get("cert_reference_date"))
     unknown = []
     invalid = []
+    missing_validity = []
+    confirmed_missing_validity = []
     if not records:
         unknown.append("认证证书原件或复印件")
     for record in records:
@@ -1237,10 +1278,20 @@ def _score_maturity_certificate(
             invalid.append(f"证书自{start.isoformat()}生效，晚于投标截止日")
             continue
         if minimum is not None and level is None:
-            unknown.append("认证等级")
+            if record.get("confirmed_missing_validity") is True:
+                confirmed_missing_validity.append("证书原件未载可核对认证等级")
+            else:
+                unknown.append("认证等级")
             continue
-        if requires_current and not (end and reference_date):
-            unknown.append("证书有效期" if reference_date else "招标文件中的投标截止日")
+        if requires_current and not reference_date:
+            unknown.append("招标文件中的投标截止日")
+            continue
+        if requires_current and not end:
+            message = "证书原件未载可核对有效期且无匹配官方有效期查询"
+            if record.get("confirmed_missing_validity") is True:
+                confirmed_missing_validity.append(message)
+            else:
+                missing_validity.append(message)
             continue
 
         score = min(per_item, maximum) if maximum else per_item
@@ -1253,6 +1304,12 @@ def _score_maturity_certificate(
     if unknown:
         detail = "仍需核验" + "、".join(dict.fromkeys(unknown))
         return CountResult(Decimal(0), detail, True, "certificate_unverified", "unreadable")
+    if missing_validity:
+        detail = "；".join(dict.fromkeys(missing_validity)) + "，有效期字段尚未核验"
+        return CountResult(Decimal(0), detail, True, "certificate_unverified", "unreadable")
+    if confirmed_missing_validity:
+        detail = "；".join(dict.fromkeys(confirmed_missing_validity)) + "，按有效期内要求不计分"
+        return CountResult(Decimal(0), detail, False, None, "confirmed_absent")
     return CountResult(Decimal(0), "；".join(dict.fromkeys(invalid)), False, zero_reason="insufficient_criteria")
 
 
@@ -1992,7 +2049,8 @@ def _normalize_role(case: dict) -> str | None:
     role = str(case.get("role") or "").strip().lower()
     if not role:
         return None
-    if "lead" in role or "负责人" in role:
+    if ("lead" in role or "负责人" in role or "项目经理" in role
+            or "项目总监" in role):
         return "leader"
     if "member" in role or "成员" in role or "团队" in role:
         return "member"

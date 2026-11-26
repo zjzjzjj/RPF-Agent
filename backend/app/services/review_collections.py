@@ -25,6 +25,112 @@ _FLIGHTS: dict[tuple, threading.Lock] = {}
 VALIDATOR_VERSION = "2026-11-18.sources-v2.2"
 
 
+_TECHNICAL_ERROR_REASONS = {
+    "evidence_binding": "原批次证据绑定待人工复核，已保留核验记录",
+    "reading_incomplete": "材料读取待补核，未生成最终分",
+    "model_output_incomplete": "自动评审输出待人工复核，未生成最终分",
+    "execution_incomplete": "材料采集或自动评审未形成可核验终态，待人工复核",
+}
+
+
+def error_reason_code(error) -> str:
+    """Map internal failures to stable, non-semantic audit categories."""
+    if bool(getattr(error, "reading_incomplete", False)):
+        return "reading_incomplete"
+    if (type(error).__name__ == "EvidenceBindingError"
+            or bool(getattr(error, "synthesis_evidence_rejected", False))
+            or bool(getattr(error, "rejected_evidence", None))):
+        return "evidence_binding"
+    if bool(getattr(error, "review_attempts_exhausted", False)):
+        return "model_output_incomplete"
+    return "execution_incomplete"
+
+
+def public_error_message(error) -> str:
+    """Never expose exception text, source IDs, paths or model responses."""
+    if isinstance(error, dict):
+        reason = str(error.get("reason_code") or "")
+        if reason not in _TECHNICAL_ERROR_REASONS:
+            code = str(error.get("code") or "")
+            if error.get("synthesis_evidence_rejected") or code == "EvidenceBindingError":
+                reason = "evidence_binding"
+            elif code == "interrupted_before_commit":
+                reason = "execution_incomplete"
+            else:
+                reason = "execution_incomplete"
+    else:
+        reason = error_reason_code(error)
+    return _TECHNICAL_ERROR_REASONS[reason]
+
+
+def sanitize_validation_history(history) -> list[dict]:
+    """Keep repair progress and response hashes, never repair-prompt details."""
+    out = []
+    for item in history or []:
+        if not isinstance(item, dict):
+            continue
+        state = str(item.get("state") or "failed")
+        row = {
+            "attempt": item.get("attempt", item.get("round")),
+            "state": state,
+            "reason_code": ("validation_repair" if state == "failed" else None),
+        }
+        response_hash = item.get("response_sha256")
+        if response_hash:
+            row["response_sha256"] = str(response_hash)[:64]
+        out.append(row)
+    return out
+
+
+def sanitize_rejected_evidence(items) -> list[dict]:
+    """Retain only the requested redacted rejection metadata."""
+    out = []
+    for item in items or []:
+        if not isinstance(item, dict):
+            continue
+        reference = item.get("reference") or item.get("evidence_id") or item.get("source_id")
+        content = str(item.get("summary") or item.get("observation") or item.get("quote") or "")
+        summary = " ".join(content.split())[:80]
+        candidates = []
+        for candidate in item.get("candidates") or []:
+            if isinstance(candidate, dict):
+                candidate = candidate.get("evidence_id") or candidate.get("source_id")
+            if candidate is not None and str(candidate) not in candidates:
+                candidates.append(str(candidate)[:80])
+            if len(candidates) == 3:
+                break
+        out.append({
+            "reference": str(reference)[:120] if reference is not None else None,
+            "document_id": item.get("document_id"),
+            "page_no": item.get("page_no"),
+            "kind": str(item.get("kind") or "text")[:20],
+            "summary": summary,
+            "candidates": candidates,
+        })
+    return out
+
+
+def sanitized_error_audit(error) -> dict:
+    """Durable batch audit metadata without raw exception or response text."""
+    reason = error_reason_code(error)
+    fingerprint = stable_hash({"type": type(error).__name__, "text": str(error)})[:16]
+    payload = {
+        "code": type(error).__name__,
+        "reason_code": reason,
+        "message": public_error_message(error),
+        "error_fingerprint": fingerprint,
+    }
+    history = sanitize_validation_history(getattr(error, "validation_history", None))
+    if history:
+        payload["validation_history"] = history
+    rejected = sanitize_rejected_evidence(getattr(error, "rejected_evidence", None))
+    if rejected:
+        payload["rejected_evidence"] = rejected
+    if getattr(error, "synthesis_evidence_rejected", False):
+        payload["synthesis_evidence_rejected"] = True
+    return payload
+
+
 def stable_hash(value) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
                                      default=str, separators=(",", ":")).encode()).hexdigest()
@@ -484,7 +590,7 @@ class CollectionCheckpoint:
                             ReviewCollectionBatch.batch_key == key,
                         ).values(state="failed", result_json=None,
                                  completed_at=None, attempt_token=None,
-                                 error_json={"code": "invalid_checkpoint", "message": str(exc)[:500]}, updated_at=utcnow()))
+                                 error_json={**sanitized_error_audit(exc), "code": "invalid_checkpoint"}, updated_at=utcnow()))
                         _refresh_collection(collection, s.execute(select(ReviewCollectionBatch).where(
                             ReviewCollectionBatch.collection_id == self.collection_id)).scalars().all())
                 else:
@@ -587,10 +693,8 @@ class CollectionCheckpoint:
                         )).scalar_one_or_none()
                         if row is not None:
                             row.state, row.completed_at, row.attempt_token = "failed", None, None
-                            row.error_json = {"code": type(exc).__name__, "message": str(exc)[:500]}
-                            history = getattr(exc, "validation_history", None)
-                            if history:
-                                row.error_json = {**row.error_json, "validation_history": deepcopy(history)}
+                            row.updated_at = utcnow()
+                            row.error_json = sanitized_error_audit(exc)
                             row.metrics_json = {**_merge_metrics(baseline_metrics, metrics),
                                                 "queued_requests": 0, "inflight_requests": 0}
                             _refresh_collection(collection, s.execute(select(ReviewCollectionBatch).where(

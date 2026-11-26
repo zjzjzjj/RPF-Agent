@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """Deterministic bid-material inventory for objective scoring.
 
 The managed executor historically asked the LLM to extract every fact *and*
@@ -298,6 +298,38 @@ def _contract_name_overlap(left: str, right: str) -> bool:
     return difflib.SequenceMatcher(None, a, b).ratio() >= 0.6
 
 
+def _apply_heading_material_states(blocks: list, pages: list[PageRec]) -> None:
+    """Bind explicit case subheadings even when page image statistics are unavailable."""
+    by_no = {page.page_no: page for page in pages}
+    patterns = {
+        "contract": re.compile(r"合同(?:原件)?复印件|合同扫描件"),
+        "invoice": re.compile(r"发票(?:原件)?复印件|发票扫描件|"
+                              r"(?:^|\n)\s*(?:\d+(?:\.\d+)+\s*)?(?:合同执行中)?发票(?:复印件|扫描件)?\s*$", re.M),
+        "acceptance": re.compile(
+            r"验收报告|验收证明|验收单|终验证书|业主证明|用户证明"
+        ),
+    }
+    for block in blocks:
+        if getattr(block, "ambiguous", False) or not getattr(block, "pages", None):
+            continue
+        for material, pattern in patterns.items():
+            hits = []
+            for number in block.pages:
+                page = by_no.get(number)
+                text = str(page.text if page else "")
+                match = pattern.search(text)
+                # Real evidence sections commonly put the material heading and
+                # the scanned copy on the same OCR page.  Only reject long
+                # requirement/index text before the heading; content after it
+                # is the proof itself and must not make the binding disappear.
+                if match and len(text[:match.start()].strip()) <= 300:
+                    hits.append(number)
+            if hits and not block.status.get(material):
+                block.status[material] = True
+                block.pages_by_material[material] = hits[:3]
+                block.reasons[material] = "material_heading"
+
+
 def _contracts_from_case_table(pages: list[dict], pdf_path: str | None) -> list[ContractRecord]:
     if not pdf_path:
         return []
@@ -331,6 +363,7 @@ def _contracts_from_case_table(pages: list[dict], pdf_path: str | None) -> list[
         if not rows:
             return []
         blocks = link_case_blocks(rows, recs, section)
+        _apply_heading_material_states(blocks, recs)
         # PR1（2026-11-24 run155 实证）：必须补跑三态分类——旧实现"跳过
         # classify_materials"使 pages_by_material/status 恒空，材料链 AND 闸把
         # "材料在但没绑上"误判"缺件"→ c43 整列 0。classify 失败只降级不阻塞
@@ -353,8 +386,12 @@ def _contracts_from_case_table(pages: list[dict], pdf_path: str | None) -> list[
                         )
                 except Exception:  # noqa: BLE001 —— 标签先验失败不阻塞三态
                     tag_pages = None
-            classify_materials(blocks, recs, page_image_ratios(pdf_path),
-                                tag_pages=tag_pages)
+            ratios = {}
+            try:
+                ratios = page_image_ratios(pdf_path)
+            except Exception:  # noqa: BLE001 —— 图像统计失败不阻断标题材料分类
+                pass
+            classify_materials(blocks, recs, ratios, tag_pages=tag_pages)
         except Exception:  # noqa: BLE001
             pass
         cases = _cases_from_blocks(blocks)
@@ -375,9 +412,9 @@ def _contracts_from_case_table(pages: list[dict], pdf_path: str | None) -> list[
         # contract_pages/invoice_pages/… 全库无写入方（run155 实证），保留
         # 仅为历史数据 fallback。
         mat = case.get("material_pages") or {}
-        for nums in list(mat.values()) + [case.get(k) for k in
-                                          ("contract_pages", "invoice_pages",
-                                           "acceptance_pages", "evidence_pages")]:
+        for nums in list(mat.values()) + [case.get("block_pages")] + [
+                case.get(k) for k in
+                ("contract_pages", "invoice_pages", "acceptance_pages", "evidence_pages")]:
             for number in nums or []:
                 try:
                     pages_found.append(int(number))
@@ -459,7 +496,7 @@ _RE_MATURITY_PROOF = re.compile(
 )
 
 
-def bind_maturity_appraisals(records: list[dict]) -> list[dict]:
+def bind_maturity_appraisals(records: list[dict], pages: list[dict] | None = None) -> list[dict]:
     """Apply a published validity period to the same appraisal on a certificate."""
     def appraisal_key(record: dict) -> tuple | None:
         appraisal_id = str(record.get("appraisal_id") or "")
@@ -491,13 +528,44 @@ def bind_maturity_appraisals(records: list[dict]) -> list[dict]:
                 cert["valid_until"] = cert.get("valid_until") or end
                 cert["appraisal_lookup_pages"] = sorted({lookup["page_no"] for lookup in lookups
                                                          if lookup.get("page_no") is not None})
+        if not cert.get("valid_until") and cert.get("page_no") is not None:
+            source = " ".join(
+                str(page.get("text") or "") for page in (pages or [])
+                if page.get("document_id") == cert.get("document_id")
+                and page.get("page_no") == cert.get("page_no")
+            )
+            maturity = _RE_MATURITY_FAMILY.search(source)
+            maturity_source = source[maturity.start():] if maturity else source
+            next_iso = _RE_ISO_TOKEN.search(maturity_source[1:])
+            if next_iso:
+                maturity_source = maturity_source[:next_iso.start() + 1]
+            if (len(maturity_source.strip()) >= 80
+                    and re.search(r"CMMI|CSMM|Maturity|Appraisal", maturity_source, re.I)
+                    and not re.search(
+                        r"有效期|有效至|到期日期|Expiration|Valid\s*(?:from|until|through|to)|"
+                        r"Appraisal\s+Validity", maturity_source, re.I)):
+                cert["confirmed_missing_validity"] = True
         certificates.append(cert)
-    return certificates
+    def title_only(cert: dict) -> bool:
+        if cert.get("backing") is not True or cert.get("valid_until") or cert.get("appraisal_lookup_pages"):
+            return False
+        source = " ".join(
+            str(page.get("text") or "") for page in (pages or [])
+            if page.get("document_id") == cert.get("document_id")
+            and page.get("page_no") == cert.get("page_no")
+        )
+        return not (_RE_MATURITY_PROOF.search(source)
+                    or re.search(r"CMMI|CSMM", source, re.I)
+                    and re.search(r"Maturity|Appraisal|Level|证书编号|评估编号|发证", source, re.I))
+
+    return [cert for cert in certificates if not title_only(cert)]
 
 
 def maturity_certificate_details(pages: list[dict], visual_records: list[dict] | None = None) -> list[dict]:
     """Extract CMMI/CSMM details from a certificate page, excluding mentions and rule echoes."""
     from datetime import date, datetime
+
+    from app.engine.objective import _maturity_level as _parse_maturity_level
 
     def date_value(groups):
         try:
@@ -526,7 +594,12 @@ def maturity_certificate_details(pages: list[dict], visual_records: list[dict] |
         prefix = page_text[:start]
         previous_iso = list(_RE_ISO_TOKEN.finditer(prefix))
         prefix_start = previous_iso[-1].end() if previous_iso else 0
-        proof_prefix = list(_RE_MATURITY_PROOF.finditer(prefix, prefix_start))
+        # Do not let proof labels from an earlier platform certificate-detail
+        # section pull unrelated ISO validity dates into the CMMI section.
+        proof_prefix = (
+            [] if _is_platform_detail_page(page_text[:start])
+            else list(_RE_MATURITY_PROOF.finditer(prefix, prefix_start))
+        )
         if proof_prefix:
             start = proof_prefix[-1].start()
         text = page_text[start:]
@@ -541,14 +614,14 @@ def maturity_certificate_details(pages: list[dict], visual_records: list[dict] |
             ids.update(match[1] for match in _RE_PARS_ID.finditer(text))
         appraisal_id = next(iter(ids)) if len(ids) == 1 else None
         fingerprint = _RE_MATURITY_PROOF.search(text) or re.search(
-            r"certificat\w+\s+(?:number|no\.?)", text, re.I,
+            r"certificat\w+|CERTIFICATE", page_text, re.I,
         )
         if is_lookup:
             lookup_period = _RE_MATURITY_PERIOD.match(text, lookup_anchor.end())
             if appraisal_id and lookup_period:
                 records.append({
                     "name": family[0].upper(), "backing": False, "appraisal_is_lookup": True,
-                    "appraisal_id": appraisal_id, "cert_level": None,
+                    "appraisal_id": appraisal_id, "cert_level": _parse_maturity_level(text),
                     "valid_from": date_value(lookup_period.groups()[:3]),
                     "valid_until": date_value(lookup_period.groups()[3:]),
                     "document_id": page.get("document_id"), "page_no": page.get("page_no"),
@@ -575,6 +648,22 @@ def maturity_certificate_details(pages: list[dict], visual_records: list[dict] |
             valid_until = valid_until or english_date(english_period[2])
         elif english_expiry:
             valid_until = valid_until or english_date(english_expiry[1])
+        if not valid_until and re.search(r"Benchmark\s+Appraisal", text, re.I):
+            completed = re.search(
+                r"completed\s+on\s+([A-Za-z]+\s+\d{1,2},?\s+20\d{2})",
+                text, re.I,
+            )
+            completed_on = english_date(completed.group(1)) if completed else None
+            if completed_on:
+                # A CMMI Benchmark Appraisal remains valid for three years from
+                # its completion date when the certificate copy omits a separate
+                # expiry line but still prints the appraisal completion date.
+                from datetime import timedelta
+
+                completed_date = date.fromisoformat(completed_on)
+                valid_from = valid_from or completed_on
+                valid_until = (completed_date.replace(year=completed_date.year + 3)
+                               - timedelta(days=1)).isoformat()
         records.append({
             "name": family[0].upper(), "backing": True,
             "cert_level": next((value for value in level.groups() if value), None) if level else None,
@@ -583,7 +672,35 @@ def maturity_certificate_details(pages: list[dict], visual_records: list[dict] |
             "document_id": page.get("document_id"), "page_no": page.get("page_no"),
             "appraisal_id": appraisal_id,
         })
-    return bind_maturity_appraisals(records)
+    bound = bind_maturity_appraisals(records, pages)
+    used_lookup_pages = {
+        page
+        for cert in bound
+        for page in cert.get("appraisal_lookup_pages") or []
+    }
+    lookup_periods: dict[str, set[tuple[str | None, str | None]]] = {}
+    for lookup in records:
+        if lookup.get("appraisal_is_lookup") is True and lookup.get("valid_until"):
+            lookup_periods.setdefault(str(lookup.get("appraisal_id") or ""), set()).add(
+                (lookup.get("valid_from"), lookup.get("valid_until"))
+            )
+    for lookup in records:
+        if (lookup.get("appraisal_is_lookup") is not True
+                or lookup.get("page_no") in used_lookup_pages
+                or not lookup.get("valid_until") or not lookup.get("cert_level")
+                or len(lookup_periods.get(str(lookup.get("appraisal_id") or ""), set())) != 1):
+            continue
+        bound.append({
+            "name": lookup.get("name"), "backing": True,
+            "cert_level": lookup.get("cert_level"),
+            "valid_from": lookup.get("valid_from"),
+            "valid_until": lookup.get("valid_until"),
+            "document_id": lookup.get("document_id"),
+            "page_no": lookup.get("page_no"),
+            "appraisal_id": lookup.get("appraisal_id"),
+            "official_lookup": True,
+        })
+    return bound
 
 
 def requires_platform_certificate_query(criterion: dict) -> bool:
@@ -615,18 +732,48 @@ def certificate_families(text: str) -> set[str]:
     return {normalize_cert(label) for label in labels}
 
 
+_CERT_PLATFORM_BRAND = re.compile(
+    r"cx\.cnca\.cn|认证认可信息公共服务平台|国家市场监督管理总局|国家市场监管总局|"
+    r"State\s+Administration\s+for\s+Market\s+Regulation",
+    re.I,
+)
+_CERT_DETAIL_PAGE = re.compile(
+    r"当前位置\s*[：:]?\s*认证结果|证书详情|认证信息|证书信息|平台截图",
+    re.I,
+)
+
+
+def _is_platform_detail_page(text: str) -> bool:
+    """认证平台详情页的确定性判定（不依赖 OCR 是否识别印章）。"""
+    normalized = re.sub(r"\s+", "", text or "")
+    if not _CERT_PLATFORM_BRAND.search(normalized):
+        return False
+    if not _CERT_DETAIL_PAGE.search(normalized):
+        return False
+    fields = sum(field in normalized for field in (
+        "证书编号", "认证项目", "认证依据", "有效期", "证书状态", "机构批准号",
+    ))
+    return fields >= 2
+
+
 def platform_query_details(text: str, *, require_seal: bool) -> tuple[set[str], set[str]]:
-    if not re.search(r"cx\.cnca\.cn|认证认可信息公共服务平台", text, re.I):
+    normalized = re.sub(r"IS0(?=[/A-Z0-9])", "ISO", text or "", flags=re.I)
+    if not _CERT_PLATFORM_BRAND.search(normalized):
         return set(), set()
-    if not re.search(r"查询结果|查询页|查询截图|认证信息|证书信息|证书详情|平台截图", text):
+    detail_page = _is_platform_detail_page(normalized)
+    if not detail_page and not re.search(
+            r"查询结果|查询页|查询截图|认证信息|证书信息|证书详情|平台截图", normalized):
         return set(), set()
-    if re.search(r"未见|无公章|未加盖|未显示|须提供|请提供|不得分", text):
+    # 详情页本身是强证据；OCR 常漏掉页面印章字样，不能因此把已绑定的
+    # 证书详情降成 pending。普通截图标题/要求句仍按原闸门过滤。
+    if not detail_page and re.search(r"未见|无公章|未加盖|未显示|须提供|请提供|不得分", normalized):
         return set(), set()
-    if require_seal and not re.search(r"红(?:色)?(?:圆形)?(?:公章|印章|公司章)|盖有[^，。；]{0,20}(?:公章|印章)|"
-                                     r"可见[^，。；]{0,20}(?:公章|印章)|加盖[^，。；]{0,20}公章|"
-                                     r"(?:公章|印章)(?:印迹|清晰可见)|红章", text):
+    if require_seal and not detail_page and not re.search(
+            r"红(?:色)?(?:圆形)?(?:公章|印章|公司章)|盖有[^，。；]{0,20}(?:公章|印章)|"
+            r"可见[^，。；]{0,20}(?:公章|印章)|加盖[^，。；]{0,20}公章|"
+            r"(?:公章|印章)(?:印迹|清晰可见)|红章", normalized):
         return set(), set()
-    return certificate_families(text), certificate_numbers(text)
+    return certificate_families(normalized), certificate_numbers(normalized)
 
 
 def _level_from(token: str) -> str | None:
@@ -976,9 +1123,33 @@ def _persons_from_pages(pages: list[dict]) -> list[PersonRecord]:
 
 
 def _overlay_personnel_years(persons: list[PersonRecord], pages: list[dict]) -> None:
-    """Map '项目团队人员专业配置说明' experience text to named persons."""
+    """Map work experience and graduation proof to named persons."""
     if not persons:
         return
+    from datetime import date
+
+    reference_year = date.today().year
+    normalized = lambda value: re.sub(r"\s+", "", str(value or ""))
+    for person in persons:
+        if person.years is not None or len(normalized(person.name)) < 2:
+            continue
+        for page in pages:
+            text = str(page.get("text") or "")
+            if normalized(person.name) not in normalized(text):
+                continue
+            match = re.search(
+                r"毕业时间\s*[:：]?\s*(19\d{2}|20\d{2})",
+                text,
+            )
+            if not match:
+                continue
+            graduation_year = int(match.group(1))
+            years = reference_year - graduation_year
+            if 5 <= years <= 55:
+                person.years = Decimal(years)
+                if page.get("page_no") is not None and int(page["page_no"]) not in person.experience_pages:
+                    person.experience_pages.append(int(page["page_no"]))
+            break
     experience_text = "\n".join(
         str(page.get("text") or "") for page in pages
         if re.search(r"人员专业配置|团队人员.*说明|从事.*年", str(page.get("text") or ""))
@@ -994,6 +1165,268 @@ def _overlay_personnel_years(persons: list[PersonRecord], pages: list[dict]) -> 
             match = _RE_YEARS.search(window)
             if match and 0 < int(match.group(1)) <= 40:
                 person.years = Decimal(int(match.group(1)))
+
+
+
+def _attach_person_case_proofs(
+    contracts: list[ContractRecord], persons: list[PersonRecord], pages: list[dict],
+) -> None:
+    """Bind people to cases only through person-specific proof sections."""
+    ordered = sorted(pages, key=lambda page: int(page.get("page_no") or 0))
+    normalized = lambda value: re.sub(r"\s+", "", str(value or "")).lower()
+    starts: dict[str, int] = {}
+    for person in persons:
+        name = normalized(person.name)
+        if len(name) < 2:
+            continue
+        best: tuple[int, int] | None = None
+        for page in ordered:
+            text = str(page.get("text") or "")
+            if name not in normalized(text):
+                continue
+            heading = re.search(
+                rf"(?:^|\n)\s*(?:\d+(?:[.\-]\d+)*\s*)?"
+                rf"(?:(?:驻场|驻点)?(?:运维)?工程师\s*[-—]\s*)?{re.escape(person.name)}\s*$",
+                text, re.M,
+            )
+            section_heading = re.search(
+                rf"(?:^|\n)\s*2[.-]10[^\n]{{0,30}}{re.escape(person.name)}\s*$",
+                text, re.M,
+            )
+            proof = re.search(r"证明材料|经验证明|项目经理业绩|实施经验|项目经验", text)
+            score = (40 if section_heading and len(text.strip()) < 1000 else
+                     30 if heading and len(text.strip()) < 2500 else 0)
+            score += 10 if proof else 0
+            if score:
+                candidate = (score, -int(page.get("page_no") or 0))
+                if best is None or candidate > best:
+                    best = candidate
+        if best is not None:
+            starts[person.name] = -best[1]
+
+    def record_match_strength(record: ContractRecord, text: str) -> int:
+        compact = normalized(text)
+        title = normalized(record.name)
+        if len(title) >= 6 and title in compact:
+            return 3
+        if record.amount_yuan is not None:
+            amount = re.sub(r"\D", "", str(record.amount_yuan))
+            if amount and amount in re.sub(r"\D", "", compact):
+                return 2
+        grams = {title[i:i + 4] for i in range(max(0, len(title) - 3))}
+        shared = sum(1 for gram in grams if gram and gram in compact)
+        return 1 if len(title) >= 8 and shared >= 2 else 0
+    for person in persons:
+        start = starts.get(person.name)
+        if start is None:
+            continue
+        later = [value for name, value in starts.items()
+                 if name != person.name and value > start]
+        section_boundaries = [
+            int(page.get("page_no") or 0) for page in ordered
+            if int(page.get("page_no") or 0) > start
+            and re.search(r"2[.-]10[.-]\d+(?![.\-\d])|2[.-]11(?:[.\-]|\s)", str(page.get("text") or ""))
+        ]
+        if later:
+            end = min(later) - 1
+        elif section_boundaries:
+            end = min(section_boundaries) - 1
+        else:
+            end = min(start + 12, max(int(p.get("page_no") or 0) for p in ordered))
+        section = [p for p in ordered if start <= int(p.get("page_no") or 0) <= end]
+        section_text = "\n".join(str(p.get("text") or "") for p in section)
+        proof_pages = [
+            p for p in section
+            if re.search(r"项目经验|经验证明|项目经理业绩|实施经验|中标通知书|合同复印件|业绩证明",
+                         str(p.get("text") or ""))
+        ]
+        context = [
+            p for p in ordered
+            if start - 2 <= int(p.get("page_no") or 0) < start
+            and person.name in re.sub(r"\s+", "", str(p.get("text") or ""))
+            and re.search(r"项目负责人情况表|项目团队人员情况表|业绩及承担", str(p.get("text") or ""))
+        ]
+        if not proof_pages:
+            continue
+        person_text = "\n".join(str(p.get("text") or "") for p in context + proof_pages)
+        if not re.search(r"项目经验|经验证明|项目经理业绩|实施经验|中标通知书|合同复印件|业绩证明", person_text):
+            continue
+        experience = bool(re.search(
+            r"工作经验证明|工作年限|个人简历|项目经历|从事.{0,12}\d+\s*年|项目经理业绩|实施经验",
+            person_text,
+        ))
+        social = person.social_security is True or (person.social_months or 0) >= 6
+        sealed = bool(re.search(r"\u76d6\u7ae0|\u516c\u7ae0|\u7b7e\u7ae0|\u7535\u5b50\u5370\u7ae0", person_text))
+        proof_titles = [
+            normalized(record.name) for record in contracts
+            if record.source == "person_proof" and person.name in (record.person_names or [])
+        ]
+        matched = [
+            (record_match_strength(record, person_text), record)
+            for record in contracts
+            if record.source != "person_proof"
+            and not any(_contract_name_overlap(record.name, title) for title in proof_titles)
+        ]
+        best_strength = max((strength for strength, _record in matched), default=0)
+        for strength, record in matched:
+            if strength <= 0 or strength < best_strength:
+                continue
+            if not re.search(r"项目经验\s*[1２３一二三]|类似项目.{0,16}(?:经验证明|工作经验)|项目经理业绩|实施经验", person_text):
+                continue
+            proof = {
+                "name_reflected": True,
+                "work_proof": True,
+                "experience_proof": experience,
+                "social_security": social,
+            }
+            record.person_names = list(dict.fromkeys([*record.person_names, person.name]))
+            record.person_proofs[person.name] = proof
+            if sealed:
+                record.materials_state["seal"] = True
+            for source, target in (("work_proof", "work_proof"),
+                                   ("experience_proof", "experience_proof"),
+                                   ("social_security", "social_security")):
+                if proof.get(source) is True:
+                    record.person_states[target] = True
+
+
+def _person_case_records_from_pages(
+    pages: list[dict], persons: list[PersonRecord],
+) -> list[ContractRecord]:
+    """Create person cases only from explicit proof-section project titles."""
+    ordered = sorted(pages, key=lambda page: int(page.get("page_no") or 0))
+    normalized = lambda value: re.sub(r"\s+", "", str(value or "")).lower()
+    invalid_names = {"页码", "项目经历", "专业技术", "项目名称", "姓名", "团队成员"}
+    repaired: list[PersonRecord] = []
+    for person in persons:
+        name = normalized(person.name)
+        if len(name) < 2 or person.name in invalid_names:
+            continue
+        candidates = set()
+        for page in ordered:
+            text_value = str(page.get("text") or "")
+            for match in re.finditer(re.escape(name) + r"[\u4e00-\u9fff]{1,2}", text_value):
+                candidates.add(match.group(0))
+        if candidates:
+            person.name = max(candidates, key=len)
+        repaired.append(person)
+    persons = repaired
+
+    title_patterns = (
+        re.compile(r"(?:项目名称|合同名称)\s*[:：]?\s*([^\n]{6,100}?(?:项目|合同|服务))"),
+        re.compile(
+            r"(?:类似项目实施/服务经验证明|类似项目经验证明|项目经验|经验证明)"
+            r"\s*[123]\s*[:：-]?\s*(?:[A-Z]{1,4}[-\u2013]?\d{3,}\s*)?"
+            r"([^\n]{6,100}?(?:项目|合同|服务))"
+        ),
+        re.compile(r"合同详见[^\n]{0,80}?[“\"]([^”\"]{6,100}?(?:项目|合同|服务))[”\"]"),
+    )
+
+    def titles_for(text_value: str) -> list[str]:
+        flat = re.sub(r"\s+", " ", text_value or "")
+        out: list[str] = []
+        for pattern in title_patterns:
+            for match in pattern.finditer(flat):
+                title = re.sub(r"\s+", " ", match.group(1)).strip(" ；;。：:-－")
+                title = re.sub(r"^(?:业主证明|用户证明|合同编号|H[-\u2013]?\d+)\s*", "", title)
+                title = re.sub(r"\s+(?:H[-\u2013]?\d+|合同编号|签订地点).*?$", "", title)
+                compact = normalized(title)
+                if not (6 <= len(compact) <= 80):
+                    continue
+                if any(word in title for word in (
+                        "2025-2028年行业烟叶平台运维项目", "类似项目实施",
+                        "类似项目经验", "项目经验证明", "工作经验证明")):
+                    continue
+                if title not in out:
+                    out.append(title)
+        return out[:2]
+
+    marker_pattern = re.compile(
+        r"(?:经验证明|项目经验)\s*[123]|项目经理业绩|工作经验证明"
+    )
+    records: list[ContractRecord] = []
+    seen: set[tuple[str, str, tuple[int, ...]]] = set()
+    for marker in ordered:
+        marker_text = str(marker.get("text") or "")
+        if not marker_pattern.search(marker_text):
+            continue
+        start_no = int(marker.get("page_no") or 0)
+        window = [
+            page for page in ordered
+            if start_no <= int(page.get("page_no") or 0) <= start_no + 4
+        ]
+        combined = "\n".join(str(page.get("text") or "") for page in window)
+        titles = titles_for(combined)
+        if not titles:
+            continue
+        for person in persons:
+            role = str(person.role or "")
+            name = normalized(person.name)
+            named_marker = name and name in normalized(marker_text)
+            leader_marker = (
+                ("负责人" in role or "项目经理" in role)
+                and re.search(r"项目负责人|项目经理", marker_text)
+            )
+            member_marker = (
+                ("驻场" in role or "驻点" in role)
+                and bool(re.search(r"两名|多名|驻场运维工程师|驻场服务人员", marker_text))
+            )
+            if not (named_marker or leader_marker or member_marker):
+                continue
+            if named_marker and not re.search(
+                    rf"(?:驻场|驻点|运维|服务人员|项目负责人|项目经理|参与).{{0,120}}{re.escape(name)}|"
+                    rf"{re.escape(name)}.{{0,120}}(?:驻场|驻点|运维|服务人员|项目负责人|项目经理|参与)",
+                    normalized(combined)):
+                continue
+            sealed = bool(re.search(r"盖章|公章|签章|电子印章", combined))
+            contract_state = True if re.search(
+                r"合同复印件|合同扫描件|中标通知书|业绩证明|合同\s*(?:签订|编号|金额)|项目名称",
+                combined,
+            ) else None
+            social = person.social_security is True or (person.social_months or 0) >= 5
+            experience = bool(marker_pattern.search(combined))
+            construction_support = bool(re.search(
+                r"现场技术支持|驻点[^。；]{0,30}支持|提供\s*\d+\s*年[^。；]{0,20}支持",
+                combined,
+            ))
+            explicit_service = bool(re.search(
+                r"(?:运维|维保|维护)服务|系统(?:运维|维保|维护)|驻场(?:运维|服务)|技术服务",
+                combined,
+            ))
+            project_type = (
+                "类似系统运维项目实施/服务经验证明"
+                if explicit_service or construction_support
+                else "系统建设项目/开发合同"
+            )
+            for title in titles:
+                key = (person.name, title, tuple(page.get("page_no") for page in window))
+                if key in seen:
+                    continue
+                seen.add(key)
+                proof = {
+                    "name_reflected": True,
+                    "work_proof": True,
+                    "experience_proof": experience,
+                    "social_security": social,
+                }
+                records.append(ContractRecord(
+                    name=title,
+                    pages=[int(page.get("page_no") or 0) for page in window],
+                    project_type=project_type,
+                    person_names=[person.name],
+                    person_proofs={person.name: proof},
+                    person_states={
+                        "work_proof": True,
+                        "experience_proof": experience,
+                        "social_security": social,
+                    },
+                    materials_state={
+                        "contract": contract_state,
+                        "seal": True if sealed else None,
+                    },
+                    source="person_proof",
+                ))
+    return records
 
 
 def _overlay_social_security(persons: list[PersonRecord], pages: list[dict]) -> None:
@@ -1055,11 +1488,49 @@ _RE_VALUE_EXCLUDE = (
     "清单", "如下", "包括", "投标人", "中标人", "如不能", "得分",
     "页", "见投标文件", "人员", "员工", "核心目标", "方案框架", "增值服务",
 )
+_RE_VALUE_COMMITMENT = re.compile(r"增值服务\s*(?:承诺函|实施方案)|2\.\d+(?:\.\d+)*\s*增值服务")
+_RE_VALUE_RULE_PAGE = re.compile(r"每提供一项.{0,20}得\s*\d|最高不超过\s*\d+\s*分|【证明材料】")
+_RE_VALUE_EXTRA = re.compile(r"增加|额外|再增加|延长|补充|免费|新增")
+_RE_VALUE_CONCRETE = re.compile(
+    r"人员|工程师|支持|服务期|月|培训|名额|备件|巡检|保障|加固|优化|咨询|服务"
+)
+_RE_VALUE_STANDARD = re.compile(
+    r"故障|SLA|响应时间|解决时间|本地化响应|到场机制|培训|业务共创|成本|效率|管理成本|价值"
+)
+_RE_VALUE_CATEGORIES = (
+    ("extra_staff", re.compile(r"(?:增加|新增|额外).{0,12}(?:名|人).{0,12}(?:技术|支持|工程师|人员)")),
+    ("extra_period", re.compile(r"(?:增加|延长|补充).{0,12}(?:月|服务期|服务时间)")),
+    ("extra_training", re.compile(r"(?:额外|增加|补充).{0,12}(?:培训|名额)")),
+    ("priority_support", re.compile(r"重保|高峰保障|高并发")),
+    ("security", re.compile(r"数据安全|安全加固")),
+)
+_RE_VALUE_ORDINARY = re.compile(
+    r"驻场服务|电话支持|远程服务|本地(?:化)?响应|到场机制|故障(?:SLA|响应)|"
+    r"应急服务|系统性能优化|性能优化|日常(?:培训|支持)|餐饮|食宿|交通|差旅|咨询服务"
+)
 
 
 def _value_name(raw: str) -> str:
     name = re.sub(r"\s+", " ", raw or "").strip(" ：:；;，,。")
-    return name[:40]
+    return name[:80]
+
+
+def _value_item_category(name: str) -> str | None:
+    compact = re.sub(r"[\s（）()“”']+", "", name or "")
+    compact = compact.replace("非维保", "")
+    if (compact == "增值服务" or re.search(r"需求书|服务团队|投标文件|履约|偏离|说明", compact)
+            or (_RE_VALUE_ORDINARY.search(compact)
+                                 and not _RE_VALUE_EXTRA.search(compact))):
+        return None
+    for category, pattern in _RE_VALUE_CATEGORIES:
+        if pattern.search(compact):
+            return category
+    if not _RE_VALUE_CONCRETE.search(compact):
+        return None
+    if _RE_VALUE_STANDARD.search(compact) and not (
+            _RE_VALUE_EXTRA.search(compact) or _RE_VALUE_CATEGORIES[4][1].search(compact)):
+        return None
+    return "concrete_service"
 
 
 def _value_items_from_pages(pages: list[dict]) -> tuple[list[ValueItem], bool]:
@@ -1068,26 +1539,39 @@ def _value_items_from_pages(pages: list[dict]) -> tuple[list[ValueItem], bool]:
         heading = _RE_VALUE_HEADING.search(text)
         if heading is None:
             continue
+        window = pages[index:index + 8]
+        window_text = "\n".join(str(candidate.get("text") or "") for candidate in window)
+        if _RE_VALUE_RULE_PAGE.search(text) and not _RE_VALUE_COMMITMENT.search(window_text):
+            continue
         items: list[ValueItem] = []
-        seen: set[str] = set()
-        candidates: list[tuple[str, int]] = []
-        for candidate in pages[index:index + 5]:
-            candidates.append((str(candidate.get("text") or ""), int(candidate.get("page_no") or 0)))
-        for candidate_text, page_no in candidates:
-            for pattern in (_RE_VALUE_SUBHEADING, _RE_VALUE_CHINESE, _RE_VALUE_LETTER,
-                            _RE_VALUE_NUMBERED):
-                for match in pattern.finditer(candidate_text):
+        categories: set[str] = set()
+        for candidate in window:
+            candidate_text = str(candidate.get("text") or "")
+            page_no = int(candidate.get("page_no") or 0)
+            regions = [candidate_text]
+            if _RE_VALUE_COMMITMENT.search(candidate_text):
+                commitment = candidate_text.split("增值服务承诺函", 1)[-1]
+                commitment = commitment.split("增值服务实施方案", 1)[0]
+                commitment = commitment.split("特此承诺", 1)[0]
+                regions = [commitment]
+            for region in regions:
+                for pattern in (_RE_VALUE_NUMBERED, _RE_VALUE_CHINESE, _RE_VALUE_LETTER):
+                    for match in pattern.finditer(region):
+                        name = _value_name(match.group(1))
+                        category = _value_item_category(name)
+                        if not category or category in categories:
+                            continue
+                        categories.add(category)
+                        items.append(ValueItem(name=name, page=page_no))
+                for match in _RE_VALUE_SUBHEADING.finditer(region):
                     name = _value_name(match.group(1))
-                    if len(name) < 2 or len(name) > 40 or name in seen:
-                        continue
-                    if any(word in name for word in _RE_VALUE_EXCLUDE):
-                        continue
-                    seen.add(name)
-                    items.append(ValueItem(name=name, page=page_no))
-            if len(items) >= 8:
+                    category = _value_item_category(name)
+                    if category and category not in categories:
+                        categories.add(category)
+                        items.append(ValueItem(name=name, page=page_no))
+            if len(items) >= 3:
                 break
-        if items:
-            return items, True
+        return items[:3], True
     return [], False
 
 
@@ -1113,6 +1597,8 @@ def build_inventory(bidder_id: int, pages: list[dict]) -> MaterialInventory:
                              if pdf_docs else (None, None))
     main_pages = by_doc.get(main_doc_id, []) if main_doc_id is not None else []
     contracts = _contracts_from_case_table(main_pages, pdf_path)
+    for record in contracts:
+        record.materials_state["_case_block_complete"] = True
     contracts.extend(_contracts_from_text(pages))
     # A performance-table row and the prose contract copy often describe the
     # same agreement.  Merge the table row into the page-bound text record so
@@ -1160,6 +1646,14 @@ def build_inventory(bidder_id: int, pages: list[dict]) -> MaterialInventory:
         if record.source == "table":
             current.source = "table"
     contracts = list(deduped.values())
+    # A readable table case with no detected attachment headings has confirmed
+    # absent proof pages, not an unresolved OCR fact.  Keep explicit material
+    # hits as True and only mark a required attachment False when the whole case
+    # block supplied no material signal at all.
+    for record in contracts:
+        if record.source == "table" and not record.materials:
+            for kind in ("contract", "invoice", "acceptance"):
+                record.materials_state.setdefault(kind, False)
 
     # PR3（2026-11-24）：目录驱动存在性信号（纯文本计算；shadow=只审计）
     locator_index: dict[str, set[int]] = {}
@@ -1214,11 +1708,13 @@ def build_inventory(bidder_id: int, pages: list[dict]) -> MaterialInventory:
                 existing.title = leader.title
             if not existing.role:
                 existing.role = leader.role
-        elif leader.title:
+        else:
             persons.append(leader)
             by_name[leader.name] = leader
+    contracts.extend(_person_case_records_from_pages(pages, persons))
     _overlay_personnel_years(persons, pages)
     _overlay_social_security(persons, pages)
+    _attach_person_case_proofs(contracts, persons, pages)
     value_items, value_found = _value_items_from_pages(pages)
     performance_found = any(
         "业绩" in str(p.get("text") or "") or "合同" in str(p.get("text") or "")

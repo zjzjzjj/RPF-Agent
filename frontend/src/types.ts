@@ -462,6 +462,19 @@ export interface AutomationProgress {
   execution_progress?: ExecutionProgress | null;
 }
 
+export interface ExecutionFailure {
+  collection_id: number;
+  batch_key: string;
+  batch_index: number | null;
+  criterion_id: number;
+  bidder_id: number | null;
+  documents: { document_id: number; filename: string | null; page_numbers: number[] }[];
+  code: string;
+  message: string;
+  covered?: boolean;
+  resolved?: boolean;
+}
+
 export interface ExecutionProgress {
   executor_version: number;
   phase: string;
@@ -474,6 +487,7 @@ export interface ExecutionProgress {
   batches_running: number;
   batches_pending?: number;
   batches_failed: number;
+  batches_failed_historical?: number;
   requests_queued?: number;
   requests_inflight?: number;
   request_scope?: "run" | "collection";
@@ -481,16 +495,8 @@ export interface ExecutionProgress {
   read_units_completed: number;
   read_pages_total?: number;
   read_pages_completed?: number;
-  failures?: {
-    collection_id: number;
-    batch_key: string;
-    batch_index: number | null;
-    criterion_id: number;
-    bidder_id: number | null;
-    documents: { document_id: number; filename: string | null; page_numbers: number[] }[];
-    code: string;
-    message: string;
-  }[];
+  failures?: ExecutionFailure[];
+  historical_failures?: ExecutionFailure[];
   last_progress_at: string | null;
   metrics: Record<string, number>;
 }

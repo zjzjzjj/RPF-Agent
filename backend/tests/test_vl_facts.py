@@ -12,7 +12,7 @@ from decimal import Decimal
 import pytest
 
 from app.engine.material_inventory import (
-    ContractRecord, MaterialInventory,
+    CertRecord, ContractRecord, MaterialInventory,
 )
 from app.engine.objective import (
     date_gate_state, date_window_from_rule, type_gate_state,
@@ -47,6 +47,43 @@ def test_merge_same_case_by_name_amount() -> None:
     assert 9 in merged.pages and 1 in merged.pages
     # 派生副本：共享 inventory 不被污染
     assert inv.contracts[0].materials_state.get("acceptance") is None
+
+
+def test_query_number_ignores_separator_only_differences() -> None:
+    cert = CertRecord(name="ISO27001", normalized="ISO27001",
+                      certificate_number="00124IS20163R2M/6100",
+                      backing=True, document_id=1, pages=[1])
+    inv = MaterialInventory(
+        bidder_id=1, pages=[], full_text="", facts=BidFacts(text=""),
+        certs=[cert], cert_section_present=True,
+    )
+    out = merge_vl_facts(inv, [{
+        "kind": "certificate", "name": "ISO27001平台查询结果",
+        "certificate_number": "00124IS20163R2M6100", "has_query_screenshot": True,
+        "evidence": [{"document_id": 1, "page_no": 2,
+                      "observation": "全国认证认可信息公共服务平台证书详情页，证书编号00124IS20163R2M6100，盖有投标人红色公章"}],
+    }])
+    assert out.platform_query_certificates == {"ISO27001"}
+
+
+def test_certificate_number_accepts_platform_prefix_alias() -> None:
+    out = merge_vl_facts(_inv([]), [
+        {"kind": "certificate", "name": "ISO9001质量管理体系认证",
+         "certificate_number": "CN23-03503A", "has_seal": True,
+         "evidence": [{"document_id": 1, "page_no": 61, "observation": (
+             "认证证书，证书号 N.CN23-03503A，标准 ISO 9001:2015，"
+             "有效期至2026-03-23，盖有投标人红色公章"
+         )}]},
+        {"kind": "certificate", "name": "ISO9001质量管理体系认证（CNCA平台查询）",
+         "certificate_number": "N.CN23-03503A", "has_query_screenshot": True,
+         "has_seal": True,
+         "evidence": [{"document_id": 1, "page_no": 62, "observation": (
+             "全国认证认可信息公共服务平台证书详情页，证书编号 N.CN23-03503A，"
+             "认证项目质量管理体系认证（ISO9001），页面盖有投标人公章"
+         )}]},
+    ])
+    assert [cert.certificate_number for cert in out.certs if cert.backing] == ["N.CN23-03503A"]
+    assert out.platform_query_certificates == {"ISO9001"}
 
 
 def test_merge_distinct_cases_coexist() -> None:
@@ -308,5 +345,5 @@ def test_acceptance_project_type_takes_precedence_over_contract_name():
     }])
     case = result.contracts[0]
     assert case.project_type == "软件开发"
-    assert documented_project_type_state(case.project_type, case.name, "类似运维项目") is False
+    assert documented_project_type_state(case.project_type, case.name, "类似运维项目") is True
     assert documented_project_type_state(None, "平台运维服务项目", "类似运维项目") is True

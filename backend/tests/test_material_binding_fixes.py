@@ -39,6 +39,67 @@ def test_maturity_certificate_links_matching_published_appraisal_validity() -> N
     assert details[0]["valid_until"] == "2026-03-24"
 
 
+def test_maturity_level_accepts_english_development_form_and_missing_validity_is_pending() -> None:
+    from app.engine.facts import BidFacts
+    from app.engine.objective import score_count
+
+    details = [{
+        "name": "CMMI Development Maturity Level 3", "backing": True,
+        "cert_level": "CMMI Development Maturity Level 3", "valid_until": None,
+        "appraisal_id": "045810", "appraisal_is_lookup": False,
+        "document_id": 71, "page_no": 46,
+    }]
+    result = score_count({"max_score": "2", "certificate_details": details}, {
+        "field": "cmmi", "per_item": "2", "cert_min_level": 2,
+        "cert_require_current": True, "cert_reference_date": "2025-11-19",
+    }, BidFacts(text=""))
+    assert result.score == Decimal("0")
+    assert result.unresolved == "certificate_unverified"
+    assert result.zero_reason == "unreadable"
+
+
+def test_maturity_complete_page_without_validity_is_final_zero() -> None:
+    """完整可读证书页明确不载有效期时按有效期内要求最终计 0。"""
+    from app.engine.facts import BidFacts
+    from app.engine.material_inventory import maturity_certificate_details
+    from app.engine.objective import score_count
+
+    details = maturity_certificate_details([{
+        "document_id": 71, "page_no": 46,
+        "text": (
+            "全国认证认可信息公共服务平台 当前位置：认证结果/证书详情\n"
+            "证书编号2022025ITSM023R0C 证书到期日期2028-07-29\n"
+            "认证项目信息技术服务管理体系认证 有效期2027-11-27\n"
+            "CERTIFICATE\nYongshu Intelligent Technology (Hangzhou) Co., Ltd.\n"
+            "has completed the Benchmark Appraisal and achieved\n"
+            "CMMI Development Maturity Level 3\n"
+            "ID: #045810\n证书查询网址：https://pars.cmmiinstitute.com"
+        ),
+    }])
+    assert details and details[0]["confirmed_missing_validity"] is True
+    result = score_count({"max_score": "2", "certificate_details": details}, {
+        "field": "cmmi", "per_item": "2", "cert_min_level": 2,
+        "cert_require_current": True, "cert_reference_date": "2025-11-19",
+    }, BidFacts(text=""))
+    assert result.score == Decimal("0")
+    assert result.unresolved is None
+    assert result.zero_reason == "confirmed_absent"
+
+
+def test_maturity_title_without_certificate_details_is_not_a_certificate() -> None:
+    from app.engine.material_inventory import maturity_certificate_details
+
+    details = maturity_certificate_details(
+        [{"document_id": 71, "page_no": 46,
+          "text": "2-7-4 CMMI 认证 第46页"}],
+        [{"name": "CMMI Development Maturity Level 3", "backing": True,
+          "cert_level": "CMMI Development Maturity Level 3",
+          "appraisal_id": "045810", "appraisal_is_lookup": False,
+          "document_id": 71, "page_no": 46}],
+    )
+    assert details == []
+
+
 def test_published_appraisal_accepts_ocr_label_variants() -> None:
     from app.engine.material_inventory import maturity_certificate_details
 
@@ -302,6 +363,28 @@ def test_detect_cert_section_locator_window_signal() -> None:
     det = detect_cert_section(pages, locator_windows=[(30, 35)])
     assert det.state is True
     assert "目录" in det.basis
+
+
+def test_heading_material_binding_accepts_owner_and_user_proof() -> None:
+    """标题级业主/用户证明补绑定到案例 acceptance，不再留作材料缺口。"""
+    from app.evidence.case_evidence import CaseBlock, CaseRow, PageRec
+    from app.engine.material_inventory import _apply_heading_material_states
+
+    for heading in ("业主证明", "用户证明"):
+        block = CaseBlock(
+            row=CaseRow(1, "运维项目", _D("1200000"), None, 10),
+            pages=[10, 11],
+        )
+        _apply_heading_material_states(
+            [block],
+            [
+                PageRec(10, "2.8.2.1 合同复印件", "text"),
+                PageRec(11, f"2.8.2.3 {heading}", "text"),
+            ],
+        )
+        assert block.status["acceptance"] is True
+        assert block.pages_by_material["acceptance"] == [11]
+        assert block.reasons["acceptance"] == "material_heading"
 
 
 _D = Decimal

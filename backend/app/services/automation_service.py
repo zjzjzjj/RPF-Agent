@@ -23,6 +23,14 @@ from app.db.models import (
 )
 from app.db.session import session_scope
 from app.errors import Conflict, NotFound, ValidationFailed
+from app.services.public_output import sanitize_public_object
+
+
+TECHNICAL_FALLBACK_KINDS = frozenset({
+    "material_review_pending", "reading_incomplete", "presence_unverified",
+    "sample_volume_unverified", "value_extraction_unresolved", "provisional_zero",
+    "provisional_conclusion", "min_level_floor", "execution_failed",
+})
 
 
 def _json(value):
@@ -134,22 +142,25 @@ def failed_keys(run_id: int) -> set[tuple[int, int]]:
 
 
 def _is_reading_gap_row(row: ScoreRecord) -> bool:
-    """补读或材料核验未完成的格可在原冻结输入下续评。"""
-    meta = (row.ai_raw_json or {}).get("auto_review") or {}
-    return (meta.get("state") == "completed"
-            and ((meta.get("fallback") or {}).get("kind")) in (
-                "reading_incomplete", "material_review_pending",
-            ))
+    """补读、证据或模型核验未完成的格可在原冻结输入下续评。"""
+    return material_review_pending(row) is not None
 
 
 def material_review_pending(score: ScoreRecord | None) -> dict | None:
+    """Return technical pending work, including legacy provisional fallbacks."""
     if score is None:
         return None
     meta = (score.ai_raw_json or {}).get("auto_review") or {}
     fallback = meta.get("fallback") or {}
-    if meta.get("basis") == "fallback" and fallback.get("kind") == "material_review_pending":
+    kind = fallback.get("kind")
+    if meta.get("basis") == "fallback" and kind in TECHNICAL_FALLBACK_KINDS:
         return fallback
     return None
+
+
+def technical_fallback_kind(score: ScoreRecord | None) -> str | None:
+    pending = material_review_pending(score)
+    return str(pending.get("kind")) if pending else None
 
 
 def public_auto_review(score: ScoreRecord | None) -> dict | None:
@@ -175,14 +186,20 @@ def public_auto_review(score: ScoreRecord | None) -> dict | None:
                           "[图像数据已省略]", value)
         return value
 
+    fallback = meta.get("fallback") if isinstance(meta.get("fallback"), dict) else {}
+    technical_evidence = bool(fallback.get("technical_error"))
     result = {key: clean(meta[key]) for key in (
-        "state", "basis", "attempts", "reasoning", "error", "error_code",
+        "state", "basis", "attempts", "reasoning",
         "confirmed_absent", "coverage_complete", "calculation", "lightweight",
     ) if key in meta}
+    if technical_evidence:
+        result["review_note"] = "证据绑定待人工复核，已保留原批次核验记录"
     if pending := material_review_pending(score):
         result["material_review_pending"] = {
-            key: clean(pending[key]) for key in ("reason", "value", "required_materials", "candidate_pages")
-            if key in pending
+            key: clean(pending[key]) for key in (
+                "reason_code", "reason", "value", "value_role",
+                "required_materials", "candidate_pages",
+            ) if key in pending
         }
     result["visual_evidence"] = [
         {key: clean(item[key]) for key in (
@@ -191,12 +208,13 @@ def public_auto_review(score: ScoreRecord | None) -> dict | None:
         for item in (meta.get("visual_evidence") or []) if isinstance(item, dict)
     ]
     result["attempt_history"] = [
-        {key: clean(item[key]) for key in ("round", "state", "error") if key in item}
+        {key: clean(item[key]) for key in ("round", "state")
+         if key in item}
         for item in (raw.get("attempt_history") or []) if isinstance(item, dict)
     ]
     if not result.get("reasoning") and score.ai_reasoning:
         result["reasoning"] = clean(score.ai_reasoning)
-    return result
+    return sanitize_public_object(result)
 
 
 def _inputs(s, run: EvaluationRun, criteria: list[dict], provider, model) -> dict:
@@ -502,6 +520,10 @@ def execution_progress(run_id: int, session=None) -> dict | None:
         ScoreRecord.run_id == run_id, ScoreRecord.review_status == "auto_confirmed",
         ScoreRecord.ai_raw_json["auto_review"]["state"].as_string() == "completed",
     )).scalars().all()
+    score_rows = session.execute(select(ScoreRecord).where(
+        ScoreRecord.run_id == run_id,
+    )).scalars().all()
+    score_by_key = {(item.bidder_id, item.criterion_id): item for item in score_rows}
     last = max([item.completed_at for item in batches if item.completed_at]
                + [item.updated_at for item in final_scores if item.updated_at], default=None)
     metric_names = ("cache_hits", "reused_batches", "queue_wait_ms", "request_ms", "ocr_ms", "render_ms",
@@ -535,6 +557,7 @@ def execution_progress(run_id: int, session=None) -> dict | None:
     names = dict(session.execute(select(Document.id, Document.original_filename).where(
         Document.id.in_(document_ids or [-1]))).all())
     failures = []
+    historical_failures = []
     for batch in failed:
         collection = by_collection[batch.collection_id]
         documents = {}
@@ -543,15 +566,41 @@ def execution_progress(run_id: int, session=None) -> dict | None:
             if unit is not None:
                 documents.setdefault(unit["document_id"], set()).add(unit["page_no"])
         error = batch.error_json if isinstance(batch.error_json, dict) else {}
-        failures.append({
+        score = score_by_key.get((collection.bidder_id, collection.criterion_id))
+        score_meta = (score.ai_raw_json or {}).get("auto_review", {}) if score else {}
+        score_time = max(
+            [value for value in (score.confirm_time, score.updated_at) if value is not None],
+            default=None,
+        ) if score is not None else None
+        batch_time = max(
+            [value for value in (batch.updated_at, batch.started_at, batch.created_at)
+             if value is not None],
+            default=None,
+        )
+        covered = bool(
+            score is not None
+            and score.review_status == "auto_confirmed"
+            and score_meta.get("state") == "completed"
+            and score_meta.get("basis") != "fallback"
+            and score_time is not None
+            and batch_time is not None
+            and score_time >= batch_time
+        )
+        from app.services.review_collections import public_error_message
+
+        item = {
             "collection_id": collection.id, "batch_key": batch.batch_key,
             "batch_index": batch_indices.get((collection.id, batch.batch_key)),
             "criterion_id": collection.criterion_id, "bidder_id": collection.bidder_id,
             "documents": [{"document_id": document_id, "filename": names.get(document_id),
                            "page_numbers": sorted(numbers)} for document_id, numbers in documents.items()],
-            "code": str(error.get("code") or "batch_failed"),
-            "message": str(error.get("message") or "材料采集失败"),
-        })
+            "code": str(error.get("reason_code") or error.get("code") or "batch_failed"),
+            "message": public_error_message(error),
+            "covered": covered,
+            "resolved": covered,
+            "covered_by_score_id": score.id if covered else None,
+        }
+        (historical_failures if covered else failures).append(item)
     queued_requests = sum(max(0, int((item.metrics_json or {}).get("queued_requests", 0) or 0))
                           for item in batches if item.state == "running") if active else 0
     inflight_requests = sum(max(0, int((item.metrics_json or {}).get("inflight_requests", 0) or 0))
@@ -578,7 +627,8 @@ def execution_progress(run_id: int, session=None) -> dict | None:
         "batches_completed": sum(item.state == "completed" for item in batches),
         "batches_running": sum(item.state == "running" for item in batches) if active else 0,
         "batches_pending": sum(item.state == "pending" for item in batches) if active else 0,
-        "batches_failed": len(failed),
+        "batches_failed": len(failures),
+        "batches_failed_historical": len(historical_failures),
         "requests_queued": queued_requests,
         "requests_inflight": inflight_requests,
         "request_scope": "run" if activity_sets else "collection",
@@ -587,6 +637,7 @@ def execution_progress(run_id: int, session=None) -> dict | None:
         "read_pages_total": len(pages_total),
         "read_pages_completed": len(pages_completed),
         "failures": failures,
+        "historical_failures": historical_failures,
         "last_progress_at": last.isoformat() + "Z" if last else None,
         "metrics": metrics,
     }

@@ -264,7 +264,7 @@ def test_missing_qualification_model_fails_without_final_report(auto_client, fro
     assert run["automation"]["remaining"] > 0 and run["automation"]["resumable"]
     cells = _cells(c, run_id)
     assert cells and all(cell["final_score"] is None for cell in cells)
-    assert any(cell["machine_status"] == "execution_failed" for cell in cells)
+    assert any(cell["machine_status"] == "concern" for cell in cells)
     report = c.get(f"/api/projects/{pid}/report").json()
     assert report["status"] == "draft" and report["progress"]["blocking_open"] > 0
     assert c.get(f"/api/projects/{pid}/report/formal.html").status_code == 422
@@ -290,8 +290,11 @@ def test_signature_requires_configured_vision_and_preserves_completed_cells(
     assert "BID_EVAL_VISION_MODEL" in str(job.get("error_json") or job.get("error") or job)
     cells = _cells(c, run_id)
     signature = next(cell for cell in cells if cell["criterion_code"] == "REJ-T2")
-    assert signature["machine_status"] == "execution_failed" and signature["final_score"] is None
-    assert len([cell for cell in cells if cell["review_status"] == "auto_confirmed"]) == 2
+    assert signature["machine_status"] == "concern" and signature["final_score"] is None
+    assert len([
+        cell for cell in cells
+        if cell["review_status"] == "auto_confirmed" and cell["machine_status"] != "concern"
+    ]) == 2
     assert c.get(f"/api/projects/{pid}/report").json()["status"] == "draft"
 
 

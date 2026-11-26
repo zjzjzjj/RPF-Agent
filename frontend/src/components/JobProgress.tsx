@@ -110,7 +110,7 @@ export function ExecutionProgressDetails({ progress }: { progress: ExecutionProg
       {progress.batches_failed > 0 ? ` · 采集故障 ${progress.batches_failed} 批` : ""}
       {progress.last_progress_at ? ` · 最近完成 ${new Date(progress.last_progress_at).toLocaleTimeString()}` : ""}
     </Typography.Text>
-    {(progress.failures ?? []).slice(0, 3).map((failure) => (
+    {(progress.failures ?? []).filter((failure) => !failure.covered).slice(0, 3).map((failure) => (
       <Typography.Text key={`${failure.collection_id}:${failure.batch_key}`} type="danger" style={{ fontSize: 12 }}>
         {failure.batch_index != null ? `第 ${failure.batch_index + 1} 批` : "材料采集"}
         {failure.documents.map((document) => ` · ${document.filename ?? `文件 ${document.document_id}`} 第 ${document.page_numbers.join("、")} 页`).join("")}

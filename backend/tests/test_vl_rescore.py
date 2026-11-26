@@ -87,6 +87,28 @@ def test_rescore_cert_confirmed_no_screenshot_clears_iso() -> None:
     assert res.facts["score_verified_only"] == "0.00"
 
 
+def test_rescore_cert_uses_deterministic_query_hit_without_ocr_seal_word() -> None:
+    rule = {
+        **CRIT_CERT,
+        "description": ("ISO9001、ISO27001、ISO20000每项1分；须提供证书复印件并"
+                        "提供全国认证认可信息公共服务平台 cx.cnca.cn 查询结果截图。"),
+    }
+    pages = [{"document_id": 1, "page_no": page, "text": (
+        "全国认证认可信息公共服务平台 证书详情页 "
+        f"证书编号 00{page} 认证项目 {family}"
+    )} for page, family in ((2, "ISO9001"), (4, "ISO27001"), (6, "ISO20000"))]
+    inv = _inv(
+        certs=[_cert("ISO9001", pages=[1]), _cert("ISO27001", pages=[3]),
+               _cert("ISO20000", pages=[5])],
+        audit={"cert_section_state": True}, cert_present=True, text="",
+    )
+    inv.pages = pages
+    res = rescore_from_merged_facts(rule, inv)
+    assert res is not None
+    assert res.score == Decimal("3.00"), res.detail
+    assert res.complete is True
+
+
 def test_rescore_cert_screenshot_true_upgrades() -> None:
     """VL has_query_screenshot=true 升级 cert_section_present=True → 计入无疑。"""
     inv = _inv(certs=[_cert("ISO9001")], audit={"cert_section_state": None},
@@ -150,7 +172,7 @@ def _person_case_inv(**state):
     rec = ContractRecord(
         name="某平台运维服务项目", amount_yuan=Decimal("700000"),
         signed_date="2024-03-01", pages=[1, 2],
-        materials={"contract": [1]}, materials_state={"contract": True},
+        materials={"contract": [1]}, materials_state={"contract": True, "seal": True},
         person_names=["杨祥海"],
         person_states={"work_proof": True, "experience_proof": True,
                        "social_security": True},
@@ -182,16 +204,14 @@ def test_rescore_person_missing_work_proof_zero() -> None:
     assert res.score == 0, f"work_proof 无正向证据不得计分：{res.detail}"
 
 
-def test_rescore_person_relaxed_partial_chain() -> None:
-    """放宽口径（2026-11-25 用户拍板）：业绩证明可见+归属 → 经验证明/社保
-    以线索计入并标疑问。"""
+def test_rescore_person_partial_chain_is_not_finalized() -> None:
+    """人员案例必须逐人闭合经验证明和社保，线索不能替代最终证明。"""
     inv = _person_case_inv(person_states={"work_proof": True,
                                           "experience_proof": None,
                                           "social_security": None})
     res = rescore_from_merged_facts(CRIT_PERSON, inv)
     assert res is not None
-    assert res.score == Decimal("2.00"), res.detail
-    assert "放宽口径" in (res.detail or "")
+    assert res.score == 0, res.detail
 
 
 def test_rescore_person_confirmed_missing_still_blocks() -> None:
@@ -219,7 +239,7 @@ def test_rescore_onsite_member_proof_is_bound_to_each_person_and_capped():
                               materials_state={"contract": True}, person_names=list(proofs), person_proofs=proofs)
                for i in range(3)]
     inventory = _inv(contracts=records + [records[0]], persons=people)
-    assert rescore_from_merged_facts(criterion, inventory).score == Decimal("3")
+    assert rescore_from_merged_facts(criterion, inventory).score == Decimal("6")
     people[2].social_months = 12
     assert rescore_from_merged_facts(criterion, inventory).score == Decimal("6")
     stamped_rule = {**criterion, "required_evidence": criterion["required_evidence"] + "业绩证明复印件加盖公章。"}
@@ -227,6 +247,37 @@ def test_rescore_onsite_member_proof_is_bound_to_each_person_and_capped():
     for record in records:
         record.materials_state["seal"] = True
     assert rescore_from_merged_facts(stamped_rule, inventory).score == Decimal("6")
+
+
+def test_person_section_count_does_not_attach_unlinked_contracts() -> None:
+    criterion = {
+        "score_type": "count", "name": "项目负责人业绩", "max_score": "4",
+        "description": "项目负责人每个类似系统运维项目实施/服务案例得2分，最高4分。"
+                       "业绩证明须反映项目负责人姓名，并提供五年以上工作经验证明和近六个月社保。",
+        "params": {"field": "performance", "person_scope": "leader",
+                   "per_item": "2", "max_items": 2},
+    }
+    person = PersonRecord(name="杨祥海", role="项目负责人", years=Decimal("12"),
+                          social_months=12, pages=[9])
+    linked = ContractRecord(
+        name="某平台运维服务项目A", amount_yuan=Decimal("700000"),
+        materials={"contract": [1]}, materials_state={"contract": True},
+        person_names=["杨祥海"], project_type="运维服务",
+        person_states={"work_proof": True, "experience_proof": True,
+                       "social_security": True},
+    )
+    unlinked = ContractRecord(
+        name="某平台运维服务项目B", amount_yuan=Decimal("800000"),
+        materials={"contract": [2]}, materials_state={"contract": True},
+        project_type="运维服务",
+    )
+    inventory = _inv(contracts=[linked, unlinked], persons=[person])
+    inventory.pages = [{"document_id": 1, "page_no": 9, "text": (
+        "项目负责人杨祥海曾担任以下项目的项目经理，两个类似项目经验证明。"
+    )}]
+    result = rescore_from_merged_facts(criterion, inventory)
+    assert result is not None
+    assert result.score == Decimal("2.00"), result.detail
 
 
 def test_social_security_coverage_uses_named_rows_and_respects_latest_gap():
@@ -249,7 +300,7 @@ def test_social_security_coverage_uses_named_rows_and_respects_latest_gap():
     assert merge_vl_facts(inventory, [visual]).persons[0].social_months == 1
 
 
-def test_leader_five_paid_months_do_not_meet_six_month_proof_requirement():
+def test_leader_recent_five_month_social_window_meets_human_rule():
     from app.engine.material_inventory import _overlay_social_security
 
     inventory = _person_case_inv()
@@ -259,7 +310,7 @@ def test_leader_five_paid_months_do_not_meet_six_month_proof_requirement():
     criterion = {**CRIT_PERSON, "required_evidence": (
         "须提供业绩证明材料、具有五年及以上工作经验证明及近六个月社保缴纳证明。")}
     assert inventory.persons[0].social_months == 5
-    assert rescore_from_merged_facts(criterion, inventory).score == 0
+    assert rescore_from_merged_facts(criterion, inventory).score == Decimal("2.00")
 
 
 def test_cmmi_field_inference_beats_generic_cert_kw() -> None:

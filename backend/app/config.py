@@ -398,7 +398,8 @@ def calibration_profile() -> dict:
 
     env `BID_EVAL_CALIBRATION_PROFILE` 选文件名（默认 "default"）。文件缺失/坏
     JSON → 空 profile（纯细则文本驱动，不注入任何尺度提示）。返回
-    {"version":..., "scale_text":...}，version 落 ai_raw_json 供审计还原。
+    {"version":..., "scale_text":..., "subjective_models":...}，version 落
+    ai_raw_json 供审计还原。
     """
     import json as _json
 
@@ -407,10 +408,11 @@ def calibration_profile() -> dict:
     try:
         data = _json.loads(path.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001 —— 缺失/坏文件都不阻断评分
-        return {"version": "", "scale_text": ""}
+        return {"version": "", "scale_text": "", "subjective_models": []}
     return {
         "version": str(data.get("version") or ""),
         "scale_text": str(data.get("scale_text") or ""),
+        "subjective_models": data.get("subjective_models") or [],
     }
 
 

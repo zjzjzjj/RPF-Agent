@@ -134,8 +134,56 @@ def test_semantic_failure_history_is_saved_without_publishing_invalid_result(che
         checkpoint.execute(0, fail, _validate)
     saved = _batches(checkpoint)[0]
     assert saved.state == "failed" and saved.result_json is None
-    assert saved.error_json["validation_history"] == history
+    assert saved.error_json["validation_history"] == [
+        {"attempt": n, "state": "failed", "reason_code": "validation_repair",
+         "response_sha256": str(n) * 64}
+        for n in range(3)
+    ]
+    assert "error" not in saved.error_json["validation_history"][0]
     assert saved.completed_at is None
+
+
+def test_rejected_evidence_error_json_is_redacted_and_structured(checkpoint_env):
+    checkpoint = _checkpoint(checkpoint_env)
+
+    def fail():
+        error = LLMError("SECRET-C7 源ID b0e0 绑定到 C:\\private\\path 失败")
+        error.review_attempts_exhausted = True
+        error.synthesis_evidence_rejected = True
+        error.validation_history = [{
+            "attempt": 1, "state": "failed",
+            "error": "SECRET-C7 修复提示与内部路径 C:\\private\\path",
+            "response_sha256": "a" * 64,
+        }]
+        error.rejected_evidence = [{
+            "evidence_id": "b0e0", "source_id": "d7p206_deadbeef",
+            "document_id": 7, "page_no": 206, "kind": "text",
+            "quote": "原始引文包含不应进入错误审计的完整内容",
+            "summary": "拒绝证据摘要",
+            "candidates": ["b6e0", "b6e1", "b6e2", "b6e3"],
+            "raw_response": {"secret": "SECRET-C7"},
+        }]
+        raise error
+
+    with pytest.raises(LLMError):
+        checkpoint.execute(0, fail, _validate)
+
+    audit = _batches(checkpoint)[0].error_json
+    serialized = str(audit)
+    assert "SECRET-C7" not in serialized
+    assert "private" not in serialized
+    assert "原始引文" not in serialized
+    assert "raw_response" not in serialized
+    assert audit["reason_code"] == "evidence_binding"
+    assert audit["message"] == "原批次证据绑定待人工复核，已保留核验记录"
+    assert audit["validation_history"] == [{
+        "attempt": 1, "state": "failed", "reason_code": "validation_repair",
+        "response_sha256": "a" * 64,
+    }]
+    assert audit["rejected_evidence"] == [{
+        "reference": "b0e0", "document_id": 7, "page_no": 206, "kind": "text",
+        "summary": "拒绝证据摘要", "candidates": ["b6e0", "b6e1", "b6e2"],
+    }]
 
 
 @pytest.mark.parametrize("failure", [False, True])
@@ -475,9 +523,10 @@ def test_page_progress_waits_for_all_slices_and_reports_exact_failure_location(c
         checkpoint.execute(1, lambda: (_ for _ in ()).throw(TimeoutError("specific batch timeout")), _validate)
     progress = execution_progress(checkpoint_env["run_id"])
     failure = progress["failures"][0]
-    assert failure["batch_index"] == 1 and failure["code"] == "TimeoutError"
+    assert failure["batch_index"] == 1 and failure["code"] == "execution_incomplete"
     assert failure["documents"] == [{"document_id": original["document_id"], "filename": None, "page_numbers": [1]}]
-    assert failure["message"] == "specific batch timeout"
+    assert failure["message"] == "材料采集或自动评审未形成可核验终态，待人工复核"
+    assert "specific batch timeout" not in str(failure)
     with session_scope() as session:
         session.get(EvaluationRun, checkpoint_env["run_id"]).status = "failed"
         batch = session.get(ReviewCollectionBatch, _batches(checkpoint)[1].id)

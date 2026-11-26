@@ -1,0 +1,161 @@
+{
+  "source_pdf": "测试6-浙江中烟工业有限责任公司2025-2028年行业烟叶平台运维项目-评审材料.pdf",
+  "page_number_note": "evidence_page_no follows the evaluation-batch page numbering; text was checked against the corresponding source PDF pages.",
+  "cases": [
+    {
+      "case": "c44_haowhale_requirements_only",
+      "bidder_id": 52,
+      "criterion": "c44",
+      "expected": "0",
+      "complete": true,
+      "pages": [
+        {
+          "document_id": 68,
+          "page_no": 66,
+          "source": "ocr",
+          "embedded_image_ratio": 0.55,
+          "text": "2.7.1.1 ISO9001 质量管理体系认证\n认证证书\n证书编号：HAO-ISO9001-2025\n有效期至：2027年12月31日"
+        },
+        {
+          "document_id": 68,
+          "page_no": 76,
+          "source": "ocr",
+          "embedded_image_ratio": 0.55,
+          "text": "2.7.1.2 ISO27001 信息安全管理体系认证\n认证证书\n证书编号：HAO-ISO27001-2025\n有效期至：2027年12月31日"
+        },
+        {
+          "document_id": 68,
+          "page_no": 91,
+          "source": "ocr",
+          "embedded_image_ratio": 0.55,
+          "text": "2.7.1.3 ISO20000 信息技术服务管理体系认证证书\n认证证书\n证书编号：HAO-ISO20000-2025\n有效期至：2027年12月31日"
+        },
+        {
+          "document_id": 68,
+          "page_no": 92,
+          "source": "text",
+          "embedded_image_ratio": 0.0,
+          "text": "查询结果截图\n须提供全国认证认可信息公共服务平台（cx.cnca.cn）查询结果截图并加盖公章，未按要求提供不得分"
+        }
+      ]
+    },
+    {
+      "case": "c44_xiaoheliu_detail_pages",
+      "bidder_id": 54,
+      "criterion": "c44",
+      "expected": "3",
+      "complete": true,
+      "pages": [
+        {
+          "document_id": 70,
+          "page_no": 61,
+          "source": "ocr",
+          "embedded_image_ratio": 0.55,
+          "text": "2.7.1 ISO9001证书\n认证证书 N.CN23-03503A\n深圳小河流信息技术有限公司\n完成质量管理体系审核并符合ISO9001:2015标准\n证书有效期至：2026年03月23日"
+        },
+        {
+          "document_id": 70,
+          "page_no": 62,
+          "source": "ocr",
+          "embedded_image_ratio": 0.55,
+          "text": "国家市场监督管理总局 全国认证认可信息公共服务平台\n当前位置：认证结果/证书详情\n证书信息\n证书编号N.CN23-03503A\n证书状态有效\n证书到期日期2026-03-23\n认证项目质量管理体系认证（ISO9001）\n认证依据ISO9001:2015\n机构批准号CNCA-RF-2016-67"
+        },
+        {
+          "document_id": 70,
+          "page_no": 63,
+          "source": "ocr",
+          "embedded_image_ratio": 0.55,
+          "text": "2.7.2 ISO27001证书\n认证证书 N.CN23-04908D\n完成信息安全管理体系审核并符合ISO/IEC27001:2022标准\n证书有效期至：2026年03月27日"
+        },
+        {
+          "document_id": 70,
+          "page_no": 64,
+          "source": "ocr",
+          "embedded_image_ratio": 0.55,
+          "text": "国家市场监督管理总局 全国认证认可信息公共服务平台\n当前位置：认证结果/证书详情\n证书信息\n证书编号N.CN23-04908D\n证书状态有效\n证书到期日期2026-03-27\n认证项目信息安全管理体系认证\n认证依据ISO/IEC27001:2022\n机构批准号CNCA-RF-2016-67"
+        },
+        {
+          "document_id": 70,
+          "page_no": 65,
+          "source": "ocr",
+          "embedded_image_ratio": 0.55,
+          "text": "2.7.3 ISO20000证书\n认证证书 N.CN23-04908F\n完成信息技术服务管理体系审核并符合ISO/IEC20000-1:2018标准\n证书有效期至：2026年03月27日"
+        },
+        {
+          "document_id": 70,
+          "page_no": 66,
+          "source": "ocr",
+          "embedded_image_ratio": 0.55,
+          "text": "国家市场监督管理总局 全国认证认可信息公共服务平台\n当前位置：认证结果/证书详情\n证书信息\n证书编号N.CN23-04908F\n证书状态有效\n证书到期日期2026-03-27\n认证项目信息技术服务管理体系认证\n认证依据ISO/IEC20000-1:2018\n机构批准号CNCA-RF-2016-67"
+        }
+      ]
+    },
+    {
+      "case": "c44_yongshu_detail_pages_without_ocr_seal",
+      "bidder_id": 55,
+      "criterion": "c44",
+      "expected": "3",
+      "complete": true,
+      "pages": [
+        {
+          "document_id": 71,
+          "page_no": 61,
+          "source": "ocr",
+          "embedded_image_ratio": 0.55,
+          "text": "2-7-1 ISO9001质量管理体系认证\n质量管理体系认证证书\n证书编号：20224Q20580R0S\n咏数智能科技（杭州）有限公司\n质量管理体系符合ISO9001:2015标准\n证书有效期至：2027年05月28日"
+        },
+        {
+          "document_id": 71,
+          "page_no": 62,
+          "source": "ocr",
+          "embedded_image_ratio": 0.55,
+          "text": "国家市场监督管理总局 全国认证认可信息公共服务平台\n当前位置：认证结果/证书详情\n证书信息\n证书编号20224Q20580R0S\n证书状态有效\n证书到期日期2027-05-28\n认证项目质量管理体系认证（ISO9001）\n认证依据GB/T19001-2016/ISO9001:2015\n机构批准号CNCA-R-2015-202"
+        },
+        {
+          "document_id": 71,
+          "page_no": 63,
+          "source": "ocr",
+          "embedded_image_ratio": 0.55,
+          "text": "2-7-2 ISO27001信息安全管理体系认证\n信息安全管理体系认证证书\n证书编号：20224ISMS10042R0S\n信息安全管理体系符合ISO/IEC27001:2022标准\n证书有效期至：2027年07月30日"
+        },
+        {
+          "document_id": 71,
+          "page_no": 64,
+          "source": "ocr",
+          "embedded_image_ratio": 0.55,
+          "text": "国家市场监督管理总局 全国认证认可信息公共服务平台\n当前位置：认证结果/证书详情\n证书信息\n证书编号20224ISMS10042R0S\n证书状态有效\n证书到期日期2027-07-30\n认证项目信息安全管理体系认证\n认证依据ISO/IEC27001:2022\n机构批准号CNCA-R-2015-202"
+        },
+        {
+          "document_id": 71,
+          "page_no": 65,
+          "source": "ocr",
+          "embedded_image_ratio": 0.55,
+          "text": "2-7-3 ISO20000信息技术服务管理体系认证证书\n信息技术服务管理体系认证证书\n证书编号：2022025ITSM023R0C\n信息技术服务管理体系符合ISO/IEC20000-1:2018标准\n证书有效期至：2028年07月29日"
+        },
+        {
+          "document_id": 71,
+          "page_no": 66,
+          "source": "ocr",
+          "embedded_image_ratio": 0.55,
+          "text": "国家市场监督管理总局 全国认证认可信息公共服务平台\n当前位置：认证结果/证书详情\n证书信息\n证书编号2022025ITSM023R0C\n证书状态有效\n证书到期日期2028-07-29\n认证项目信息技术服务管理体系认证\n认证依据ISO/IEC20000-1:2018\n机构批准号CNCA-R-2015-202"
+        }
+      ]
+    },
+    {
+      "case": "c45_yongshu_title_claim_without_validity",
+      "bidder_id": 55,
+      "criterion": "c45",
+      "expected": "0",
+      "complete": true,
+      "pages": [
+        {
+          "document_id": 71,
+          "page_no": 66,
+          "source": "ocr",
+          "embedded_image_ratio": 0.6,
+          "text": "全国认证认可信息公共服务平台 当前位置：认证结果/证书详情\n证书编号2022025ITSM023R0C 证书到期日期2028-07-29\n认证项目信息技术服务管理体系认证 有效期2027-11-27\n2-7-4 CMMI 认证\nCERTIFICATE\nYongshu Intelligent Technology (Hangzhou) Co., Ltd.\nhas completed the Benchmark Appraisal and achieved\nCMMI Development Maturity Level 3\nID: #045810\n证书查询网址：https://pars.cmmiinstitute.com"
+        }
+      ]
+    }
+  ]
+}
