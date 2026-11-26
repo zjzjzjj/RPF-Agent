@@ -342,3 +342,88 @@ def test_no_sanction_keeps_legacy_lenient_material_gate():
                                         per_item="2"), _contract_inv([record]))
     assert result is not None
     assert result.score == Decimal("2.00")
+
+
+# --- 测试2 run166 P0-4/P0-5/P1-4 回归锚（2026-11-27） --------------------------
+
+def _persons_inv(persons):
+    from app.engine.facts import BidFacts as _BF
+    return MaterialInventory(
+        bidder_id=1, pages=[], full_text="", facts=_BF(text=""),
+        contracts=[], persons=persons, personnel_table_found=True)
+
+
+def test_p04_person_experience_not_routed_to_company_contracts():
+    """P0-4：c51「项目经理类似项目经验」命中人员主体词族 → 不得走公司合同金额桶。
+
+    run166 c51 五家全 0 根因：'类似项目'命中 contracts 计划，无金额档→rate=0。
+    """
+    from app.engine.material_inventory import PersonRecord as _PR  # noqa: F401
+    criterion = {
+        "code": "c51", "name": "项目经理类似项目经验", "score_type": "subjective",
+        "max_score": "3",
+        "description": "项目经理具有五年及以上类似会议系统运维项目的实施/服务经验得3分；"
+                       "四年及以上得2分，三年及以上得1分。",
+    }
+    plan = build_objective_plan(criterion)
+    assert plan is None or plan.kind != "contracts", \
+        "人员主体项不得走公司合同金额桶（c51 系统性 0 分根因）"
+
+
+def test_p05_hard_sanction_accepts_no_recognition_clause():
+    """P0-5：c39 制裁句'否则不予认可'（非'不得分'）→ 材料闸门激活，缺件表行判 0。
+
+    run166 集服 c39 材料全缺仍计 6 分根因：旧正则只认'不得分'→AND 核验整段不执行。
+    """
+    rule_text = (
+        "投标人业绩实力：承担类似会议、大屏系统维护合同金额50万及以上的业绩的，每个得2分，"
+        "最高不超过6分。【证明材料】：投标人提供2022年1月1日至今项目业绩，以提供合同的复印件"
+        "及合同内任意一张发票，业主证明或验收材料作为证明材料，否则不予认可。"
+    )
+    record = ContractRecord(name="某会议维保", amount_yuan=_D("600000"),
+                            pages=[1], materials={"contract": [1]}, source="table",
+                            materials_state={"contract": False, "invoice": False,
+                                             "acceptance": False, "_case_block_complete": True})
+    result = score_objective(
+        _perf_rule(rule_text, min_amount_yuan="500000", per_item="2", max_score="6"),
+        _contract_inv([record]))
+    assert result is not None
+    assert result.score == Decimal("0.00"), "'否则不予认可'制裁句须激活材料闸门"
+
+
+def test_p05_table_row_not_exempt_when_materials_confirmed_missing():
+    """P0-5：无制裁句但 materials_state 确认缺件（三件全 False+案例块完整）→ 表行不豁免。"""
+    rule_text = ("合同金额50万及以上的业绩的，每个得2分，最高不超过6分。"
+                 "【证明材料】：合同复印件及发票、验收材料。")
+    record = ContractRecord(name="某维保", amount_yuan=_D("600000"),
+                            pages=[1], materials={"contract": [1]}, source="table",
+                            materials_state={"contract": False, "invoice": False,
+                                             "acceptance": False, "_case_block_complete": True})
+    result = score_objective(
+        _perf_rule(rule_text, min_amount_yuan="500000", per_item="2", max_score="6"),
+        _contract_inv([record]))
+    assert result is not None
+    assert result.score == Decimal("0.00"), "确认缺件的表行不得无条件豁免"
+
+
+def test_p14_special_certs_requires_electric_and_climbing_pair():
+    """P1-4：c53'电工作业和登高作业证，具备齐全的每人得1分'→ 只数两证齐全者。
+
+    run166 c53 双向错根因之一：旧 any() 数'持任一证的人'（科通 3 人各持单证计 2）。
+    """
+    from app.engine.material_inventory import PersonRecord as _PR
+    persons = [
+        _PR(name="吴绍松", certs=["电工证"]),          # 仅电工 → 不计
+        _PR(name="宋继勇", certs=["高处作业"]),        # 仅登高 → 不计
+        _PR(name="杨育贵", certs=["电工证", "登高证"]),  # 两证齐全 → 计 1
+    ]
+    criterion = {
+        "code": "c53", "name": "特种作业操作证", "score_type": "count",
+        "max_score": "2",
+        "description": "服务团队成员具有特种作业操作证（作业类别：电工作业和登高作业证），"
+                       "具备齐全的每人得1分，最高不超2分。",
+    }
+    result = score_objective(criterion, _persons_inv(persons))
+    assert result is not None
+    assert result.score == Decimal("1.00"), "只数电工+登高两证齐全者"
+    assert "杨育贵" in result.detail

@@ -70,6 +70,22 @@ _EQUIPMENT_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("灯光", ("灯光",)),
 )
 _SPECIAL_CERTS = ("电工证", "特种作业操作证", "高处作业", "登高证")
+# P1-4（测试2 run166 c53）：细则「作业类别：电工作业和登高作业证，具备齐全的
+# 每人得1分」——须同时具备电工作业族 + 登高/高处作业族两证才算齐全。旧 any()
+# 数「持任一证的人」导致科通（3人各持单证）计 2、安保（3人只电工）计 2，人工
+# 只认两证齐全者（科通 1、安保 0）。
+_SPECIAL_CERT_ELECTRIC = ("电工", "电工作业")
+_SPECIAL_CERT_CLIMBING = ("登高", "高处")
+
+# P0-4（测试2 run166 c51）：人员主体词族——与 check_infer._LEADER_KW/_MEMBER_KW
+# 同源。命中人员主体的「类似项目/业绩/合同金额」是**人员级经验档**（按项目经理
+# 年限 5/4/3 年给分），不得被公司级合同金额桶（contracts）替代，否则无金额档
+# →rate=0→结构性 0 分。run166 c51 五家全 0 即此根因（objective_fastpath.py:145
+# 的业绩关键词分支前无此守卫，person_scope 因 c51 params=null 永不生效）。
+_PERSON_SUBJECT_KW = re.compile(
+    r"项目负责人|项目经理|负责人|拟派负责人|项目总监|技术负责人"
+    r"|团队成员|驻场人员|人员名单|拟派人员|技术人员|维护保养服务团队"
+)
 
 
 def _rule_text(criterion: dict) -> str:
@@ -143,7 +159,9 @@ def build_objective_plan(criterion: dict) -> ObjectivePlan | None:
             r"[一二两三四五六七八九十\d]+\s*项[^。；]{0,12}?得\s*\d", expanded):
         return ObjectivePlan("cert_count_tier", params)
     if "业绩" in expanded or "合同金额" in expanded or "类似项目" in expanded:
-        if params.get("person_scope"):
+        # P0-4：人员主体守卫（c51 项目经理类似项目经验）——命中人员主体词族时
+        # 一律不走公司级 contracts 桶，回退 LLM 人员经验评审（year 档 5/4/3 年）。
+        if params.get("person_scope") or _PERSON_SUBJECT_KW.search(name):
             # 人员级业绩必须逐案例核验人员归属（合同须体现拟派人员，否则需业主
             # 证明）；公司级合同桶不得替代——run128 c29 曾把公司合同当团队经验。
             return None
@@ -207,7 +225,14 @@ def _contract_material_ok(record: ContractRecord, requires_material: bool) -> bo
     # A row in the bidder's own performance table is itself a structured claim
     # of the contract; the material chain is recorded separately and must not
     # turn an otherwise countable table row into zero.
+    # 测试2 run166 c39：表格行豁免不得无条件放行——materials_state 可读确认缺件
+    # （contract/invoice/acceptance 全 False 且案例块完整）时按缺件处理（run158
+    # 严口径），否则材料全缺的表行仍被计分（集服 6 分虚高）。
     if record.source == "table":
+        ms = record.materials_state or {}
+        if ms.get("_case_block_complete") and all(
+                ms.get(k) is False for k in ("contract", "invoice", "acceptance")):
+            return False
         return True
     return bool(record.materials.get("invoice") or record.materials.get("acceptance")
                 or record.materials.get("owner_proof") or record.materials.get("contract"))
@@ -215,9 +240,12 @@ def _contract_material_ok(record: ContractRecord, requires_material: bool) -> bo
 
 # P0-5（测试10 run113）：三件套材料链——细则点名材料 + 硬制裁句（"以上资料
 # 未提供的不得分"）时逐案例 AND 核验；无制裁句不设闸（不猜）。
+# 测试2 run166 c39：制裁句写作"否则不予认可"（非"不得分"）→ 旧正则漏判整段
+# AND 核验不执行 → 集服材料全缺仍计 6 分。补制裁句同义族（认可/计分/得分）。
 _RE_HARD_SANCTION = re.compile(
     r"(?:未提供|不提供|未按要求提供|未提交)[^。；]{0,30}不得分"
     r"|不提供或提供[^。；]{0,15}不全的不得分"
+    r"|(?:否则|则|一律|均)?\s*(?:不予认可|不予计分|不予得分|不得分)"
 )
 _MATERIAL_NAME2KIND = {
     "合同": "contract", "中标通知书": "contract",
@@ -552,16 +580,24 @@ def _person_experience_score(criterion: dict, inventory: MaterialInventory) -> F
     )
 
 
+def _has_special_cert_pair(certs: list) -> bool:
+    """c53「电工作业和登高作业证，具备齐全的每人得1分」：须同持电工族+登高族。"""
+    joined = "、".join(str(c) for c in (certs or []))
+    has_electric = any(k in joined for k in _SPECIAL_CERT_ELECTRIC)
+    has_climbing = any(k in joined for k in _SPECIAL_CERT_CLIMBING)
+    return has_electric and has_climbing
+
+
 def _person_special_certs(criterion: dict, inventory: MaterialInventory) -> FastPathResult:
     maximum = _max(criterion) or Decimal(0)
     per_person = _RE_PER_PERSON.search(_rule_text(criterion))
     per = _decimal(per_person.group(1)) if per_person else Decimal(1)
-    eligible = [p for p in inventory.persons
-                if any(cert in _SPECIAL_CERTS for cert in p.certs)]
+    # P1-4：齐全 = 同时具备电工作业族 + 登高/高处族（见 _has_special_cert_pair）。
+    eligible = [p for p in inventory.persons if _has_special_cert_pair(p.certs)]
     score = min(maximum, Decimal(len(eligible)) * (per or Decimal(0)))
     detail = (
-        "特种作业证人员：" + "、".join(f"{p.name}（{'/'.join(p.certs)}）" for p in eligible[:10])
-        if eligible else "未从团队表检出电工/登高/高处作业证"
+        "特种作业证两证齐全人员：" + "、".join(f"{p.name}（{'/'.join(p.certs)}）" for p in eligible[:10])
+        if eligible else "未从团队表检出电工+登高两证齐全人员"
     )
     score = _cap(score, criterion)
     zero_reason = None if score > 0 else ("confirmed_absent" if inventory.personnel_table_found else "no_facts")
