@@ -425,7 +425,12 @@ def _rescore_person_cases(criterion: dict, inventory: MaterialInventory,
         r"(?:无法反映|未反映|不能反映).{0,30}(?:业主|用户)证明"
         r"|(?:否则|或|另)[^。；]{0,20}(?:业主|用户)证明", factor_text))
     cases = []
+    person_proof_exists = any(
+        rec.source == "person_proof" for rec in inventory.contracts
+    )
     for rec in inventory.contracts:
+        if person_proof_exists and rec.source != "person_proof":
+            continue
         for name, proof in _named_case_proofs(rec, inventory, allow_owner).items():
             person = people.get(person_key(name))
             if person is None:
