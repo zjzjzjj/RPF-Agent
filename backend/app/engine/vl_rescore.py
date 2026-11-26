@@ -450,9 +450,17 @@ def _rescore_person_cases(criterion: dict, inventory: MaterialInventory,
         return compact
 
     unique = {}
+    proof_flags = ("name_reflected", "work_proof", "experience_proof", "social_security")
     for case in cases:
         key = (case.get("person_name"), _project_identity(case.get("name")))
-        unique.setdefault(key, case)
+        current = unique.get(key)
+        if current is None:
+            unique[key] = case
+            continue
+        current_score = sum(current.get(flag) is True for flag in proof_flags)
+        case_score = sum(case.get(flag) is True for flag in proof_flags)
+        if case_score > current_score:
+            unique[key] = case
     cases = list(unique.values())
     per_case = _decimal_or_none(params.get("per_item"))
     person_max = re.search(r"每(?:人|名[^。；，]{0,10}?)[^。；，]{0,12}?最高(?:得|计)?\s*(\d+(?:\.\d+)?)\s*分",

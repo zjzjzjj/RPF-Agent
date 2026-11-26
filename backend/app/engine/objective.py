@@ -2052,7 +2052,8 @@ def _normalize_role(case: dict) -> str | None:
     if ("lead" in role or "负责人" in role or "项目经理" in role
             or "项目总监" in role):
         return "leader"
-    if "member" in role or "成员" in role or "团队" in role:
+    if ("member" in role or "成员" in role or "团队" in role
+            or "现场运维" in role or "现场支持" in role or "运维人员" in role):
         return "member"
     return None
 
