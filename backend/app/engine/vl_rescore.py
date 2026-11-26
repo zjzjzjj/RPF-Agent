@@ -441,10 +441,17 @@ def _rescore_person_cases(criterion: dict, inventory: MaterialInventory,
     cases.sort(key=lambda row: (row.get("type_eligible") is False,
                                 row.get("work_proof") is not True,
                                 row.get("social_security") is not True))
+    def _project_identity(value) -> str:
+        compact = re.sub(r"\s+", "", str(value or "")).lower()
+        compact = re.sub(r"^20\d{2}(?:-20\d{2})?年", "", compact)
+        compact = re.sub(r"中烟工业有限责任公司", "", compact)
+        for generic in ("服务", "项目", "合同", "系统"):
+            compact = compact.replace(generic, "")
+        return compact
+
     unique = {}
     for case in cases:
-        key = (case.get("person_name"), "".join(str(case.get("name") or "").split()),
-               case.get("amount_yuan"), case.get("sign_date"))
+        key = (case.get("person_name"), _project_identity(case.get("name")))
         unique.setdefault(key, case)
     cases = list(unique.values())
     per_case = _decimal_or_none(params.get("per_item"))
