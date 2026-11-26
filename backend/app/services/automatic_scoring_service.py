@@ -1122,10 +1122,20 @@ def _assess_cell(criterion: dict, pages: list[dict], data_class: str, gateway_fa
             if getattr(decision, "_review_pages", None) is not None:
                 current_pages = decision._review_pages
             if decision.missing_evidence and not direct_subjective:
-                if material_review:
-                    raise _MaterialReviewPending("仍需核验：" + "；".join(decision.missing_evidence),
-                                                 facts=decision.facts, missing=decision.missing_evidence)
-                raise LLMError("评审证据尚未解决：" + "；".join(decision.missing_evidence))
+                # Objective counts are recomputed from the immutable material
+                # inventory.  A model-requested attachment cannot veto that
+                # deterministic result; only an unresolved deterministic result
+                # remains pending after the scorer has run.
+                deterministic_count = (
+                    objective_score and criterion.get("score_type") == "count"
+                )
+                if not deterministic_count:
+                    if material_review:
+                        raise _MaterialReviewPending(
+                            "仍需核验：" + "；".join(decision.missing_evidence),
+                            facts=decision.facts, missing=decision.missing_evidence,
+                        )
+                    raise LLMError("评审证据尚未解决：" + "；".join(decision.missing_evidence))
             is_visual = any(e.get("kind") == "visual" for e in decision.evidence)
             if needs_visual and not is_visual:
                 raise LLMError("签章结论缺少原页视觉核验依据")
