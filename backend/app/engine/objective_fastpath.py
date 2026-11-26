@@ -442,11 +442,13 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
     # A zero is a confirmed conclusion only when contracts were actually
     # located and every one carries a readable amount.  Otherwise let the LLM
     # path attempt the missing blocks; the closure pass is still the backstop.
-    unknown_amounts = any(record.amount_yuan is None for record in inventory.contracts)
-    missing_materials = any("缺" in reason for reason in rejected)
-    complete = (inventory.performance_section_found and bool(inventory.contracts)
-                and not unknown_amounts and not missing_materials
-                and not unverified_notes)
+    company_contracts = [
+        record for record in inventory.contracts
+        if record.source != "person_proof"
+    ]
+    unknown_amounts = any(record.amount_yuan is None for record in company_contracts)
+    complete = (inventory.performance_section_found and bool(company_contracts)
+                and not unknown_amounts and not unverified_notes)
     zero_reason = None
     if score == 0:
         if unverified_notes:

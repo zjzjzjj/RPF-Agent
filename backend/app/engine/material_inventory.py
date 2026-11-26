@@ -1296,22 +1296,6 @@ def _person_case_records_from_pages(
     """Create person cases only from explicit proof-section project titles."""
     ordered = sorted(pages, key=lambda page: int(page.get("page_no") or 0))
     normalized = lambda value: re.sub(r"\s+", "", str(value or "")).lower()
-    invalid_names = {"页码", "项目经历", "专业技术", "项目名称", "姓名", "团队成员"}
-    repaired: list[PersonRecord] = []
-    for person in persons:
-        name = normalized(person.name)
-        if len(name) < 2 or person.name in invalid_names:
-            continue
-        candidates = set()
-        for page in ordered:
-            text_value = str(page.get("text") or "")
-            for match in re.finditer(re.escape(name) + r"[\u4e00-\u9fff]{1,2}", text_value):
-                candidates.add(match.group(0))
-        if candidates:
-            person.name = max(candidates, key=len)
-        repaired.append(person)
-    persons = repaired
-
     title_patterns = (
         re.compile(r"(?:项目名称|合同名称)\s*[:：]?\s*([^\n]{6,100}?(?:项目|合同|服务))"),
         re.compile(
@@ -1335,7 +1319,11 @@ def _person_case_records_from_pages(
                     continue
                 if any(word in title for word in (
                         "2025-2028年行业烟叶平台运维项目", "类似项目实施",
-                        "类似项目经验", "项目经验证明", "工作经验证明")):
+                        "类似项目经验", "项目经验证明", "工作经验证明",
+                        "合同详见", "业主证明", "用户证明")):
+                    continue
+                title = re.sub(r"^\d{8,}\s*", "", title)
+                if re.match(r"^2\.8(?:\.|\s)", title):
                     continue
                 if title not in out:
                     out.append(title)
@@ -1399,7 +1387,7 @@ def _person_case_records_from_pages(
                 else "系统建设项目/开发合同"
             )
             for title in titles:
-                key = (person.name, title, tuple(page.get("page_no") for page in window))
+                key = (person.name, normalized(title))
                 if key in seen:
                     continue
                 seen.add(key)
