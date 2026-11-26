@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
+
 from app.engine.material_inventory import (
     ContractRecord, MaterialInventory,
 )
@@ -87,13 +89,125 @@ def test_merge_cert_and_screenshot_flag() -> None:
     out = merge_vl_facts(_inv([]), [
         {"kind": "certificate", "name": "ISO9001 质量管理体系认证证书",
          "has_query_screenshot": True,
-         "evidence": [{"document_id": 1, "page_no": 30, "observation": "查询结果截图"}]},
+         "evidence": [{"document_id": 1, "page_no": 30, "observation": "全国认证认可信息公共服务平台证书信息 ISO9001，可见红色公章"}]},
+        {"kind": "certificate", "name": "ISO27001 信息安全管理体系认证证书",
+         "has_query_screenshot": True,
+         "evidence": [{"document_id": 1, "page_no": 31, "observation": "裁判文书查询结果截图，盖有投标人公章"}]},
+        {"kind": "certificate", "name": "ISO9001 质量管理体系认证证书",
+         "evidence": [{"document_id": 1, "page_no": 32, "observation": "ISO9001 证书原件扫描"}]},
         {"kind": "person", "name": "张三", "person_years": "6",
          "evidence": [{"document_id": 1, "page_no": 40, "observation": "简历"}]},
     ])
     assert any((c.normalized or "") == "ISO9001" for c in out.certs), out.certs
     assert out.cert_section_present is True
+    assert out.platform_query_certificates == {"ISO9001"}
     assert out.persons and out.persons[0].years == Decimal("6")
+
+
+def test_query_platform_binds_certificate_number_or_same_explicit_family():
+    def evidence(page, observation):
+        return [{"document_id": 1, "page_no": page, "observation": observation}]
+
+    facts = [
+        {"kind": "certificate", "name": "ISO9001", "certificate_number": "01234Q1345",
+         "has_cert_proof": True,
+         "evidence": evidence(1, "ISO9001 证书原件，证书编号 01234Q1345")},
+        {"kind": "certificate", "name": "ISO27001", "certificate_number": "05678I9876",
+         "has_cert_proof": True,
+         "evidence": evidence(2, "ISO27001 证书原件，证书编号 05678I9876")},
+        {"kind": "certificate", "name": "ISO9001", "has_query_screenshot": True,
+         "evidence": evidence(3, "全国认证认可信息公共服务平台证书详情页，证书编号 01234Q1345，红章")},
+        {"kind": "certificate", "name": "ISO27001", "has_query_screenshot": True,
+         "evidence": evidence(4, "全国认证认可信息公共服务平台证书详情页，信息安全管理体系，证书编号 12345Z，红章")},
+        {"kind": "certificate", "name": "ISO20000", "has_query_screenshot": True,
+         "evidence": evidence(5, "全国认证认可信息公共服务平台证书详情页，信息技术服务管理体系，红章")},
+    ]
+    result = merge_vl_facts(_inv([]), facts)
+    assert result.platform_query_certificates == {"ISO9001", "ISO20000"}
+
+
+@pytest.mark.parametrize(("combined", "query_label", "numbers"), [
+    (False, "证书详情页", ("16424Q30532R3M", "00124IS20163R2M/6100", "0012024ITSM0101R2NM/6100")),
+    (True, "查询页", ("N.CN23-03503A", "N.CN23-04908D", "N.CN23-04908F")),
+    (True, "查询结果截图", ("39324Q2050R0M", "0350125IS30792R0S", "0352023ITSM595R1LMN")),
+])
+def test_iso_binding_recovers_copy_flag_from_original_and_exact_query_pages(
+        combined: bool, query_label: str, numbers: tuple[str, ...],
+) -> None:
+    from app.engine.vl_rescore import rescore_from_merged_facts
+
+    facts = []
+    families = ("ISO9001", "ISO27001", "ISO20000")
+    labels = ("质量管理体系", "信息安全管理体系", "信息技术服务管理体系")
+    for index, (family, label, number) in enumerate(zip(families, labels, numbers)):
+        original = {"document_id": 1, "page_no": 61 + index * 2, "observation": (
+            f"认证机构出具的《{label}认证证书》，注册号{number}，符合{family}，"
+            "发证日期2024年5月9日，有效期至2027年5月9日，盖有投标人红色公章。"
+        )}
+        screenshot = {"document_id": 1, "page_no": 62 + index * 2, "observation": (
+            f"全国认证认可信息公共服务平台{query_label}，证书编号{number}，"
+            "证书状态有效，页面盖有投标人公章。"
+        )}
+        fact = {"kind": "certificate", "name": f"{label}认证证书（{family}）",
+                "certificate_number": number, "has_cert_proof": None, "has_seal": True}
+        if combined:
+            facts.append({**fact, "has_query_screenshot": True, "evidence": [original, screenshot]})
+        else:
+            facts.extend([{**fact, "evidence": [original]},
+                          {**fact, "has_query_screenshot": True, "evidence": [screenshot]}])
+
+    inventory = merge_vl_facts(_inv([]), facts)
+
+    assert {cert.certificate_number for cert in inventory.certs if cert.backing} == set(numbers)
+    assert {tuple(cert.pages) for cert in inventory.certs} == {(61,), (63,), (65,)}
+    assert inventory.platform_query_certificates == set(families)
+    result = rescore_from_merged_facts({
+        "name": "管理体系认证", "score_type": "count", "max_score": "3",
+        "description": "ISO9001、ISO27001、ISO20000证书每项1分，最高3分",
+        "required_evidence": "须提供证书复印件和全国认证认可信息公共服务平台查询结果截图并加盖公章",
+        "params": {"field": "certificates", "per_item": "1", "max_items": "3"},
+    }, inventory)
+    assert result is not None and result.complete and result.score == Decimal(3)
+
+
+def test_iso_original_accepts_documented_seal_flag_with_institution_seal():
+    inventory = merge_vl_facts(_inv([]), [{
+        "kind": "certificate", "name": "ISO9001", "certificate_number": "02925QJDD30R7L",
+        "has_seal": True,
+        "evidence": [{"document_id": 1, "page_no": 61, "observation": (
+            "质量管理体系认证证书复印件，注册号02925QJDD30R7L，"
+            "发证日期2025年4月7日，有效期至2028年4月6日，盖有认证中心印章"
+        )}],
+    }])
+    assert len(inventory.certs) == 1
+    assert inventory.certs[0].backing is True
+    assert inventory.certs[0].certificate_number == "02925QJDD30R7L"
+
+@pytest.mark.parametrize("variant", ["screenshot_only", "unrelated_screenshot", "wrong_number", "cross_document"])
+def test_iso_binding_infers_copy_only_from_original_and_requires_exact_query(variant: str) -> None:
+    original = {"document_id": 1, "page_no": 61, "observation": (
+        "ISO27001认证证书复印件，证书号00124IS20163R2M/6100，有效期至2027年5月9日，盖有投标人红色公章"
+    )}
+    query = {"document_id": 1, "page_no": 62, "observation": (
+        "全国认证认可信息公共服务平台查询页，ISO27001，证书编号00124IS20163R2M/6100，盖有投标人红色公章"
+    )}
+    if variant == "unrelated_screenshot":
+        query["observation"] = "裁判文书查询结果截图，盖有投标人公章"
+    elif variant == "wrong_number":
+        query["observation"] = query["observation"].replace("/6100", "/6300")
+    elif variant == "cross_document":
+        query["document_id"] = 2
+    evidence = [query] if variant == "screenshot_only" else [original, query]
+    inventory = merge_vl_facts(_inv([]), [{
+        "kind": "certificate", "name": "ISO27001", "certificate_number": "00124IS20163R2M/6100",
+        "has_cert_proof": None, "has_query_screenshot": True, "evidence": evidence,
+    }])
+
+    if variant == "screenshot_only":
+        assert not inventory.certs
+    else:
+        assert inventory.certs[0].pages == [61]
+        assert not inventory.platform_query_certificates
 
 
 # ---- 金额伪迹补正（2026-11-25 翻案通道收口）---------------------------------
@@ -182,3 +296,17 @@ def test_type_gate_state_tri() -> None:
     assert type_gate_state("某网络系统建设项目", rule) is False
     assert type_gate_state(None, rule) is None
     assert type_gate_state("某系统集成项目", "类似项目经验") is None, "细则未点名运维不启用"
+
+
+def test_acceptance_project_type_takes_precedence_over_contract_name():
+    from app.engine.objective import documented_project_type_state
+
+    record = ContractRecord("某人工智能运维系统开发项目", Decimal("1843000"), project_type="运维服务")
+    result = merge_vl_facts(_inv([record]), [{
+        "kind": "contract", "name": record.name, "project_type": "软件开发", "has_acceptance": True,
+        "evidence": [{"document_id": 1, "page_no": 104, "observation": "工程终验证书，系统类型：软件开发"}],
+    }])
+    case = result.contracts[0]
+    assert case.project_type == "软件开发"
+    assert documented_project_type_state(case.project_type, case.name, "类似运维项目") is False
+    assert documented_project_type_state(None, "平台运维服务项目", "类似运维项目") is True

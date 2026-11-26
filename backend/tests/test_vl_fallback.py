@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
+
 from app.engine import vl_fallback
 from app.llm.base import LLMError
 
@@ -73,6 +75,18 @@ def test_rescue_facts_happy_path_page_images() -> None:
     # 页码对照必须进提示词（VL 看到的是页图，页码靠映射告知）
     assert "第1张图=文档1第1页" in gw.calls[0]["user"]
     assert gw.calls[0]["data_class"] == "synthetic"
+
+
+def test_rescue_accepts_null_appraisal_flag_for_contract_and_person_facts():
+    gateway = FakeGateway(
+        '{"verdict":"pass","facts":['
+        '{"kind":"contract","name":"运维合同A","amount_yuan":"800000","appraisal_is_lookup":null,'
+        '"evidence":[{"document_id":1,"page_no":1,"observation":"原页合同金额80万元"}]},'
+        '{"kind":"person","name":"张三","appraisal_is_lookup":null,'
+        '"evidence":[{"document_id":1,"page_no":1,"observation":"张三，驻场工程师"}]}]}')
+    result = vl_fallback.rescue(CRIT, PAGE_IMAGES, gateway=gateway)
+    assert result.kind == "facts"
+    assert [fact["kind"] for fact in result.facts] == ["contract", "person"]
 
 
 def test_rescue_verdict_fail_rejected() -> None:
@@ -292,6 +306,247 @@ def test_maybe_vl_rescue_facts_rescore_outcome(tmp_path, monkeypatch) -> None:  
     assert out.evidence and out.evidence[0]["kind"] == "visual"
     assert out.pages[0]["image_url"].startswith("data:image/png;base64,"), "页级 image_url 已就位"
     assert out.raw["visual_fallback"]["facts"], "事实留痕"
+
+
+def test_onsite_case_annexes_rank_before_unrelated_pages():
+    from app.services.automatic_scoring_service import _material_recovery_pages
+
+    criterion = {"name": "两名驻场运维工程师实施或服务经验", "score_type": "count",
+                 "params": {"field": "performance", "person_scope": "member"}}
+    originals = {
+        214: "2.10.2 项目团队人员情况表",
+        253: "2.10.2.4.3 卢晓军的社保证明\n社会保险参保证明",
+        254: "2.10.2.4.4 吴家隆的社保证明\n社会保险参保证明",
+        255: "2.10.2.5 两名项目驻场运维工程师的类似项目实施/服务经验证明\n"
+             "两名项目驻场运维工程师卢晓军和吴家隆，曾参加两个项目。\n合同一",
+        258: "工作职能 项目人员 参与项目阶段\n业务顾问 卢晓军\n开发工程师 吴家隆",
+        262: "2.10.2.5.2 两名项目驻场运维工程师的类似项目实施/服务经验证明2\n合同二",
+        267: "附件2 姓名 部门 项目中任职\n卢晓军 项目实施顾问\n吴家隆 项目技术人员",
+        268: "2.10.3 到位率承诺",
+        280: "工作职能 参与项目阶段 卢晓军 吴家隆",
+    }
+    pages = [{"document_id": 69, "page_no": number, "text": content} for number, content in originals.items()]
+    ranked = [page["page_no"] for page in _material_recovery_pages(
+        criterion, pages, {"kind": "material_review_pending"}, None)]
+    assert {255, 258, 262, 267}.issubset(ranked[:7])
+    assert ranked.index(280) > ranked.index(267)
+
+
+def test_material_review_recovers_proof_across_distinct_batches(tmp_path, monkeypatch):
+    from app.services import automatic_scoring_service as scoring
+
+    _png_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("BID_EVAL_SCORING_OCR", "0")
+    monkeypatch.setenv("BID_EVAL_VL_FALLBACK_MAX_IMAGES", "1")
+    criterion = {**_perf_criterion(), "max_score": "1"}
+    pages = [{"document_id": 9, "page_no": page, "stored_path": "x.pdf", "sha256": "s"}
+             for page in (1, 2)]
+    pending = scoring._material_review_pending(criterion, pages, "发票和合同须分别核验")
+    pending.raw["fallback"]["candidate_pages"] = [
+        {"document_id": 9, "page_no": 2}, {"document_id": 9, "page_no": 2}]
+    reviewed = []
+
+    def rescue(rule, images, **kwargs):
+        page = images[0]["page_no"]
+        reviewed.append(page)
+        fact = _fact_case("运维项目A", "1200000", page)
+        if page == 2:
+            fact.update(amount_yuan=None, has_contract=None, has_acceptance=None)
+        else:
+            fact.update(has_invoice=None)
+        return vl_fallback.VlResult("facts", facts=[fact])
+
+    monkeypatch.setattr(vl_fallback, "rescue", rescue)
+    result, error = scoring._maybe_vl_rescue(1, 2, criterion, pending, None,
+                                            {2: (pages, "synthetic")}, vl_fallback.Budget(),
+                                            inventory_factory=lambda _: _empty_inv())
+    assert error is None
+    assert reviewed == [2, 1]
+    assert result.score == Decimal("1")
+    assert {(e["document_id"], e["page_no"]) for e in result.evidence} == {(9, 1), (9, 2)}
+
+
+def test_visual_proof_requires_correct_document_and_accepts_amountless_fragment():
+    pages = [{"document_id": 1, "page_no": 7}, {"document_id": 2, "page_no": 7}]
+
+    def make_fact(doc):
+        return vl_fallback.VlFact(
+            kind="contract", name="运维项目A", has_invoice=True,
+            evidence=[{"document_id": doc, "page_no": 7, "observation": "发票备注列示项目名称"}])
+
+    facts, dropped = vl_fallback._sanitize_facts([make_fact(9), make_fact(None), make_fact(1)], pages)
+    assert dropped == 2
+    assert facts[0]["amount_yuan"] is None
+    assert facts[0]["evidence"][0]["document_id"] == 1
+
+
+@pytest.mark.parametrize("source_changed", [False, True])
+def test_material_resume_reuses_evidence_and_moves_to_unread_pages(tmp_path, monkeypatch, source_changed):
+    from app.services import automatic_scoring_service as scoring
+
+    _png_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("BID_EVAL_VL_FALLBACK_MAX_IMAGES", "1")
+    monkeypatch.setenv("BID_EVAL_VL_FALLBACK_MAX_PER_CELL", "1")
+    criterion = {**_perf_criterion(), "max_score": "1"}
+    pages = [{"document_id": 9, "page_no": page, "stored_path": "x.pdf", "sha256": "s"}
+             for page in (1, 2)]
+    reviewed = []
+
+    def rescue(rule, images, **kwargs):
+        page = images[0]["page_no"]
+        reviewed.append(page)
+        fact = _fact_case("运维项目A", "1200000", page)
+        if page == 1:
+            fact["has_invoice"] = None
+        else:
+            fact.update(amount_yuan=None, has_contract=None, has_acceptance=None)
+        return vl_fallback.VlResult("facts", facts=[fact])
+
+    def review(checkpoint=None):
+        pending = scoring._material_review_pending(criterion, pages, "须分别核验发票及合同")
+        return scoring._maybe_vl_rescue(1, 2, criterion, pending, None, {2: (pages, "synthetic")},
+                                        vl_fallback.Budget(), inventory_factory=lambda _: _empty_inv(),
+                                        checkpoint=checkpoint)[0]
+
+    monkeypatch.setattr(vl_fallback, "rescue", rescue)
+    initial = review()
+    assert initial.score is None and reviewed == [1]
+    previous_image = initial.pages[0]
+    checkpoint = {"visual_fallback_note": initial.raw["visual_fallback_note"],
+                  "visual_evidence": [{**initial.evidence[0], "sha256": previous_image["sha256"],
+                                       "image_sha256": previous_image["image_sha256"]}]}
+    if source_changed:
+        pages[0]["sha256"] = "changed"
+    result = review(checkpoint)
+    if source_changed:
+        assert result.score is None and reviewed == [1, 1]
+    else:
+        assert result.score == 1 and reviewed == [1, 2]
+        assert {entry["page_no"] for entry in result.evidence} == {1, 2}
+
+
+def test_resumed_bounded_material_review_closes_verified_zero(tmp_path, monkeypatch):
+    from app.services import automatic_scoring_service as scoring
+
+    _png_env(tmp_path, monkeypatch)
+    criterion = {**_perf_criterion(), "max_score": "1"}
+    pages = [{"document_id": 9, "page_no": page, "stored_path": "x.pdf", "sha256": "s"}
+             for page in range(1, 25)]
+    checkpoint = {
+        "visual_fallback_note": {
+            "reviewed_pages": [{"document_id": 9, "page_no": page, "sha256": "s"}
+                               for page in range(1, 25)],
+            "facts": [],
+        },
+        "visual_evidence": [],
+    }
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("completed checkpoint must not call vision again")
+
+    monkeypatch.setattr(vl_fallback, "rescue", unexpected)
+    pending = scoring._material_review_pending(criterion, pages, "核对业绩")
+    result, error = scoring._maybe_vl_rescue(
+        1, 2, criterion, pending, None, {2: (pages, "synthetic")}, vl_fallback.Budget(),
+        inventory_factory=lambda _: _empty_inv(), checkpoint=checkpoint,
+    )
+    assert error is None
+    assert result.score == 0
+    assert result.verdict == "fail"
+    assert result.basis == "visual_fallback"
+
+def test_material_resume_rechecks_omitted_certificate_page_once(tmp_path, monkeypatch):
+    from app.services import automatic_scoring_service as scoring
+
+    _png_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("BID_EVAL_VL_FALLBACK_MAX_IMAGES", "1")
+    monkeypatch.setenv("BID_EVAL_VL_FALLBACK_MAX_PER_CELL", "1")
+    criterion = {**CRIT, "params": {"field": "cmmi"}, "max_score": "2"}
+    pages = [{"document_id": 9, "page_no": page, "stored_path": "x.pdf", "sha256": "s"}
+             for page in (1, 2)]
+    requests = []
+
+    def rescue(rule, images, **kwargs):
+        requests.append((images[0]["page_no"], rule.get("_recheck_certificate_pages")))
+        return vl_fallback.VlResult("failed", reason="vl_no_facts")
+
+    def review(checkpoint=None):
+        pending = scoring._material_review_pending(criterion, pages, "核对证书有效期")
+        result, _ = scoring._maybe_vl_rescue(1, 2, criterion, pending, None,
+                                            {2: (pages, "synthetic")}, vl_fallback.Budget(),
+                                            checkpoint=checkpoint)
+        return {"visual_fallback_note": result.raw["visual_fallback_note"]}
+
+    monkeypatch.setattr(vl_fallback, "rescue", rescue)
+    first = review()
+    second = review(first)
+    review(second)
+    assert requests == [(1, None), (1, [(9, 1)]), (2, None)]
+
+
+def test_confirmed_missing_platform_query_finalizes_zero(tmp_path, monkeypatch):
+    from app.services import automatic_scoring_service as scoring
+
+    _png_env(tmp_path, monkeypatch)
+    criterion = {
+        "code": "c44", "name": "管理体系认证", "score_type": "count", "max_score": "3",
+        "description": ("ISO9001、ISO27001、ISO20000 每项1分；须提供有效证书复印件并加盖公章，"
+                        "并提供全国认证认可信息公共服务平台 cx.cnca.cn 查询结果截图。"),
+        "required_evidence": "证书复印件及 cx.cnca.cn 查询结果截图",
+        "params": {"field": "certificates", "per_item": "1", "max_items": "3"},
+    }
+    pages = [{"document_id": 9, "page_no": 1, "stored_path": "x.pdf", "sha256": "s"}]
+    fact = {
+        "kind": "certificate", "name": "ISO9001质量管理体系认证证书",
+        "has_cert_proof": True, "has_seal": True, "has_query_screenshot": None,
+        "certificate_number": None, "appraisal_is_lookup": None,
+        "evidence": [{"document_id": 9, "page_no": 1,
+                      "observation": "质量管理体系认证证书复印件，加盖红色公章"}],
+    }
+    monkeypatch.setattr(vl_fallback, "rescue", lambda *a, **k: vl_fallback.VlResult(
+        "facts", facts=[fact],
+        observations=[{"document_id": 9, "page_no": 1,
+                       "observation": "认证章节复核完毕，未见认证认可信息公共服务平台查询结果截图"}],
+        reasoning="证书已核验，查询截图缺失"))
+    pending = scoring._material_review_pending(criterion, pages, "补核查询结果截图")
+    result, error = scoring._maybe_vl_rescue(
+        1, 2, criterion, pending, None, {2: (pages, "synthetic")}, vl_fallback.Budget(),
+        inventory_factory=lambda _: _empty_inv(),
+    )
+    assert error is None
+    assert result.score == 0
+    assert result.verdict == "fail"
+    assert result.basis == "visual_fallback"
+
+def test_material_resume_rescores_authenticated_checkpoint_before_calling_vision(tmp_path, monkeypatch):
+    from app.services import automatic_scoring_service as scoring
+
+    _png_env(tmp_path, monkeypatch)
+    criterion = {**_perf_criterion(), "max_score": "1"}
+    pages = [{"document_id": 9, "page_no": 1, "stored_path": "x.pdf", "sha256": "s"}]
+    inputs = {2: (pages, "synthetic")}
+    calls = []
+
+    def rescue(*args, **kwargs):
+        calls.append(True)
+        return vl_fallback.VlResult("facts", facts=[_fact_case("运维项目A", "1200000", 1)])
+
+    monkeypatch.setattr(vl_fallback, "rescue", rescue)
+    first, _ = scoring._maybe_vl_rescue(
+        1, 2, criterion, scoring._material_review_pending(criterion, pages, "核对业绩"),
+        None, inputs, vl_fallback.Budget(),
+    )
+    source = first.pages[0]
+    checkpoint = {"visual_fallback_note": first.raw["visual_fallback_note"],
+                  "visual_evidence": [{**first.evidence[0], "sha256": source["sha256"],
+                                       "image_sha256": source["image_sha256"]}]}
+    result, _ = scoring._maybe_vl_rescue(
+        1, 2, criterion, scoring._material_review_pending(criterion, pages, "核对业绩"),
+        None, inputs, vl_fallback.Budget(), inventory_factory=lambda _: _empty_inv(), checkpoint=checkpoint,
+    )
+    assert result.score == Decimal(1)
+    assert result.raw["visual_fallback"]["reason"] == "checkpoint_rescored"
+    assert len(calls) == 1
 
 
 def test_vision_gateway_timeout_passed(monkeypatch) -> None:  # noqa: ANN001

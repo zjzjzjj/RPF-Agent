@@ -17,7 +17,7 @@ from app.engine.material_inventory import (
     CertRecord, ContractRecord, MaterialInventory, PersonRecord,
 )
 from app.engine.objective import (
-    date_gate_state, date_window_from_rule, normalize_cert, type_gate_state,
+    date_gate_state, date_window_from_rule, documented_project_type_state, normalize_cert,
 )
 from app.rules.check_infer import infer_count_params, infer_objective_route
 
@@ -345,8 +345,7 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
                 f"{record.name}（签订时间 {record.signed_date} 不在细则时间窗内）")
             date_dropped += 1
             continue
-        t_state = type_gate_state(
-            f"{record.name or ''} {record.project_type or ''}", text)
+        t_state = documented_project_type_state(record.project_type, record.name, text)
         if t_state is False:
             rejected.append(f"{record.name}（明确非细则要求类型，按类型门槛剔除）")
             type_dropped += 1

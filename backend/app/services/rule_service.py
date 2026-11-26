@@ -19,6 +19,7 @@ from app.db.models import (
     CriterionCheck,
     CriterionLevel,
     DocNode,
+    Document,
     EvidenceCitation,
     PackageValidation,
     PriceFormula,
@@ -843,6 +844,84 @@ def _auto_settle_blocking(package_id: int, actor: str) -> None:
             )
 
 
+def _repair_explicit_count_allocations(s: Session, package: RulePackage,
+                                       active: list[Criterion], actor: str) -> int:
+    """从原评分表恢复可逐字定位的子项分值，仅处理可编辑的规则包。"""
+    from app.rules.check_infer import extract_tender_submission_date
+    from app.rules.model import ExtractedCriterion
+    from app.rules.reconcile import reconcile_explicit_count_allocations
+    from app.rules.scoring_skeleton import extract_score_skeleton
+
+    source = s.get(Document, package.source_document_id) if package.source_document_id else None
+    if source is None or not str(source.stored_path).lower().endswith(".pdf"):
+        return 0
+    eligible = [
+        c for c in active if c.origin == "document" and not c.is_veto
+        and c.category in ("commercial", "technical") and c.score_type in ("match", "count", "subjective")
+        and c.source_page and c.source_quote and len(c.name) <= 200
+    ]
+    if len(eligible) < 2:
+        return 0
+    tender_pages = compiler._load_tender_pages(source.id)
+    skeleton = extract_score_skeleton(source.stored_path, tender_pages)
+    if skeleton is None:
+        return 0
+
+    checks_by_id: dict[int, list[CriterionCheck]] = {}
+    for check in s.scalars(select(CriterionCheck).where(
+            CriterionCheck.criterion_id.in_([c.id for c in eligible]))):
+        checks_by_id.setdefault(check.criterion_id, []).append(check)
+    extracted = [
+        ExtractedCriterion(
+            code=c.code, name=c.name, category=c.category, score_type=c.score_type,
+            max_score=c.max_score, description=c.description, required_evidence=c.required_evidence,
+            quote=c.source_quote, page_hint=c.source_page,
+            params=(checks_by_id[c.id][0].params_json or {}) if checks_by_id.get(c.id) else {},
+        )
+        for c in eligible
+    ]
+    repaired = 0
+    reason = "按招标评分表原文校正独立子项的满分和计数规则"
+    fields = ("max_score", "score_type", "description", "required_evidence")
+    submission_date = extract_tender_submission_date(tender_pages)
+    for group in reconcile_explicit_count_allocations(extracted, skeleton.rows, submission_date=submission_date):
+        indexes = [part["criterion_index"] for part in group["allocations"]]
+        if any(len(checks_by_id.get(eligible[i].id, [])) > 1 or any(
+            edit.get("field") in (*fields, "source_quote")
+            for edit in (eligible[i].edit_json or {}).get("edits", [])
+        ) for i in indexes):
+            continue
+        for i in indexes:
+            criterion, corrected = eligible[i], extracted[i]
+            before = {field: getattr(criterion, field) for field in fields}
+            after = {field: getattr(corrected, field) for field in fields}
+            checks = checks_by_id.get(criterion.id, [])
+            check = checks[0] if checks else None
+            old_check = ({"check_type": check.check_type, "field": check.field,
+                          "params": check.params_json} if check else None)
+            new_check = {"check_type": corrected.check_type, "field": corrected.params.get("field"),
+                         "params": corrected.params}
+            if before == after and old_check == new_check:
+                continue
+            for field, value in after.items():
+                setattr(criterion, field, value)
+            if check is None:
+                check = CriterionCheck(criterion_id=criterion.id, on_fail="need_human",
+                                       source_quote=criterion.source_quote)
+                s.add(check)
+            check.check_type = corrected.check_type
+            check.field = corrected.params.get("field")
+            check.params_json = corrected.params
+            s.add(ReviewRecord(
+                subject_type="criterion", subject_id=str(criterion.id), action="edit",
+                actor=actor, reason=reason,
+                old_value_json={**before, "max_score": str(before["max_score"]), "check": old_check},
+                new_value_json={**after, "max_score": str(after["max_score"]), "check": new_check},
+            ))
+            repaired += 1
+    return repaired
+
+
 def normalize_package(package_id: int, actor: str = "auto") -> dict[str, int]:
     """确定性自愈草稿包（幂等）。只改数据，不改 status（状态由 auto-settle/人工处置）。
 
@@ -865,6 +944,7 @@ def normalize_package(package_id: int, actor: str = "auto") -> dict[str, int]:
         "levels_dropped": 0,
         "price_repaired": 0,
         "count_repaired": 0,
+        "count_allocations_repaired": 0,
         "veto_normalized": 0,
         "veto_consequence_filled": 0,
         "match_scored_fixed": 0,
@@ -892,6 +972,9 @@ def normalize_package(package_id: int, actor: str = "auto") -> dict[str, int]:
             select(Criterion).where(Criterion.package_id == package_id)
         ).scalars().all()
         active = [c for c in crits if c.status != "retired"]
+
+        if config.scoring_skeleton_enabled():
+            stats["count_allocations_repaired"] = _repair_explicit_count_allocations(s, pkg, active, actor)
 
         def record(c: Criterion, reason: str) -> None:
             s.add(

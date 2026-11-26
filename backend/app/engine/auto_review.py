@@ -797,11 +797,11 @@ def _validate_fact_sources(decision: AutoReviewDecision, criterion: dict | None 
             if isinstance(references, list):
                 references = {"evidence": references}
             if not isinstance(references, dict) or not _has_fact_source(references, decision.evidence):
-                raise LLMError(f"证书 {cert} 缺少逐本原页证据")
+                raise EvidenceBindingError(f"证书 {cert} 缺少逐本原页证据")
 
     def check_performance_amounts() -> None:
         if not decision.facts.get("verified_cases"):
-            raise LLMError("业绩金额列表缺少逐案例证明材料核验")
+            raise EvidenceBindingError("业绩金额列表缺少逐案例证明材料核验")
 
     def check_scalar(field: str, fact_refs, is_yearly: bool) -> None:
         prov = (decision.facts.get("_fact_provenance") or {}).get(field) or {}
@@ -813,7 +813,8 @@ def _validate_fact_sources(decision: AutoReviewDecision, criterion: dict | None 
         if isinstance(references, list):
             references = {"evidence": references}
         if not isinstance(references, dict) or not _has_fact_source(references, decision.evidence):
-            raise LLMError(f"事实 {field} 缺少对应原页证据，不能只凭模型数值计分")
+            error_type = EvidenceBindingError if field == "cert_section_present" else LLMError
+            raise error_type(f"事实 {field} 缺少对应原页证据，不能只凭模型数值计分")
         if field in ("bid_price", "price_items_total", "registered_capital", "response_hours", "warranty_months") or is_yearly:
             try:
                 value = Decimal(str(decision.facts[field]))
@@ -1115,6 +1116,10 @@ def _source_material(pages: list[dict]) -> tuple[list[dict], dict[str, dict]]:
     return material, sources
 
 
+class EvidenceBindingError(LLMError):
+    """The model supplied a reference that cannot be used as original-page evidence."""
+
+
 def _source_id_feedback(path: str, reference_path: str, reference, reason: str, *,
                         source: dict | None = None, candidates: list[str] | None = None,
                         action: str | None = None) -> str:
@@ -1189,7 +1194,7 @@ def _resolve_source_ids(value, sources: dict[str, dict], *, _path: str = "$"):
             if result.get("kind") == "visual":
                 action = ("不得生成或改写ID；初评没有可用visual ID时，须基于实际送入页图返回kind=visual、document_id、page_no和observation，"
                           "不填source_id/evidence_id；综合时只选已核验visual证据的evidence_id，不得改写归属。")
-            raise LLMError(_source_id_feedback(reference_path, reference_path, reference, reason,
+            raise EvidenceBindingError(_source_id_feedback(reference_path, reference_path, reference, reason,
                                               candidates=candidates, action=action))
         source = next(iter(unique.values()))
     for key in ("document_id", "page_no", "kind"):
@@ -1198,16 +1203,16 @@ def _resolve_source_ids(value, sources: dict[str, dict], *, _path: str = "$"):
             if result.get("kind") == "visual" and source.get("kind") == "text":
                 action = ("文本ID不能充当视觉证据；初评须基于实际送入页图返回kind=visual、document_id、page_no和observation，"
                           "不填文本source_id/evidence_id；综合时仅引用已核验visual证据的evidence_id，不得自动改kind或页码。")
-            raise LLMError(_source_id_feedback(field_path(key), reference_path, reference,
+            raise EvidenceBindingError(_source_id_feedback(field_path(key), reference_path, reference,
                                               "证据引用 ID 与文件或页码不一致", source=source, action=action))
     if source.get("kind") == "visual":
         if result.get("observation") and result["observation"] != source.get("observation"):
-            raise LLMError(_source_id_feedback(field_path("observation"), reference_path, reference,
+            raise EvidenceBindingError(_source_id_feedback(field_path("observation"), reference_path, reference,
                                               "综合复评改写了未经原批次核验的视觉观察", source=source))
     elif result.get("quote"):
         quote = _original_quote(str(result["quote"]), str(source.get("quote") or ""))
         if quote is None:
-            raise LLMError(_source_id_feedback(field_path("quote"), reference_path, reference,
+            raise EvidenceBindingError(_source_id_feedback(field_path("quote"), reference_path, reference,
                                               "引文与绑定原文 ID 不匹配", source=source))
         source = {**source, "quote": quote}
     return {**result, **source}
@@ -1484,6 +1489,7 @@ def _call(gateway: Gateway, criterion: dict, pages: list[dict], *, data_class: s
                 raise LLMError("签章综合结论缺少已核验视觉证据，须从verified_visual_evidence_ids逐字选用原ID；"
                                "可用示例：" + json.dumps(required_visual_ids[:8], ensure_ascii=False))
             if (summaries is not None and not collection_only and decision.missing_evidence
+                    and not criterion.get("_allow_material_recovery")
                     and not (external and decision.verdict == "unverifiable"
                              and not _has_reading_obligation(decision.missing_evidence))
                     and not (price_limit and decision.verdict == "fail" and decision.confirmed_absent
@@ -2317,6 +2323,7 @@ def _finish_decision(decision: AutoReviewDecision, criterion: dict, pages: list[
     """One finality contract for V1 and the shared-collection V2 executor."""
     criterion = resolve_price_limit_requirement(criterion)
     direct_subjective = bool(criterion.get("_subjective_direct"))
+    material_recovery = bool(criterion.get("_allow_material_recovery"))
     decision.reviewed_pages = [{"document_id": p["document_id"], "page_no": p["page_no"]}
                                for p in selected]
     decision.coverage_complete = full and all(_readable(p, use_vision) for p in selected)
@@ -2353,9 +2360,9 @@ def _finish_decision(decision: AutoReviewDecision, criterion: dict, pages: list[
     elif not direct_subjective:
         if decision.confirmed_absent and not decision.coverage_complete:
             raise LLMError("材料缺失结论未覆盖全部可读原页，需补做 OCR 或视觉核验")
-        if not decision.confirmed_absent and not decision.evidence:
+        if not material_recovery and not decision.confirmed_absent and not decision.evidence:
             raise LLMError("自动评审结论没有可核验的原页证据")
-        if not decision.confirmed_absent and not [
+        if not material_recovery and not decision.confirmed_absent and not [
             e for e in decision.evidence if not e.get("engine_supplied")
         ]:
             # 确定性供给证据只服务事实计分，不能给空口结论洗白（ADR 0015）

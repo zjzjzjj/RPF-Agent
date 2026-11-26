@@ -10,13 +10,20 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
 
+import pytest
+
+from app.engine.facts import BidFacts
+from app.engine.objective import score_count
+from app.rules.check_infer import extract_tender_submission_date
 from app.rules.model import ExtractedCriterion
 from app.rules.reconcile import (
     _fragment_probes,
     _union_coverage,
+    reconcile_explicit_count_allocations,
     reconcile_with_skeleton,
 )
 from app.rules.scoring_skeleton import ScoreSkeleton, SkeletonRow, parse_skeleton
@@ -29,6 +36,152 @@ ISO_QUOTES = [
     "具有ISO20000 信息技术服务管理体系认证得1 分；",
     "具有ISO9000 质量管理体系认证得1 分。",
 ]
+ISO_ALLOCATION = (
+    "投标人具有有效期内的ISO9001 质量管理体系认证、ISO27001信息安全管理体系认证、"
+    "ISO20000 信息技术服务管理体系认证证书的，每项得1 分。最高得3 分。"
+)
+CMMI_ALLOCATION = "具有有效期内CMMI 认证二级或CSMM 认证二级及以上得2 分。"
+SHARED_PROOF = (
+    "以上资质均提供有效证书复印件并加盖公章，其中管理体系认证还需提供全国认证认可"
+    "信息公共服务平台http://cx.cnca.cn/查询结果截图并加盖公章，未按要求提供不得分。"
+)
+
+
+def _certificate_allocations() -> tuple[SkeletonRow, list[ExtractedCriterion]]:
+    row = SkeletonRow(
+        group="投标人认证及资质情况", group_total=None, sub_idx=None,
+        subjectivity="objective", max_score=Decimal(5), page_no=95,
+        text=f"{ISO_ALLOCATION}\n{CMMI_ALLOCATION}\n【证明材料】{SHARED_PROOF}",
+    )
+    children = [
+        ExtractedCriterion(
+            code="c44", name=f"{row.group}—管理体系认证", category="commercial",
+            score_type="count", max_score=Decimal(5), quote=ISO_ALLOCATION, page_hint=95,
+            description=f"{ISO_ALLOCATION}\n【证明材料】{SHARED_PROOF}",
+            params={"field": "certificates", "per_item": "1", "max_items": "3"},
+        ),
+        ExtractedCriterion(
+            code="c45", name=f"{row.group}—CMMI/CSMM 认证", category="commercial",
+            score_type="match", max_score=Decimal(2), quote=CMMI_ALLOCATION, page_hint=95,
+            description=f"{CMMI_ALLOCATION}\n【证明材料】{SHARED_PROOF}",
+            check_type="human_only", params={"field": "certificates", "engine": "count_tier"},
+        ),
+    ]
+    return row, children
+
+
+@pytest.mark.parametrize("iso_maximum", [Decimal(3), Decimal(5)])
+def test_count_allocations_keep_explicit_child_maxima(iso_maximum: Decimal) -> None:
+    row, children = _certificate_allocations()
+    children[0].max_score = iso_maximum
+    performance = SkeletonRow(
+        group="业绩", group_total=None, sub_idx=None, subjectivity="objective",
+        max_score=Decimal(4), text="每提供一个类似项目案例得2分，最高得4分。", page_no=95,
+    )
+    out, report = reconcile_with_skeleton(
+        [ExtractedCriterion(
+            code="c43", name=performance.group, category="commercial", score_type="count",
+            max_score=performance.max_score, quote=performance.text, page_hint=95,
+        ), *children],
+        document_id=1, pages=[
+            (5, "五、投标文件的递交\n递交截止时间：2025 年11 月19 日09 时30 分00 秒"),
+            (95, f"1、商务部分（9分）\n{performance.text}\n{row.text}"),
+        ],
+        skeleton=ScoreSkeleton(rows=[performance, row]),
+    )
+
+    assert [(item.code, item.max_score) for item in out] == [
+        ("c43", Decimal(4)), ("c44", Decimal(3)), ("c45", Decimal(2)),
+    ]
+    assert report["final_sum"] == 9.0
+    assert report["generated"] == []
+    assert report["explicit_count_allocations"][0]["sum"] == 5.0
+    assert report["multi_covered_rows"] == []
+    assert out[1].params["field"] == "certificates"
+    assert "查询结果截图" in (out[1].required_evidence or "")
+    cmmi = out[2]
+    assert cmmi.score_type == "count"
+    assert cmmi.check_type == "count_at_least"
+    assert cmmi.params == {
+        "field": "cmmi", "per_item": "2", "max_items": "1", "_objective_form": "existence",
+        "cert_min_level": 2, "cert_require_current": True, "cert_reference_date": "2025-11-19",
+    }
+    assert "盖公章" in (cmmi.required_evidence or "")
+    assert "截图" not in (cmmi.description or "") + (cmmi.required_evidence or "")
+
+
+@pytest.mark.parametrize("reason", ["missing", "wrong_sum", "duplicate", "full_row", "ambiguous", "alternative"])
+def test_count_allocations_require_disjoint_complete_source(reason: str) -> None:
+    row, children = _certificate_allocations()
+    rows = [row]
+    if reason == "missing":
+        children.pop()
+    elif reason == "wrong_sum":
+        row.max_score = Decimal(6)
+    elif reason == "duplicate":
+        children.append(children[0].model_copy())
+    elif reason == "full_row":
+        children[0].quote = f"{ISO_ALLOCATION}{CMMI_ALLOCATION}"
+    elif reason == "alternative":
+        children[1].quote = f"或者{CMMI_ALLOCATION}"
+        row.text = row.text.replace(f"。\n{CMMI_ALLOCATION}", f"，{children[1].quote}")
+    else:
+        rows.append(replace(row, group="另一评分行"))
+    before = [item.model_dump() for item in children]
+
+    assert reconcile_explicit_count_allocations(children, rows) == []
+    assert [item.model_dump() for item in children] == before
+
+
+@pytest.mark.parametrize(("text", "expected"), [
+    ("递交截止时间：2025 年11 月19 日09 时30 分00 秒", "2025-11-19"),
+    ("投标截止时间：2025-11-19，投标截止日期为2025年11月19日", "2025-11-19"),
+    ("投标截止时间：2025-11-19，递交截止日期为2025年11月20日", None),
+    ("开标时间：2025-11-19。投标截止时间详见前附表", None),
+    ("投标截止时间：2025年2月30日", None),
+])
+def test_extract_tender_submission_date(text: str, expected: str | None) -> None:
+    assert extract_tender_submission_date([(5, text)]) == expected
+
+
+@pytest.mark.parametrize(("evidence", "score", "unresolved"), [
+    ({"name": "CSMM", "backing": True, "cert_level": "二级", "valid_until": "2025年11月19日"}, 2, None),
+    ({"name": "CMMI", "backing": True, "cert_level": "Maturity Level 5", "valid_until": "2026-01-01"}, 2, None),
+    ({"name": "CMMI", "backing": True, "cert_level": "一级", "valid_until": "2027-01-01"}, 0, None),
+    ({"name": "CSMM", "backing": True, "cert_level": "三级", "valid_until": "2025-11-18"}, 0, None),
+    ({"name": "CSMM", "backing": True, "cert_level": "三级", "valid_until": "2027-01-01",
+      "valid_from": "2025-11-20"}, 0, None),
+    ({"name": "CSMM", "backing": True, "cert_level": "三级"}, 0, "certificate_unverified"),
+    ({"name": "CSMM", "backing": True, "valid_until": "2027-01-01"}, 0, "certificate_unverified"),
+    ({"name": "CSMM", "cert_level": "三级", "valid_until": "2027-01-01"}, 0, "certificate_unverified"),
+    ({"name": "ISO9001", "backing": True, "cert_level": "三级", "valid_until": "2027-01-01"},
+     0, "certificate_unverified"),
+    (None, 0, "certificate_unverified"),
+])
+def test_maturity_certificate_scoring(evidence: dict | None, score: int, unresolved: str | None) -> None:
+    row, children = _certificate_allocations()
+    reconcile_explicit_count_allocations(children, [row], submission_date="2025-11-19")
+    criterion = {"max_score": children[1].max_score, "certificate_details": [evidence] if evidence else []}
+    facts = BidFacts(text="", cert_claims=["CMMI 五级"])
+
+    result = score_count(criterion, children[1].params, facts)
+
+    assert result.score == Decimal(score)
+    assert result.unresolved == unresolved
+
+
+def test_maturity_certificate_does_not_assume_reference_date() -> None:
+    row, children = _certificate_allocations()
+    reconcile_explicit_count_allocations(children, [row])
+    criterion = {"max_score": children[1].max_score, "certificate_details": [
+        {"name": "CMMI", "backing": True, "cert_level": "三级", "valid_until": "2027-01-01"},
+    ]}
+
+    result = score_count(criterion, children[1].params, BidFacts(text=""))
+
+    assert result.score == 0
+    assert result.unresolved == "certificate_unverified"
+    assert "投标截止日" in result.detail
 
 
 def _yitihua_skeleton_and_pages():

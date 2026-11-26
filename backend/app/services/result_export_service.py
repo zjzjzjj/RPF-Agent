@@ -10,7 +10,7 @@ from sqlalchemy import select
 from app.db.models import EvaluationRun, ScoreRecord
 from app.db.session import session_scope
 from app.errors import NotFound, ValidationFailed
-from app.services.automation_service import completed_keys, progress
+from app.services.automation_service import completed_keys, material_review_pending, progress
 
 
 def _text(value) -> str:
@@ -35,15 +35,17 @@ def export_results_csv(run_id: int) -> str:
         output = io.StringIO(newline="")
         writer = csv.writer(output)
         writer.writerow(["评分运行", run_id, "运行状态", run.status, "已评分项", state["completed"],
-                         "故障项", state["failed"], "未执行项", state["remaining"] - state["failed"]])
-        writer.writerow(["说明", "合计仅包含有效完成的计分项；故障和未执行项留空。评分覆盖率不同的合计为已评分小计。"])
+                         "材料待核验", state["material_pending"], "故障项", state["failed"],
+                         "未执行项", state["remaining"] - state["failed"] - state["material_pending"]])
+        writer.writerow(["说明", "合计为已评分小计。待处理条目的详情见下表。"])
         writer.writerow([])
         writer.writerow(["投标人", "已评分小计", "已定分项", "应计分项", "评分覆盖率", "故障项"])
         for bidder in manifest["bidders"]:
             bid = int(bidder["id"])
             scoring = [c for c in manifest["criteria"] if c["score_type"] not in ("veto", "match")
                        and (c.get("params") or {}).get("in_total") is not False]
-            scores = [records[bid, int(c["id"])].final_score for c in scoring if (bid, int(c["id"])) in valid]
+            scores = [records[bid, int(c["id"])].final_score for c in scoring
+                      if (bid, int(c["id"])) in valid and records[bid, int(c["id"])].final_score is not None]
             failed = sum(((records.get((bid, int(c["id"]))).ai_raw_json or {}).get("auto_review") or {}).get("state") == "failed"
                          for c in manifest["criteria"] if (bid, int(c["id"])) in records)
             writer.writerow([_text(bidder["name"]), str(sum(scores, Decimal(0))) if scores else "",
@@ -60,8 +62,13 @@ def export_results_csv(run_id: int) -> str:
                 key = (int(bidder["id"]), int(criterion["id"]))
                 row = records.get(key)
                 meta = ((row.ai_raw_json or {}).get("auto_review") or {}) if row else {}
-                completed = key in valid
-                status = "已完成" if completed else "故障跳过" if meta.get("state") == "failed" and state["failure_policy"] == "continue" else "执行失败" if meta.get("state") == "failed" else "未完成"
+                pending_material = material_review_pending(row)
+                completed = key in valid and not pending_material
+                status = (
+                    "材料待核验" if pending_material else "已完成" if completed
+                    else "故障跳过" if meta.get("state") == "failed" and state["failure_policy"] == "continue"
+                    else "执行失败" if meta.get("state") == "failed" else "未完成"
+                )
                 light_payload = meta.get("lightweight") if isinstance(meta.get("lightweight"), dict) else {}
                 if meta.get("basis") == "lightweight":
                     labels = light_verdicts_v3 if light_payload.get("schema_version") == 3 else light_verdicts
@@ -70,5 +77,6 @@ def export_results_csv(run_id: int) -> str:
                 writer.writerow([_text(bidder["name"]), _text(criterion.get("code")), _text(criterion.get("name")),
                                  criterion.get("max_score"), str(row.final_score) if completed and row.final_score is not None else "",
                                  labels.get(row.machine_status, row.machine_status) if completed else "", status,
-                                 _text((row.ai_reasoning if completed else meta.get("error")) if row else "尚未执行")])
+                                 _text((row.ai_reasoning if completed or pending_material else meta.get("error"))
+                                       if row else "尚未执行")])
         return "\ufeff" + output.getvalue()

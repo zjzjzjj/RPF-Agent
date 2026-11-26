@@ -10,6 +10,137 @@ from __future__ import annotations
 
 from decimal import Decimal
 
+import pytest
+
+
+def _maturity_pages(appraisal_id: str = "64122", document_id: int = 1) -> list[dict]:
+    return [
+        {"document_id": 1, "page_no": 67, "text": (
+            "CMMI 证书\nExample bidder Ltd. has been appraised at CMMI Maturity Level 3.\n"
+            "Appraisal ID: # 64122"
+        )},
+        {"document_id": document_id, "page_no": 69, "text": (
+            "CMMI Appraisals\nTotal Appraisals in PARS: 14154\nExample bidder Ltd.\n"
+            f"ID: {appraisal_id}\nAppraisal Validity\n2023/03/24 - 2026/03/24"
+        )},
+    ]
+
+
+def test_maturity_certificate_links_matching_published_appraisal_validity() -> None:
+    from app.engine.material_inventory import maturity_certificate_details
+
+    details = maturity_certificate_details(_maturity_pages())
+
+    assert len(details) == 1
+    assert details[0]["page_no"] == 67
+    assert details[0]["appraisal_lookup_pages"] == [69]
+    assert details[0]["cert_level"] == "3"
+    assert details[0]["valid_from"] == "2023-03-24"
+    assert details[0]["valid_until"] == "2026-03-24"
+
+
+def test_published_appraisal_accepts_ocr_label_variants() -> None:
+    from app.engine.material_inventory import maturity_certificate_details
+
+    pages = _maturity_pages()
+    pages[0]["text"] = (pages[0]["text"].replace("Appraisal ID", "Appralsal ID")
+                        .replace("has been appraised at", "hasbeenappraisedat"))
+    pages[1]["text"] = pages[1]["text"].replace("Appraisal Validity", "Appralisal Validity")
+
+    assert maturity_certificate_details(pages)[0]["valid_until"] == "2026-03-24"
+
+
+@pytest.mark.parametrize(("appraisal_id", "document_id"), [("64123", 1), ("64122", 2), ("64122A", 1)])
+def test_maturity_certificate_needs_exact_appraisal_source(appraisal_id: str, document_id: int) -> None:
+    from app.engine.material_inventory import maturity_certificate_details
+
+    assert maturity_certificate_details(_maturity_pages(appraisal_id, document_id))[0]["valid_until"] is None
+
+
+def test_maturity_lookup_alone_does_not_count_as_certificate() -> None:
+    from app.engine.material_inventory import maturity_certificate_details
+
+    assert maturity_certificate_details(_maturity_pages()[1:]) == []
+
+
+def test_conflicting_published_appraisal_periods_are_not_combined() -> None:
+    from app.engine.material_inventory import maturity_certificate_details
+
+    pages = _maturity_pages()
+    pages.append({**pages[-1], "page_no": 70, "text": pages[-1]["text"].replace("2026/03/24", "2027/03/24")})
+
+    assert maturity_certificate_details(pages)[0]["valid_until"] is None
+
+
+def test_maturity_certificate_reads_english_validity_period() -> None:
+    from app.engine.material_inventory import maturity_certificate_details
+
+    pages = _maturity_pages()[:1]
+    pages[0]["text"] += "\nValid from March 24, 2023 to March 24, 2026"
+
+    details = maturity_certificate_details(pages)
+
+    assert details[0]["valid_from"] == "2023-03-24"
+    assert details[0]["valid_until"] == "2026-03-24"
+
+
+@pytest.mark.parametrize(("document_id", "page_no", "text", "appraisal_id", "valid_until"), [
+    (68, 94, "2.7.4 CMMI 三级认证证书\nExample bidder Ltd.\n"
+     "has been successfully appraised at\nCMMI Maturity Level 5\n"
+     "of the Capability Maturity Model Integration for Development\n"
+     "Expiration Date Apr 04, 2026\nLead Appraiser ID #0500528-01", None, "2026-04-04"),
+    (68, 94, "94\nExample bidder Ltd.\nhasbeensuccessfullyappraisedat\nCMMIMaturityLevel5\n"
+     "of the Capability Maturity Model Integration for Development\n"
+     "ExpirationDateApr04,2026\nLeadAppraiserID#0500528-01", None, "2026-04-04"),
+    (69, 107, "2.7.4 CMMI 认证二级证书\nExample bidder Ltd.\n"
+     "A Benchmark Appraisal # 71680 was conducted\nat Maturity Level 5\n"
+     "This certificate is valid from July 26, 2024 to July 26, 2027.", "71680", "2027-07-26"),
+    (69, 107, "107\nExample bidder Ltd.\nABenchmarkAppraisal#71680 was conducted\n"
+     "CMMIMaturityLevel5\nThiscertificateisvalidfromJuly26,2024toJuly26,2027.", "71680", "2027-07-26"),
+])
+def test_maturity_certificate_reads_run166_shapes(
+        document_id: int, page_no: int, text: str, appraisal_id: str | None, valid_until: str,
+) -> None:
+    from app.engine.facts import BidFacts
+    from app.engine.material_inventory import maturity_certificate_details
+    from app.engine.objective import score_count
+
+    unrelated_lookup = {**_maturity_pages()[1], "document_id": document_id}
+    assert maturity_certificate_details([unrelated_lookup]) == []
+    details = maturity_certificate_details([
+        {"document_id": document_id, "page_no": page_no, "text": text}, unrelated_lookup,
+    ])
+
+    assert len(details) == 1
+    assert details[0]["page_no"] == page_no
+    assert details[0]["cert_level"] == "5"
+    assert details[0]["valid_until"] == valid_until
+    assert details[0]["appraisal_id"] == appraisal_id
+    assert "appraisal_lookup_pages" not in details[0]
+    result = score_count({"max_score": "2", "certificate_details": details}, {
+        "field": "cmmi", "per_item": "2", "cert_min_level": 2,
+        "cert_require_current": True, "cert_reference_date": "2025-11-19",
+    }, BidFacts(text=""))
+    assert result.score == Decimal(2)
+    assert result.unresolved is None
+
+
+def test_maturity_certificate_uses_printed_level_and_expiry_on_physical_page() -> None:
+    from app.engine.material_inventory import maturity_certificate_details
+
+    details = maturity_certificate_details([{
+        "document_id": 72, "page_no": 100,
+        "text": ("2.7.4.\nCMMI 认证三级证书\nCERTIFICATE OF ACHIEVEMENT\nExample bidder Ltd.\n"
+                 "The Organization Unit has been appraised at\nCMMI\nDEV|ML3\nAPPRAISED\n"
+                 "Appraisal 63812\n|Exp.Mar 10,2026\nhttps://cmmiinstitute.com/pars/appraisals/63812\n-99-"),
+    }])
+
+    assert len(details) == 1
+    assert details[0]["page_no"] == 100
+    assert details[0]["cert_level"] == "3"
+    assert details[0]["valid_until"] == "2026-03-10"
+    assert details[0]["appraisal_id"] == "63812"
+
 
 # ---- ②截图盲态：OCR 噪声截图页 ≠ 确认无 ---------------------------------
 

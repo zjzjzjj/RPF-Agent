@@ -43,15 +43,15 @@
 
 {% if status == "partial" %}
 <div class="draft">
-  <h2>评审结果汇总（含故障跳过项）</h2>
-  <p>本次评审已结束：有效完成 {{ run.automation.completed }} 项，故障跳过 {{ run.automation.skipped }} 项。</p>
-  <p>合计仅包含有效完成的评分项；故障项得分留空，原因逐项列于报告。各家的评分覆盖率可能不同，合计为已评分小计。</p>
+  <h2>{{ status_label }}</h2>
+  <p>已完成 {{ run.automation.completed }} 项{% if run.automation.material_pending %}，{{ run.automation.material_pending }} 项材料待核验{% endif %}{% if run.automation.skipped %}，故障跳过 {{ run.automation.skipped }} 项{% endif %}。</p>
+  <p>合计为已评分小计，待处理条目的详情见疑问清单。</p>
 </div>
 {% elif status == "draft" %}
 <div class="draft">
   <h2>⚠ 本报告为草稿，不得作为最终评审结论</h2>
   {% if run.automation %}
-  <p>自动评审已完成 {{ progress.settled }}/{{ progress.total }} 项，尚有 {{ progress.open }} 项未完成。技术故障恢复后继续自动评审。</p>
+  <p>自动评审已完成 {{ progress.settled }}/{{ progress.total }} 项，尚有 {{ progress.open }} 项未完成。待处理条目的详情见疑问清单。</p>
   <p>下表仅展示已完成结果，不发布最终排名。全部应评项完成后才能生成正式报告。</p>
   {% else %}
   <p>尚有 <b>{{ progress.open }}</b> 项评分未经人工处置，其中 <b>{{ progress.blocking }}</b> 项为需优先裁决事项
@@ -157,7 +157,13 @@
           {% if item.auto_completed and item.auto_review.basis == "external" %}<div class="muted">外部事实证据边界：现有材料无法证实该事实，已作为最终结论记录。</div>{% endif %}
           {% if item.auto_completed and item.auto_review.basis == "deterministic" %}<div class="muted">依据已留存事实与冻结规则完成程序计算。</div>{% endif %}
           {% for v in item.auto_review.visual_evidence or [] %}<div class="quote">页图证据：文件 #{{ v.document_id }} 第 {{ v.page_no }} 页：{{ v.observation }}</div>{% endfor %}
-          {% if item.auto_review.error %}<div class="bad tag">技术故障：{{ item.auto_review.error }}</div>{% endif %}
+          {% if item.auto_review.material_review_pending %}
+            {% set review = item.auto_review.material_review_pending %}
+            <div class="warn tag">材料待核验</div>
+            {% if review.required_materials %}<div>待核对 {{ review.required_materials | join("、") }}</div>{% endif %}
+            {% if review.value is defined and review.value is not none %}<div>已核实小计 {{ review.value }} 分</div>{% endif %}
+            {% for page in review.candidate_pages or [] %}<div class="muted">候选原页 文件 #{{ page.document_id }} 第 {{ page.page_no }} 页</div>{% endfor %}
+          {% elif item.auto_review.error %}<div class="bad tag">技术故障：{{ item.auto_review.error }}</div>{% endif %}
         {% endif %}
       {% elif not item.is_veto and not item.citations %}
         <div class="muted">无证据引用——该项分值须人工补录证据或降级处理。</div>

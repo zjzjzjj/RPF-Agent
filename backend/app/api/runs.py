@@ -73,6 +73,7 @@ class MatrixCell(BaseModel):
     veto_flag: bool
     machine_status: str | None
     auto_review_basis: str | None = None
+    auto_review_fallback_kind: str | None = None
     # 轻量 payload 的 schema_version（3=二值化否决点筛查；1/2=旧三态显示口径）
     lightweight_schema_version: int | None = None
 
@@ -273,6 +274,7 @@ def run_matrix(run_id: int) -> dict:
                 "category": crit.category, "score_type": crit.score_type,
                 "max_score": str(crit.max_score) if crit.max_score is not None else None,
             }
+        auto_review = (score.ai_raw_json or {}).get("auto_review") or {}
         cells.setdefault(bidder.id, {})[crit.id] = MatrixCell(
             score_record_id=score.id,
             criterion_code=meta["code"] or crit.code,
@@ -286,7 +288,8 @@ def run_matrix(run_id: int) -> dict:
             evidence_status=score.evidence_status,
             veto_flag=score.veto_flag,
             machine_status=score.machine_status,
-            auto_review_basis=(score.ai_raw_json or {}).get("auto_review", {}).get("basis"),
+            auto_review_basis=auto_review.get("basis"),
+            auto_review_fallback_kind=(auto_review.get("fallback") or {}).get("kind"),
             lightweight_schema_version=_light_schema_version(score),
         )
     return {

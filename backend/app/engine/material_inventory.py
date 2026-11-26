@@ -44,6 +44,7 @@ class ContractRecord:
     # social_security/cert_proof），只升不降（VL True 可翻案）
     person_names: list[str] = field(default_factory=list)
     person_states: dict[str, bool | None] = field(default_factory=dict)
+    person_proofs: dict[str, dict[str, bool]] = field(default_factory=dict)
     amount_corrected: bool = False   # 金额伪迹补正留痕（文本<1000 且 VL≥1000）
     source: str = "text"
 
@@ -56,6 +57,11 @@ class CertRecord:
     valid_until: str | None = None
     pages: list[int] = field(default_factory=list)
     backing: bool | None = None
+    valid_from: str | None = None
+    certificate_number: str | None = None
+    appraisal_id: str | None = None
+    appraisal_is_lookup: bool = False
+    document_id: int | None = None
 
 
 @dataclass
@@ -69,6 +75,8 @@ class PersonRecord:
     experience_pages: list[int] = field(default_factory=list)
     social_security: bool | None = None
     pages: list[int] = field(default_factory=list)
+    social_months: int | None = None
+    social_months_from_register: bool = False
 
 
 @dataclass
@@ -89,6 +97,7 @@ class MaterialInventory:
     value_items: list[ValueItem] = field(default_factory=list)
     cert_section_present: bool = False
     cert_backing: dict[str, bool | None] = field(default_factory=dict)
+    platform_query_certificates: set[str] = field(default_factory=set)
     # PR3（2026-11-24）：目录驱动定位页集（kind→页号）——存在性核验页源；
     # shadow=只审计，on=供护栏/判定消费
     locator_index: dict[str, set[int]] = field(default_factory=dict)
@@ -415,6 +424,209 @@ _RE_SYSTEM_CERT = re.compile(
 _RE_VALID_TO = re.compile(
     r"有效期(?:至|到)[：:]?\s*(20\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日"
 )
+
+_CERT_DATE = r"(20\d{2})\s*[-年./]\s*(\d{1,2})\s*[-月./]\s*(\d{1,2})\s*日?"
+_RE_MATURITY_FAMILY = re.compile(r"(?<![A-Za-z])(?:CMMI|CSMM)(?=\b|Maturity|Apprais|Institute)|能力成熟度", re.I)
+_RE_MATURITY_LEVEL = re.compile(
+    r"(?:maturity\s*level|level|(?<![a-z])ML|成熟度等级?|评估等级|级别)\s*[:：]?\s*([1-5一二三四五ⅠⅡⅢⅣⅤ])(?!\d)"
+    r"|([1-5一二三四五ⅠⅡⅢⅣⅤ])\s*级", re.I)
+_RE_MATURITY_PERIOD = re.compile(_CERT_DATE + r"\s*(?:至|到|~|～|-|—|–|to)\s*" + _CERT_DATE, re.I)
+_RE_MATURITY_EXPIRY = re.compile(
+    r"(?:有效期\s*至|有效\s*至|到期日期|valid\s*(?:until|to|through)|expir\w*\s*(?:date)?)\s*[:：]?\s*"
+    + _CERT_DATE, re.I)
+_RE_MATURITY_FROM = re.compile(
+    r"(?:有效期\s*自|签发日期|发证日期|Date\s+Issued|issued(?:\s+on)?|appraisal\s+date)\s*[:：]?\s*"
+    + _CERT_DATE, re.I)
+_ENGLISH_CERT_DATE = r"[A-Za-z]{3,9}\s*\d{1,2}\s*,?\s*20\d{2}(?!\d)"
+_RE_ENGLISH_MATURITY_PERIOD = re.compile(
+    r"valid\s*from\s*(" + _ENGLISH_CERT_DATE + r")\s*to\s*(" + _ENGLISH_CERT_DATE + r")", re.I,
+)
+_RE_ENGLISH_MATURITY_EXPIRY = re.compile(
+    r"(?:expir(?:ation|y|es)\s*(?:date\s*)?|\bexp\.|valid\s*(?:until|through))\s*[:：]?\s*("
+    + _ENGLISH_CERT_DATE + r")", re.I,
+)
+_APPRAISAL_LABEL = r"Appra(?:i|l|li)sal"  # OCR can read the letter i as l or li.
+_RE_APPRAISAL_ID = re.compile(
+    rf"(?:{_APPRAISAL_LABEL}\s*(?:(?:ID|number|no\.?)\s*[:：]?\s*#?|#)\s*|appraisals/)([0-9]{{3,}})(?![\w-])", re.I,
+)
+_RE_PARS_LOOKUP = re.compile(r"\bPARS\b|Published\s+Appraisal\s+Results|cmmiinstitute\.com/pars", re.I)
+_RE_PARS_ID = re.compile(r"(?<!\w)ID\s*[:：]\s*#?\s*([0-9]{3,})(?![\w-])", re.I)
+_RE_PARS_VALIDITY = re.compile(rf"{_APPRAISAL_LABEL}\s+Validity\s*[:：]?\s*", re.I)
+_RE_MATURITY_PROOF = re.compile(
+    r"has\s*been\s*(?:successfully\s*)?appraised\s*at|certificate\s*of\s*appraisal|"
+    rf"benchmark\s*{_APPRAISAL_LABEL}\s*#\s*[0-9]{{3,}}(?![\w-])|证书编号|评估编号|认证编号|签发日期|发证日期|评估机构|date\s+issued",
+    re.I,
+)
+
+
+def bind_maturity_appraisals(records: list[dict]) -> list[dict]:
+    """Apply a published validity period to the same appraisal on a certificate."""
+    def appraisal_key(record: dict) -> tuple | None:
+        appraisal_id = str(record.get("appraisal_id") or "")
+        document_id = record.get("document_id")
+        if document_id and re.fullmatch(r"[0-9]{3,}", appraisal_id):
+            return document_id, appraisal_id
+        return None
+
+    by_appraisal = {}
+    for record in records:
+        if record.get("appraisal_is_lookup") is not True or not record.get("valid_until"):
+            continue
+        key = appraisal_key(record)
+        if key is not None:
+            by_appraisal.setdefault(key, []).append(record)
+
+    certificates = []
+    for original in records:
+        if original.get("appraisal_is_lookup") is True:
+            continue
+        cert = dict(original)
+        lookups = by_appraisal.get(appraisal_key(cert), [])
+        periods = {(lookup.get("valid_from"), lookup["valid_until"]) for lookup in lookups}
+        if cert.get("backing") is True and len(periods) == 1:
+            start, end = periods.pop()
+            if (cert.get("valid_from") in (None, start) and cert.get("valid_until") in (None, end)
+                    and (not cert.get("valid_from") or not cert.get("valid_until"))):
+                cert["valid_from"] = cert.get("valid_from") or start
+                cert["valid_until"] = cert.get("valid_until") or end
+                cert["appraisal_lookup_pages"] = sorted({lookup["page_no"] for lookup in lookups
+                                                         if lookup.get("page_no") is not None})
+        certificates.append(cert)
+    return certificates
+
+
+def maturity_certificate_details(pages: list[dict], visual_records: list[dict] | None = None) -> list[dict]:
+    """Extract CMMI/CSMM details from a certificate page, excluding mentions and rule echoes."""
+    from datetime import date, datetime
+
+    def date_value(groups):
+        try:
+            return date(*map(int, groups)).isoformat()
+        except ValueError:
+            return None
+
+    def english_date(value):
+        value = re.sub(r"\s*([A-Za-z]+)\s*(\d{1,2})\s*,?\s*(20\d{2})", r"\1 \2 \3", value)
+        for form in ("%b %d %Y", "%B %d %Y"):
+            try:
+                return datetime.strptime(value, form).date().isoformat()
+            except ValueError:
+                continue
+        return None
+
+    records = list(visual_records or [])
+    for page in pages:
+        page_text = str(page.get("text") or "")
+        family = _RE_MATURITY_FAMILY.search(page_text)
+        if not family:
+            continue
+        # A physical page can contain another certification, so use the maturity
+        # section and preserve a certificate phrase directly before its family name.
+        start = family.start()
+        prefix = page_text[:start]
+        previous_iso = list(_RE_ISO_TOKEN.finditer(prefix))
+        prefix_start = previous_iso[-1].end() if previous_iso else 0
+        proof_prefix = list(_RE_MATURITY_PROOF.finditer(prefix, prefix_start))
+        if proof_prefix:
+            start = proof_prefix[-1].start()
+        text = page_text[start:]
+        next_family = _RE_ISO_TOKEN.search(text)
+        if next_family:
+            text = text[:next_family.start()]
+        lookup_anchor = _RE_PARS_VALIDITY.search(text)
+        lookup_brand = _RE_PARS_LOOKUP.search(page_text)
+        is_lookup = lookup_anchor is not None and lookup_brand is not None
+        ids = {match[1] for match in _RE_APPRAISAL_ID.finditer(text)}
+        if is_lookup:
+            ids.update(match[1] for match in _RE_PARS_ID.finditer(text))
+        appraisal_id = next(iter(ids)) if len(ids) == 1 else None
+        fingerprint = _RE_MATURITY_PROOF.search(text) or re.search(
+            r"certificat\w+\s+(?:number|no\.?)", text, re.I,
+        )
+        if is_lookup:
+            lookup_period = _RE_MATURITY_PERIOD.match(text, lookup_anchor.end())
+            if appraisal_id and lookup_period:
+                records.append({
+                    "name": family[0].upper(), "backing": False, "appraisal_is_lookup": True,
+                    "appraisal_id": appraisal_id, "cert_level": None,
+                    "valid_from": date_value(lookup_period.groups()[:3]),
+                    "valid_until": date_value(lookup_period.groups()[3:]),
+                    "document_id": page.get("document_id"), "page_no": page.get("page_no"),
+                })
+            continue
+        if not fingerprint:
+            continue
+        if re.search(r"提供(?:有效期内|[^。；\n]{0,12}证书复印件)|每(?:提供|项|个)[^。；\n]{0,15}得\s*\d+\s*分", text):
+            continue
+        # Printed section titles can give a different level from the certificate.
+        certificate = re.sub(r"(?im)^\s*(?:\d+\s*[.\-]\s*){2,}\d*\.?\s*(?:CMMI|CSMM)[^\n]{0,45}\n",
+                             "", text)
+        levels = list(_RE_MATURITY_LEVEL.finditer(certificate))
+        level = next((candidate for candidate in levels if candidate[1]), levels[0] if levels else None)
+        period = _RE_MATURITY_PERIOD.search(text)
+        expiry = _RE_MATURITY_EXPIRY.search(text)
+        start = _RE_MATURITY_FROM.search(text)
+        english_period = _RE_ENGLISH_MATURITY_PERIOD.search(text)
+        english_expiry = _RE_ENGLISH_MATURITY_EXPIRY.search(text)
+        valid_from = date_value(period.groups()[:3]) if period else date_value(start.groups()) if start else None
+        valid_until = date_value(period.groups()[3:]) if period else date_value(expiry.groups()) if expiry else None
+        if english_period:
+            valid_from = valid_from or english_date(english_period[1])
+            valid_until = valid_until or english_date(english_period[2])
+        elif english_expiry:
+            valid_until = valid_until or english_date(english_expiry[1])
+        records.append({
+            "name": family[0].upper(), "backing": True,
+            "cert_level": next((value for value in level.groups() if value), None) if level else None,
+            "valid_from": valid_from,
+            "valid_until": valid_until,
+            "document_id": page.get("document_id"), "page_no": page.get("page_no"),
+            "appraisal_id": appraisal_id,
+        })
+    return bind_maturity_appraisals(records)
+
+
+def requires_platform_certificate_query(criterion: dict) -> bool:
+    rule = "\n".join(str(criterion.get(key) or "") for key in
+                     ("required_evidence", "description", "source_quote"))
+    return bool(re.search(r"cx\.cnca\.cn|认证认可信息公共服务平台", rule, re.I)
+                and "截图" in rule and re.search(r"ISO\s*(?:/IEC\s*)?\d", rule, re.I))
+
+
+def platform_query_families(text: str, *, require_seal: bool) -> set[str]:
+    families, _ = platform_query_details(text, require_seal=require_seal)
+    return families
+
+
+_CERTIFICATE_NUMBER = re.compile(
+    r"(?:证书编号|证书号码|证书号|注册号|certificat\w+\s+(?:no\.?|number))"
+    r"\s*[:：#]?\s*([0-9A-Z]+(?:[./-][0-9A-Z]+)*)", re.I,
+)
+
+
+def certificate_numbers(text: str) -> set[str]:
+    return {match[1].upper() for match in _CERTIFICATE_NUMBER.finditer(text)
+            if 5 <= len(match[1]) <= 50 and any(char.isdigit() for char in match[1])}
+
+
+def certificate_families(text: str) -> set[str]:
+    labels = [m[0] for m in _RE_ISO_TOKEN.finditer(text.upper())]
+    labels.extend(m[0] for m in _RE_SYSTEM_CERT.finditer(text))
+    return {normalize_cert(label) for label in labels}
+
+
+def platform_query_details(text: str, *, require_seal: bool) -> tuple[set[str], set[str]]:
+    if not re.search(r"cx\.cnca\.cn|认证认可信息公共服务平台", text, re.I):
+        return set(), set()
+    if not re.search(r"查询结果|查询页|查询截图|认证信息|证书信息|证书详情|平台截图", text):
+        return set(), set()
+    if re.search(r"未见|无公章|未加盖|未显示|须提供|请提供|不得分", text):
+        return set(), set()
+    if require_seal and not re.search(r"红(?:色)?(?:圆形)?(?:公章|印章|公司章)|盖有[^，。；]{0,20}(?:公章|印章)|"
+                                     r"可见[^，。；]{0,20}(?:公章|印章)|加盖[^，。；]{0,20}公章|"
+                                     r"(?:公章|印章)(?:印迹|清晰可见)|红章", text):
+        return set(), set()
+    return certificate_families(text), certificate_numbers(text)
 
 
 def _level_from(token: str) -> str | None:
@@ -785,10 +997,11 @@ def _overlay_personnel_years(persons: list[PersonRecord], pages: list[dict]) -> 
 
 
 def _overlay_social_security(persons: list[PersonRecord], pages: list[dict]) -> None:
-    social_text = "\n".join(
+    social_sources = [
         str(page.get("text") or "") for page in pages
         if re.search(r"社保|参保|社会保险|缴费", str(page.get("text") or ""))
-    )
+    ]
+    social_text = "\n".join(social_sources)
     if not social_text.strip():
         return
     unit_wide = bool(re.search(r"单位专用|参保缴费总人数|人员信息如下", social_text))
@@ -799,6 +1012,29 @@ def _overlay_social_security(persons: list[PersonRecord], pages: list[dict]) -> 
             person.social_security = True
         else:
             person.social_security = False
+        if not person.name:
+            continue
+        paid_periods = set()
+        for source in social_sources:
+            if person.name not in source or not re.search(r"参保人员信息|缴费明细|个人参保证明|参保证明", source):
+                continue
+            rows = re.finditer(rf"{re.escape(person.name)}\s+(?:\d{{17}}[\dXx]|\d{{15}})\s+"
+                               r"(20\d{2})(\d{2})\s*(?:至|到|[-—–~～])?\s*"
+                               r"(20\d{2})(\d{2})\s+(\d{1,3})(?!\d)", source)
+            for row in rows:
+                from_year, from_month, to_year, to_month, paid_months = map(int, row.groups())
+                start = 12 * from_year + from_month
+                end = 12 * to_year + to_month
+                months = end - start + 1
+                if 1 <= from_month <= 12 and 1 <= to_month <= 12 and paid_months == months and 0 < months <= 120:
+                    paid_periods.update(range(start, end + 1))
+        if paid_periods:
+            latest_month = max(paid_periods)
+            start_month = latest_month
+            while start_month - 1 in paid_periods:
+                start_month -= 1
+            person.social_months = latest_month - start_month + 1
+            person.social_months_from_register = True
 
 
 # ---------------------------------------------------------------------------

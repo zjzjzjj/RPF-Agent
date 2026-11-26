@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from datetime import date
 from decimal import Decimal
 
 from app import config
@@ -1166,6 +1167,95 @@ def type_gate_state(type_text: str | None, rule_text: str) -> bool | None:
     return None
 
 
+def documented_project_type_state(project_type: str | None, name: str, rule_text: str) -> bool | None:
+    explicit = type_gate_state(project_type, rule_text)
+    return explicit if explicit is not None else type_gate_state(name, rule_text)
+
+
+_RE_MATURITY_CERT_LEVEL = re.compile(
+    r"^(?:(?:CMMI|CSMM)(?:认证)?)?(?:(?:MATURITY|评估)?(?:LEVEL|等级)|ML)?"
+    r"[:：]?(?P<level>[1-9一二三四五六七八九ⅠⅡⅢⅣⅤ])级?$",
+    re.I,
+)
+_MATURITY_ROMAN_LEVELS = {"Ⅰ": 1, "Ⅱ": 2, "Ⅲ": 3, "Ⅳ": 4, "Ⅴ": 5}
+_RE_CERTIFICATE_DATE = re.compile(r"(\d{4})(?:-|/|\.|年)(\d{1,2})(?:-|/|\.|月)(\d{1,2})日?$")
+
+
+def _certificate_date(value: object) -> date | None:
+    match = _RE_CERTIFICATE_DATE.fullmatch(normalize_no_ws(str(value or "")))
+    if match is None:
+        return None
+    try:
+        return date(*(int(part) for part in match.groups()))
+    except ValueError:
+        return None
+
+
+def _maturity_level(value: object) -> int | None:
+    match = _RE_MATURITY_CERT_LEVEL.fullmatch(normalize_no_ws(str(value or "")))
+    if match is None:
+        return None
+    level = match["level"]
+    return int(_MATURITY_ROMAN_LEVELS.get(level, _CN_NUM.get(level, level)))
+
+
+def _score_maturity_certificate(
+    criterion: dict, params: dict, facts: BidFacts, per_item: Decimal, maximum: Decimal,
+) -> CountResult:
+    records = [
+        record for record in criterion.get("certificate_details") or []
+        if isinstance(record, dict) and normalize_cert(record.get("name", "")) == "CMMI"
+    ]
+    has_claim = any(normalize_cert(cert) == "CMMI" for cert in facts.certificates + facts.cert_claims)
+    if not records and not has_claim:
+        return CountResult(Decimal(0), "未检出CMMI或CSMM认证证书", False, "no_facts", "no_facts")
+
+    minimum = _maturity_level(params.get("cert_min_level"))
+    requires_current = params.get("cert_require_current") is True
+    reference_date = _certificate_date(params.get("cert_reference_date"))
+    unknown = []
+    invalid = []
+    if not records:
+        unknown.append("认证证书原件或复印件")
+    for record in records:
+        if record.get("backing") is not True:
+            unknown.append("认证证书原件或复印件")
+            continue
+        if record.get("confirmed_invalid") is True:
+            invalid.append("证书经核验不符合材料要求")
+            continue
+        level = _maturity_level(record.get("cert_level"))
+        end = _certificate_date(record.get("valid_until"))
+        start = _certificate_date(record.get("valid_from"))
+        if minimum is not None and level is not None and level < minimum:
+            invalid.append(f"认证等级{level}低于要求的{minimum}级")
+            continue
+        if requires_current and reference_date and end and end < reference_date:
+            invalid.append(f"证书有效期至{end.isoformat()}，早于投标截止日")
+            continue
+        if requires_current and reference_date and start and start > reference_date:
+            invalid.append(f"证书自{start.isoformat()}生效，晚于投标截止日")
+            continue
+        if minimum is not None and level is None:
+            unknown.append("认证等级")
+            continue
+        if requires_current and not (end and reference_date):
+            unknown.append("证书有效期" if reference_date else "招标文件中的投标截止日")
+            continue
+
+        score = min(per_item, maximum) if maximum else per_item
+        detail = f"核验到1项符合要求的{record['name']}认证证书"
+        if level is not None:
+            detail += f"，等级{level}级"
+        if requires_current:
+            detail += f"，截至投标截止日{reference_date.isoformat()}有效"
+        return CountResult(score.quantize(Decimal("0.01")), detail, False)
+    if unknown:
+        detail = "仍需核验" + "、".join(dict.fromkeys(unknown))
+        return CountResult(Decimal(0), detail, True, "certificate_unverified", "unreadable")
+    return CountResult(Decimal(0), "；".join(dict.fromkeys(invalid)), False, zero_reason="insufficient_criteria")
+
+
 def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
     """count 类评分项。
 
@@ -1250,6 +1340,8 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
             elif key == "CMMI":
                 has_cmmi = True
     if field == "cmmi":
+        if params.get("cert_min_level") is not None or params.get("cert_require_current") is True:
+            return _score_maturity_certificate(criterion, params, facts, per_item, max_score)
         # CMMI 独立计分项（reconcile 生成的 field=cmmi）：「CMMI 二级以上 1 项
         # 得 N 分」，存在性计分、与 ISO 项互斥。LLM 曾把此条标 match 丢失满分，
         # 现按单一证书计数（remote_reconcile 2026-10-30）。

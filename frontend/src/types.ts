@@ -297,6 +297,7 @@ export interface MatrixCell {
   veto_flag: boolean;
   machine_status: string | null;
   auto_review_basis?: string | null;
+  auto_review_fallback_kind?: string | null;
   /** 轻量 payload schema_version（3=二值化；1/2=旧三态口径） */
   lightweight_schema_version?: number | null;
 }
@@ -362,6 +363,12 @@ export interface AutoReviewMetadata {
   calculation?: string | Record<string, unknown> | null;
   confirmed_absent?: boolean;
   coverage_complete?: boolean;
+  material_review_pending?: {
+    reason?: string;
+    value?: string | null;
+    required_materials?: string[];
+    candidate_pages?: { document_id: number; page_no: number }[];
+  };
   attempt_history?: { round: number; state: string; error?: string }[];
   visual_evidence?: {
     document_id: number;
@@ -442,6 +449,7 @@ export interface AutomationProgress {
   expected: number;
   completed: number;
   failed: number;
+  material_pending?: number;
   remaining: number;
   resumable: boolean;
   last_error: string | null;

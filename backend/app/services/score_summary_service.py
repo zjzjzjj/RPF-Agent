@@ -136,7 +136,7 @@ MACHINE_VERDICT_LABELS = {
     "conflict_flagged": "冲突待裁决",
     "fail": "不通过",
     "unknown": "无法自动判定",
-    "concern": "预检存疑（未深评）",
+    "concern": "存疑",
     "not_deeply_reviewed": "未深评",
 }
 
@@ -431,7 +431,8 @@ def _build_item(
             labels = LIGHTWEIGHT_VERDICT_LABELS
         else:
             labels = MACHINE_VERDICT_LABELS
-        verdict = labels.get(score.machine_status, score.machine_status)
+        verdict = ("材料待核验" if (auto_review_out or {}).get("material_review_pending")
+                   else labels.get(score.machine_status, score.machine_status))
 
     cit_out = [
         {
@@ -723,11 +724,15 @@ def build_score_summary(
             )
 
     if not run_meta["ready"]:
-        run_meta["incomplete_reason"] = (
-            f"评审已结束：已评分 {automation['completed']} 项，故障跳过 {automation['skipped']} 项；下表合计仅包含已评分项"
-            if automation and run_meta["status"] == "partial" else
-            f"评分运行 #{run_meta['id']} 状态为 {run_meta['status']}，结果可能不完整"
-        )
+        if automation and run_meta["status"] == "partial":
+            details = [f"已完成 {automation['completed']} 项"]
+            if automation["material_pending"]:
+                details.append(f"{automation['material_pending']} 项材料待核验")
+            if automation["skipped"]:
+                details.append(f"故障跳过 {automation['skipped']} 项")
+            run_meta["incomplete_reason"] = "，".join(details) + "。下表合计为已评分小计。"
+        else:
+            run_meta["incomplete_reason"] = f"评分运行 #{run_meta['id']} 状态为 {run_meta['status']}，结果可能不完整"
         warnings.append(run_meta["incomplete_reason"])
     else:
         run_meta["incomplete_reason"] = None

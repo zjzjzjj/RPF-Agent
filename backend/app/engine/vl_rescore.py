@@ -10,7 +10,7 @@ fastpath_cell 定分语义、score_count 冻结分支）零改动。
 
 红线：
 - 判定只依据细则原文（required_artifacts 缺省时按 _verified_count 同口径合成）；
-- owner_proof/业主证明**绝不映射 work_proof**（overlay 输入侧剔除业主/用户证明页）；
+- 业主证明按条款明示的补证条件与人员、合同分别绑定；
 - cert_section_present 三态直传（audit["cert_section_state"]，绝不传压扁 bool）；
 - 确认缺判 0 不放宽（zero_reason 照 score_count 原语义透传）；
 - 无法构造/重算失败 → 返 None，调用方维持 no_deterministic_rescore 放弃语义。
@@ -23,7 +23,7 @@ from typing import Any
 
 from app.engine.material_inventory import MaterialInventory
 from app.engine.objective import (
-    normalize_cert, parse_required_artifacts, score_count, type_gate_state,
+    documented_project_type_state, normalize_cert, parse_required_artifacts, score_count,
 )
 from app.engine.objective_fastpath import FastPathResult, _cap, _rule_text
 
@@ -58,6 +58,12 @@ def _infer_field(criterion: dict) -> str:
 def _synthesize_requirements(scoring: dict) -> None:
     """required_artifacts 缺省时从规则文本合成（照 _verified_count 同口径）——
     截图硬闸/人员材料闸都读它，缺了会静默失效。"""
+    required_evidence = str(scoring.get("required_evidence") or "").strip()
+    if required_evidence:
+        raw = str(scoring.get("required_artifacts_raw") or "").strip()
+        scoring["required_artifacts_raw"] = "\n".join(dict.fromkeys(filter(None, (raw, required_evidence))))
+        if not scoring.get("required_artifacts"):
+            scoring["required_artifacts"] = required_evidence
     if str(scoring.get("required_artifacts") or ""):
         return
     rule_text = (str(scoring.get("description") or "")
@@ -78,6 +84,8 @@ def _wrap(criterion: dict, result, extra_note: str = "") -> FastPathResult:
     score = _cap(Decimal(str(result.score or 0)), criterion)
     zero_reason = getattr(result, "zero_reason", None)
     unresolved = getattr(result, "unresolved", None)
+    verified = getattr(result, "score_verified_only", None)
+    unverified = bool(getattr(result, "unverified_counted", 0))
     detail = str(result.detail or "")
     if extra_note:
         detail += extra_note
@@ -85,11 +93,12 @@ def _wrap(criterion: dict, result, extra_note: str = "") -> FastPathResult:
         score=score, detail=detail + f"；合计 {score} 分",
         verdict=("pass" if score > 0 else
                  ("concern" if zero_reason not in (None, "confirmed_absent") else "fail")),
-        facts={"detail": detail},
+        facts={"detail": detail, "unverified_score_included": unverified and (verified is None or verified < score),
+               "score_verified_only": str(verified) if verified is not None else None if unverified else str(score)},
         pages=[],
         zero_reason=zero_reason,
         confidence="medium",
-        complete=not bool(unresolved),
+        complete=not unresolved and not unverified,
     )
 
 
@@ -114,6 +123,8 @@ def rescore_from_merged_facts(
 
 def _rescore_cert(criterion: dict, inventory: MaterialInventory,
                   params: dict) -> FastPathResult | None:
+    from app.engine.material_inventory import platform_query_families, requires_platform_certificate_query
+
     facts = inventory.to_bid_facts()
     # cert_backing：记录级（VL 图上见到复印件=翻案 True）+ 文本期逐本定位，
     # 归一键三态只升不降
@@ -121,11 +132,11 @@ def _rescore_cert(criterion: dict, inventory: MaterialInventory,
     for c in inventory.certs:
         key = c.normalized or normalize_cert(c.name)
         if key:
-            backing[key] = _tri_max(backing.get(key), c.backing)
+            backing[key] = _tri_max(backing[key], c.backing) if key in backing else c.backing
     for k, st in (inventory.cert_backing or {}).items():
         nk = normalize_cert(str(k))
         if nk:
-            backing[nk] = _tri_max(backing.get(nk), st)
+            backing[nk] = _tri_max(backing[nk], st) if nk in backing else st
     # cert_section_present 三态直传：build_inventory 的 bool 是压扁值（None→False），
     # 用 audit 原三态 + VL has_query_screenshot 升级——截图三态语义原样
     # （False 清零/None 照计+疑/VL true 升级），不私自裁决争议格
@@ -138,6 +149,31 @@ def _rescore_cert(criterion: dict, inventory: MaterialInventory,
         "cert_section_present": section_state,
         "verified_facts": {"vl_rescore": True},
     }
+    missing_queries = False
+    if params.get("field") == "certificates" and requires_platform_certificate_query(criterion):
+        rule = _rule_text(criterion)
+        needs_seal = bool(re.search(r"公章|盖章|签章", rule))
+        queried = set(inventory.platform_query_certificates)
+        for page in inventory.pages:
+            queried.update(platform_query_families(str(page.get("text") or ""), require_seal=needs_seal))
+        missing_queries = any(normalize_cert(cert) not in queried for cert in facts.certificates
+                              if backing.get(normalize_cert(cert)) is not False)
+        facts.certificates = [cert for cert in facts.certificates if normalize_cert(cert) in queried
+                              and backing.get(normalize_cert(cert)) is True]
+        scoring["cert_section_present"] = bool(queried)
+    if params.get("field") == "cmmi" and (params.get("cert_min_level") or params.get("cert_require_current")):
+        from app.engine.material_inventory import maturity_certificate_details
+
+        visual_records = [{
+            "name": cert.name, "backing": cert.backing, "cert_level": cert.level,
+            "valid_from": cert.valid_from, "valid_until": cert.valid_until,
+            "appraisal_id": cert.appraisal_id,
+            "appraisal_is_lookup": cert.appraisal_is_lookup,
+            "document_id": cert.document_id,
+            "page_no": page_no,
+        } for cert in inventory.certs if normalize_cert(cert.name) == "CMMI"
+            for page_no in cert.pages or [None]]
+        scoring["certificate_details"] = maturity_certificate_details(inventory.pages, visual_records)
     _synthesize_requirements(scoring)
     try:
         result = score_count(scoring, params, facts)
@@ -147,7 +183,22 @@ def _rescore_cert(criterion: dict, inventory: MaterialInventory,
             result = score_count(scoring, params, facts)
         except Exception:  # noqa: BLE001
             return None
-    return _wrap(criterion, result)
+    wrapped = _wrap(criterion, result)
+    if scoring.get("certificate_details"):
+        wrapped.facts["certificate_details"] = scoring["certificate_details"]
+    if missing_queries and section_state is False and wrapped.score == 0:
+        # The reviewed proof section explicitly confirms that the required
+        # platform screenshots are absent, so zero is a final evidence result.
+        wrapped.complete = True
+        wrapped.verdict = "fail"
+        wrapped.zero_reason = "confirmed_absent"
+    elif missing_queries:
+        wrapped.complete = False
+    if ("截图" in scoring.get("required_artifacts_raw", "") and section_state is None
+            and not requires_platform_certificate_query(criterion)):
+        wrapped.complete = False
+        wrapped.facts.update(unverified_score_included=True, score_verified_only=None)
+    return wrapped
 
 
 # ---------------------------------------------------------------------------
@@ -173,7 +224,8 @@ def _role_of(name: str, inventory: MaterialInventory) -> str | None:
 
 
 def _case_from_record(rec, inventory: MaterialInventory,
-                      factor_text: str) -> dict:
+                      factor_text: str, person=None, *, allow_owner: bool = False,
+                      min_social_months: int | None = None, proof: dict | None = None) -> dict:
     case: dict[str, Any] = {
         "name": rec.name,
         "sanitized": "ok",           # 构造件默认 ok（AS 路只读值，不走 _sanitize_case）
@@ -184,7 +236,24 @@ def _case_from_record(rec, inventory: MaterialInventory,
         case["amount_yuan"] = str(rec.amount_yuan)
     if rec.signed_date:
         case["sign_date"] = rec.signed_date
-    if rec.person_names:
+    if person is not None:
+        proof = proof or {}
+        case["person_name"] = person.name
+        case["role"] = "member"
+        case["name_reflected"] = True
+        case["work_proof"] = proof.get("work_proof")
+        if allow_owner and proof.get("owner_proof") is True and (
+                rec.materials_state.get("contract") is True or rec.materials.get("contract")):
+            case["work_proof"] = True
+        if (case["work_proof"] is True and re.search(r"加盖投标人公章|复印件加盖公章", factor_text)
+                and rec.materials_state.get("seal") is not True):
+            case["work_proof"] = None
+        if min_social_months is not None:
+            months = person.social_months
+            case["social_security"] = (months >= min_social_months if months is not None else None)
+        else:
+            case["social_security"] = proof.get("social_security", person.social_security)
+    elif rec.person_names:
         case["name_reflected"] = True
         case["person_name"] = rec.person_names[0]
         for nm in rec.person_names:
@@ -193,11 +262,12 @@ def _case_from_record(rec, inventory: MaterialInventory,
                 case["role"] = role
                 break
     # 类型闸：managed 强校验要求 bool（L1541 raise）——None→True 保留+疑问注记
-    tstate = type_gate_state(f"{rec.name or ''} {rec.project_type or ''}", factor_text)
+    tstate = documented_project_type_state(rec.project_type, rec.name, factor_text)
     case["type_eligible"] = True if tstate is None else bool(tstate)
     # 人员材料三态：VL person_states 起点（overlay 稍后只升不降并入）
-    for vl_key, case_key in _PERSON_STATE_MAP:
-        case[case_key] = (rec.person_states or {}).get(vl_key)
+    if person is None:
+        for vl_key, case_key in _PERSON_STATE_MAP:
+            case[case_key] = (rec.person_states or {}).get(vl_key)
     # 项目级三态（_required_flags 点名合同/发票/验收时消费）
     for key in ("contract", "invoice", "acceptance"):
         st = (rec.materials_state or {}).get(key)
@@ -205,6 +275,29 @@ def _case_from_record(rec, inventory: MaterialInventory,
             st = True
         case[key] = st
     return case
+
+
+def _named_case_proofs(rec, inventory: MaterialInventory, allow_owner: bool) -> dict[str, dict]:
+    from app.parsing.normalize import normalize_no_ws
+
+    proofs = {name: dict(flags) for name, flags in rec.person_proofs.items()}
+    project = normalize_no_ws(rec.name)
+    if not allow_owner or len(project) < 8:
+        return proofs
+    for page in inventory.pages:
+        text = str(page.get("text") or "")
+        if not re.search(r"业主证明|用户证明", text[:250]) or not re.search(r"参与|担任|驻场|运维服务人员", text):
+            continue
+        if re.search(r"须提供|请提供|每[个项人].{0,15}得分", text):
+            continue
+        normalized = normalize_no_ws(text)
+        if project not in normalized:
+            continue
+        for person in inventory.persons:
+            name = normalize_no_ws(person.name).lower()
+            if len(name) >= 2 and name in normalized.lower():
+                proofs.setdefault(name, {})["owner_proof"] = True
+    return proofs
 
 
 def _reconcile_person_states(cases: list[dict], prior: list[dict]) -> None:
@@ -278,15 +371,51 @@ def _relax_person_states(cases: list[dict]) -> int:
 def _rescore_person_cases(criterion: dict, inventory: MaterialInventory,
                           params: dict) -> FastPathResult | None:
     scope = str(params.get("person_scope") or "")
-    factor_text = (str(criterion.get("name") or "")
-                   + str(criterion.get("description") or ""))
-    cases = [_case_from_record(rec, inventory, factor_text)
-             for rec in inventory.contracts or []]
+    factor_text = _rule_text(criterion)
+    strict_members = scope == "member" and "驻场" in factor_text
+    if strict_members:
+        min_months = re.search(r"(?:六|6)\s*个?\s*月", factor_text)
+        people = {"".join(p.name.split()).lower(): p for p in inventory.persons
+                  if re.search(r"驻场|工程师", p.role) and _role_of(p.name, inventory) != "leader"}
+        allow_owner = bool(re.search(r"(?:否则|或|另)[^。；]{0,20}(?:业主|用户)证明", factor_text))
+        cases = [_case_from_record(rec, inventory, factor_text, people[name], allow_owner=allow_owner,
+                                   min_social_months=6 if min_months else None, proof=proof)
+                 for rec in inventory.contracts for name, proof in _named_case_proofs(rec, inventory, allow_owner).items()
+                 if name in people]
+        cases.sort(key=lambda row: (row.get("type_eligible") is False, row.get("work_proof") is not True,
+                                    row.get("social_security") is not True))
+        unique = {}
+        for case in cases:
+            key = (case["person_name"], "".join(case["name"].split()), case.get("amount_yuan"), case.get("sign_date"))
+            unique.setdefault(key, case)
+        cases = list(unique.values())
+        person_max = re.search(r"每(?:人|名[^。；，]{0,10}?)[^。；，]{0,12}?最高(?:得|计)?\s*(\d+(?:\.\d+)?)\s*分",
+                               factor_text)
+        per_case = _decimal_or_none(params.get("per_item"))
+        if person_max and per_case and per_case > 0 and not params.get("tiers"):
+            maximum_cases = int(Decimal(person_max[1]) / per_case)
+            candidates_by_person = {}
+            for case in cases:
+                candidates_by_person.setdefault(case["person_name"], []).append(case)
+            cases = [case for rows in candidates_by_person.values() for case in rows[:maximum_cases]]
+    else:
+        cases = [_case_from_record(rec, inventory, factor_text) for rec in inventory.contracts]
     cases = [c for c in cases if c.get("name")]
     if not cases:
         return None
-    _apply_overlays(cases, inventory, scope)
-    relaxed = _relax_person_states(cases)
+    if strict_members:
+        relaxed = 0
+    else:
+        _apply_overlays(cases, inventory, scope)
+        relaxed = _relax_person_states(cases)
+        if scope == "leader" and re.search(r"(?:六|6)\s*个?\s*月", factor_text):
+            short_paid_leaders = {"".join(person.name.split()) for person in inventory.persons
+                                  if person.social_months_from_register and person.social_months is not None
+                                  and person.social_months < 6}
+            for case in cases:
+                name = "".join(str(case.get("person_name") or "").split())
+                if name in short_paid_leaders:
+                    case["social_security"] = False
     # 金额档预滤（managed 金额档要求每案例有已核验金额，否则 raise）
     tiers = params.get("tiers") or []
     amount_tier = bool(tiers) and any(

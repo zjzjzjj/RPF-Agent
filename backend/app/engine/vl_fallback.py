@@ -33,6 +33,7 @@ from typing import Any
 from pydantic import BaseModel, Field
 
 from app import config
+from app.jobs.queue import JobCancelled
 
 log = logging.getLogger("bid_eval.engine.vl_fallback")
 
@@ -45,6 +46,7 @@ TRIGGER_KINDS = frozenset({
     "presence_unverified",
     "sample_volume_unverified",
     "material_unverified",      # 严口径未核验格（2026-11-24 run158 修正）：VL 翻案
+    "material_review_pending",
 })
 
 VERDICT_SCORE_TYPES = ("veto", "match")
@@ -93,16 +95,23 @@ class VlFact(BaseModel):
     # —— 人员归属与人员材料（contract 事实：材料上出现的评分人员姓名）——
     person_names: list[str] = Field(default_factory=list)   # 图上所见评分人员姓名，空=未见
     has_work_proof: bool | None = None       # 业绩证明材料上有其姓名（业主证明/用户证明/社保页不算业绩证明）
+    has_owner_proof: bool | None = None
     has_experience_proof: bool | None = None # 个人工作经验证明上有其姓名
     has_social_security: bool | None = None  # 社保/参保证明上有其姓名
     has_cert_proof: bool | None = None       # 细则点名的人员证书/培训证书
     # —— 证书 ——
     cert_level: str | None = None
+    valid_from: str | None = None
     valid_until: str | None = None
+    certificate_number: str | None = None
+    appraisal_id: str | None = None
+    appraisal_is_lookup: bool | None = None
     has_query_screenshot: bool | None = None   # 查询结果截图有无（细则常点名要件）
     # —— 人员 ——
     person_title: str | None = None
+    person_role: str | None = None
     person_years: str | None = None
+    social_security_months: int | None = Field(default=None, ge=0, le=1200)
     # —— 证据（每条事实必须给页级依据）——
     evidence: list[VlObservation] = Field(default_factory=list)
 
@@ -170,11 +179,12 @@ SYSTEM_PROMPT = (
     '"has_contract":true|null|false,"has_invoice":true|null|false,'
     '"has_acceptance":true|null|false,"has_seal":true|null|false,'
     '"person_names":["图上所见评分人员姓名，未见=空数组"],'
-    '"has_work_proof":true|null|false,"has_experience_proof":true|null|false,'
+    '"has_work_proof":true|null|false,"has_owner_proof":true|null|false,"has_experience_proof":true|null|false,'
     '"has_social_security":true|null|false,"has_cert_proof":true|null|false,'
-    '"cert_level":"等级或null","valid_until":"有效期至或null",'
+    '"cert_level":"实际等级或null","valid_from":"有效期起始日或null","valid_until":"有效期截止日或null",'
+    '"certificate_number":"实际证书编号或null","appraisal_id":"实际数字评估编号或null","appraisal_is_lookup":null,'
     '"has_query_screenshot":true|null|false,'
-    '"person_title":"职称或null","person_years":"年限或null",'
+    '"person_title":"职称或null","person_role":"投标文件载明岗位或null","person_years":"年限或null","social_security_months":null,'
     '"evidence":[{"document_id":<编号或null>,"page_no":<页码或null>,'
     '"observation":"该事实的页级依据"}]}],'
     '"observations":[{"document_id":<编号或null>,"page_no":<页码或null>,'
@@ -185,7 +195,17 @@ SYSTEM_PROMPT = (
     "禁止用细则或常识补全；金额填元的纯数字字符串；has_contract/has_invoice/"
     "has_acceptance/has_seal/has_query_screenshot 填 true/null/false（true=确认有、"
     "false=确认无、null=看不清或未见）；evidence 必须给 document_id/page_no 与客观观察。"
+    "同一案例的合同、发票、验收或人员证明可在不同页。单页证明只看到案例名而没看到合同总额时，"
+    "amount_yuan 填 null，只填该页能证实的字段，禁止把发票金额当合同总额。"
+    "项目类型 project_type 逐字引用合同或验收原件中明确标注的项目类型、系统类型或服务类型，"
+    "例如软件开发、运维服务。不能用项目名中的词替代原件载明的类型。看不清或未标注时填 null。"
     "图中确实无法判定任何事实时 facts=[] 且 verdict=\"unverifiable\"；\n"
+    "认证原件或查询截图须明确指出对应的认证类别。能力成熟度等级与有效期只从证书载明内容读取，"
+    "日期用 YYYY-MM-DD，证书目录、承诺或招标规则的文字不得当作证书原件。\n"
+    "原件复印件与平台查询页分别输出，每条只填该页所见的证书编号或评估编号。"
+    "CNCA 页若有可见的公章，请在该查询页的 observation 一并写明平台原名、印章、证书号或体系名称。"
+    "CMMI PARS 官方查询页的 appraisal_is_lookup 填 true，须与证书原件的 Appraisal ID 匹配。"
+    "CMMI 证书原件填 false，其他事实填 null。\n"
     "4. 否决/资格/符合性格：**绝对禁止输出 verdict=\"fail\"**——即使图中发现不符"
     "也只在 clues 里写线索，verdict 只能是 pass 或 unverifiable（否决由评标"
     "委员会认定，AI 不否决）；facts 对判定格不需要；\n"
@@ -199,12 +219,17 @@ SYSTEM_PROMPT = (
     "（年限/经历证明）上有其姓名；has_social_security=社保/参保证明上有其姓名；"
     "has_cert_proof=细则点名的人员证书/培训证书。三态含义同 has_contract"
     "（true=确认、null=未见或看不清、false=确认无）。\n"
+    "同一案例的不同人员分别填写事实，person_names 只填该证据页明确关联的人。业主证明明确载明该人参与"
+    "同一个合同项目时单独填 has_owner_proof=true。社保按每名人员单独提交 kind=person，提供姓名及实缴"
+    "月数 social_security_months，观察写明缴费起止年月或累计缴费月数。简历自述不能作为社保证明。\n"
+    "人员名单在合同附件时，同一合同各页统一填写合同首页的项目全名，观察说明合同原页、名单或盖章"
+    "分别出现在哪些页。若评分细则要求投标人盖章，has_seal 只在已看见投标人盖章时填 true。\n"
+    "投标拟派岗位 person_role 只从拟派人员表或个人岗位页读取，须在该 observation 写出该人的姓名与岗位。\n"
 )
 
 
 def build_user_prompt(criterion: dict, *, is_verdict: bool,
                       page_images: list[dict] | None = None) -> str:
-    max_score = criterion.get("max_score")
     head = "本条为否决/资格/符合性条款：只给观察与线索，禁止给分、禁止判不符合。" \
         if is_verdict else (
             "本条为计分条款：只报事实不下分（逐案例/逐证书/逐人员填 facts）。"
@@ -216,12 +241,34 @@ def build_user_prompt(criterion: dict, *, is_verdict: bool,
     ]
     if criterion.get("required_evidence"):
         parts.append(f"证明材料要求：{str(criterion['required_evidence'])[:500]}")
+    pending = criterion.get("_material_recovery") or {}
+    if pending.get("required_materials"):
+        parts.append("补核材料：" + "、".join(pending["required_materials"])[:800])
+    names = [str(item.get("name") or "") for item in pending.get("unverified_records") or []
+             if isinstance(item, dict) and item.get("name")]
+    if names:
+        parts.append("检索线索（以原页实际所见为准）：" + "、".join(dict.fromkeys(names))[:800])
+    if rechecks := criterion.get("_recheck_certificate_pages"):
+        sources = "、".join(f"文档{doc}第{page}页" for doc, page in rechecks)
+        parts.append(f"逐页复核 {sources}。分别记录可辨认的证书原件和平台查询页，"
+                     "只填写各页可核对的字段，保留可核对的部分事实。")
     if page_images:
         mapping = "；".join(
             f"第{i + 1}张图=文档{pi.get('document_id')}第{pi.get('page_no')}页"
             for i, pi in enumerate(page_images))
         parts.append(f"页码对照：{mapping}。observation/evidence 的 page_no 请填上述实际页码。")
     return "\n".join(parts)
+
+
+def resolve_page_reference(reference: dict, allowed) -> dict | None:
+    """Bind evidence to the sent image. Infer an omitted document only if unique."""
+    document, number = reference.get("document_id"), reference.get("page_no")
+    if document is not None:
+        return dict(reference) if (document, number) in allowed else None
+    documents = [doc for doc, page in allowed if page == number]
+    if len(documents) == 1:
+        return {**reference, "document_id": documents[0]}
+    return None
 
 
 def _sanitize_facts(
@@ -231,30 +278,28 @@ def _sanitize_facts(
 
     ①evidence 页码不在本次送审页集→剔越界页，evidence 清空→丢案；
     ②观察含"未见X/无X/未提供X"而 has_x=true→has_x 回退 null（模型自相矛盾）；
-    ③contract 无金额/金额非法/无名称→丢案（翻案必须有金额，防"金额没看清照计"）；
+    ③contract 无名称或金额非法→丢案；有名称无金额的材料只用于合并既有案例；
     ④false 归一为 None（消费侧不判缺——VL 只看≤8 页，未见≠全书没有，防误杀）。
     单案例矛盾只污染该案例；拒整格=一个坏案例废掉全部翻案机会。丢弃留痕可审计。
     返回 (清洗后 facts dict 列表, 拒收条数)。
     """
     allowed_pairs = {(p.get("document_id"), p.get("page_no")) for p in page_images}
-    allowed_nos = {p.get("page_no") for p in page_images}
     out: list[dict] = []
     dropped = 0
     for f in raw_facts:
         data = f.model_dump()
         # ④ false → None（归一未核实，只作线索）
         for key in ("has_contract", "has_invoice", "has_acceptance", "has_seal",
-                    "has_query_screenshot", "has_work_proof", "has_experience_proof",
+                    "has_query_screenshot", "has_work_proof", "has_owner_proof", "has_experience_proof",
                     "has_social_security", "has_cert_proof"):
             if data.get(key) is False:
                 data[key] = None
         # ① 证据页越界剔除
         evidence = []
         for e in data.get("evidence") or []:
-            pair = (e.get("document_id"), e.get("page_no"))
-            pg = e.get("page_no")
-            if pair in allowed_pairs or (pg is not None and pg in allowed_nos):
-                evidence.append(e)
+            reference = resolve_page_reference(e, allowed_pairs)
+            if reference is not None:
+                evidence.append(reference)
         data["evidence"] = evidence
         if not evidence:
             # ① 证据清空→丢案（每条事实必须给页级依据）
@@ -267,6 +312,7 @@ def _sanitize_facts(
                           ("公章", "has_seal"), ("签章", "has_seal"),
                           ("截图", "has_query_screenshot"),
                           ("业绩证明", "has_work_proof"),
+                          ("业主证明", "has_owner_proof"),
                           ("工作经验证明", "has_experience_proof"),
                           ("经验证明", "has_experience_proof"),
                           ("社保证明", "has_social_security"),
@@ -279,17 +325,18 @@ def _sanitize_facts(
         # （不知道为谁开的证明不能当归属证据）
         if data.get("has_work_proof") is True and not (data.get("person_names") or []):
             data["has_work_proof"] = None
-        # ③ contract 金额/名称硬要求
+        # ③ 独立证明页通常不载合同总额，允许名称绑定的局部事实。
         if data.get("kind") == "contract":
+            amount = data.get("amount_yuan")
             try:
-                val = (Decimal(str(data.get("amount_yuan")).replace(",", "").strip())
-                       if data.get("amount_yuan") else None)
+                val = Decimal(str(amount).replace(",", "").strip()) if amount is not None else None
             except (InvalidOperation, ValueError):
-                val = None
-            if val is None or val <= 0 or not str(data.get("name") or "").strip():
                 dropped += 1
                 continue
-            data["amount_yuan"] = str(val)
+            if not data.get("name") or (val is not None and (not val.is_finite() or val <= 0)):
+                dropped += 1
+                continue
+            data["amount_yuan"] = str(val) if val is not None else None
         out.append(data)
     return out, dropped
 
@@ -335,6 +382,8 @@ def rescue(
 
     try:
         text = _chat()
+    except JobCancelled:
+        raise
     except Exception as exc:  # noqa: BLE001 —— 网络/涉密闸门/模型故障=维持暂定
         log.warning("VL 兜底调用失败：%s", exc)
         if getattr(exc, "transient", True) is False:
@@ -357,6 +406,8 @@ def rescue(
             log.warning("VL 输出契约校验失败（重试 1 次）：%s", exc)
             try:
                 text = _chat()
+            except JobCancelled:
+                raise
             except Exception as exc2:  # noqa: BLE001
                 log.warning("VL 兜底重试调用失败：%s", exc2)
                 if getattr(exc2, "transient", True) is False:

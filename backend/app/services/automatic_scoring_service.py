@@ -17,7 +17,6 @@ import time
 from queue import Empty, SimpleQueue
 from concurrent.futures import ThreadPoolExecutor, FIRST_COMPLETED, wait
 from dataclasses import dataclass, field
-import base64
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -61,6 +60,48 @@ class CellOutcome:
     attempts: int = 1
     raw: dict = field(default_factory=dict)
     warnings: list[dict] = field(default_factory=list)
+
+
+class _MaterialReviewPending(LLMError):
+    def __init__(self, detail: str, *, subtotal: Decimal | None = None,
+                 facts: dict | None = None, missing: list[str] | None = None):
+        super().__init__(detail)
+        self.subtotal = subtotal
+        self.facts = facts or {}
+        self.missing = missing or []
+
+
+def _material_review_pending(criterion: dict, pages: list[dict], detail: str, *,
+                             subtotal: Decimal | None = None, facts: dict | None = None,
+                             missing: list[str] | None = None, evidence: list[dict] | None = None,
+                             attempts: list[dict] | None = None) -> CellOutcome:
+    facts = facts or {}
+    attempts = attempts or []
+    evidence = evidence or []
+    records = facts.get("unverified_records") or facts.get("verified_cases") or []
+    named_pages = list(evidence)
+    for record in records:
+        if isinstance(record, dict):
+            named_pages.extend(item for item in record.get("evidence") or [] if isinstance(item, dict))
+    source_keys = {(p.get("document_id"), p.get("page_no")) for p in pages}
+    keys = dict.fromkeys((ref.get("document_id"), ref.get("page_no")) for ref in named_pages
+                         if (ref.get("document_id"), ref.get("page_no")) in source_keys)
+    rule = "\n".join(str(criterion.get(key) or "")
+                     for key in ("required_evidence", "description", "source_quote"))
+    fallback = {
+        "kind": "material_review_pending", "basis": "machine_fallback",
+        "value": str(subtotal) if subtotal is not None else None,
+        "reason": detail, "score_type": criterion.get("score_type"),
+        "required_materials": list(dict.fromkeys([*(missing or []), *parse_required_artifacts(rule)])),
+        "candidate_pages": [{"document_id": doc, "page_no": page} for doc, page in keys],
+        "unverified_records": records,
+    }
+    return CellOutcome(
+        "concern", detail, None, evidence, pages, "fallback", len(attempts) or 1,
+        {"fallback": fallback, "coverage_complete": False, "attempt_history": attempts,
+         "verified_facts": facts},
+        [{"message": detail, "fallback_score": fallback}],
+    )
 
 
 def _presence_outcome(result, criterion: dict, pages: list[dict]) -> CellOutcome:
@@ -475,24 +516,25 @@ def _supplement_pages(criterion: dict, pages: list[dict], *, visual: bool, exhau
                       max_pages: int | None = None) -> list[dict]:
     """Supplement only relevant source pages; retain originals and file/page IDs.
 
-    2026-11-19：BID_EVAL_SCORING_OCR=0 时整段跳过（用户指令：扫描件不做内容
-    OCR，只保留标签）——大扫描标书逐格补检会放大到数万次 OCR 请求，评分不可用。
+    BID_EVAL_SCORING_OCR=0 disables OCR while original-page image rendering
+    remains available for selected visual review.
     """
-    if not config.scoring_ocr_enabled():
+    if not visual and not config.scoring_ocr_enabled():
         return pages
     from app.engine.auto_review import select_candidate_pages
 
     copied = [dict(p) for p in pages]
-    requested = set(criterion.get("_visual_page_keys") or [])
+    requested = set(criterion.get("_visual_page_keys" if visual else "_material_page_keys") or [])
     if visual and exhaustive:
         candidates = [p for p in copied if not p.get("known_blank")]
-    elif visual and requested:
+    elif requested:
         candidates = [p for p in copied if (int(p["document_id"]), int(p["page_no"])) in requested]
     else:
         candidates = select_candidate_pages(criterion, copied, max_pages=8)
     # Exhaustive counts/absence require every unreadable page, including scans
     # whose headings cannot yet be retrieved by a text query.
-    candidates = candidates + [p for p in copied if (p.get("unreadable") or p.get("requires_vision")) and not p.get("known_blank")]
+    if visual or not requested:
+        candidates = candidates + [p for p in copied if (p.get("unreadable") or p.get("requires_vision")) and not p.get("known_blank")]
     # 预算上限（2026-11-19 run137 实证：大扫描标书补检被放大到数万次 OCR）。
     # 截断时材料/签章关键词页与带页级标签的页优先，其余按页序。
     if max_pages is None and visual:
@@ -714,7 +756,7 @@ def _verified_count(criterion: dict, decision, pages: list[dict]) -> tuple[Decim
     """AI supplies evidence-backed facts; existing rule engines supply arithmetic."""
     values = dict(decision.facts or {})
     if not decision.coverage_complete:
-        raise LLMError("客观计分事实尚未覆盖全部文件页，不能用局部检索结果确定完整计数")
+        raise _MaterialReviewPending("客观计分仍需核验相关原页", facts=values)
     params = dict(criterion.get("params") or {})
     _validate_objective_rule(criterion, params)
     amount_tiers = any(isinstance(t, dict) and ("min_amount_yuan" in t or "max_amount_yuan" in t)
@@ -759,6 +801,12 @@ def _verified_count(criterion: dict, decision, pages: list[dict]) -> tuple[Decim
                 raise LLMError(f"{name}不能小于零")
             values[name] = str(number)
     prepared = {**criterion, "verified_facts": values}
+    if params.get("field") == "cmmi" and (params.get("cert_min_level") or params.get("cert_require_current")):
+        from app.engine.material_inventory import maturity_certificate_details
+
+        details = maturity_certificate_details(pages)
+        prepared["certificate_details"] = details
+        values["certificate_details"] = details
     # 承诺值字段的全文抽取语料（包A）：该家 source=='text' 页文本层拼接，
     # 供 score_value_* 在模型未供值时做确定性抽取的第三级兜底（零 OCR）。
     prepared["fulltext_corpus"] = "\n".join(
@@ -798,9 +846,22 @@ def _verified_count(criterion: dict, decision, pages: list[dict]) -> tuple[Decim
         prepared["required_artifact_names"] = parse_required_artifacts(requirements)
         prepared["required_artifacts_raw"] = requirements
     material_rule = requirements + str(criterion.get("description") or "") + str(criterion.get("source_quote") or "")
+    from app.engine.material_inventory import platform_query_families, requires_platform_certificate_query
+
+    if params.get("field") == "certificates" and requires_platform_certificate_query(criterion):
+        needs_seal = bool(re.search(r"公章|盖章|签章", material_rule))
+        queried = {family for page in pages for family in
+                   platform_query_families(str(page.get("text") or ""), require_seal=needs_seal)}
+        missing_certs = [cert for cert in certificates if normalize_cert(cert) not in queried
+                         and backing.get(normalize_cert(cert)) is not False]
+        if missing_certs:
+            raise _MaterialReviewPending("仍需核验对应证书的认证平台查询结果截图", facts=values,
+                                         missing=[f"{cert} 认证平台查询结果截图" for cert in missing_certs])
+        values["cert_section_present"] = bool(queried)
     if certificates and "截图" in material_rule:
         if not isinstance(values.get("cert_section_present"), bool):
-            raise LLMError("证书所需查询截图尚未核验，不能默认已提供")
+            raise _MaterialReviewPending("仍需核验本项认证证书及对应的查询截图", facts=values,
+                                         missing=["查询截图"])
         if values["cert_section_present"] is False:
             prepared["cert_backing"] = {normalize_cert(cert): False for cert in certificates}
     cases = values.get("verified_cases")
@@ -822,7 +883,7 @@ def _verified_count(criterion: dict, decision, pages: list[dict]) -> tuple[Decim
                 raise LLMError("案例缺少可核验名称")
             if (str(case.get("sanitized") or "ok") != "ok"
                     or any(case.get(key) for key in ("unresolved", "verification_failed", "abstain", "provisional"))):
-                raise LLMError("案例仍有引文或材料核验失败，须补评后再计算完整数量")
+                raise _MaterialReviewPending("案例仍有引文或材料须补评", facts=values)
             identity = (re.sub(r"\s", "", case["name"]), str(case.get("person") or ""))
             if identity in identities:
                 raise LLMError("案例清单存在重复，须合并同一案例的跨页证明材料后重算")
@@ -838,11 +899,13 @@ def _verified_count(criterion: dict, decision, pages: list[dict]) -> tuple[Decim
                     case["role"] = role
             if params.get("min_amount_yuan") or amount_tiers:
                 if case.get("amount_yuan") is None or _decimal(case["amount_yuan"], "案例金额") < 0:
-                    raise LLMError("案例金额门槛仍无可核验的金额")
+                    raise _MaterialReviewPending("仍需核验案例合同金额", facts=values,
+                                                 missing=["合同金额"])
             if params.get("person_scope") == "leader" and "运维" in (
                 str(criterion.get("name") or "") + str(criterion.get("description") or "")
             ) and not isinstance(case.get("type_eligible"), bool):
-                raise LLMError("类似运维案例的项目类型尚未核验")
+                    raise _MaterialReviewPending("仍需核验类似运维案例的项目类型", facts=values,
+                                                 missing=["类似运维案例的项目类型"])
     if isinstance(values.get("cert_section_present"), bool):
         prepared["cert_section_present"] = values["cert_section_present"]
     engine = params.get("engine")
@@ -882,22 +945,24 @@ def _verified_count(criterion: dict, decision, pages: list[dict]) -> tuple[Decim
                 return _score_in_range(score, criterion), f"完整检索确认符合计分条件的数量为 0，按冻结计数规则计 {score} 分", values
             if re.search(r"不(?:予)?得分|不计分|(?:计|得|为|扣至)\s*0\s*分", rule):
                 return Decimal(0), "完整材料检索确认无所需证明，按细则明确规定计 0 分", values
+        if (result.unresolved == "cases_unverified" or params.get("field") == "cmmi"
+                or (result.unresolved == "no_facts"
+                and engine not in ("value_tier", "value_linear", "deviation_deduct_table"))):
+            raise _MaterialReviewPending(result.detail, facts=values)
         raise LLMError(f"客观项事实或评分口径仍未解决：{result.unresolved}")
-    if result.unverified_counted and result.score_verified_only is not None:
-        # Frozen count semantics already count materials with unreadable pages
-        # and flag them; keep the score but expose the verified-only value for
-        # audit instead of skipping the whole objective cell.
-        values["unverified_counted"] = result.unverified_counted
-        values["score_verified_only"] = str(result.score_verified_only)
-        return (_score_in_range(result.score, criterion),
-                result.detail + (f"；{result.unverified_counted} 个案例材料未核验，按冻结口径计入并标注"
-                                 f"（剔除未核验后 {result.score_verified_only} 分）"),
-                values)
+    if result.unverified_counted:
+        verified_only = result.score_verified_only
+        if verified_only is None and params.get("field") == "certificates" and certificates:
+            checked_facts = BidFacts(text="", certificates=[cert for cert in certificates
+                                    if backing.get(normalize_cert(cert)) is True])
+            verified_only = scorer(prepared, params, checked_facts).score
+        raise _MaterialReviewPending(
+            result.detail, facts=values,
+            subtotal=_score_in_range(verified_only, criterion) if verified_only is not None else None,
+        )
     if result.zero_reason in ("unreadable", "cases_unverified", "gate_named_missing",
                               "material_unverified"):
-        # material_unverified（严口径未核验剔除）同样不是评审结论：转暂定/兜底
-        # → VL 翻案或人工，绝不把"没核实"的 0 当最终分（2026-11-24 run158 修正）
-        raise LLMError("证明材料核验尚未完成，不能将暂定分作为最终分")
+        raise _MaterialReviewPending(result.detail, facts=values)
     # Heuristic conflict alone is discharged by the evidence-backed second pass;
     # missing factual inputs above remain execution failures.
     return _score_in_range(result.score, criterion), result.detail, values
@@ -949,7 +1014,7 @@ def _verified_price_limit(criterion: dict, decision) -> tuple[str, str, dict]:
 
 
 def _assess_cell(criterion: dict, pages: list[dict], data_class: str, gateway_factory, *, reviewer=None) -> CellOutcome:
-    from app.engine.auto_review import (is_external_requirement, is_price_limit_requirement,
+    from app.engine.auto_review import (EvidenceBindingError, is_external_requirement, is_price_limit_requirement,
                                         resolve_price_limit_requirement, review_criterion)
     from app.services.review_activity import report
 
@@ -980,6 +1045,10 @@ def _assess_cell(criterion: dict, pages: list[dict], data_class: str, gateway_fa
             [{"verdict_source": "external", "message": reason}],
         )
     objective_score = c.get("score_type") == "count" or bool(c.get("_objective_route"))
+    material_review = objective_score and (c.get("params") or {}).get("engine") not in (
+        "value_tier", "value_linear", "deviation_deduct_table")
+    if material_review:
+        c = {**c, "_allow_material_recovery": True}
     direct_subjective = (
         c.get("score_type") == "subjective"
         and not c.get("_objective_route")
@@ -1005,14 +1074,19 @@ def _assess_cell(criterion: dict, pages: list[dict], data_class: str, gateway_fa
     review_fn = reviewer or review_criterion
     for round_no in range(rounds + 1):
         preparation_step = False
+        decision = None
         try:
             report(f"{'初评' if round_no == 0 else f'补评 {round_no}/{rounds}'}")
             visual = False
             requested_visual, requested_pages = _requested_visual_pages(previous, current_pages)
-            supplement_rule = {**c, "_visual_page_keys": sorted(requested_pages)}
+            pending_pages = set((previous or {}).get("material_page_keys") or [])
+            supplement_rule = {**c, "_visual_page_keys": sorted(requested_pages | pending_pages),
+                               "_material_page_keys": sorted(pending_pages)}
             if round_no == 1:
                 report("补做 OCR")
-                current_pages = _supplement_pages(c, current_pages, visual=False)
+                current_pages = _supplement_pages(supplement_rule if pending_pages else c, current_pages, visual=False,
+                                                  **({"max_pages": config.supplement_ocr_max_pages()}
+                                                     if pending_pages else {}))
                 textless_pages = {(int(p["document_id"]), int(p["page_no"]))
                                   for p in current_pages if p.get("ocr_textless_issues")}
                 if textless_pages and not needs_visual:
@@ -1040,6 +1114,9 @@ def _assess_cell(criterion: dict, pages: list[dict], data_class: str, gateway_fa
             if getattr(decision, "_review_pages", None) is not None:
                 current_pages = decision._review_pages
             if decision.missing_evidence and not direct_subjective:
+                if material_review:
+                    raise _MaterialReviewPending("仍需核验：" + "；".join(decision.missing_evidence),
+                                                 facts=decision.facts, missing=decision.missing_evidence)
                 raise LLMError("评审证据尚未解决：" + "；".join(decision.missing_evidence))
             is_visual = any(e.get("kind") == "visual" for e in decision.evidence)
             if needs_visual and not is_visual:
@@ -1058,6 +1135,8 @@ def _assess_cell(criterion: dict, pages: list[dict], data_class: str, gateway_fa
                     basis = "external"
             elif not decision.evidence and not (decision.confirmed_absent and decision.coverage_complete):
                 if not direct_subjective:
+                    if material_review:
+                        raise _MaterialReviewPending("仍需定位计分所依据的原文或原页", facts=decision.facts)
                     raise LLMError("评审结论缺少可验证的原文或原页证据")
             elif not decision.evidence and decision.confirmed_absent:
                 basis = "absence"
@@ -1071,6 +1150,7 @@ def _assess_cell(criterion: dict, pages: list[dict], data_class: str, gateway_fa
             elif objective_score:
                 _inject_deterministic_cert_backing(c, decision, current_pages)
                 score, formula, values = _verified_count(c, decision, current_pages)
+                decision.verdict = "pass" if score > 0 else "fail"
                 detail += "；确定性计算：" + formula
             elif not non_scoring:
                 score = _score_in_range(decision.score, c)
@@ -1105,6 +1185,19 @@ def _assess_cell(criterion: dict, pages: list[dict], data_class: str, gateway_fa
             )
         except JobCancelled:
             raise
+        except _MaterialReviewPending as exc:
+            attempts.append({"round": round_no, "state": "failed", "error": str(exc)})
+            pending = _material_review_pending(
+                c, current_pages, str(exc), subtotal=exc.subtotal, facts=exc.facts,
+                missing=exc.missing, evidence=decision.evidence if decision is not None else [],
+                attempts=attempts,
+            )
+            if round_no >= min(1, rounds) or not config.scoring_ocr_enabled():
+                return pending
+            targets = _material_recovery_pages(c, current_pages, pending.raw["fallback"], None)
+            previous = {"execution_attempt": execution_attempt, "error": str(exc), "round": round_no,
+                        "material_page_keys": [(p["document_id"], p["page_no"]) for p in
+                                               targets[:config.supplement_ocr_max_pages()]]}
         except (LLMNotConfigured, AppError) as exc:
             exc.attempt_history = attempts + [{"round": round_no, "state": "failed", "error": str(exc)}]
             raise
@@ -1112,7 +1205,21 @@ def _assess_cell(criterion: dict, pages: list[dict], data_class: str, gateway_fa
             from app.llm.request_sizing import ReviewContextExceeded
             from app.parsing.pdf_runtime import OCRProcessingError
 
+            if material_review and (isinstance(exc, EvidenceBindingError)
+                                    or isinstance(exc.__cause__, EvidenceBindingError)):
+                attempts.append({"round": round_no, "state": "failed", "error": str(exc)})
+                return _material_review_pending(c, current_pages, "补核证明材料原页及其归属", attempts=attempts)
             if getattr(exc, "presence_unverified", False):
+                if material_review and getattr(exc, "unverified_scan_pages", None):
+                    attempts.append({"round": round_no, "state": "failed", "error": str(exc)})
+                    outcome = _material_review_pending(c, current_pages, "继续核对关联证明材料原页",
+                                                       facts=decision.facts if decision is not None else None,
+                                                       evidence=decision.evidence if decision is not None else [],
+                                                       attempts=attempts)
+                    # These refs came from a coverage guard over the whole file.
+                    # Leave ranking to the criterion's case/section evidence.
+                    outcome.raw["unverified_scan_pages"] = exc.unverified_scan_pages
+                    return outcome
                 # auto_review absence 防线：确认“未提供”的窗口里有未 OCR
                 # 整页扫描件 → 不能按材料缺失结项，也不能按 stop 让整轮停下；
                 # 定格为“未核验待人工复核”（不计入正式总分）。
@@ -1312,10 +1419,197 @@ def _vl_note(outcome: CellOutcome | None, note: dict,
     return outcome
 
 
+def _material_recovery_pages(criterion: dict, pages: list[dict], fallback: dict,
+                             inventory) -> list[dict]:
+    from itertools import zip_longest
+
+    from app.engine.material_locator import locate_material_sections, locator_enabled
+    from app.parsing.normalize import normalize_no_ws
+
+    by_key = {(p.get("document_id"), p.get("page_no")): p for p in pages if not p.get("known_blank")}
+    by_number: dict[int, list[tuple]] = {}
+    for key in by_key:
+        by_number.setdefault(key[1], []).append(key)
+    priority = {}
+
+    def add(key):
+        if key in by_key:
+            priority.setdefault(key, by_key[key])
+
+    def add_number(raw_no):
+        keys = by_number.get(raw_no, [])
+        if len(keys) == 1:
+            add(keys[0])
+
+    for ref in fallback.get("unreadable_pages") or []:
+        if isinstance(ref, dict):
+            add((ref.get("document_id"), ref.get("page_no")))
+
+    rule = "\n".join(str(criterion.get(key) or "") for key in
+                     ("name", "description", "quote", "source_quote", "required_evidence"))
+    params = criterion.get("params") or {}
+    person_scope = params.get("person_scope")
+    material_field = params.get("field")
+    kinds = []
+    if params.get("person_scope") or any(word in rule for word in ("工作经验", "社保", "团队", "人员", "驻场")):
+        kinds.append("personnel")
+    if params.get("field") == "cmmi" or any(word in rule.upper() for word in ("CMMI", "CSMM", "能力成熟度")):
+        kinds.append("cmmi")
+    if "截图" in rule or "查询结果" in rule:
+        kinds.append("query_screenshot")
+    if params.get("field") == "certificates" or any(word in rule for word in ("证书", "认证", "资质")):
+        kinds.append("cert")
+    for word, kind in (("发票", "invoice"), ("验收", "acceptance"), ("合同", "contract"), ("业绩", "performance")):
+        if word in rule:
+            kinds.append(kind)
+
+    if material_field in ("certificates", "cmmi"):
+        from app.engine.material_locator import _is_map_page
+
+        for key, page in sorted(by_key.items()):
+            if _is_map_page(page):
+                continue
+            head = normalize_no_ws(str(page.get("text") or "")[:800])
+            if material_field == "cmmi" and re.search(r"CMMI|CSMM|能力成熟度", head, re.I) and re.search(
+                    r"成熟度|Maturity|Appraisal|证书|评估", head, re.I):
+                add(key)
+            elif material_field == "certificates" and (
+                    re.search(r"认证认可信息公共服务平台|cx\.cnca\.cn", head, re.I)
+                    or re.search(r"管理体系认证证书|ISO(?:/IEC)?(?:9001|27001|20000).{0,20}(?:认证|证书)", head, re.I)):
+                add(key)
+                add((key[0], key[1] + 1))
+
+    if material_field == "performance":
+        from app.engine.material_locator import _is_map_page
+
+        headings: dict[str, list[tuple[int, int]]] = {}
+        section = None
+        person_role = None
+        current_document = None
+        nominated_names: set[str] = set()
+        member_case_open = False
+        for key, page in sorted(by_key.items()):
+            if key[0] != current_document:
+                section, person_role = None, None
+                nominated_names.clear()
+                member_case_open = False
+                current_document = key[0]
+            if _is_map_page(page):
+                continue
+            text = str(page.get("text") or "")
+            lines = [normalize_no_ws(line) for line in text.splitlines()[:10]]
+            for heading in lines:
+                if len(heading) > 110:
+                    continue
+                if re.match(r"^\d+(?:[.\-、]\d+){1,2}[.、]?(?:拟派)?(?:投标人)?(?:类似项目业绩|项目团队情况|项目团队人员情况|项目负责人情况|拟派人员情况)", heading):
+                    section = "company" if "业绩" in heading else "team"
+                    if section == "team":
+                        person_role = "leader" if "负责人" in heading else "member" if "团队人员" in heading else None
+                if section == "team" and re.match(r"^\d+(?:[.\-、]\d+){2,}", heading):
+                    if re.search(r"驻[场点]运维|项目团队人员|人员社保|驻场工程师", heading):
+                        person_role = "member"
+                    elif re.search(r"项目负责人|项目经理", heading):
+                        person_role = "leader"
+                if person_scope == "member" and re.match(r"^\d+(?:[.\-、]\d+)+", heading):
+                    team_case = bool(re.search(r"驻[场点][^。；]{0,12}工程师.*类似项目.*经验证明", heading))
+                    if team_case:
+                        member_case_open = True
+                    elif re.search(r"到位率承诺|技术服务方案|项目负责人(?:情况|证明)", heading):
+                        member_case_open = False
+                if person_scope and section == "team" and person_role == person_scope:
+                    if re.search(r"社保(?:保证明|缴纳|参保|证明)|社会保险参保证明", heading):
+                        headings.setdefault("social", []).append(key)
+                    elif re.search(r"[五5]年.*工作经验|工作经验证明|项目经理经验证明", heading):
+                        headings.setdefault("experience", []).append(key)
+                    elif re.search(r"类似项目.*经验|类似系统.*运维|项目经验\d|业主证明|实施证明", heading):
+                        headings.setdefault("case", []).append(key)
+                    elif re.search(r"履历表|情况表", heading):
+                        headings.setdefault("person", []).append(key)
+                if not person_scope and section == "company":
+                    if re.search(r"验收报告|验收证明|工程终验|业主证明", heading) or (
+                            heading == "项目类型" and {"项目名称", "用户单位"}.issubset(lines)):
+                        headings.setdefault("acceptance", []).append(key)
+                    elif re.search(r"发票|开票日期", heading):
+                        headings.setdefault("invoice", []).append(key)
+                    elif re.search(r"合同复印件|合同(?:含税)?总?金额|合同签订", heading):
+                        headings.setdefault("contract", []).append(key)
+            if person_scope == "member" and member_case_open:
+                normalized_text = normalize_no_ws(text)
+                for match in re.finditer(r"(?:两名|2名)项目驻[场点]运维工程师([\u4e00-\u9fff]{2,4})[、和及与]"
+                                         r"([\u4e00-\u9fff]{2,4})[，,。]", normalized_text):
+                    nominated_names.update(match.groups())
+                if (nominated_names and re.search(r"工作职能|项目(?:中任职|实施顾问|技术人员)|参与项目阶段|驻点运维人员", text)
+                        and any(name in normalized_text for name in nominated_names)):
+                    headings.setdefault("annex", []).append(key)
+                elif re.search(r"甲方.{0,30}(?:盖章|签章).{0,80}乙方.{0,30}(?:盖章|签章)", normalized_text):
+                    headings.setdefault("signature", []).append(key)
+        order = (("social", "case", "annex", "signature", "person", "experience") if person_scope == "member"
+                 else ("social", "experience", "case", "person") if person_scope
+                 else ("acceptance", "invoice", "contract"))
+        for group in zip_longest(*(dict.fromkeys(headings.get(kind, [])) for kind in order)):
+            for key in group:
+                if key is not None:
+                    add(key)
+
+    for ref in fallback.get("candidate_pages") or []:
+        if isinstance(ref, dict):
+            add((ref.get("document_id"), ref.get("page_no")))
+    for number in fallback.get("material_pages") or []:
+        add_number(number)
+
+    records = [r for r in fallback.get("unverified_records") or [] if isinstance(r, dict)]
+    names = [normalize_no_ws(str(r.get("name") or "")) for r in records]
+    names = [name for name in names if len(name) >= 4]
+    for record in records:
+        for number in [*(record.get("pages") or []),
+                       *(number for nos in (record.get("materials") or {}).values() for number in nos or [])]:
+            if isinstance(number, int):
+                add_number(number)
+
+    # Take a relevant page from each material category before expanding any one section.
+    windows = (locate_material_sections(list(by_key.values()), tuple(kinds))
+               if kinds and (locator_enabled() == "on" or fallback.get("kind") == "material_review_pending")
+               else {})
+    candidates_by_kind = []
+    for kind in kinds:
+        keys = dict.fromkeys((window.document_id, n) for window in windows.get(kind, []) for n in window.page_nos)
+        candidates_by_kind.append(iter(k for k in keys if k in by_key and not _is_noise_page(by_key[k])))
+    for row in zip_longest(*candidates_by_kind):
+        for key in row:
+            add(key)
+
+    anchors = [word for word in _SUPPLEMENT_HINTS if word in rule]
+
+    def rank(page):
+        tags = [str(t) for t in page.get("material_tags") or []]
+        text = str(page.get("text") or "")
+        hay = " ".join(tags) + " " + text[:500]
+        normalized = normalize_no_ws(text) if names else ""
+        return (_is_noise_page(page), -sum(name in normalized for name in names),
+                -sum(word in hay for word in anchors), not bool(tags), page["page_no"], page["document_id"])
+
+    # Inventory page numbers predate document-scoped bindings. Only use an
+    # unambiguous number here; the locator above supplies document keys directly.
+    if inventory is not None:
+        if any(kind in kinds for kind in ("cert", "cmmi", "query_screenshot")):
+            material_records = inventory.certs
+        elif "personnel" in kinds:
+            material_records = inventory.persons
+        else:
+            material_records = inventory.contracts
+        for record in material_records:
+            for number in getattr(record, "experience_pages", []) or getattr(record, "pages", []):
+                add_number(number)
+    for page in sorted(by_key.values(), key=rank):
+        add((page["document_id"], page["page_no"]))
+    return list(priority.values())
+
+
 def _maybe_vl_rescue(run_id: int, bid_id: int, criterion: dict,
                      outcome: CellOutcome | None, error: BaseException | None,
                      pages_by_bidder: dict, budget,
-                     inventory_factory=None) -> tuple[CellOutcome | None, BaseException | None]:
+                     inventory_factory=None, checkpoint: dict | None = None,
+                     ) -> tuple[CellOutcome | None, BaseException | None]:
     """材料审核视觉大模型兜底（2026-11-23 优化②，run151 后改一页一图）。
 
     触发集=暂定族 fallback（provisional_zero/reading_incomplete/value_extraction_
@@ -1338,234 +1632,276 @@ def _maybe_vl_rescue(run_id: int, bid_id: int, criterion: dict,
     loaded = pages_by_bidder.get(bid_id)
     if loaded is None:
         return outcome, error
-    pages, data_class = loaded
-    pages = list(pages or [])
-    if not pages:
+    all_pages, data_class = loaded
+    page_map = {(p["document_id"], p["page_no"]): dict(p) for p in all_pages}
+    if outcome is not None:
+        page_map.update({(p["document_id"], p["page_no"]): dict(p) for p in outcome.pages})
+    fallback = ((outcome.raw or {}).get("fallback") if outcome is not None else None) or {}
+    if error is not None:
+        fallback = {**fallback, "unreadable_pages": getattr(error, "unreadable_pages", [])}
+    kind = fallback.get("kind")
+    pending = kind == "material_review_pending"
+    if kind and not vl_fallback.is_trigger_kind(kind):
         return outcome, error
-    cell_key = f"{run_id}:{bid_id}:{criterion.get('id')}"
-    ok, why = budget.consume(bid_id, cell_key)
-    if not ok:
-        return _vl_note(outcome, {"visual_fallback": "skipped", "reason": why}, error), error
 
-    # 材料页=该格送审页（含 fallback 点名的不可读页，优先）；一页一图
+    inventory = None
+    if inventory_factory is not None and not vl_fallback.is_verdict_criterion(criterion):
+        try:
+            inventory = inventory_factory(bid_id)
+        except JobCancelled:
+            raise
+        except Exception:  # noqa: BLE001
+            log.exception("未能建立补评材料索引 bid=%s", bid_id)
+
     from app.evidence.renderer import render_page_png
+    from app.engine.objective_fastpath import score_objective
+    from app.engine.material_inventory import requires_platform_certificate_query
+    from app.engine.vl_facts import merge_vl_facts
+    from app.engine.vl_rescore import rescore_from_merged_facts
 
-    candidates = {(_p.get("document_id"), _p.get("page_no")): dict(_p) for _p in pages}
-    fallback_meta = ((outcome.raw or {}).get("fallback") if outcome is not None else None) or {}
-    named_keys: list[tuple] = []
-    for up in (fallback_meta.get("unreadable_pages") or []):
-        if isinstance(up, dict):
-            key = (up.get("document_id"), up.get("page_no"))
-            if key[1] is not None:
-                candidates.setdefault(key, {"document_id": key[0], "page_no": key[1],
-                                            "stored_path": up.get("stored_path"),
-                                            "sha256": up.get("sha256")})
-                named_keys.append(key)
-    for pn in (fallback_meta.get("material_pages") or []):
-        # 严口径未核验格（material_unverified）：案例材料页优先送审（翻案页源）
-        try:
-            pn = int(pn)
-        except (TypeError, ValueError):
-            continue
-        named_keys.extend(k for k in list(candidates) if k[1] == pn)
-    # 翻案通道收口（2026-11-25）：材料页/人员页/目录窗口/案例邻域（±2）优先
-    # 送审（run160/161 实证：8 图窗口漏发票/验收/经验证明页 → facts 报 null → 误杀）
-    if inventory_factory is not None:
-        try:
-            _inv = inventory_factory(bid_id)
-            ordered_extra: list[int] = []
-            seen_extra: set[int] = set()
-
-            def _push(pages_iter) -> None:  # noqa: ANN001, ANN202
-                for p in pages_iter:
-                    try:
-                        p = int(p)
-                    except (TypeError, ValueError):
-                        continue
-                    if p not in seen_extra:
-                        seen_extra.add(p)
-                        ordered_extra.append(p)
-
-            rec_pages: set[int] = set()
-            for rec in (getattr(_inv, "contracts", None) or []):
-                rpages = [int(p) for p in (rec.pages or []) if p is not None]
-                rec_pages.update(rpages)
-                for lst in (rec.materials or {}).values():
-                    _push(lst or [])
-            for person in (getattr(_inv, "persons", None) or []):
-                _push(person.pages or [])
-                _push(person.experience_pages or [])
-            # locator 目录窗口（材料章节页）：每类取最靠近案例页的 6 页
-            for pageset in (getattr(_inv, "locator_index", None) or {}).values():
-                ranked = sorted(pageset, key=lambda q: min(
-                    (abs(int(q) - rp) for rp in rec_pages), default=10 ** 6))
-                _push(ranked[:6])
-            # 案例页邻域 ±2（材料页常紧邻案例块）——垫底优先级
-            for rp in sorted(rec_pages):
-                _push(range(max(1, rp - 2), rp + 3))
-            named_keys.extend(k for k in list(candidates) if k[1] in seen_extra)
-        except Exception:  # noqa: BLE001 —— 页源增强失败不阻断 VL
-            log.exception("VL 页源增强失败 bid=%s", bid_id)
-    crit_text = (str(criterion.get("name") or "") + str(criterion.get("description") or "")
-                 + str(criterion.get("quote") or "") + str(criterion.get("required_evidence") or ""))
-    # 该格自己的材料锚词（细则里出现的合同/社保/业绩/证书…）——run154 实证：
-    # 仅按"有标签+页序"排序时，文档最前的资格页（营业执照/信用报告，同为
-    # material_tags）占满 8 图名额，p200 的业绩合同永远进不来，模型仍弃权。
-    crit_anchors = [a for a in _SUPPLEMENT_HINTS if a in crit_text]
-
-    locator_nos: set[int] = set()
-    try:
-        from app.engine import material_locator as _ml
-
-        if _ml.locator_enabled() == "on":
-            for _ns in _ml.material_page_index(pages).values():
-                locator_nos |= _ns
-    except Exception:  # noqa: BLE001
-        locator_nos = set()
-
-    def _vl_rank(pg: dict) -> tuple[int, int, int, int, int]:
-        """候选页排序：噪声垫底 → 该格锚词命中数倒序 → 有标签优先 → 页序。
-
-        锚词命中把"本条细则要的材料页"顶到前面（业绩/社保/合同页 > 资格页）；
-        纯文本计算（material_tags 解析期分类 + 文本层关键词），零 OCR。
-        """
-        tags = [str(t) for t in (pg.get("material_tags") or [])]
-        noise = 1 if _is_noise_page(pg) else 0
-        hay = " ".join(tags) + " " + str(pg.get("text") or "")[:500]
-        hits = sum(1 for a in crit_anchors if a in hay)
-        loc = 0 if int(pg.get("page_no") or 0) in locator_nos else 1
-        return (noise, loc, -hits, 0 if tags else 1, int(pg.get("page_no") or 0))
-
-    rest = [q for k, q in candidates.items() if k not in set(named_keys)]
-    rest.sort(key=_vl_rank)
-    ordered = [candidates[k] for k in named_keys if k in candidates] + rest
-    ordered = [q for q in ordered if q.get("page_no") is not None and q.get("stored_path")]
-    selected = ordered[: config.vl_fallback_max_images()]
-
-    page_images: list[dict] = []
-    for cp in selected:
-        try:
-            png = render_page_png(str(cp.get("sha256") or ""), str(cp["stored_path"]),
-                                  int(cp["page_no"]))
-            content = png.read_bytes()
-        except Exception as exc:  # noqa: BLE001 —— 单页渲染失败=跳过该页
-            log.warning("VL 兜底页渲染失败（跳过该页）：%s", exc)
-            continue
-        data_url = "data:image/png;base64," + base64.b64encode(content).decode("ascii")
-        cp["image_url"] = data_url
-        cp["image_sha256"] = hashlib.sha256(content).hexdigest()
-        page_images.append({"data_url": data_url, "document_id": cp.get("document_id"),
-                            "page_no": int(cp["page_no"])})
-    if not page_images:
-        return _vl_note(outcome, {"visual_fallback": "failed",
-                                  "reason": "no_renderable_pages"}, error), error
-
-    vres = vl_fallback.rescue(criterion, page_images, data_class=data_class)
-    if vres.kind == "failed":
-        # 统一失败日志（run152 实证：vl_no_valid_score 等契约类失败此前零日志）
-        log.warning("VL 兜底未定分：criterion=%s reason=%s reasoning=%s",
-                    criterion.get("name"), vres.reason, (vres.reasoning or "")[:200])
-        return _vl_note(outcome, {"visual_fallback": "failed", "reason": vres.reason,
-                                  "clues": vres.clues,
-                                  "reasoning": (vres.reasoning or "")[:500],
-                                  "observations": len(vres.observations)}, error), error
-    # 页级视觉证据：观察/事实证据页落到候选页（严格匹配，同文档页码最近兜底）
-    merged = list(candidates.values())
-    obs_all = list(vres.observations) + [
-        e for f in (vres.facts or []) for e in (f.get("evidence") or [])]
-    evidence: list[dict] = []
-    for ob in obs_all:
-        try:
-            doc_key = ob.get("document_id")
-            page_no = int(ob.get("page_no"))
-        except (TypeError, ValueError):
-            continue
-        page = candidates.get((doc_key, page_no)) or candidates.get((None, page_no))
-        if page is None:
-            same_doc = [q for q in merged
-                        if q.get("page_no") is not None
-                        and (doc_key is None or q.get("document_id") == doc_key)]
-            if same_doc:
-                page = min(same_doc, key=lambda q: abs(int(q["page_no"]) - page_no))
-        if page is None or not page.get("image_url"):
-            continue
-        evidence.append({"kind": "visual",
-                         "document_id": int(page.get("document_id") or 0),
-                         "page_no": int(page["page_no"]),
-                         "observation": ob.get("observation") or ""})
-    if vres.kind == "clue_only":
-        # 否决/资格/符合性格：只收线索，结论仍暂定/存疑（AI 不否决）
-        return _vl_note(outcome, {"visual_fallback": "clue_only",
-                                  "clues": vres.clues,
-                                  "reasoning": (vres.reasoning or "")[:500]}, error), error
-    trigger_kind = (fallback_meta.get("kind") if outcome is not None
-                    else type(error).__name__ if error is not None else None)
-    if vres.kind != "facts":
-        return _vl_note(outcome, {"visual_fallback": "failed",
-                                  "reason": vres.reason or "vl_unknown_kind"}, error), error
-    # ---- VL 报事实、代码算分（2026-11-24 run159 实证）----
-    # facts → 派生 inventory 合并 → 确定性重算（三件套 AND/金额/时间/类型闸都在
-    # 代码里）；基准只升不降；"看了没改善"绝不洗成"已核验"。
-    inv = None
-    try:
-        if inventory_factory is not None:
-            inv = inventory_factory(bid_id)
-    except Exception:  # noqa: BLE001
-        inv = None
+    image_limit = config.vl_fallback_max_images()
+    cell_key = f"{run_id}:{bid_id}:{criterion.get('id')}"
+    facts: list[dict] = []
+    visual_evidence: list[dict] = []
+    observations: set[tuple] = set()
+    reviewed_pages: list[dict] = []
+    rechecked_certificate_pages: set[tuple[int, int]] = set()
+    results: list = []
     res = None
-    if inv is not None:
+    halt_reason = "no_renderable_pages"
+    base = Decimal(str(fallback["value"])) if fallback.get("value") is not None else None
+    maximum = Decimal(str(criterion["max_score"])) if criterion.get("max_score") is not None else None
+    request_rule = {**criterion, "_material_recovery": fallback} if pending else criterion
+
+    def render_original(page):
+        if not page.get("stored_path") or page.get("page_no") is None:
+            return None
         try:
-            from app.engine.objective_fastpath import score_objective
-            from app.engine.vl_facts import merge_vl_facts
+            png = render_page_png(str(page.get("sha256") or ""), str(page["stored_path"]), int(page["page_no"]))
+            content = png.read_bytes()
+        except JobCancelled:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.warning("补评原页渲染失败 document=%s page=%s: %s", page["document_id"], page["page_no"], exc)
+            return None
+        page["image_url"] = "data:image/png;base64," + base64.b64encode(content).decode("ascii")
+        page["image_sha256"] = hashlib.sha256(content).hexdigest()
+        return {"data_url": page["image_url"], "document_id": page["document_id"], "page_no": page["page_no"]}
 
-            merged_inv = merge_vl_facts(inv, vres.facts)
-            res = score_objective(criterion, merged_inv)
-            if res is None:
-                # 翻案通道收口（2026-11-25 run160）：证书格/person 业绩格无
-                # fastpath plan 覆盖——facts→score_count 适配器重算
-                from app.engine.vl_rescore import rescore_from_merged_facts
+    def rescore():
+        if inventory is None or not facts:
+            return None
+        try:
+            merged = merge_vl_facts(inventory, facts)
+            if (requires_platform_certificate_query(criterion)
+                    and not merged.platform_query_certificates
+                    and any(re.search(r"未见.{0,24}(?:查询结果截图|查询截图|查询结果)", str(ref.get("observation") or ""))
+                            for ref in visual_evidence)):
+                # A reviewed proof section can explicitly establish that the
+                # required platform screenshots are absent. Keep that negative
+                # scoped to this merged recovery evidence set.
+                merged.audit = {**merged.audit, "cert_section_state": False}
+            if not requires_platform_certificate_query(criterion):
+                objective = score_objective(criterion, merged)
+                if objective is not None:
+                    return objective
+            return rescore_from_merged_facts(criterion, merged)
+        except JobCancelled:
+            raise
+        except Exception:  # noqa: BLE001
+            log.exception("视觉补评事实未能重算 criterion=%s", criterion.get("name"))
+            return None
 
-                res = rescore_from_merged_facts(criterion, merged_inv)
-        except Exception:  # noqa: BLE001 —— 算分失败=维持原暂定
-            log.exception("VL facts 确定性重算失败 criterion=%s", criterion.get("name"))
-            res = None
-    if res is None:
-        return _vl_note(outcome, {"visual_fallback": "facts_only",
-                                  "reason": "no_deterministic_rescore",
-                                  "facts": vres.facts,
-                                  "reasoning": (vres.reasoning or "")[:500]}, error), error
-    base = None
-    try:
-        if fallback_meta.get("value") is not None:
-            base = Decimal(str(fallback_meta.get("value")))
-    except Exception:  # noqa: BLE001
-        base = None
-    final = res.score
-    if base is not None and (final is None or final < base):
-        final = base  # 只升不降：翻案只允许加分/维持——"误否决不可接受"镜像
-    improved = final is not None and (
-        (base is None and final > 0) or (base is not None and final > base))
-    if not improved and res.zero_reason != "confirmed_absent":
-        return _vl_note(outcome, {"visual_fallback": "facts_no_improvement",
-                                  "facts": vres.facts,
-                                  "calculation": str(res.detail or "")[:500],
-                                  "reasoning": (vres.reasoning or "")[:500]}, error), error
-    log.info("VL 事实翻案定分：criterion=%s score=%s（基准 %s）facts=%d",
-             criterion.get("name"), final, base, len(vres.facts))
-    new_outcome = CellOutcome(
-        "pass", f"{res.detail or '视觉AI事实+确定性算分'}（视觉AI报事实、代码算分）",
-        final, evidence, merged, "visual_fallback", 1,
-        {"visual_fallback": {
-            "score": str(final), "reasoning": vres.reasoning,
-            "facts": vres.facts,
-            "calculation": str(res.detail or "")[:800],
-            "zero_reason": res.zero_reason,
-            "clues": vres.clues, "trigger": trigger_kind,
-        }},
-        [{"verdict_source": "visual",
-          "message": "视觉AI报事实、代码算分（页级证据，非逐字引文）"}],
-    )
-    return new_outcome, None
+    def at_verified_maximum(result):
+        return (result is not None and maximum is not None and result.score >= maximum
+                and not (result.facts or {}).get("unverified_score_included"))
+
+    def at_confirmed_zero(result):
+        return (result is not None and result.score == 0 and result.verdict == "fail"
+                and result.complete
+                and not (result.facts or {}).get("unverified_score_included"))
+
+    if pending and checkpoint:
+        earlier = checkpoint.get("visual_fallback_note") or {}
+        for ref in earlier.get("reviewed_pages") or []:
+            key = (ref.get("document_id"), ref.get("page_no"))
+            page = page_map.get(key)
+            if page and ref.get("sha256") == page.get("sha256"):
+                reviewed_pages.append(ref)
+                if ref.get("certificate_rechecked"):
+                    rechecked_certificate_pages.add(key)
+        for ref in checkpoint.get("visual_evidence") or []:
+            key = (ref.get("document_id"), ref.get("page_no"))
+            page = page_map.get(key)
+            if not page or page.get("sha256") != ref.get("sha256") or not ref.get("observation"):
+                continue
+            # The immutable source-page hash authenticates the prior observation.
+            # Rendering can vary slightly across workers, so image hash mismatch
+            # must not discard a source-validated fact on resume. Keep the page
+            # renderable for the persisted visual citation.
+            if not page.get("image_url") and render_original(page) is None:
+                continue
+            observations.add((*key, ref["observation"]))
+            visual_evidence.append({"kind": "visual", "document_id": key[0], "page_no": key[1],
+                                    "observation": ref["observation"],
+                                    **({"sha256": ref["sha256"]}
+                                       if ref.get("sha256") else {})})
+        for fact in earlier.get("facts") or []:
+            refs = fact.get("evidence") or []
+            if refs and all((ref.get("document_id"), ref.get("page_no"), ref.get("observation")) in observations
+                            for ref in refs):
+                facts.append(fact)
+        res = rescore()
+        if at_verified_maximum(res) or at_confirmed_zero(res):
+            halt_reason = "checkpoint_rescored"
+
+    prior_pages = {(ref["document_id"], ref["page_no"]) for ref in reviewed_pages}
+    ranked_pages = _material_recovery_pages(criterion, list(page_map.values()), fallback, inventory)
+    retry_pages = set()
+    if prior_pages and (criterion.get("params") or {}).get("field") in ("certificates", "cmmi"):
+        fact_pages = {(ref["document_id"], ref["page_no"])
+                      for fact in facts for ref in fact.get("evidence") or []}
+        best_pages = {(page["document_id"], page["page_no"]) for page in ranked_pages[:image_limit]}
+        # A batch may omit a relevant original from its facts even though the
+        # image was sent. Recheck the strongest such candidates once, then advance.
+        retry_pages = (best_pages & prior_pages) - fact_pages - rechecked_certificate_pages
+    ordered = (page for page in ranked_pages
+               if (page["document_id"], page["page_no"]) not in prior_pages
+               or (page["document_id"], page["page_no"]) in retry_pages)
+
+    for _ in range(config.vl_fallback_max_per_cell() if pending else 1):
+        if pending and (at_verified_maximum(res) or at_confirmed_zero(res)):
+            break
+        page_images = []
+        rendered = {}
+        for page in ordered:
+            image = render_original(page)
+            if not image:
+                continue
+            key = (page["document_id"], page["page_no"])
+            rendered[key] = page
+            page_images.append(image)
+            if len(page_images) == image_limit:
+                break
+        if not page_images:
+            break
+        ok, why = budget.consume(bid_id, cell_key)
+        if not ok:
+            halt_reason = why
+            break
+        rechecks = rendered.keys() & retry_pages
+        batch_rule = request_rule
+        if rechecks:
+            batch_rule = {**request_rule, "_recheck_certificate_pages": sorted(rechecks)}
+        result = vl_fallback.rescue(batch_rule, page_images, data_class=data_class)
+        results.append(result)
+        halt_reason = result.reason or "material_review_pending"
+        if not result.reason.startswith(("vision_gateway_unavailable", "vl_call", "vl_contract_invalid")):
+            rechecked_certificate_pages.update(rechecks)
+            reviewed_pages.extend({"document_id": doc, "page_no": page, "sha256": original.get("sha256")}
+                                  for (doc, page), original in rendered.items() if (doc, page) not in prior_pages)
+
+        for ref in [*result.observations, *(e for f in result.facts for e in f.get("evidence") or [])]:
+            normalized = vl_fallback.resolve_page_reference(ref, rendered)
+            if normalized is None or not normalized.get("observation"):
+                continue
+            key = (normalized["document_id"], normalized["page_no"], normalized["observation"])
+            if key not in observations:
+                observations.add(key)
+                visual_evidence.append({"kind": "visual", **normalized})
+
+        if result.kind != "facts":
+            if result.kind == "failed":
+                log.warning("VL 兜底未定分：criterion=%s reason=%s reasoning=%s",
+                            criterion.get("name"), result.reason, (result.reasoning or "")[:200])
+            if result.kind == "clue_only" or result.reason.startswith(("vision_gateway_unavailable", "vl_call")):
+                break
+            continue
+        facts.extend(result.facts)
+        res = rescore()
+
+    reasoning = "；".join(result.reasoning for result in results if result.reasoning)[:500]
+    clues = list(dict.fromkeys(clue for result in results for clue in result.clues))
+    note = {"reason": halt_reason, "reasoning": reasoning, "clues": clues,
+            "reviewed_pages": [{**ref, "certificate_rechecked": True}
+                               if (ref["document_id"], ref["page_no"]) in rechecked_certificate_pages else ref
+                               for ref in reviewed_pages], "facts": facts}
+    positive_complete = False
+    confirmed_zero = False
+    bounded_material_complete = False
+    if pending and outcome is not None:
+        outcome.pages = list(page_map.values())
+        outcome.evidence.extend(visual_evidence)
+        outcome.attempts += len(results)
+        fallback["candidate_pages"] = [{"document_id": ref["document_id"], "page_no": ref["page_no"]}
+                                       for ref in reviewed_pages] or fallback["candidate_pages"]
+        if res is not None:
+            verified_subtotal = (res.facts or {}).get("score_verified_only", res.score)
+            if verified_subtotal is not None and (base is None or Decimal(str(verified_subtotal)) > base):
+                fallback["value"] = str(verified_subtotal)
+        # A bounded visual sample can prove observed points. It cannot
+        # establish absence on unsent source pages.
+        unverified_included = bool((res.facts or {}).get("unverified_score_included")) if res else False
+        positive_complete = (res is not None and res.score > 0 and res.verdict == "pass"
+                             and not unverified_included
+                             and (base is None or res.score >= base)
+                             and bool(visual_evidence) and (res.complete or maximum == res.score))
+        confirmed_zero = (res is not None and res.score == 0 and res.verdict == "fail"
+                          and res.complete and not unverified_included and bool(visual_evidence))
+        # A resumed recovery has now reviewed a broad, source-hashed material
+        # sample. Preserve verified subtotals, but do not leave a score item
+        # unresolved indefinitely after that bounded review.
+        bounded_material_complete = (criterion.get("score_type") == "count"
+                                     and bool(checkpoint) and len(reviewed_pages) >= 24)
+        complete = positive_complete or confirmed_zero or bounded_material_complete
+        if not complete:
+            note["visual_fallback"] = "facts_no_improvement" if facts else "failed"
+            return _vl_note(outcome, note), error
+    else:
+        improved = res is not None and res.score > (base if base is not None else Decimal(0))
+        if not improved or not visual_evidence:
+            note["visual_fallback"] = ("facts_no_improvement" if facts else
+                                       "clue_only" if clues else "failed")
+            if res is not None:
+                note["calculation"] = str(res.detail or "")[:500]
+            return _vl_note(outcome, note, error), error
+
+    if bounded_material_complete:
+        verified_value = ((res.facts or {}).get("score_verified_only") if res is not None else None)
+        if verified_value is None:
+            verified_value = fallback.get("value")
+        if verified_value is None:
+            verified_value = 0
+    elif not pending or positive_complete or confirmed_zero:
+        verified_value = res.score
+    else:
+        verified_value = ((res.facts or {}).get("score_verified_only") if res is not None else None)
+        if verified_value is None:
+            verified_value = fallback.get("value")
+        if verified_value is None and res is not None:
+            verified_value = res.score
+    final_score = Decimal(str(verified_value or 0))
+    if maximum is not None:
+        final_score = min(final_score, maximum)
+    calculation = str((res.detail if res is not None else fallback.get("reason")) or "")[:800]
+    closure_note = ("；已完成原页核验，按已核验材料定分"
+                    if bounded_material_complete and not positive_complete and not confirmed_zero else "")
+    reason = f"{calculation}（视觉AI报事实、代码算分）{closure_note}"
+    zero_reason = (res.zero_reason if res is not None else "material_review_exhausted")
+    raw = {
+        "calculation": calculation,
+        "visual_fallback": {**note, "score": str(final_score), "calculation": calculation,
+                            "zero_reason": zero_reason, "trigger": kind},
+    }
+    evidence = visual_evidence
+    if outcome is not None:
+        raw["attempt_history"] = outcome.raw.get("attempt_history") or []
+        evidence = outcome.evidence if pending else [*outcome.evidence, *visual_evidence]
+    return CellOutcome(
+        "pass" if final_score > 0 else "fail", reason, final_score, evidence, list(page_map.values()), "visual_fallback",
+        outcome.attempts if pending and outcome is not None else len(results), raw,
+        [{"verdict_source": "visual", "message": reason}],
+    ), None
 
 
 def _persist_cell(run_id: int, bidder_id: int, criterion: dict, outcome: CellOutcome | None,
@@ -2009,7 +2345,8 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
         continue_errors = policy == "continue"
         qual_mode = automation_service.qualification_mode(run)
         count_mode = automation_service.count_deterministic_mode(run)
-        if run.status == "partial" and continue_errors:
+        recovery_checkpoints = (run.config_json or {}).get("material_recovery_checkpoints") or {}
+        if run.status == "partial":
             state = automation_service.progress(run_id, session=s)
             if state and state["pending"] == 0:
                 return _run_summary(run_id, manifest, state)
@@ -2161,33 +2498,13 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
             # 有据则翻案计入（页级证据），弃权/失败维持 verified 分（0 或部分
             # 分）+疑问待人工，绝不无据计入、也不静默 0。
             unverified_records = (result.facts or {}).get("unverified_records") or []
-            if unverified_records:
-                material_pages = sorted({
-                    int(p) for rec in unverified_records
-                    for p in (list(rec.get("pages") or [])
-                              + [q for v in (rec.get("materials") or {}).values()
-                                 for q in (v or [])])
-                    if p is not None})
-                fallback = {
-                    "kind": "material_unverified",
-                    "value": str(result.score) if result.score is not None else None,
-                    "basis": "machine_fallback",
-                    "reason": "；".join(
-                        str(w.get("message") or "") for w in (result.warnings or []))
-                        or str(result.detail or "")[:300],
-                    "unverified_records": unverified_records,
-                    "material_pages": material_pages,
-                    "zero_reason": result.zero_reason,
-                    "score_type": criterion.get("score_type"),
-                }
-                raw["fallback"] = fallback
-                return CellOutcome(
-                    result.verdict, result.detail, result.score, [], pages, "fallback", 1,
-                    raw,
-                    [{"message": result.detail + "（未核实待视觉核验/人工）",
-                      "verdict_source": "deterministic",
-                      "fallback_score": fallback}],
-                )
+            if unverified_records or result.zero_reason == "material_binding_conflict":
+                maximum = Decimal(str(criterion["max_score"]))
+                if result.score < maximum:
+                    return _material_review_pending(criterion, pages, result.detail,
+                                                    subtotal=result.score, facts=result.facts)
+            if result.zero_reason == "no_facts" and not result.complete:
+                return None  # Search the text path before deciding which original pages to supplement.
             return CellOutcome(
                 result.verdict, result.detail, result.score, [], pages, "deterministic", 1,
                 raw, [{"message": result.detail, "verdict_source": "deterministic"}],
@@ -2467,6 +2784,7 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
 
     def worker_guarded(bid_id, criterion):  # noqa: ANN001, ANN202
         """VL 兜底在 worker 线程内并行执行（run 151 实证：收口线程串行拖死尾盘）。"""
+        checkpoint = recovery_checkpoints.get(f"{bid_id}:{criterion['id']}")
         try:
             outcome = worker(bid_id, criterion)
         except JobCancelled:
@@ -2474,14 +2792,14 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
         except Exception as exc:  # noqa: BLE001
             rescued, err = _maybe_vl_rescue(
                 run_id, bid_id, criterion, None, exc, pages_by_bidder, vl_budget,
-                inventory_factory=get_inventory)
+                inventory_factory=get_inventory, checkpoint=checkpoint)
             if rescued is not None:
                 return rescued
             raise err
         if outcome is not None:
             outcome, _ = _maybe_vl_rescue(
                 run_id, bid_id, criterion, outcome, None, pages_by_bidder, vl_budget,
-                inventory_factory=get_inventory)
+                inventory_factory=get_inventory, checkpoint=checkpoint)
         return outcome
     workers = min(config.llm_concurrency_ceiling(), len(cells) or 1, max(1, config.llm_max_concurrency()))
     cancelled = False
@@ -2621,9 +2939,13 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
         raise LLMError(f"自动评审未完成，已保留 {len(completed)} 项结果：{errors[0]}") from errors[0]
     automation = automation_service.finish_run(run_id)
     if ctx:
-        ctx.advance(n=automation["processed"] - reported_items + 1,
-                    message=(f"评审已结束：已评分 {automation['completed']} 项，跳过 {automation['skipped']} 项；结果可导出"
-                             if automation["skipped"] else "全部应评项已完成并通过完整性校验"))
+        if automation.get("material_pending"):
+            message = f"有 {automation['material_pending']} 项待补证复核，可继续评分"
+        elif automation["skipped"]:
+            message = f"评审已结束，已评分 {automation['completed']} 项，跳过 {automation['skipped']} 项，结果可导出"
+        else:
+            message = "全部应评项已完成并通过完整性校验"
+        ctx.advance(n=automation["processed"] - reported_items + 1, message=message)
     with session_scope() as s:
         for bid in s.execute(select(Bidder).where(Bidder.id.in_(bidder_ids))).scalars():
             if automation["is_final"]:

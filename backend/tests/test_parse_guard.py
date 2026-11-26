@@ -66,15 +66,17 @@ def test_page_progress_callback_reports_each_page(monkeypatch, tmp_path):
     assert seen[-1] == (3, 3)
 
 
-def test_scoring_supplement_skipped_when_ocr_disabled(monkeypatch):
-    """BID_EVAL_SCORING_OCR=0：评分期补检整段跳过（扫描件只保留标签）。"""
+def test_scoring_ocr_switch_still_allows_original_page_review(monkeypatch, tmp_path):
     from app.services import automatic_scoring_service as A
 
     monkeypatch.setenv("BID_EVAL_SCORING_OCR", "0")
+    rendered = tmp_path / "source-page.png"
+    rendered.write_bytes(b"synthetic page image")
+    monkeypatch.setattr("app.evidence.renderer.render_page_png", lambda *args, **kwargs: rendered)
     pages = [{"document_id": 1, "page_no": 1, "text": "", "known_blank": False,
-              "unreadable": True, "requires_vision": True}]
+              "unreadable": True, "requires_vision": True, "stored_path": "source.pdf", "sha256": "sha"}]
     assert A._supplement_pages({}, pages, visual=False) is pages
-    assert A._supplement_pages({}, pages, visual=True) is pages
+    assert A._supplement_pages({}, pages, visual=True)[0]["image_url"].startswith("data:image/png;")
 
 
 def test_xls_routes_to_xlrd_extractor(tmp_path):

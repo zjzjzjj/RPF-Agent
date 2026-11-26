@@ -509,16 +509,21 @@ def _build_automatic_questions(run, rows: list, automation: dict, completed: set
     for bidder in manifest.get("bidders", []):
         for crit in manifest.get("criteria", []):
             key = (int(bidder["id"]), int(crit["id"]))
-            if key in completed:
-                continue
             score = row_by_key.get(key)
             meta = public_auto_review(score) or {}
+            material_pending = meta.get("material_review_pending")
+            if key in completed and not material_pending:
+                continue
             failed = meta.get("state") == "failed"
+            label = "材料待核验" if material_pending else "技术故障" if failed else "自动评审未完成"
+            action = ("核对所列材料及候选原页后继续本次评审" if material_pending
+                      else "恢复本次运行，继续执行未完成项")
             question = {
-                "kind": "execution_failed" if failed else "automatic_incomplete",
+                "kind": ("material_review_pending" if material_pending
+                         else "execution_failed" if failed else "automatic_incomplete"),
                 "severity": "high" if failed else "medium",
-                "label": "技术故障" if failed else "自动评审未完成",
-                "action": "故障恢复后继续本次运行，仅执行未完成项",
+                "label": label,
+                "action": action,
                 "machine_message": str(meta.get("error") or (score.ai_reasoning if score else "尚未产生评审记录") or "尚未形成有效终态"),
                 "bidder": bidder.get("name") or str(bidder["id"]),
                 "bidder_id": key[0], "score_id": score.id if score else None,
@@ -529,7 +534,8 @@ def _build_automatic_questions(run, rows: list, automation: dict, completed: set
                 "max_score": crit.get("max_score"),
                 "final_score": str(score.final_score) if score and score.final_score is not None else None,
                 "machine_status": score.machine_status if score else None,
-                "review_status": "评审执行失败" if failed else "自动评审未完成",
+                "review_status": label,
+                "material_review_pending": material_pending,
                 "evidence_status": score.evidence_status if score else "none",
                 "source_page": crit.get("source_page"), "source_quote": crit.get("source_quote"),
                 "blocks_final": True,
@@ -543,7 +549,7 @@ def _build_automatic_questions(run, rows: list, automation: dict, completed: set
                 "bidders": [],
             })
             group["bidders"].append({field: question[field] for field in (
-                "bidder", "bidder_id", "score_id", "final_score", "machine_message"
+                "bidder", "bidder_id", "score_id", "final_score", "machine_message", "material_review_pending"
             )})
             if failed:
                 group.update(severity="high", kind="execution_failed", label="技术故障")
@@ -624,7 +630,8 @@ def build_report(project_id: str, run_id: int | None = None) -> dict:
         for score, crit, bidder in rows:
             frozen = frozen_criteria.get(crit.id, {}) if automated else {}
             auto_review = public_auto_review(score) if automated else None
-            cell_completed = (bidder.id, crit.id) in completed
+            material_pending = (auto_review or {}).get("material_review_pending")
+            cell_completed = (bidder.id, crit.id) in completed and not material_pending
             entry = bidders_detail.setdefault(
                 bidder.id,
                 {"bidder_id": bidder.id, "name": ranking_by_bidder.get(bidder.id, {}).get("bidder_name", bidder.name),
@@ -654,7 +661,7 @@ def build_report(project_id: str, run_id: int | None = None) -> dict:
                     if (score.ai_suggested_score is not None and score.ai_revealed_at is not None)
                     else None,
                     "ai_revealed": score.ai_revealed_at is not None,
-                    "review_status": ("自动评审完成" if cell_completed else
+                    "review_status": ("材料待核验" if material_pending else "自动评审完成" if cell_completed else
                                       "评审执行失败" if (auto_review or {}).get("state") == "failed" else
                                       "自动评审未完成") if automated else REVIEW_LABELS.get(score.review_status, score.review_status),
                     "evaluator_actor": score.evaluator_actor,
@@ -709,6 +716,8 @@ def build_report(project_id: str, run_id: int | None = None) -> dict:
             },
             "status": report_status,
             "status_label": ("报告定稿" if report_status == "final" else
+                             "评审已结束（有材料待核验）"
+                             if report_status == "partial" and automation.get("material_pending") else
                              "评审已结束（含故障跳过项）" if report_status == "partial" else
                              "自动评审未完成" if automation is not None else "报告草稿（待复核）"),
             "progress": progress,

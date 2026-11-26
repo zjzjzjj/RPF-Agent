@@ -83,6 +83,8 @@ def test_rescore_cert_confirmed_no_screenshot_clears_iso() -> None:
     inv = _inv(certs=[_cert("ISO9001")], audit={"cert_section_state": False})
     res = rescore_from_merged_facts(CRIT_CERT, inv)
     assert res.score == 0
+    assert res.complete
+    assert res.facts["score_verified_only"] == "0.00"
 
 
 def test_rescore_cert_screenshot_true_upgrades() -> None:
@@ -99,6 +101,47 @@ def test_rescore_cmmi_from_record_backing() -> None:
     res = rescore_from_merged_facts(CRIT_CMMI, inv)
     assert res is not None
     assert res.score == Decimal("2.00")
+
+
+def test_rescore_cmmi_binds_visual_maturity_certificate_to_its_published_record() -> None:
+    proof = CertRecord(name="CMMI", normalized="CMMI", level="3", backing=True, pages=[67],
+                       document_id=1, appraisal_id="64122")
+    lookup = CertRecord(name="CMMI", normalized="CMMI", valid_from="2023-03-24", valid_until="2026-03-24",
+                        backing=False, pages=[69], document_id=1, appraisal_id="64122", appraisal_is_lookup=True)
+    rule = {**CRIT_CMMI, "params": {
+        **CRIT_CMMI["params"], "cert_min_level": 2, "cert_require_current": True,
+        "cert_reference_date": "2025-11-19",
+    }}
+
+    result = rescore_from_merged_facts(rule, _inv(certs=[proof, lookup]))
+
+    assert result is not None and result.complete
+    assert result.score == Decimal("2.00")
+    assert result.facts["certificate_details"][0]["appraisal_lookup_pages"] == [69]
+
+
+def test_rescore_cmmi_accepts_source_maturity_level_string() -> None:
+    from app.engine.vl_facts import merge_vl_facts
+    from app.engine.vl_fallback import VlFact, _sanitize_facts
+
+    rule = {**CRIT_CMMI, "params": {
+        **CRIT_CMMI["params"], "cert_min_level": 2, "cert_require_current": True,
+        "cert_reference_date": "2025-11-19",
+    }}
+    source = {"document_id": 70, "page_no": 67}
+    fact = VlFact(
+        kind="certificate", name="CMMI Maturity Level 3", cert_level="CMMI Maturity Level 3",
+        has_cert_proof=True, has_seal=True, valid_until="2026-03-24",
+        evidence=[{**source, "observation": "证书复印件，Appraisal Expiration Date 24th Mar 2026，盖红色公章"}],
+    )
+    sanitized, dropped = _sanitize_facts([fact], [source])
+
+    assert not dropped
+    result = rescore_from_merged_facts(rule, merge_vl_facts(_inv(), sanitized))
+
+    assert result is not None and result.complete
+    assert result.score == Decimal("2.00")
+    assert result.facts["certificate_details"][0]["page_no"] == 67
 
 
 # ---- person_scope 业绩格（c48/c49）------------------------------------------
@@ -159,6 +202,64 @@ def test_rescore_person_confirmed_missing_still_blocks() -> None:
     res = rescore_from_merged_facts(CRIT_PERSON, inv)
     assert res is not None
     assert res.score == 0, f"确认缺（False）必须阻计：{res.detail}"
+
+
+def test_rescore_onsite_member_proof_is_bound_to_each_person_and_capped():
+    criterion = {
+        "score_type": "count", "name": "驻场工程师业绩", "max_score": "6",
+        "description": "驻场工程师每个案例得1.5分，每人最高3分。",
+        "required_evidence": "合同中体现人员，否则须提供业主证明，并提供近六个月社会保险缴纳证明。",
+        "params": {"field": "performance", "person_scope": "member", "per_item": "1.5", "max_items": 4},
+    }
+    people = [PersonRecord("张三", role="项目负责人", social_months=12),
+              PersonRecord("李四", role="驻场运维工程师", social_months=12),
+              PersonRecord("王五", role="驻场运维工程师", social_months=5)]
+    proofs = {name: {"owner_proof": True} for name in ("张三", "李四", "王五")}
+    records = [ContractRecord(f"某平台独立运维服务项目{i}", Decimal("700000"),
+                              materials_state={"contract": True}, person_names=list(proofs), person_proofs=proofs)
+               for i in range(3)]
+    inventory = _inv(contracts=records + [records[0]], persons=people)
+    assert rescore_from_merged_facts(criterion, inventory).score == Decimal("3")
+    people[2].social_months = 12
+    assert rescore_from_merged_facts(criterion, inventory).score == Decimal("6")
+    stamped_rule = {**criterion, "required_evidence": criterion["required_evidence"] + "业绩证明复印件加盖公章。"}
+    assert rescore_from_merged_facts(stamped_rule, inventory).score == 0
+    for record in records:
+        record.materials_state["seal"] = True
+    assert rescore_from_merged_facts(stamped_rule, inventory).score == Decimal("6")
+
+
+def test_social_security_coverage_uses_named_rows_and_respects_latest_gap():
+    from app.engine.material_inventory import _overlay_social_security
+    from app.engine.vl_facts import merge_vl_facts
+
+    member = PersonRecord("张三", role="驻场运维工程师")
+    other = PersonRecord("李四", role="驻场运维工程师")
+    reported = {"document_id": 1, "page_no": 1, "text": (
+        "社会保险参保证明（单位专用）\n2024年12月 2025年11月，该单位参保人员信息如下\n"
+        "1\n张三\n110101198112120001\n202412 202509\n10\n"
+        "2\n张三\n110101198112120001\n202511 202511\n1\n"
+        "3\n李四\n110101198112120002\n202506 202511\n6\n")}
+    _overlay_social_security([member, other], [reported])
+    assert member.social_months == 1
+    assert other.social_months == 6
+    inventory = _inv(persons=[member, other])
+    visual = {"kind": "person", "name": "张三", "social_security_months": 12,
+              "evidence": [{"document_id": 1, "page_no": 1, "observation": "张三出现在社保清单"}]}
+    assert merge_vl_facts(inventory, [visual]).persons[0].social_months == 1
+
+
+def test_leader_five_paid_months_do_not_meet_six_month_proof_requirement():
+    from app.engine.material_inventory import _overlay_social_security
+
+    inventory = _person_case_inv()
+    _overlay_social_security(inventory.persons, [{"text": (
+        "社会保险参保证明（单位专用） 2025年05月 - 2025年10月，该单位参保人员信息如下\n"
+        "1\n杨祥海\n110101198112120001\n202505 - 202509\n5\n")}])
+    criterion = {**CRIT_PERSON, "required_evidence": (
+        "须提供业绩证明材料、具有五年及以上工作经验证明及近六个月社保缴纳证明。")}
+    assert inventory.persons[0].social_months == 5
+    assert rescore_from_merged_facts(criterion, inventory).score == 0
 
 
 def test_cmmi_field_inference_beats_generic_cert_kw() -> None:

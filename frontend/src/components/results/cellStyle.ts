@@ -18,7 +18,9 @@ export function cellStyle(cell: MatrixCell | undefined, managed = false): { bg: 
     return { bg: "#f6ffed", label: "通过", tip };
   }
   if (managed && cell.auto_review_basis === "fallback") {
-    if (cell.score_type === "match" || cell.machine_status === "not_deeply_reviewed")
+    if (cell.auto_review_fallback_kind === "material_review_pending")
+      return { bg: "#fff7e6", label: "材料待核验", tip: "查看评审记录中的待核对材料和候选原页" };
+    if (cell.auto_review_fallback_kind === "duplicate_summary" || cell.machine_status === "not_deeply_reviewed")
       return { bg: "#fafafa", label: "不适用", tip: "汇总或判断条目，分值已在对应计分项计算，不重复计分" };
     return {
       bg: "#fff7e6",

@@ -43,6 +43,7 @@ function verdictTag(item: SummaryItem) {
 }
 
 function scoreCell(item: SummaryItem, managed: boolean) {
+  if (item.auto_review?.material_review_pending) return <Tag color="orange">材料待核验</Tag>;
   if (managed && item.machine_status === "execution_failed") return <Tag color="red">执行失败</Tag>;
   if (item.state === "veto" || item.state === "match") return verdictTag(item);
   if (item.state === "not_run") return <Typography.Text type="secondary">未执行</Typography.Text>;

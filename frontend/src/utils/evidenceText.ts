@@ -77,6 +77,7 @@ export function evidenceCellLabel(
 }
 
 export function automaticEvidenceCellLabel(metadata?: AutoReviewMetadata | null): string {
+  if (metadata?.material_review_pending) return "材料待核验";
   if (metadata?.visual_evidence?.length) return `原页视觉核验 ${metadata.visual_evidence.length} 页`;
   if (metadata?.basis === "external") return "外部事实证据边界";
   if (metadata?.confirmed_absent && metadata.coverage_complete) return "已确认材料缺失";
@@ -86,6 +87,7 @@ export function automaticEvidenceCellLabel(metadata?: AutoReviewMetadata | null)
 }
 
 export function automaticEvidenceEmptyText(metadata?: AutoReviewMetadata | null): string {
+  if (metadata?.material_review_pending) return "待核对的证明材料及候选原页见自动评审记录。";
   if (metadata?.visual_evidence?.length) return "本项采用原页视觉证据，观察记录和页图见上方。";
   if (metadata?.basis === "external") return "本项已明确外部事实的证据边界，现有材料无法证实。";
   if (metadata?.confirmed_absent && metadata.coverage_complete) return "已完成全部关联材料检索，确认所需证明缺失。";

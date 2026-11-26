@@ -77,7 +77,8 @@ export default function ItemReasonDrawer({ pid, item, open, onClose, managed = f
         <>
           <Descriptions size="small" column={2} bordered style={{ marginBottom: 16 }}>
             <Descriptions.Item label="得分">
-              {item.state === "scored" ? <b>{item.final}</b> : (item.verdict ?? "—")}
+              {item.auto_review?.material_review_pending ? "材料待核验" :
+                item.state === "scored" ? <b>{item.final}</b> : (item.verdict ?? "—")}
             </Descriptions.Item>
             <Descriptions.Item label="满分">{item.max_score ?? "—"}</Descriptions.Item>
             <Descriptions.Item label="失分">

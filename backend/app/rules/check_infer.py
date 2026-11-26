@@ -15,6 +15,7 @@ compiler 落库与 rule_service.normalize_package 自愈共用本模块，口径
 from __future__ import annotations
 
 import re
+from datetime import date
 from decimal import Decimal
 from typing import Any
 
@@ -33,6 +34,15 @@ PERF_KW = re.compile(r"业绩|案例|合同|项目经验|类似项目|服务经�
 # CMMI/CSMM/能力成熟度是具体证书名（cmmi 专属计数分支），优先于通用"认证"词
 # ——"CMMI/CSMM 认证"落到 certificates 会给任何证书计分（2026-11-25 c45 实证）
 CMMI_KW = re.compile(r"CMMI|CSMM|能力成熟度", re.I)
+_MATURITY_LEVEL_NUMBER = r"[一二三四五六七八九1-9]"
+_RE_MATURITY_LEVEL = re.compile(
+    rf"(?:CMMI|CSMM|能力成熟度)(?:认证|评估|证书)*(?:等级)?({_MATURITY_LEVEL_NUMBER})级(及以上|或以上|以上)?",
+    re.I,
+)
+_RE_SUBMISSION_DATE = re.compile(
+    r"(?:投标(?:文件(?:的)?递交)?|递交)截止(?:时间|日期)[:为]?"
+    r"(20\d{2})(?:年|-|/|\.)(\d{1,2})(?:月|-|/|\.)(\d{1,2})(?:日|(?!\d))"
+)
 # 人员级范围
 _LEADER_KW = re.compile(r"项目负责人|项目经理|负责人|拟派负责人|项目总监|技术负责人")
 _MEMBER_KW = re.compile(r"团队成员|成员|团队|驻场人员|人员名单|拟派人员|技术人员")
@@ -650,6 +660,54 @@ def classify_scoring_form(text: str) -> tuple[str, dict[str, Any]] | None:
                  else "certificates" if CERT_KW.search(text) else "items")
         return "existence", {"field": field, "per_item": m.group(1), "max_items": "1"}
     return None
+
+
+def extract_tender_submission_date(pages: list[tuple[int, str]]) -> str | None:
+    """Return the unambiguous date explicitly labeled as the tender submission deadline."""
+    dates = set()
+    for _, page in pages:
+        for match in _RE_SUBMISSION_DATE.finditer(normalize_no_ws(page)):
+            try:
+                dates.add(date(*(int(value) for value in match.groups())).isoformat())
+            except ValueError:
+                return None
+    return next(iter(dates)) if len(dates) == 1 else None
+
+
+def maturity_certificate_requirements(text: str, submission_date: str | None = None) -> dict[str, Any]:
+    """Read explicitly stated maturity level and validity requirements from one clause."""
+    from app.engine.objective import _CN_NUM
+
+    text = normalize_no_ws(text)
+    matches = list(_RE_MATURITY_LEVEL.finditer(text))
+    levels = {_CN_NUM.get(match[1], match[1]) for match in matches}
+    if len(levels) != 1 or not matches[-1][2]:
+        return {}
+    result: dict[str, Any] = {"cert_min_level": int(levels.pop())}
+    if re.search(r"有效期(?:之)?内|有效的(?:CMMI|CSMM|能力成熟度)", text, re.I):
+        result["cert_require_current"] = True
+        if submission_date:
+            result["cert_reference_date"] = submission_date
+    return result
+
+
+def explicit_count_allocation(text: str) -> tuple[Decimal, dict[str, Any]] | None:
+    """Extract the ceiling of one self-contained count clause from its source text."""
+    form = classify_scoring_form(text)
+    if form is None or len(list(_RE_SCORE_CLAUSE.finditer(text))) != 1:
+        return None
+    kind, params = form
+    caps = list(_RE_CAP.finditer(text))
+    if kind == "per_item" and len(caps) == 1:
+        ceiling = Decimal(caps[0].group(1))
+        per_item = Decimal(params["per_item"])
+        if per_item <= 0 or ceiling < per_item or ceiling % per_item:
+            return None
+    elif kind == "existence" and not caps:
+        ceiling = Decimal(params["per_item"])
+    else:
+        return None
+    return (ceiling, {**params, "_objective_form": kind}) if ceiling > 0 else None
 
 
 # ---------------------------------------------------------------------------

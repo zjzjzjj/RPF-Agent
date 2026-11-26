@@ -315,6 +315,10 @@ _FRAGMENT_MIN_LEN = 8            # 归一化引文下限（与 _row_cores 的 8 
 _FRAGMENT_LONG_LEN = 16          # 超过此长度不再要求计分锚点
 _FRAGMENT_COVER_RATIO = 0.6      # 片段并集须覆盖评分正文的比例
 _FRAGMENT_TYPES = ("count", "subjective")  # formula 不参与：价格 ledger 语义独立
+_RE_MANAGEMENT_PROOF = re.compile(
+    r"[,;。]其中(?:的)?管理体系认证(?:还|另)(?:需|须)[^,。;]*截图[^,。;]*"
+)
+_RE_ALTERNATIVE_CLAUSE = re.compile(r"^(?:或|二选一|择一|任选|若|如未|否则)")
 
 
 def _row_label(row: SkeletonRow) -> str:
@@ -359,6 +363,111 @@ def _fragment_page_ok(c: ExtractedCriterion, row: SkeletonRow) -> bool:
     return abs(ph - rp) <= 1
 
 
+def _without_management_proof(text: str | None) -> str | None:
+    if text:
+        normalized, offsets = normalize_no_ws_with_map(text)
+        match = _RE_MANAGEMENT_PROOF.search(normalized)
+        if match is not None:
+            start = offsets[match.start()]
+            end = offsets[match.end() - 1] + 1
+            return text[:start] + text[end:]
+    return text
+
+
+def reconcile_explicit_count_allocations(
+    criteria: list[ExtractedCriterion], rows: list[SkeletonRow], *, submission_date: str | None = None,
+) -> list[dict[str, Any]]:
+    """Reconcile separate count clauses whose exact quotes partition one table row."""
+    from app.rules.check_infer import explicit_count_allocation, maturity_certificate_requirements
+
+    bodies = [_row_scoring_body(row) for row in rows]
+    by_row: dict[int, list[tuple[int, int, int]]] = {}
+    for ci, criterion in enumerate(criteria):
+        if criterion.is_veto or criterion.score_type not in ("count", "match", "subjective"):
+            continue
+        quote = _norm(criterion.quote or "").strip("。;,")
+        if len(quote) < _FRAGMENT_MIN_LEN:
+            continue
+        hits = []
+        for ri, body in enumerate(bodies):
+            if not _fragment_page_ok(criterion, rows[ri]):
+                continue
+            start = body.find(quote)
+            if start >= 0:
+                hits.append((ri, start))
+                if body.find(quote, start + 1) >= 0:
+                    hits.append((ri, start))
+        if len(hits) == 1:
+            ri, start = hits[0]
+            by_row.setdefault(ri, []).append((start, start + len(quote), ci))
+
+    report: list[dict[str, Any]] = []
+    for ri, spans in by_row.items():
+        row, body = rows[ri], bodies[ri]
+        if row.subjectivity == "subjective" or len(spans) < 2:
+            continue
+        allocations = []
+        end = 0
+        for start, stop, ci in sorted(spans):
+            gap = body[end:start]
+            if start < end or gap.strip("。;") or (allocations and not gap):
+                break
+            clause = body[start:stop]
+            if _RE_ALTERNATIVE_CLAUSE.match(clause):
+                break
+            allocation = explicit_count_allocation(clause)
+            if allocation is None:
+                break
+            ceiling, params = allocation
+            if params.get("field") == "cmmi":
+                params.update(maturity_certificate_requirements(clause, submission_date))
+            allocations.append((ci, ceiling, params))
+            end = stop
+        if len(allocations) != len(spans) or body[end:].strip("。;"):
+            continue
+        total = sum((maximum for _, maximum, _ in allocations), Decimal(0))
+        if total != row.max_score:
+            continue
+
+        # Keep the existing fragment path for correctly extracted short fragments.
+        # The full-row prefix is unsafe if it matched only the first count clause.
+        if not any(
+            criteria[ci].max_score != maximum or criteria[ci].score_type != "count"
+            or _covers(_crit_text(criteria[ci]), row)
+            for ci, maximum, _ in allocations
+        ):
+            continue
+
+        proof_heading = _RE_MATERIAL_HEAD.search(row.text)
+        proof = row.required_evidence
+        if not proof and proof_heading is not None:
+            proof = row.text[proof_heading.end():].strip()
+        changes = []
+        for ci, maximum, params in allocations:
+            criterion = criteria[ci]
+            changes.append({
+                "criterion_index": ci, "code": criterion.code, "name": criterion.name,
+                "from": float(criterion.max_score) if criterion.max_score is not None else None,
+                "to": float(maximum),
+            })
+            criterion.max_score = maximum
+            criterion.score_type = "count"
+            criterion.check_type = "count_at_least"
+            criterion.count_per_item = Decimal(params["per_item"])
+            criterion.params = {k: v for k, v in criterion.params.items() if k not in {"engine", "tiers"}}
+            criterion.params.update(params)
+            if row.subjectivity is not None:
+                criterion.score_column = row.subjectivity
+                criterion.score_column_source = "file"
+            if params.get("field") in ("certificates", "cmmi") and proof:
+                criterion.required_evidence = proof
+            if params.get("field") == "cmmi":
+                criterion.description = _without_management_proof(criterion.description)
+                criterion.required_evidence = _without_management_proof(criterion.required_evidence)
+        report.append({"row_index": ri, "allocations": changes, "sum": float(total)})
+    return report
+
+
 def _union_coverage(body_n: str, probes: list[str]) -> float:
     """片段并集（首次出现区间合并）覆盖评分正文的比例。"""
     if not body_n:
@@ -401,7 +510,10 @@ def _reconcile_fragments(
     bodies = {ri: _row_scoring_body(row) for ri, row in enumerate(rows)}
 
     # 诊断：同一行被 ≥2 条计分条目完整覆盖——只披露，不自动去重
+    allocated_rows = {entry["row_index"] for entry in report["explicit_count_allocations"]}
     for ri, row in enumerate(rows):
+        if ri in allocated_rows:
+            continue
         cis = [ci for ci in covered_by[ri]
                if ci not in dropped_idx and criteria[ci].score_type in SCORING_TYPES]
         if len(cis) >= 2:
@@ -535,6 +647,8 @@ def reconcile_with_skeleton(
     if skeleton is None:
         return criteria, report
 
+    from app.rules.check_infer import extract_tender_submission_date
+
     pages_by_no = dict(pages or [])
     index = _PageIndex(pages_by_no) if pages_by_no else None
     report = {"skipped": False,
@@ -547,16 +661,29 @@ def reconcile_with_skeleton(
               "fragment_ambiguous": [], "fragment_shadowed": [],
               "multi_covered_rows": []}
 
+    submission_date = extract_tender_submission_date(pages or [])
+    allocations = reconcile_explicit_count_allocations(
+        criteria, skeleton.rows, submission_date=submission_date)
+    report["explicit_count_allocations"] = allocations
+    allocated_rows = {
+        entry["row_index"]: [part["criterion_index"] for part in entry["allocations"]]
+        for entry in allocations
+    }
+    allocated_criteria = {ci for parts in allocated_rows.values() for ci in parts}
     texts = [(c, _crit_text(c)) for c in criteria]
     # 行 → 覆盖它的 criteria（前缀/子串命中）
     covered_by: dict[int, list[int]] = {i: [] for i in range(len(skeleton.rows))}
     for ci, (_c, tn) in enumerate(texts):
+        if ci in allocated_criteria:
+            continue
         for ri, row in enumerate(skeleton.rows):
             if _covers(tn, row):
                 covered_by[ri].append(ci)
 
     # 父项粒度：name 含组名 且 分值==组分值 → 整组覆盖
     for ci, (c, tn) in enumerate(texts):
+        if ci in allocated_criteria:
+            continue
         for gi, group in enumerate(sorted({r.group for r in skeleton.rows})):
             rows_g = [i for i, r in enumerate(skeleton.rows) if r.group == group]
             totals = {skeleton.rows[i].group_total for i in rows_g}
@@ -567,6 +694,9 @@ def reconcile_with_skeleton(
                 for i in rows_g:
                     if ci not in covered_by[i]:
                         covered_by[i].append(ci)
+
+    for ri, indices in allocated_rows.items():
+        covered_by[ri].extend(indices)
 
     # score_type 校正（2026-11-18 列覆盖全面归正，用户拍板「主/客观分列=ground truth」）：
     # ① 骨架行有主/客观列标注、被 1:1 覆盖 → 按列+形态决策树归正（不信 LLM 自报；

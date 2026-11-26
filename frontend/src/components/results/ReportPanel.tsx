@@ -23,7 +23,7 @@ export default function ReportPanel({ report, error, managed = false }: Props) {
         type="info"
         showIcon
         message="尚无可用的评标报告"
-        description={managed ? "全部应评项自动完成后才生成正式报告。当前成功结果已保留，可在评分明细中查看；技术故障修复后可恢复评审。" : "报告需要一次已完成的评分运行。请先在上方「发起评分运行」，完成后回到本页。"}
+        description={managed ? "全部应评项完成后可生成正式报告，已评分项和待核验材料可在评分明细中查看。" : "报告需要一次已完成的评分运行。请先在上方「发起评分运行」，完成后回到本页。"}
       />
     );
   }
@@ -35,16 +35,17 @@ export default function ReportPanel({ report, error, managed = false }: Props) {
         <Alert
           type={report.status === "final" ? "success" : "warning"}
           showIcon
-          message={report.status === "final" ? "全自动评审已完成，正式报告可导出" : report.status === "partial" ? "评审已结束，评分结果与跳过项清单可导出" : "自动评审进行中"}
+          message={report.status === "final" ? "全自动评审已完成，正式报告可导出" : report.status === "partial" ? "评审已结束，评分结果和待处理清单可导出" : "自动评审尚未完成"}
           description={report.status === "final"
             ? "系统已核对全部应评条款、最终分值和证据。符合性不通过和外部事实无法证实均为已评审结论，投标人继续参与计分和排名。"
-            : "评分结果仅合计有效完成项；故障项分值留空，原因保留。使用上方按钮可导出全部评分明细和故障清单。"}
+            : "评分结果合计已评分项。待处理条目的详情见下表，可随评分明细导出。"}
         />
-        <Card size="small" title="故障与未完成项">
-          <Table dataSource={report.open_questions} rowKey="score_record_id" size="small" pagination={{ pageSize: 10 }}
+        <Card size="small" title="待处理条目">
+          <Table dataSource={report.open_questions} rowKey={(q) => `${q.bidder_id}-${q.code}`} size="small" pagination={{ pageSize: 10 }}
             columns={[
-              { title: "投标人", dataIndex: "bidder_name" },
-              { title: "条款", dataIndex: "criterion_name" },
+              { title: "投标人", dataIndex: "bidder" },
+              { title: "条款", dataIndex: "criterion" },
+              { title: "状态", dataIndex: "label" },
               { title: "原因", dataIndex: "machine_message" },
             ]} />
         </Card>

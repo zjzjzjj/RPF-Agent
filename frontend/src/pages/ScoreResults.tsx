@@ -290,7 +290,7 @@ export default function ScoreResults() {
             disabled={hasActiveRun}
             onClick={() => resumeRun.mutate(runId)}
           >
-            跳过故障并继续评审
+            {automation.material_pending ? "继续核验材料" : "继续评审"}
           </Button>
         )}
         {currentRunActive && runId != null && (
@@ -323,7 +323,7 @@ export default function ScoreResults() {
 
       <Space style={{ marginBottom: 12 }} wrap>
         {managed && <Button icon={<FileTextOutlined />} href={`/api/runs/${runId}/results.csv`} disabled={!runId}>
-          导出评分结果与故障清单（CSV）
+          导出评分结果与待处理清单（CSV）
         </Button>}
         <Button
           icon={<FileTextOutlined />}
@@ -355,6 +355,7 @@ export default function ScoreResults() {
           <Typography.Text>
             已评分 {automation.completed} / {automation.expected} 项 · {continueErrors ? `待处理 ${automation.pending ?? automation.remaining}` : `剩余 ${automation.remaining}`} 项
             {automation.failed > 0 ? ` · ${continueErrors ? "故障已跳过" : "技术故障"} ${automation.failed} 项` : ""}
+            {automation.material_pending ? ` · 材料待核验 ${automation.material_pending} 项` : ""}
           </Typography.Text>
           <div style={{ marginTop: 8 }}>
             <ExecutionProgressDetails progress={currentRun?.execution_progress ?? automation.execution_progress} />

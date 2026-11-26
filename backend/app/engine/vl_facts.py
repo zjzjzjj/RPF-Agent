@@ -14,12 +14,15 @@ scorer（objective_fastpath.score_objective）执行。合并语义：
 """
 from __future__ import annotations
 
+import re
 from dataclasses import replace
 from decimal import Decimal, InvalidOperation
 
 from app.engine.material_inventory import (
-    CertRecord, ContractRecord, MaterialInventory, PersonRecord,
+    CertRecord, ContractRecord, MaterialInventory, PersonRecord, certificate_families,
+    certificate_numbers, platform_query_details,
 )
+from app.engine.objective import normalize_cert
 
 
 def _norm_name(name: str | None) -> str:
@@ -75,17 +78,46 @@ def _merge_contract(contracts: list[ContractRecord], fact: dict,
                     ev_pages: list[int]) -> None:
     name = str(fact.get("name") or "").strip()
     amount = _amount_val(fact.get("amount_yuan"))
-    if not name or amount is None:
+    if not name or (fact.get("amount_yuan") is not None and
+                    (amount is None or not amount.is_finite() or amount <= 0)):
         return  # sanitize 已拦；防御
     state_map = (("has_contract", "contract"), ("has_invoice", "invoice"),
                  ("has_acceptance", "acceptance"), ("has_seal", "seal"))
     person_names = [str(n).strip() for n in (fact.get("person_names") or [])
                     if str(n).strip()]
-    target = None
-    for rec in contracts:
-        if _same_case(rec, name, amount):
-            target = rec
-            break
+    observations = [str(ref.get("observation") or "") for ref in fact.get("evidence") or []]
+    observed = " ".join(observations)
+    project_type = str(fact.get("project_type") or "").strip() or None
+    if project_type and not any(
+            re.search(r"(?:项目|系统|服务)(?:的)?(?:类型|类别)|(?:本项目|本合同)(?:明确)?(?:为|属于)", observation)
+            and _norm_name(project_type) in _norm_name(observation) for observation in observations):
+        project_type = None
+    types_from_acceptance = [observation for observation in observations
+                             if re.search(r"验收|终验", observation) and re.search(r"(?:项目|系统|服务)(?:类型|类别)", observation)]
+    acceptance_type = bool(project_type and any(_norm_name(project_type) in _norm_name(observation)
+                                               for observation in types_from_acceptance))
+    name_proofs = {}
+    for person in person_names:
+        if _norm_name(person) not in _norm_name(observed):
+            continue
+        flags = {key: True for source, key in _PERSON_STATE_MAP if fact.get(source) is True}
+        if fact.get("has_owner_proof") is True and any(word in observed for word in ("业主证明", "用户证明", "业主出具")):
+            flags["owner_proof"] = True
+        if flags:
+            name_proofs[_norm_name(person)] = flags
+    matches = [rec for rec in contracts if _same_case(rec, name, amount)]
+    exact = [rec for rec in contracts if _norm_name(rec.name) == _norm_name(name)]
+    signed = str(fact.get("sign_date") or "").strip()
+    if signed:
+        matches = [rec for rec in matches if not rec.signed_date or rec.signed_date == signed]
+        exact = [rec for rec in exact if not rec.signed_date or rec.signed_date == signed]
+    if len(matches) > 1:
+        return
+    target = matches[0] if matches else None
+    if target is None and len(exact) == 1 and (amount is None or exact[0].amount_yuan is None):
+        target = exact[0]
+    if target is None and amount is None:
+        return  # A fragment cannot add a contract or select between similarly named records.
     if target is None:
         # 伪迹同案匹配：同名/名称重叠 + 文本伪迹额（或两值皆伪迹）——0.01 记录
         # 与 VL 大额事实并成一条，防双计/漏计；两值皆伪迹只并案不改值
@@ -111,8 +143,8 @@ def _merge_contract(contracts: list[ContractRecord], fact: dict,
             name=name, amount_yuan=amount,
             signed_date=str(fact.get("sign_date") or "").strip() or None,
             pages=list(ev_pages), materials=materials, materials_state=state,
-            project_type=str(fact.get("project_type") or "").strip() or None,
-            person_names=person_names, person_states=pstate,
+            project_type=project_type,
+            person_names=person_names, person_states=pstate, person_proofs=name_proofs,
             source="vl",
         ))
         return
@@ -125,8 +157,8 @@ def _merge_contract(contracts: list[ContractRecord], fact: dict,
         target.amount_corrected = True       # 留痕（审计可见）
     if not target.signed_date and fact.get("sign_date"):
         target.signed_date = str(fact["sign_date"]).strip()
-    if not target.project_type and fact.get("project_type"):
-        target.project_type = str(fact["project_type"]).strip()
+    if project_type and (not target.project_type or acceptance_type):
+        target.project_type = project_type
     for p in ev_pages:
         if p not in target.pages:
             target.pages.append(p)
@@ -145,41 +177,116 @@ def _merge_contract(contracts: list[ContractRecord], fact: dict,
     for src, key in _PERSON_STATE_MAP:
         if fact.get(src) is True:
             target.person_states[key] = True   # 只升不降
+    for name_key, proof in name_proofs.items():
+        target.person_proofs.setdefault(name_key, {}).update(proof)
 
 
 def _merge_cert(certs: list[CertRecord], fact: dict, ev_pages: list[int]) -> None:
     name = str(fact.get("name") or "").strip()
     if not name:
         return
-    from app.engine.objective import normalize_cert
-
     norm = normalize_cert(name)
-    target = next((c for c in certs if (c.normalized or "") == norm
-                   or normalize_cert(c.name) == norm), None)
+    number = str(fact.get("certificate_number") or "").strip().upper()
+    appraisal_id = str(fact.get("appraisal_id") or "").strip() or None
+    lookup = bool(fact.get("appraisal_is_lookup"))
+    document_ids = {ref.get("document_id") for ref in fact.get("evidence") or []}
+    document_id = next(iter(document_ids)) if len(document_ids) == 1 else None
+    if norm == "CMMI":
+        # Keep visual maturity records independent so one certificate's level
+        # cannot inherit the expiry of another certificate from the same family.
+        target = next((c for c in certs if _norm_name(c.name) == _norm_name(name)
+                       and c.appraisal_is_lookup == lookup
+                       and appraisal_id and c.appraisal_id == appraisal_id
+                       and c.document_id == document_id
+                       and set(c.pages) & set(ev_pages)), None)
+    else:
+        target = next((c for c in certs if normalize_cert(c.name) == norm
+                       and (not number or c.certificate_number == number)), None)
     if target is None:
         certs.append(CertRecord(
             name=name, normalized=norm,
             level=str(fact.get("cert_level") or "").strip() or None,
             valid_until=str(fact.get("valid_until") or "").strip() or None,
             pages=list(ev_pages),
-            backing=True if ev_pages else None,
+            backing=True if ev_pages and not lookup else None,
+            valid_from=str(fact.get("valid_from") or "").strip() or None,
+            certificate_number=number or None,
+            appraisal_id=appraisal_id,
+            appraisal_is_lookup=lookup,
+            document_id=document_id,
         ))
         return
     if not target.level and fact.get("cert_level"):
         target.level = str(fact["cert_level"]).strip()
     if not target.valid_until and fact.get("valid_until"):
         target.valid_until = str(fact["valid_until"]).strip()
+    if not target.valid_from and fact.get("valid_from"):
+        target.valid_from = str(fact["valid_from"]).strip()
     for p in ev_pages:
         if p not in target.pages:
             target.pages.append(p)
-    if target.backing is not True and ev_pages:
+    if target.backing is not True and ev_pages and not lookup:
         target.backing = True
+
+
+_PLATFORM_REFERENCE = re.compile(r"cx\.cnca\.cn|认证认可信息公共服务平台", re.I)
+_CERT_COPY = re.compile(r"认证证书|证书(?:原件|复印件|扫描件)")
+_CERT_SEAL = re.compile(r"(?:盖有|可见|加盖)[^，。；]{0,45}公章|红(?:色)?公章")
+_CERT_EXPIRY = re.compile(r"(?:有效期(?:至|到)|到期日期)\s*[:：]?\s*20\d{2}")
+_COPY_NEGATION = re.compile(r"(?:未见|未提供|缺少)(?:[^，。；]{0,12})(?:证书|公章)|未加盖|无公章|须提供|不得分")
+
+
+def _merge_certificate_observations(certs: list[CertRecord], fact: dict) -> list[tuple]:
+    """Read ISO copy and platform observations independently of optional model flags."""
+    normalized = normalize_cert(str(fact.get("name") or ""))
+    refs = [ref for ref in fact.get("evidence") or [] if ref.get("page_no") is not None]
+    if not normalized.startswith("ISO"):
+        if fact.get("has_query_screenshot") is not True or fact.get("has_cert_proof") is True:
+            _merge_cert(certs, fact, sorted({int(ref["page_no"]) for ref in refs}))
+        return []
+
+    expected_number = str(fact.get("certificate_number") or "").strip().upper()
+    copies = []
+    queries = []
+    has_platform_ref = False
+    for ref in refs:
+        observation = str(ref.get("observation") or "")
+        if _PLATFORM_REFERENCE.search(observation):
+            has_platform_ref = True
+            families, numbers = platform_query_details(observation, require_seal=True)
+            if families or numbers:
+                queries.append((normalized, families, numbers, ref.get("document_id")))
+            continue
+        numbers = certificate_numbers(observation)
+        if (ref.get("document_id") and len(numbers) == 1
+                and (not expected_number or expected_number in numbers)
+                and certificate_families(observation) == {normalized}
+                and _CERT_COPY.search(observation)
+                and (_CERT_SEAL.search(observation) or fact.get("has_seal") is True)
+                and _CERT_EXPIRY.search(observation) and not _COPY_NEGATION.search(observation)):
+            copies.append(({**fact, "certificate_number": next(iter(numbers)), "evidence": [ref]},
+                           int(ref["page_no"])))
+    if copies:
+        for copy, page in copies:
+            _merge_cert(certs, copy, [page])
+    elif (not has_platform_ref and fact.get("has_query_screenshot") is not True
+          and (not expected_number or fact.get("has_cert_proof") is True)):
+        _merge_cert(certs, fact, sorted({int(ref["page_no"]) for ref in refs}))
+    return queries
 
 
 def _merge_person(persons: list[PersonRecord], fact: dict, ev_pages: list[int]) -> None:
     name = str(fact.get("name") or "").strip()
     if not name:
         return
+    observed = " ".join(str(ref.get("observation") or "") for ref in fact.get("evidence") or [])
+    months = fact.get("social_security_months")
+    if (not isinstance(months, int) or months < 0 or _norm_name(name) not in _norm_name(observed)
+            or not any(word in observed for word in ("社保", "缴费", "参保", "社会保险"))):
+        months = None
+    role = str(fact.get("person_role") or "").strip()
+    if not role or _norm_name(name) not in _norm_name(observed) or _norm_name(role) not in _norm_name(observed):
+        role = ""
 
     def _years(raw) -> Decimal | None:
         try:
@@ -192,15 +299,20 @@ def _merge_person(persons: list[PersonRecord], fact: dict, ev_pages: list[int]) 
     target = next((p for p in persons if _norm_name(p.name) == _norm_name(name)), None)
     if target is None:
         persons.append(PersonRecord(
-            name=name, title=str(fact.get("person_title") or "").strip(),
+            name=name, role=role, title=str(fact.get("person_title") or "").strip(),
             years=_years(fact.get("person_years")),
-            experience_pages=list(ev_pages), pages=list(ev_pages),
+            experience_pages=list(ev_pages), pages=list(ev_pages), social_months=months,
         ))
         return
     if not target.title and fact.get("person_title"):
         target.title = str(fact["person_title"]).strip()
+    if not target.role and role:
+        target.role = role
     if target.years is None:
         target.years = _years(fact.get("person_years"))
+    if (months is not None and not target.social_months_from_register
+            and (target.social_months is None or months > target.social_months)):
+        target.social_months = months
     for p in ev_pages:
         if p not in target.pages:
             target.pages.append(p)
@@ -218,6 +330,7 @@ def merge_vl_facts(inventory: MaterialInventory,
         materials_state=dict(r.materials_state or {}),
         person_names=list(r.person_names or []),
         person_states=dict(r.person_states or {}),
+        person_proofs={name: dict(proof) for name, proof in r.person_proofs.items()},
     ) for r in inventory.contracts]
     certs = [replace(c, pages=list(c.pages or [])) for c in inventory.certs]
     persons = [replace(
@@ -225,17 +338,33 @@ def merge_vl_facts(inventory: MaterialInventory,
         experience_pages=list(p.experience_pages or []),
     ) for p in inventory.persons]
     cert_section_present = inventory.cert_section_present
-    for fact in vl_facts or []:
+    # Main contract pages establish identity and total before detached proof
+    # fragments are applied. This also handles batches arriving out of order.
+    query_families = set(inventory.platform_query_certificates)
+    observations_of_queries = []
+    ordered_facts = sorted(vl_facts or [], key=lambda f: f.get("kind") == "contract" and f.get("amount_yuan") is None)
+    for fact in ordered_facts:
         ev_pages = sorted({int(e["page_no"]) for e in (fact.get("evidence") or [])
                            if e.get("page_no") is not None})
         kind = str(fact.get("kind") or "")
         if kind == "contract":
             _merge_contract(contracts, fact, ev_pages)
         elif kind == "certificate":
-            _merge_cert(certs, fact, ev_pages)
+            observations_of_queries.extend(_merge_certificate_observations(certs, fact))
         elif kind == "person":
             _merge_person(persons, fact, ev_pages)
-        if fact.get("has_query_screenshot") is True:
-            cert_section_present = True  # 只升不降：图上确认有查询截图
+    for name, families, numbers, document_id in observations_of_queries:
+        numbered = {normalize_cert(cert.name) for cert in certs
+                    if cert.backing is True and cert.certificate_number in numbers
+                    and cert.document_id == document_id}
+        # An explicit certificate-number match carries identity across pages.
+        # A conflicting known number must never fall back to a broad family match.
+        known_numbers = {cert.certificate_number for cert in certs if normalize_cert(cert.name) == name
+                         and cert.backing is True and cert.certificate_number}
+        if len(numbered) == 1 and (not families or numbered <= families):
+            query_families.update(numbered)
+        elif name in families and len(families) == 1 and not (numbers and known_numbers):
+            query_families.add(name)
+    cert_section_present = cert_section_present or bool(query_families)
     return replace(inventory, contracts=contracts, certs=certs, persons=persons,
-                   cert_section_present=cert_section_present)
+                   cert_section_present=cert_section_present, platform_query_certificates=query_families)

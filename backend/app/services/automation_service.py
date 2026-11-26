@@ -134,13 +134,22 @@ def failed_keys(run_id: int) -> set[tuple[int, int]]:
 
 
 def _is_reading_gap_row(row: ScoreRecord) -> bool:
-    """P0-3：读取故障待补读格（closure 以 reading_incomplete 定格、未定分）。
-
-    这类格是"已定格但未定分"的终态：计完成（运行可收口、报告可出），
-    但没有数值分；补读完成后经 resume_run 重置重跑。"""
+    """补读或材料核验未完成的格可在原冻结输入下续评。"""
     meta = (row.ai_raw_json or {}).get("auto_review") or {}
     return (meta.get("state") == "completed"
-            and ((meta.get("fallback") or {}).get("kind")) == "reading_incomplete")
+            and ((meta.get("fallback") or {}).get("kind")) in (
+                "reading_incomplete", "material_review_pending",
+            ))
+
+
+def material_review_pending(score: ScoreRecord | None) -> dict | None:
+    if score is None:
+        return None
+    meta = (score.ai_raw_json or {}).get("auto_review") or {}
+    fallback = meta.get("fallback") or {}
+    if meta.get("basis") == "fallback" and fallback.get("kind") == "material_review_pending":
+        return fallback
+    return None
 
 
 def public_auto_review(score: ScoreRecord | None) -> dict | None:
@@ -170,6 +179,11 @@ def public_auto_review(score: ScoreRecord | None) -> dict | None:
         "state", "basis", "attempts", "reasoning", "error", "error_code",
         "confirmed_absent", "coverage_complete", "calculation", "lightweight",
     ) if key in meta}
+    if pending := material_review_pending(score):
+        result["material_review_pending"] = {
+            key: clean(pending[key]) for key in ("reason", "value", "required_materials", "candidate_pages")
+            if key in pending
+        }
     result["visual_evidence"] = [
         {key: clean(item[key]) for key in (
             "document_id", "page_no", "observation", "quote", "sha256", "image_sha256",
@@ -297,6 +311,9 @@ def _valid_cell(score: ScoreRecord, criterion: dict, citations: list[EvidenceCit
             except (TypeError, ValueError):
                 return False
         return bool(score.ai_reasoning or meta.get("reasoning"))
+    if material_review_pending(score):
+        return (score.machine_status == "concern" and score.final_score is None
+                and not meta.get("error") and not meta.get("confirmed_absent"))
     if basis == "fallback" and ((meta.get("fallback") or {}).get("kind")) in (
             "reading_incomplete", "presence_unverified", "sample_volume_unverified",
             "value_extraction_unresolved"):
@@ -409,6 +426,7 @@ def _state(s, run: EvaluationRun) -> tuple[dict | None, set[tuple[int, int]]]:
     completed = set()
     failed = 0
     fallback = 0
+    material_pending = 0
     latest_error = None
     for row in rows:
         key = (row.bidder_id, row.criterion_id)
@@ -416,6 +434,8 @@ def _state(s, run: EvaluationRun) -> tuple[dict | None, set[tuple[int, int]]]:
             continue
         if _valid_cell(row, criteria[row.criterion_id], by_score.get(row.id, [])):
             completed.add(key)
+            if material_review_pending(row):
+                material_pending += 1
             _auto_meta = (row.ai_raw_json or {}).get("auto_review") or {}
             if (_auto_meta.get("basis") == "fallback"
                     and ((_auto_meta.get("fallback") or {}).get("kind")) != "duplicate_summary"):
@@ -423,18 +443,23 @@ def _state(s, run: EvaluationRun) -> tuple[dict | None, set[tuple[int, int]]]:
         elif ((row.ai_raw_json or {}).get("auto_review") or {}).get("state") == "failed":
             failed += 1
             latest_error = ((row.ai_raw_json or {}).get("auto_review") or {}).get("error")
-    remaining = len(expected - completed)
+    finalized = len(completed) - material_pending
+    remaining = len(expected) - finalized
     skip_errors = failure_policy(run) == "continue"
     skipped = failed if skip_errors else 0
     data = {
-        "expected": len(expected), "completed": len(completed), "failed": failed,
+        "expected": len(expected), "completed": finalized, "failed": failed,
         "fallback": fallback,
-        "remaining": remaining, "resumable": run.status == "failed" and bool(manifest),
+        "material_pending": material_pending,
+        "remaining": remaining,
+        "resumable": bool(manifest) and (
+            run.status == "failed" or (material_pending > 0 and run.status in ("partial", "succeeded"))
+        ),
         "last_error": cfg.get("error") or latest_error,
         "complete": bool(expected) and remaining == 0,
         "is_final": run.status == "succeeded" and bool(expected) and remaining == 0,
         "failure_policy": failure_policy(run), "skipped": skipped,
-        "processed": len(completed) + skipped, "pending": remaining - skipped,
+        "processed": len(completed) + skipped, "pending": remaining - skipped - material_pending,
         "execution_finished": run.status in ("succeeded", "partial", "failed", "cancelled"),
         "result_available": run.status in ("succeeded", "partial"),
     }
@@ -630,10 +655,13 @@ def finish_run(run_id: int) -> dict:
             }
             if state.get("fallback"):
                 run.config_json["fallback_count"] = state["fallback"]
-        elif error is None and failure_policy(run) == "continue" and state["expected"] > 0 and state["pending"] == 0:
+        elif error is None and state["expected"] > 0 and state["pending"] == 0 and (
+                state["material_pending"] or failure_policy(run) == "continue"):
             run.status = "partial"
-            run.config_json = {**(run.config_json or {}),
-                               "error": f"评审已结束：已评分 {state['completed']} 项，故障跳过 {state['skipped']} 项"}
+            run.config_json = {k: v for k, v in (run.config_json or {}).items()
+                               if k not in ("error", "fallback_count")}
+            if state["skipped"]:
+                run.config_json["error"] = f"评审已结束，故障跳过 {state['skipped']} 项"
         else:
             error = error or (run.config_json or {}).get("error") or f"自动评审尚有 {state['remaining']} 项未完成"
             run.status = "failed"
@@ -661,12 +689,8 @@ def resume_run(run_id: int, actor: str) -> tuple[int, int]:
         ).order_by(Job.id.desc()).limit(1)).scalar_one_or_none()
         if active is not None:
             return run_id, active.id
-        # P0-3（测试10 run113）：读取故障待补读格（kind=reading_incomplete）可续评——
-        # 补读（OCR/视觉）完成后重跑这些格"读完再评"，不受"仅失败运行可续评"限制；
-        # 重跑前重置这些格（ReviewRecord 审计链保留）。
-        gap_rows = [row for row in s.execute(
-            select(ScoreRecord).where(ScoreRecord.run_id == run_id)).scalars()
-            if _is_reading_gap_row(row)]
+        scores = list(s.scalars(select(ScoreRecord).where(ScoreRecord.run_id == run_id)))
+        gap_rows = [row for row in scores if _is_reading_gap_row(row)]
         if (run.status in ("succeeded", "partial") and not gap_rows
                 and int((run.config_json or {}).get("resume_count", 0)) > 0):
             resumed_job = s.execute(select(Job).where(
@@ -678,13 +702,30 @@ def resume_run(run_id: int, actor: str) -> tuple[int, int]:
                 # finished. Return the original receipt without another job.
                 return run_id, resumed_job.id
         if run.status != "failed" and not gap_rows:
-            raise Conflict("仅失败的自动评审运行可以续评")
+            raise Conflict("本次运行没有执行失败或待核验的评审项")
         manifest = (run.config_json or {})["automation_manifest"]
         current = _inputs(s, run, manifest["criteria"], manifest.get("provider"), manifest.get("model"))
         manifest = _bind_unused_capabilities(s, run, manifest, current, actor)
         if current != manifest:
             raise Conflict("运行输入或评审配置已变化，请新建评分运行")
+        checkpoints = dict((run.config_json or {}).get("material_recovery_checkpoints") or {})
+        for row in gap_rows:
+            if not (pending := material_review_pending(row)):
+                continue
+            raw = row.ai_raw_json or {}
+            meta = raw["auto_review"]
+            checkpoints[f"{row.bidder_id}:{row.criterion_id}"] = {
+                "fallback": pending,
+                "visual_fallback_note": raw.get("visual_fallback_note") or {},
+                "visual_evidence": meta.get("visual_evidence") or [],
+            }
         if gap_rows:
+            # A price benchmark may depend on a score being retried. Recompute
+            # its shared inputs for every bidder if the prior price was provisional.
+            if any(material_review_pending(row) for row in gap_rows):
+                price_ids = {int(c["id"]) for c in manifest["criteria"] if c.get("score_type") == "formula"
+                             and ((c.get("formula") or {}).get("params_json") or {}).get("benchmark_gate")}
+                gap_rows.extend(row for row in scores if row.criterion_id in price_ids)
             gap_ids = [row.id for row in gap_rows]
             for cit in s.execute(select(EvidenceCitation).where(
                     EvidenceCitation.score_record_id.in_(gap_ids or [-1]))).scalars():
@@ -699,6 +740,7 @@ def resume_run(run_id: int, actor: str) -> tuple[int, int]:
         run.status = "queued"
         run.finished_at = None
         run.config_json = {**(run.config_json or {}),
+                           "material_recovery_checkpoints": checkpoints,
                            "resume_count": int((run.config_json or {}).get("resume_count", 0)) + 1}
         s.add(run)
         s.flush()

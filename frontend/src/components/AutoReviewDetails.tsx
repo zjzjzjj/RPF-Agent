@@ -6,6 +6,8 @@ import PdfPageViewer from "./PdfPageViewer";
 const BASIS_LABEL: Record<string, string> = {
   evidence: "原文证据核验",
   visual: "原页视觉核验",
+  visual_fallback: "原页视觉补核",
+  fallback: "评审补充记录",
   external: "外部事实证据边界",
   deterministic: "程序计算",
   absence: "完整材料检索确认缺失",
@@ -18,18 +20,36 @@ export default function AutoReviewDetails({ metadata }: { metadata?: AutoReviewM
   const visuals = metadata.visual_evidence ?? [];
   const visual = visuals[selectedVisual] ?? visuals[0];
   const rejectQuotes = metadata.lightweight?.reject_quotes ?? [];
+  const pending = metadata.material_review_pending;
+  const pendingPages = pending?.candidate_pages ?? [];
 
   return (
     <Card size="small" title="自动评审记录" style={{ marginBottom: 12 }}>
       <Space direction="vertical" size={8} style={{ width: "100%" }}>
         <Space wrap>
-          <Tag color={metadata.state === "completed" ? "green" : "red"}>
-            {metadata.state === "completed" ? "已自动完成" : "执行失败，可恢复"}
+          <Tag color={pending ? "orange" : metadata.state === "completed" ? "green" : "red"}>
+            {pending ? "材料待核验" : metadata.state === "completed" ? "已自动完成" : "执行失败，可恢复"}
           </Tag>
           {metadata.basis && <Tag>{BASIS_LABEL[metadata.basis] ?? metadata.basis}</Tag>}
           {metadata.attempts != null && <Typography.Text type="secondary">共评审 {metadata.attempts} 轮</Typography.Text>}
         </Space>
         {metadata.error && <Alert type="error" showIcon message="技术故障" description={metadata.error} />}
+        {pending && (
+          <Alert
+            type="warning"
+            showIcon
+            message={pending.reason || "可继续核验关联证明材料"}
+            description={
+              <Space direction="vertical" size={4}>
+                {pending.required_materials?.length ? <span>待核对 {pending.required_materials.join("、")}</span> : null}
+                {pending.value != null && <span>已核实小计 {pending.value} 分</span>}
+                {pendingPages.length > 0 && (
+                  <span>候选原页 {pendingPages.map((page) => `文件 #${page.document_id} 第 ${page.page_no} 页`).join("、")}</span>
+                )}
+              </Space>
+            }
+          />
+        )}
         {metadata.confirmed_absent && metadata.coverage_complete && (
           <Alert type="info" showIcon message="已完成全部关联材料检索，确认所需证明缺失，按细则形成最终结论。" />
         )}
