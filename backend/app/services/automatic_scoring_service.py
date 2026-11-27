@@ -2236,8 +2236,7 @@ def _price_stage(run_id: int, manifest: dict, criteria: list[dict], prices: dict
                 bid_id = int(bid["id"])
                 bidder = s.get(Bidder, bid_id)
                 price = prices.get(bid_id)
-                if bidder is not None and bidder.status == "rejected":
-                    excluded_bidders.add(bid_id)
+                # 人工确认否决/无效标不反馈到自动价格计算；自动结果保持独立。
                 if price is None or Decimal(str(price)) <= 0:
                     excluded_bidders.add(bid_id)
                 if config.benchmark_exclude_suspect():

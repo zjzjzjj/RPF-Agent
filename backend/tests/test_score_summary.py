@@ -370,7 +370,7 @@ def test_run_not_ready(client, summary_chain):  # noqa: ANN001
     assert any("不完整" in w for w in d["warnings"])
 
 
-def test_rejected_bidder_keeps_audit_but_has_no_formal_rank(client, summary_chain):  # noqa: ANN001
+def test_rejected_bidder_keeps_automatic_ranking(client, summary_chain):  # noqa: ANN001
     from app.db.models import Bidder
     from app.db.session import session_scope
 
@@ -381,38 +381,17 @@ def test_rejected_bidder_keeps_audit_but_has_no_formal_rank(client, summary_chai
 
     d = _get(client, summary_chain).json()
     b = next(x for x in d["bidders"] if x["bidder_id"] == target)
-    assert b["state"] == "excluded"
-    assert b["rank"] is None
-    assert "人工确认否决" in b["excluded_reason"]
+    assert b["state"] == "scored"
+    assert b["rank"] is not None
+    assert b["bidder_status"] == "rejected"
 
     ranking = client.get(
         f"/api/projects/{summary_chain['pid']}/ranking",
         params={"run_id": summary_chain["run_id"]},
     ).json()
     row = next(x for x in ranking["rows"] if x["bidder_id"] == target)
-    assert row["rank"] is None
-    assert row["reference_rank"] is None
+    assert row["rank"] is not None
     assert row["status"] == "rejected"
-
-
-def test_excluded_bidder(client, summary_chain):  # noqa: ANN001
-    from app.db.models import Bidder, EvaluationRun
-    from app.db.session import session_scope
-
-    target = summary_chain["bidder_ids"][2]
-    with session_scope() as s:
-        name = s.get(Bidder, target).name
-        run = s.get(EvaluationRun, summary_chain["run_id"])
-        run.config_json = {**(run.config_json or {}),
-                           "auto_dropped_bidders": [name]}
-
-    d = _get(client, summary_chain).json()
-    b = next(x for x in d["bidders"] if x["bidder_id"] == target)
-    assert b["state"] == "excluded"
-    assert b["rank"] is None
-    assert b["buckets"] == []
-    assert "自动剔除" in b["excluded_reason"]
-    assert b["name"] in d["warnings"][-1] or any(b["name"] in w for w in d["warnings"])
 
 
 def test_multiple_price_items_reconciliation(client, summary_chain):  # noqa: ANN001

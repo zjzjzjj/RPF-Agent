@@ -156,8 +156,9 @@ def compute_ranking(project_id: str, run_id: int | None = None) -> dict:
             )
 
         # 人工确认无效/否决的投标人保留审计行，但不参与正式名次。
-        active_entries = [e for e in bidders.values() if e["status"] != "rejected"]
-        rejected_entries = [e for e in bidders.values() if e["status"] == "rejected"]
+        # 人工确认否决/无效标不反馈到自动排名；自动结果仍按系统评分正常排名。
+        active_entries = list(bidders.values())
+        rejected_entries: list[dict] = []
         rank_rows_in = [
             RankRow(
                 bidder_id=e["bidder_id"],
