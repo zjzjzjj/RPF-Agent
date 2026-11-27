@@ -469,6 +469,13 @@ def case_max_batches_ceiling() -> int:
     return max(1, int(os.environ.get("BID_EVAL_CASE_MAX_BATCHES_CEILING", 12)))
 
 
+def subjective_relative_calibration_enabled() -> bool:
+    """同项横向比例校准：按通用质量特征调整主观分高低顺序。"""
+    return os.environ.get("BID_EVAL_SUBJECTIVE_RELATIVE_CALIBRATION", "0").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
 def full_auto_finalization_enabled() -> bool:
     """全自动收口：技术缺口也按当前材料形成最终结果，不显示待人工复核。"""
     return os.environ.get("BID_EVAL_FULL_AUTO", "0").strip().lower() not in (

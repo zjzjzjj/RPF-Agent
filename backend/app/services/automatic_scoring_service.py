@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 
 from app import config
 from app.db.models import (
@@ -1991,6 +1991,87 @@ def _maybe_vl_rescue(run_id: int, bid_id: int, criterion: dict,
     ), None
 
 
+_SUBJECTIVE_POSITIVE = (
+    "完整", "详细", "具体", "可行", "清晰", "齐全", "完善", "合理", "量化", "明确",
+    "针对性", "可操作", "保障", "闭环", "覆盖",
+)
+_SUBJECTIVE_NEGATIVE = (
+    "缺少", "不足", "欠缺", "粗糙", "较少", "简单", "略少", "不够", "模糊", "一般",
+    "未见", "不完整", "不够具体", "含糊",
+)
+
+
+def _subjective_quality_score(reasoning: str, evidence_count: int, raw_ratio: Decimal) -> Decimal:
+    text = reasoning or ""
+    positive = sum(text.count(term) for term in _SUBJECTIVE_POSITIVE)
+    negative = sum(text.count(term) for term in _SUBJECTIVE_NEGATIVE)
+    language = Decimal(positive - 2 * negative) / Decimal(20)
+    evidence = Decimal(min(evidence_count, 12)) / Decimal(12)
+    return min(max(Decimal("0.45") * raw_ratio + Decimal("0.40") * language
+                   + Decimal("0.15") * evidence, Decimal(0)), Decimal(1))
+
+
+def calibrate_subjective_scores(run_id: int) -> int:
+    """同一评分项内按通用质量特征调整主观分比例；不读取投标人身份或人工答案。"""
+    if not config.subjective_relative_calibration_enabled():
+        return 0
+    updated = 0
+    with session_scope() as s:
+        rows = list(s.execute(select(ScoreRecord).where(
+            ScoreRecord.run_id == run_id, ScoreRecord.score_type == "subjective"
+        )).scalars())
+        criteria = {row.criterion_id: row for row in rows}
+        grouped: dict[int, list[ScoreRecord]] = {}
+        for row in rows:
+            if row.final_score is not None and row.max_score:
+                grouped.setdefault(row.criterion_id, []).append(row)
+        for criterion_id, items in grouped.items():
+            if len(items) < 3:
+                continue
+            maximum = Decimal(str(items[0].max_score))
+            if maximum <= 0:
+                continue
+            qualities = []
+            raw_ratios = []
+            evidence_counts = []
+            for row in items:
+                raw_ratio = Decimal(str(row.final_score)) / maximum
+                citations = s.execute(select(func.count(EvidenceCitation.id)).where(
+                    EvidenceCitation.score_record_id == row.id
+                )).scalar_one()
+                qualities.append(_subjective_quality_score(row.ai_reasoning or "", int(citations), raw_ratio))
+                raw_ratios.append(raw_ratio)
+                evidence_counts.append(citations)
+            quality_mean = sum(qualities, Decimal(0)) / Decimal(len(qualities))
+            raw_mean = sum(raw_ratios, Decimal(0)) / Decimal(len(raw_ratios))
+            if quality_mean == 0:
+                continue
+            for row, quality, raw_ratio, evidence_count in zip(items, qualities, raw_ratios, evidence_counts):
+                # 相对调整限制在满分的20%以内，避免一次校准改变整项档位。
+                delta_ratio = Decimal("0.20") * (quality - quality_mean)
+                target_ratio = min(max(raw_ratio + delta_ratio, Decimal(0)), Decimal(1))
+                calibrated = (Decimal("0.65") * raw_ratio + Decimal("0.35") * target_ratio) * maximum
+                calibrated = min(max(calibrated, Decimal(0)), maximum).quantize(Decimal("0.01"))
+                if calibrated == Decimal(str(row.final_score)):
+                    continue
+                raw = dict(row.ai_raw_json or {})
+                raw["subjective_relative_calibration"] = {
+                    "before": str(row.final_score),
+                    "after": str(calibrated),
+                    "quality": str(quality),
+                    "quality_mean": str(quality_mean),
+                    "evidence_count": evidence_count,
+                    "rule": "同项质量特征横向比例校准",
+                }
+                row.final_score = calibrated
+                row.machine_score = None
+                row.ai_suggested_score = calibrated
+                row.ai_raw_json = raw
+                s.add(row)
+                updated += 1
+    return updated
+
+
 def _persist_cell(run_id: int, bidder_id: int, criterion: dict, outcome: CellOutcome | None,
                   error: BaseException | None = None) -> None:
     from app.evidence.verifier import verify_automatic_citation
@@ -3028,6 +3109,12 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
                     )
                 except JobCancelled:
                     raise
+    try:
+        calibrated_subjective = calibrate_subjective_scores(run_id)
+        if calibrated_subjective and ctx and hasattr(ctx, "report"):
+            ctx.report(f"主观分横向校准完成 {calibrated_subjective} 项")
+    except Exception:
+        log.exception("主观分横向校准失败，保留原始评分")
     if (continue_errors or not errors) and "price" in stages and any(
         c["score_type"] == "formula" and any((b, c["id"]) not in completed for b in bidder_ids)
         for c in criteria

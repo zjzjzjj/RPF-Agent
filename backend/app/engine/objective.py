@@ -1785,7 +1785,11 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
             unverified_counted = 0
             null_dropped = 0  # 仅回退模式（None 不计）
             dropped_false = 0
-            _unverified_on = config.case_unverified_count_enabled()
+            hard_material_rule = bool(re.search(
+                r"否则不予认可|未提供(?:的)?不得分|不提供(?:的)?不得分|以上资料未提供",
+                artifacts + str(criterion.get("description") or "") + str(criterion.get("source_quote") or ""),
+            ))
+            _unverified_on = config.case_unverified_count_enabled() and not hard_material_rule
             for c in cases:
                 vals = {k: c.get(k) for k in required_flags}
                 if any(v is False for v in vals.values()):

@@ -681,7 +681,9 @@ def _person_special_certs(criterion: dict, inventory: MaterialInventory) -> Fast
         for page in inventory.pages:
             page_text = str(page.get("text") or "")
             if person.name and person.name in page_text:
-                person_text += "\n" + page_text
+                start = max(0, page_text.find(person.name) - 350)
+                end = min(len(page_text), page_text.find(person.name) + len(person.name) + 650)
+                person_text += "\n" + page_text[start:end]
         if _has_special_cert_pair(person.certs) or _has_special_cert_pair([person_text]):
             eligible.append(person)
     score = min(maximum, Decimal(len(eligible)) * (per or Decimal(0)))
