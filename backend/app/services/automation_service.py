@@ -143,7 +143,19 @@ def failed_keys(run_id: int) -> set[tuple[int, int]]:
 
 def _is_reading_gap_row(row: ScoreRecord) -> bool:
     """补读、证据或模型核验未完成的格可在原冻结输入下续评。"""
-    return material_review_pending(row) is not None
+    if material_review_pending(row) is not None:
+        return True
+    # 已核实小计为正数的历史 fallback 也允许续核一次，
+    # 让新执行器按全自动口径把正向小计正式定分。
+    meta = (row.ai_raw_json or {}).get("auto_review") or {}
+    fallback = meta.get("fallback") or {}
+    if meta.get("basis") != "fallback" or fallback.get("technical_error"):
+        return False
+    try:
+        value = Decimal(str(fallback.get("value")))
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    return fallback.get("kind") == "material_review_pending" and value > 0
 
 
 def material_review_pending(score: ScoreRecord | None) -> dict | None:
