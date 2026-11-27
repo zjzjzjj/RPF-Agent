@@ -132,6 +132,187 @@ def test_complete_confirmed_absence_with_explicit_sanction_still_settles_zero(ap
     assert ranked["rows"][0]["total"] == "5.00"
 
 
+# ==== P0-A（2026-11-28）全自动口径：技术失败格=暂定分+保留续跑 ====
+# run205 实证：同规则包两次运行，c44/c49 被收口定 0 翻转 18 分——管线失败
+# 不得冒充评审结论。以下四例锁「崩溃小计不外泄 + 暂定分计入总分直接排名 +
+# 保留续跑 + 回滚开关」。
+
+
+def _full_auto_env(monkeypatch):
+    monkeypatch.setenv("BID_EVAL_FULL_AUTO", "1")
+    monkeypatch.setenv("BID_EVAL_SCORE_CLOSURE", "1")
+
+
+def test_full_auto_technical_failure_keeps_crash_subtotal_audit_only(app_env, monkeypatch):
+    _full_auto_env(monkeypatch)
+    ctx = _run_context(app_env)
+    error = LLMError("INTERNAL-SECRET 输出字段缺失")
+    error.review_attempts_exhausted = True
+    error.verified_subtotal = Decimal("2.00")
+    error.verified_subtotal_source = "model_crash"
+    _persist_cell(ctx["run_id"], ctx["bidder_id"], ctx["criteria"][0], None, error)
+    _persist_cell(ctx["run_id"], ctx["bidder_id"], ctx["criteria"][1], CellOutcome(
+        "pass", "完整证据核验后确定性计分", Decimal("5"), [], [],
+        basis="deterministic", raw={"calculation": "满足条件，计5分"},
+    ))
+    with session_scope() as session:
+        session.get(EvaluationRun, ctx["run_id"]).status = "succeeded"
+
+    with session_scope() as session:
+        row = session.query(ScoreRecord).filter_by(criterion_id=ctx["criteria"][0]["id"]).one()
+        # 崩溃模型小计 2.00 绝不进分：暂定 0（非评审结论，续核可翻案）
+        assert row.final_score == Decimal("0")
+        assert row.machine_status == "concern"
+        meta = row.ai_raw_json["auto_review"]
+        assert meta["basis"] == "fallback"
+        assert meta["provisional"] is True
+        assert meta["provisional_value"] == "0"
+        assert meta["resumable"] is True
+        fallback = meta["fallback"]
+        assert fallback["value"] == "2.00"  # 仅审计留痕
+        assert fallback["value_source"] == "model_crash"
+        assert "provisional_zero" not in str(row.ai_raw_json)
+
+    state = progress(ctx["run_id"])
+    assert state["material_pending"] == 1 and state["failed"] == 0
+    # is_final（可发布出排名）与 resumable（可翻案）解耦，二者同时成立
+    assert state["is_final"] is True and state["resumable"] is True
+    ranked = compute_ranking("technical-finality", ctx["run_id"])
+    row0 = ranked["rows"][0]
+    assert row0["rank"] == 1  # 零未定分：暂定分直接排名
+    assert Decimal(row0["total"]) == Decimal("5")  # 5（定分）+ 0（暂定）；崩溃小计 2.00 不在总分
+    assert row0["fallback"] == ["案例一"]
+    assert ranked["has_fallback"] is True
+
+
+def test_full_auto_technical_failure_uses_deterministic_provisional(app_env, monkeypatch):
+    _full_auto_env(monkeypatch)
+    ctx = _run_context(app_env)
+    error = LLMError("执行故障")
+    error.provisional_value = Decimal("3.00")
+    error.provisional_source = "deterministic"
+    _persist_cell(ctx["run_id"], ctx["bidder_id"], ctx["criteria"][0], None, error)
+    _persist_cell(ctx["run_id"], ctx["bidder_id"], ctx["criteria"][1], CellOutcome(
+        "pass", "完整证据核验后确定性计分", Decimal("5"), [], [],
+        basis="deterministic", raw={"calculation": "满足条件，计5分"},
+    ))
+    with session_scope() as session:
+        session.get(EvaluationRun, ctx["run_id"]).status = "succeeded"
+
+    with session_scope() as session:
+        row = session.query(ScoreRecord).filter_by(criterion_id=ctx["criteria"][0]["id"]).one()
+        assert row.final_score == Decimal("3.00")
+        meta = row.ai_raw_json["auto_review"]
+        assert meta["provisional"] is True
+        assert meta["provisional_value"] == "3.00"
+        assert meta["provisional_source"] == "deterministic"
+
+    state = progress(ctx["run_id"])
+    assert state["material_pending"] == 1 and state["resumable"] is True
+    ranked = compute_ranking("technical-finality", ctx["run_id"])
+    assert Decimal(ranked["rows"][0]["total"]) == Decimal("8")
+    assert ranked["rows"][0]["rank"] == 1
+    assert ranked["rows"][0]["breakdown"][0]["provisional"] is True
+
+
+def test_full_auto_provisional_cell_remains_resumable(app_env, monkeypatch):
+    """暂定格保留续跑（P0-A）：_is_reading_gap_row 认它，resume 可删行重评。
+
+    完整 resume_run 链（输入指纹校验/删行/入队）由 test_automatic_scoring 的
+    managed_run 用例覆盖；这里锁全自动暂定格的续跑资格判定。"""
+    _full_auto_env(monkeypatch)
+    ctx = _run_context(app_env)
+    error = LLMError("执行故障")
+    _persist_cell(ctx["run_id"], ctx["bidder_id"], ctx["criteria"][0], None, error)
+    with session_scope() as session:
+        session.get(EvaluationRun, ctx["run_id"]).status = "succeeded"
+        row = session.query(ScoreRecord).one()
+
+        from app.services.automation_service import _is_reading_gap_row
+
+        assert _is_reading_gap_row(row) is True
+    state = progress(ctx["run_id"])
+    assert state["material_pending"] == 1 and state["resumable"] is True
+
+
+def test_full_auto_technical_provisional_off_keeps_legacy_settle(app_env, monkeypatch):
+    _full_auto_env(monkeypatch)
+    monkeypatch.setenv("BID_EVAL_TECHNICAL_PROVISIONAL", "0")
+    ctx = _run_context(app_env)
+    error = LLMError("执行故障")
+    error.verified_subtotal = Decimal("2.00")
+    error.verified_subtotal_source = "model_crash"
+    _persist_cell(ctx["run_id"], ctx["bidder_id"], ctx["criteria"][0], None, error)
+
+    with session_scope() as session:
+        row = session.query(ScoreRecord).one()
+        assert row.final_score == Decimal("2.00")  # 回滚：旧收口语义（小计直接定格）
+        assert not (row.ai_raw_json["auto_review"] or {}).get("provisional")
+    state = progress(ctx["run_id"])
+    assert state["material_pending"] == 0 and state["resumable"] is False
+
+
+def test_full_auto_settled_fallback_survives_closure_pass(app_env, monkeypatch):
+    """run205 根因回归（2026-11-28 实证）：全自动定格过的真实评分（正已核实
+    小计）不得被 closure 收口覆盖成通用 0——auto_finalized 必须落进
+    auto_review 元数据，_valid_cell 警告闸据其放行，closure 只封真正
+    未完成的格。c44/c48/c49 两次运行翻转 18 分即此覆盖链。"""
+    _full_auto_env(monkeypatch)
+    ctx = _run_context(app_env)
+    outcome = CellOutcome(
+        "concern", "仍需核验查询截图", None, [], [], "fallback", 1,
+        {"fallback": {"kind": "material_review_pending", "value": "3",
+                      "value_role": "verified_subtotal", "basis": "machine_fallback",
+                      "required_materials": ["查询截图"], "candidate_pages": []},
+         "coverage_complete": False},
+        [{"message": "仍需核验查询截图",
+          "fallback_score": {"kind": "material_review_pending", "value": "3"}}],
+    )
+    _persist_cell(ctx["run_id"], ctx["bidder_id"], ctx["criteria"][0], outcome)
+
+    # closure 再收口一次：已完成格必须原样保留（is_cell_completed 短路）
+    sealed = LLMError("自动评审已按当前材料形成最终结果")
+    sealed.code = "closure_sealed"
+    _persist_cell(ctx["run_id"], ctx["bidder_id"], ctx["criteria"][0], None, sealed)
+
+    with session_scope() as session:
+        row = session.query(ScoreRecord).one()
+        assert row.final_score == Decimal("3")  # 真实定格分保留
+        meta = row.ai_raw_json["auto_review"]
+        assert meta.get("error_code") != "closure_sealed"
+        assert meta.get("auto_finalized") is True
+
+
+def test_full_auto_settled_zero_fallback_is_provisional_and_survives_closure(app_env, monkeypatch):
+    """零值技术兜底格：暂定 0 + 可续核，closure 不得二次覆盖其审计内容。"""
+    _full_auto_env(monkeypatch)
+    ctx = _run_context(app_env)
+    outcome = CellOutcome(
+        "concern", "仍需核验查询截图", None, [], [], "fallback", 1,
+        {"fallback": {"kind": "material_review_pending", "value": None,
+                      "value_role": "verified_subtotal", "basis": "machine_fallback",
+                      "required_materials": ["查询截图"], "candidate_pages": []},
+         "coverage_complete": False},
+        [{"message": "仍需核验查询截图",
+          "fallback_score": {"kind": "material_review_pending", "value": None}}],
+    )
+    _persist_cell(ctx["run_id"], ctx["bidder_id"], ctx["criteria"][0], outcome)
+    sealed = LLMError("自动评审已按当前材料形成最终结果")
+    sealed.code = "closure_sealed"
+    _persist_cell(ctx["run_id"], ctx["bidder_id"], ctx["criteria"][0], None, sealed)
+    with session_scope() as session:
+        session.get(EvaluationRun, ctx["run_id"]).status = "succeeded"
+
+    with session_scope() as session:
+        row = session.query(ScoreRecord).one()
+        meta = row.ai_raw_json["auto_review"]
+        assert row.final_score == Decimal("0")
+        assert meta.get("provisional") is True
+        assert meta.get("error_code") != "closure_sealed"
+    state = progress(ctx["run_id"])
+    assert state["material_pending"] == 1 and state["resumable"] is True
+
+
 def test_execution_progress_moves_only_later_covered_failures_to_history(app_env):
     ctx = _run_context(app_env)
     now = utcnow()

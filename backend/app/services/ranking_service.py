@@ -8,6 +8,7 @@ from decimal import Decimal
 
 from sqlalchemy import select
 
+from app import config
 from app.db.models import Bidder, Criterion, CriterionCheck, EvaluationRun, ScoreRecord
 from app.db.session import session_scope
 from app.engine.aggregate import rank_rows
@@ -117,9 +118,13 @@ def compute_ranking(project_id: str, run_id: int | None = None) -> dict:
                 from app.services.automation_service import technical_fallback_kind
                 if technical_fallback_kind(score):
                     entry["fallback"].append(criterion_name)
-                    # Technical fallback values are audit subtotals only. They
-                    # never enter totals, provisional totals or published rank.
-                    final = None
+                    if not config.full_auto_finalization_enabled():
+                        # 人工模式（既有契约）：技术兜底值仅审计，不进总分/排名。
+                        final = None
+                    # 全自动（P0-A，2026-11-28）：暂定分计入总分直接排名（2026-11-24
+                    # 零未定分拍板，覆盖 P0-1 旧口径）——entry["provisional"] 累计
+                    # 「其中含暂定」，续核翻案后可重汇总。崩溃模型小计不在此列
+                    # （settled_fallback_score 已滤 model_crash，收尾层只落暂定值）。
             # match 判断项按设计不打分（final 恒 None）：不进 missing_final、不计总分，
             # 但照常落 breakdown（否则法律包的 8 条检查在评分矩阵里彻底消失）。
             if score_type not in ("veto", "match"):
@@ -226,7 +231,10 @@ def compute_ranking(project_id: str, run_id: int | None = None) -> dict:
         elif any(row["fallback"] for row in out_rows):
             # 零未定分口径（2026-11-24 用户拍板，覆盖 P0-1 旧口径）：兜底暂定分
             # 计入总分、直接排名——只发疑问提示（人工改分后可重汇总），不抑制名次
-            warnings.append("已完成自动评分，当前结果按已核验分汇总")
+            if config.full_auto_finalization_enabled():
+                warnings.append("已完成自动评分，其中含暂定分项（非评审结论，续核后可重算），当前按暂定分直接排名")
+            else:
+                warnings.append("已完成自动评分，当前结果按已核验分汇总")
         if rank_suppressed and any(row.get("reference_rank") is not None for row in out_rows):
             warnings.append("已提供参考名次（含暂定分/未完成项，仅供人工定位，不构成评审结论）")
         for row in out_rows:
@@ -236,10 +244,16 @@ def compute_ranking(project_id: str, run_id: int | None = None) -> dict:
                     f"（{('、'.join(row['missing_final'][:5]))}），总分不含这些项"
                 )
             if row.get("fallback"):
-                warnings.append(
-                    f"{row['bidder_name']} 有 {len(row['fallback'])} 项待复核"
-                    f"（{('、'.join(row['fallback'][:5]))}），未计入排名"
-                )
+                if config.full_auto_finalization_enabled():
+                    warnings.append(
+                        f"{row['bidder_name']} 有 {len(row['fallback'])} 项暂定分"
+                        f"（{('、'.join(row['fallback'][:5]))}），已计入总分，续核后可重算"
+                    )
+                else:
+                    warnings.append(
+                        f"{row['bidder_name']} 有 {len(row['fallback'])} 项待复核"
+                        f"（{('、'.join(row['fallback'][:5]))}），未计入排名"
+                    )
         return {
             "run_id": run_id,
             "rows": out_rows,

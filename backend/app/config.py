@@ -519,6 +519,37 @@ def case_unverified_count_enabled() -> bool:
     )
 
 
+def technical_provisional_enabled() -> bool:
+    """技术失败格「暂定分+保留续跑」（2026-11-28 P0-A）。
+
+    开（默认）：管线技术失败（执行/读取/模型输出/证据绑定故障）的计分格
+    记 **暂定分**（确定性已核实小计>0 照计；否则暂定 0）并保留续跑（可
+    「继续核验材料」翻案），暂定分计入总分直接排名（2026-11-24 零未定分
+    拍板）；崩溃模型小计只入审计、绝不外泄进分（run166 拍板「崩溃小计不
+    外泄」）。run205 实证：同规则包两次运行，c44/c49 被收口定 0 翻转 18 分。
+    关（回滚）：退回旧收口语义——失败格直接定 final 0 且不可续跑。
+    """
+    return os.environ.get("BID_EVAL_TECHNICAL_PROVISIONAL", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def technical_auto_retry_enabled() -> bool:
+    """暂定格自动重试（2026-11-28 P0-A）：run 收口后存在暂定格时自动入队
+    一次续核（受 technical_auto_retry_limit 防环）。关=只保留手动
+    「继续核验材料」入口。"""
+    return os.environ.get("BID_EVAL_TECHNICAL_AUTO_RETRY", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def technical_auto_retry_limit() -> int:
+    try:
+        return max(0, int(os.environ.get("BID_EVAL_TECHNICAL_AUTO_RETRY_LIMIT", "2")))
+    except (TypeError, ValueError):
+        return 2
+
+
 def leader_table_proof_enabled() -> bool:
     """负责人业绩 work_proof 宽松口径开关（2026-11-02）。
 

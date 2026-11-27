@@ -1354,11 +1354,31 @@ def _write_closure_fallback(s, row: ScoreRecord, criterion: dict, error: BaseExc
         "execution_incomplete": "自动核验已完成的评审工作",
     }[reason_code]
     rejected = sanitize_rejected_evidence(getattr(error, "rejected_evidence", None))
+    # P0-A（2026-11-28）暂定分取值次序（「崩溃小计不外泄」的落实方式）：
+    #   ①确定性重算的 verified-only 小计（_maybe_vl_rescue 挂载）→ 暂定采用；
+    #   ②崩溃模型小计（auto_review 挂载，verified_subtotal_source="model_crash"）
+    #     只入审计，绝不进暂定/最终分；
+    #   ③其余 → 暂定 0（非评审结论，可续核翻案）。
+    crash_subtotal = (subtotal_value
+                      if getattr(error, "verified_subtotal_source", None) == "model_crash" else None)
+    deterministic_value = getattr(error, "provisional_value", None)
+    if deterministic_value is not None:
+        try:
+            deterministic_value = Decimal(str(deterministic_value))
+            if not deterministic_value.is_finite() or deterministic_value < 0:
+                deterministic_value = None
+        except (InvalidOperation, TypeError, ValueError):
+            deterministic_value = None
     fallback = {
         "kind": "material_review_pending",
         "reason_code": reason_code,
-        "value": str(subtotal_value) if subtotal_value is not None else None,
+        "value": (str(crash_subtotal) if crash_subtotal is not None
+                  else str(deterministic_value) if deterministic_value is not None
+                  else str(subtotal_value) if subtotal_value is not None else None),
         "value_role": "verified_subtotal",
+        "value_source": ("model_crash" if crash_subtotal is not None
+                         else "deterministic" if deterministic_value is not None
+                         else "unverified"),
         "basis": "machine_fallback",
         "reason": reason,
         "score_type": criterion.get("score_type"),
@@ -1374,22 +1394,42 @@ def _write_closure_fallback(s, row: ScoreRecord, criterion: dict, error: BaseExc
 
     scoring = criterion.get("score_type") not in ("veto", "match")
     full_auto = config.full_auto_finalization_enabled()
-    final_value = subtotal_value if subtotal_value is not None else (Decimal("0") if scoring else None)
-    if full_auto:
-        row.final_score = final_value
-        row.machine_score = final_value if scoring and criterion.get("score_type") != "subjective" else None
-        row.ai_suggested_score = final_value if criterion.get("score_type") == "subjective" else None
-        row.machine_status = ("pass" if final_value is not None and final_value > 0 else "fail") if scoring else "concern"
-    else:
-        row.final_score = None
-        row.machine_score = None
-        row.ai_suggested_score = None
+    provisional_on = config.technical_provisional_enabled()
+    if full_auto and provisional_on:
+        # P0-A「暂定分+保留续跑」：管线技术失败≠投标人缺材料——格记暂定分
+        # 计入总分直接排名（零未定分拍板），同时保留续跑可翻案；崩溃模型
+        # 小计只入审计（fallback.value，value_source=model_crash）。
+        if scoring:
+            provisional_value = deterministic_value if deterministic_value is not None else Decimal("0")
+        else:
+            provisional_value = None
+        provisional_source = "deterministic" if deterministic_value is not None else "none"
+        row.final_score = provisional_value
+        row.machine_score = (provisional_value
+                             if scoring and criterion.get("score_type") != "subjective" else None)
+        row.ai_suggested_score = (provisional_value
+                                  if criterion.get("score_type") == "subjective" else None)
         row.machine_status = "concern"
+    else:
+        final_value = subtotal_value if subtotal_value is not None else (Decimal("0") if scoring else None)
+        provisional_value = final_value
+        provisional_source = "legacy_settled" if full_auto else None
+        if full_auto:
+            row.final_score = final_value
+            row.machine_score = final_value if scoring and criterion.get("score_type") != "subjective" else None
+            row.ai_suggested_score = final_value if criterion.get("score_type") == "subjective" else None
+            row.machine_status = ("pass" if final_value is not None and final_value > 0 else "fail") if scoring else "concern"
+        else:
+            row.final_score = None
+            row.machine_score = None
+            row.ai_suggested_score = None
+            row.machine_status = "concern"
     row.review_status = "auto_confirmed"
     row.evidence_status = "none"
     row.ai_reasoning = reason
     row.evaluator_actor = "auto"
     row.confirm_time = utcnow()
+    provisional_cell = bool(full_auto and provisional_on)
     row.ai_raw_json = {
         "attempt_history": sanitize_validation_history(getattr(error, "attempt_history", None)),
         "validation_history": sanitize_validation_history(getattr(error, "validation_history", None)),
@@ -1398,21 +1438,29 @@ def _write_closure_fallback(s, row: ScoreRecord, criterion: dict, error: BaseExc
         "technical_detail": detail,
         "auto_review": {
             "state": "completed",
-            "basis": "deterministic" if full_auto else "fallback",
-            "reasoning": "自动核验完成，已按当前材料形成最终结果" if full_auto else reason,
+            "basis": "fallback",
+            "reasoning": reason,
             "fallback": fallback,
             "auto_finalized": full_auto,
-            "coverage_complete": full_auto,
-            "calculation": (f"自动核验完成，按当前材料计 {final_value if final_value is not None else 0} 分"
+            "coverage_complete": False if provisional_cell else full_auto,
+            "provisional": provisional_cell,
+            "provisional_value": (str(provisional_value)
+                                  if provisional_cell and provisional_value is not None else None),
+            "provisional_source": provisional_source if provisional_cell else None,
+            "resumable": provisional_cell,
+            "calculation": (f"自动核验未形成可核验终态，暂定 {provisional_value if provisional_value is not None else 0} 分"
+                            f"（非评审结论，续核后可重算）" if provisional_cell
+                            else f"自动核验完成，按当前材料计 {provisional_value if provisional_value is not None else 0} 分"
                             if full_auto else None),
             "error_code": fallback["error_code"],
         },
     }
     warnings = [{
-        "message": "自动核验完成，已按当前材料形成最终结果" if full_auto else reason,
+        "message": reason if not provisional_cell else f"{reason}（暂定 {provisional_value if provisional_value is not None else 0} 分，非评审结论，续核后可重算）",
         "fallback_score": fallback,
-        "technical_error": not full_auto,
+        "technical_error": True,
         "auto_finalized": full_auto,
+        "provisional": provisional_cell,
     }]
     vl_note = getattr(error, "vl_fallback_note", None)
     if isinstance(vl_note, dict):
@@ -1952,6 +2000,18 @@ def _maybe_vl_rescue(run_id: int, bid_id: int, criterion: dict,
                                        "clue_only" if clues else "failed")
             if res is not None:
                 note["calculation"] = str(res.detail or "")[:500]
+                if error is not None:
+                    # P0-A：确定性重算的 verified-only 小计挂到错误对象上，
+                    # 收尾时作为暂定分来源（「VL 报事实、代码算分」；崩溃模型
+                    # 小计不在此列，收尾只入审计）。
+                    try:
+                        provisional = Decimal(
+                            str((res.facts or {}).get("score_verified_only", res.score)))
+                        if provisional.is_finite() and provisional >= 0:
+                            error.provisional_value = provisional
+                            error.provisional_source = "deterministic"
+                    except (InvalidOperation, TypeError, ValueError):
+                        pass
             return _vl_note(outcome, note, error), error
 
     if bounded_material_complete:
@@ -2154,8 +2214,10 @@ def _persist_cell(run_id: int, bidder_id: int, criterion: dict, outcome: CellOut
             _write_closure_fallback(s, row, criterion, error)
             return
         else:
-            # 全自动口径：任何 material_review_pending 收敛为最终结果。
-            # 有已核实小计用小计；没有小计按 0 分定格并保留自动核验审计。
+            # 全自动口径：material_review_pending 收敛为已落值结果。
+            # 有确定性已核实小计（>0）按小计定分；没有小计按 P0-A「暂定分+
+            # 保留续跑」记暂定 0（非评审结论，可续核翻案），崩溃模型小计只
+            # 入审计（value_source=model_crash 不得作为定格值）。
             if (config.full_auto_finalization_enabled()
                     and outcome is not None and outcome.basis == "fallback"):
                 fallback_payload = (outcome.raw or {}).get("fallback") or {}
@@ -2164,18 +2226,47 @@ def _persist_cell(run_id: int, bidder_id: int, criterion: dict, outcome: CellOut
                     try:
                         finalized_value = Decimal(str(fallback_payload.get("value")))
                     except (InvalidOperation, TypeError, ValueError):
-                        finalized_value = Decimal("0")
-                    outcome.score = finalized_value
-                    outcome.verdict = ("pass" if finalized_value > 0 else "fail"
-                                       if criterion.get("score_type") not in ("veto", "match") else "concern")
-                    outcome.basis = "deterministic"
-                    outcome.reasoning = "自动核验完成，已按当前材料形成最终结果"
-                    outcome.raw = {
-                        **(outcome.raw or {}),
-                        "auto_finalized": True,
-                        "partial_material_review": fallback_payload,
-                        "calculation": f"自动核验完成，按当前材料计 {finalized_value} 分",
-                    }
+                        finalized_value = None
+                    if (finalized_value is not None and finalized_value > 0
+                            and fallback_payload.get("value_source") != "model_crash"):
+                        outcome.score = finalized_value
+                        outcome.verdict = ("pass" if finalized_value > 0 else "fail"
+                                           if criterion.get("score_type") not in ("veto", "match") else "concern")
+                        outcome.basis = "deterministic"
+                        outcome.reasoning = "自动核验完成，已按当前材料形成最终结果"
+                        outcome.raw = {
+                            **(outcome.raw or {}),
+                            "auto_finalized": True,
+                            "partial_material_review": fallback_payload,
+                            "calculation": f"自动核验完成，按当前材料计 {finalized_value} 分",
+                        }
+                    elif config.technical_provisional_enabled():
+                        # P0-A：无确定性已核实小计 → 暂定 0 + 保留续跑。
+                        scoring_cell = criterion.get("score_type") not in ("veto", "match")
+                        outcome.score = Decimal("0") if scoring_cell else None
+                        outcome.verdict = "concern"
+                        outcome.raw = {
+                            **(outcome.raw or {}),
+                            "auto_finalized": True,
+                            "provisional": True,
+                            "provisional_value": str(outcome.score) if outcome.score is not None else None,
+                            "provisional_source": "none",
+                            "partial_material_review": fallback_payload,
+                            "calculation": "自动核验未形成可核验终态，暂定 0 分（非评审结论，续核后可重算）",
+                        }
+                    else:
+                        # 回滚通道（BID_EVAL_TECHNICAL_PROVISIONAL=0）：旧收口语义。
+                        outcome.score = finalized_value if finalized_value is not None else Decimal("0")
+                        outcome.verdict = ("pass" if outcome.score > 0 else "fail"
+                                           if criterion.get("score_type") not in ("veto", "match") else "concern")
+                        outcome.basis = "deterministic"
+                        outcome.reasoning = "自动核验完成，已按当前材料形成最终结果"
+                        outcome.raw = {
+                            **(outcome.raw or {}),
+                            "auto_finalized": True,
+                            "partial_material_review": fallback_payload,
+                            "calculation": f"自动核验完成，按当前材料计 {outcome.score} 分",
+                        }
             if outcome is not None and outcome.basis == "fallback" and outcome.score is None:
                 fallback_payload = (outcome.raw or {}).get("fallback") or {}
                 try:
@@ -2244,6 +2335,11 @@ def _persist_cell(run_id: int, bidder_id: int, criterion: dict, outcome: CellOut
             metadata = {
                 "state": "completed", "attempts": outcome.attempts, "basis": outcome.basis,
                 "reasoning": outcome.reasoning, "external_requirement": outcome.basis == "external",
+                # auto_finalized 必须落进 auto_review 元数据（不只 raw）：
+                # _valid_cell 的警告闸以 meta.auto_finalized 判「已收口定格」，
+                # 缺了它，全自动定格过的真实评分会被判未完成、随后被 closure
+                # 收口整体覆盖成 0（run205 c44/c48/c49 翻转 18 分的真机制）。
+                "auto_finalized": bool(outcome.raw.get("auto_finalized")),
                 "calculation": (outcome.raw.get("calculation") or outcome.raw.get("sub_score_calculation")
                                 or outcome.raw.get("formula")),
                 "visual_evidence": visual_evidence,
@@ -2261,6 +2357,12 @@ def _persist_cell(run_id: int, bidder_id: int, criterion: dict, outcome: CellOut
                                 if outcome.basis == "lightweight" else None),
                 "fallback": (outcome.raw.get("fallback")
                              if outcome.basis == "fallback" else None),
+                # P0-A：暂定格标记（basis=fallback 且 provisional）——计入总分
+                # 但非评审结论，保留续跑可翻案。
+                "provisional": bool(outcome.raw.get("provisional")),
+                "provisional_value": outcome.raw.get("provisional_value"),
+                "provisional_source": outcome.raw.get("provisional_source"),
+                "resumable": bool(outcome.raw.get("provisional")),
             }
             row.ai_raw_json = {**outcome.raw, "auto_review": metadata}
             row.final_score = outcome.score
@@ -3241,8 +3343,11 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
         if pending_cells:
             for bid_id, c in pending_cells:
                 try:
-                    _persist_cell(run_id, bid_id, c, None,
-                                  LLMError("自动评审已按当前材料形成最终结果"))
+                    # error_code=closure_sealed（取证标记）：区分「执行中故障」
+                    # 与「整格从未产出结果被收口」，便于回归定位（run206 实证）。
+                    closure_error = LLMError("自动评审已按当前材料形成最终结果")
+                    closure_error.code = "closure_sealed"
+                    _persist_cell(run_id, bid_id, c, None, closure_error)
                 except JobCancelled:
                     raise
                 except Exception:  # noqa: BLE001 - one bad row must not break closure

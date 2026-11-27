@@ -145,6 +145,9 @@ def _is_reading_gap_row(row: ScoreRecord) -> bool:
     """补读、证据或模型核验未完成的格可在原冻结输入下续评。"""
     if material_review_pending(row) is not None:
         return True
+    # P0-A：全自动下的技术失败暂定格同样可续核翻案（暂定分不锁死）。
+    if provisional_fallback(row) is not None:
+        return True
     # 已核实小计为正数的历史 fallback 也允许续核一次，
     # 让新执行器按全自动口径把正向小计正式定分。
     meta = (row.ai_raw_json or {}).get("auto_review") or {}
@@ -159,7 +162,10 @@ def _is_reading_gap_row(row: ScoreRecord) -> bool:
 
 
 def settled_fallback_score(score: ScoreRecord | None) -> Decimal | None:
-    """全自动收口的历史 fallback 分值（含 0），None 表示没有可定格分值。"""
+    """全自动收口的历史 fallback 分值（含 0），None 表示没有可定格分值。
+
+    P0-A：崩溃模型小计（value_source="model_crash"）只入审计，永不返回；
+    带 provisional 标记的暂定格返回暂定值（确定性来源优先）。"""
     if score is None or not config.full_auto_finalization_enabled():
         return None
     meta = (score.ai_raw_json or {}).get("auto_review") or {}
@@ -169,6 +175,14 @@ def settled_fallback_score(score: ScoreRecord | None) -> Decimal | None:
     kind = fallback.get("kind")
     if not kind or kind == "duplicate_summary" or kind not in TECHNICAL_FALLBACK_KINDS:
         return None
+    if fallback.get("value_source") == "model_crash":
+        return None
+    provisional_value = meta.get("provisional_value")
+    if provisional_value is not None:
+        try:
+            return Decimal(str(provisional_value))
+        except (InvalidOperation, TypeError, ValueError):
+            return None
     try:
         return Decimal(str(fallback.get("value") or 0))
     except (InvalidOperation, TypeError, ValueError):
@@ -196,8 +210,27 @@ def material_review_pending(score: ScoreRecord | None) -> dict | None:
 
 
 def technical_fallback_kind(score: ScoreRecord | None) -> str | None:
-    pending = material_review_pending(score)
+    pending = material_review_pending(score) or provisional_fallback(score)
     return str(pending.get("kind")) if pending else None
+
+
+def provisional_fallback(score: ScoreRecord | None) -> dict | None:
+    """P0-A（2026-11-28）：全自动收口下的技术失败**暂定格**。
+
+    basis=fallback 且带 provisional 标记：暂定分已落值（计入总分直接排名，
+    零未定分拍板），但不是评审结论——保留续跑可翻案（_is_reading_gap_row
+    / resume_run 据此重评）。人工模式下 material_review_pending 语义不变，
+    此函数只服务全自动口径。"""
+    if score is None or not config.full_auto_finalization_enabled():
+        return None
+    meta = (score.ai_raw_json or {}).get("auto_review") or {}
+    if not meta.get("provisional"):
+        return None
+    fallback = meta.get("fallback") or {}
+    kind = fallback.get("kind")
+    if not kind or kind == "duplicate_summary" or kind not in TECHNICAL_FALLBACK_KINDS:
+        return None
+    return fallback
 
 
 def public_auto_review(score: ScoreRecord | None) -> dict | None:
@@ -495,7 +528,7 @@ def _state(s, run: EvaluationRun) -> tuple[dict | None, set[tuple[int, int]]]:
             continue
         if _valid_cell(row, criteria[row.criterion_id], by_score.get(row.id, [])):
             completed.add(key)
-            if material_review_pending(row):
+            if material_review_pending(row) or provisional_fallback(row):
                 material_pending += 1
             _auto_meta = (row.ai_raw_json or {}).get("auto_review") or {}
             if (_auto_meta.get("basis") == "fallback"
@@ -504,8 +537,15 @@ def _state(s, run: EvaluationRun) -> tuple[dict | None, set[tuple[int, int]]]:
         elif ((row.ai_raw_json or {}).get("auto_review") or {}).get("state") == "failed":
             failed += 1
             latest_error = ((row.ai_raw_json or {}).get("auto_review") or {}).get("error")
-    finalized = len(completed) - material_pending
-    remaining = len(expected) - finalized
+    if config.full_auto_finalization_enabled():
+        # P0-A（2026-11-28）：暂定格已落值（零未定分）——is_final（可发布出
+        # 排名）与 resumable（可翻案）解耦，二者可同时为真；remaining 只算
+        # 真正没值的格（缺记录/未执行）。
+        finalized = len(completed)
+        remaining = len(expected) - finalized
+    else:
+        finalized = len(completed) - material_pending
+        remaining = len(expected) - finalized
     skip_errors = failure_policy(run) == "continue"
     skipped = failed if skip_errors else 0
     data = {
@@ -525,7 +565,10 @@ def _state(s, run: EvaluationRun) -> tuple[dict | None, set[tuple[int, int]]]:
             and bool(expected) and remaining == 0
         ),
         "failure_policy": failure_policy(run), "skipped": skipped,
-        "processed": len(completed) + skipped, "pending": remaining - skipped - material_pending,
+        "processed": len(completed) + skipped,
+        "pending": (max(0, remaining - skipped)
+                    if config.full_auto_finalization_enabled()
+                    else remaining - skipped - material_pending),
         "execution_finished": run.status in ("succeeded", "partial", "failed", "cancelled"),
         "result_available": run.status in ("succeeded", "partial"),
     }
@@ -768,7 +811,37 @@ def finish_run(run_id: int) -> dict:
         s.add(run)
     if error:
         raise ValidationFailed(error)
-    return progress(run_id)
+    state_after = progress(run_id)
+    _maybe_auto_retry(run_id, state_after)
+    return state_after
+
+
+def _maybe_auto_retry(run_id: int, state: dict | None) -> None:
+    """P0-A（2026-11-28）：全自动收口后仍有技术失败暂定格时自动入队一次续核
+    （「暂定分+保留续跑」拍板的自动重试；auto_retry_count 防环，耗尽即停）。
+    不影响 finish_run 的发布结果：失败只留审计日志，暂定分与排名照常可见。"""
+    import logging
+
+    if not state or not config.technical_auto_retry_enabled():
+        return
+    if not config.full_auto_finalization_enabled():
+        return
+    if not state.get("material_pending") or not state.get("resumable"):
+        return
+    try:
+        with session_scope() as s:
+            run = s.get(EvaluationRun, run_id)
+            if run is None:
+                return
+            cfg = dict(run.config_json or {})
+            attempts = int(cfg.get("auto_retry_count") or 0)
+            if attempts >= config.technical_auto_retry_limit():
+                return
+            cfg["auto_retry_count"] = attempts + 1
+            run.config_json = cfg
+        resume_run(run_id, "auto_retry")
+    except Exception:  # noqa: BLE001 - 自动重试失败不得影响已发布的暂定结果
+        logging.getLogger(__name__).exception("暂定格自动重试入队失败 run=%s", run_id)
 
 
 def resume_run(run_id: int, actor: str) -> tuple[int, int]:
@@ -809,7 +882,8 @@ def resume_run(run_id: int, actor: str) -> tuple[int, int]:
             raise Conflict("运行输入或评审配置已变化，请新建评分运行")
         checkpoints = dict((run.config_json or {}).get("material_recovery_checkpoints") or {})
         for row in gap_rows:
-            if not (pending := material_review_pending(row)):
+            pending = material_review_pending(row) or provisional_fallback(row)
+            if not pending:
                 continue
             raw = row.ai_raw_json or {}
             meta = raw["auto_review"]

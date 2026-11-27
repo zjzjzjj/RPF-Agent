@@ -1883,6 +1883,7 @@ def _call(gateway: Gateway, criterion: dict, pages: list[dict], *, data_class: s
                 error.validation_history = history
                 error.review_attempts_exhausted = True
                 for attr in ("rejected_evidence", "verified_facts", "verified_subtotal",
+                             "verified_subtotal_source", "provisional_value", "provisional_source",
                              "synthesis_evidence_rejected"):
                     if hasattr(exc, attr):
                         setattr(error, attr, getattr(exc, attr))
@@ -2426,6 +2427,8 @@ def synthesis_decision(gateway, criterion, pages, *, data_class, previous,
             ]
             scores = [result.score for result in decisions if result.score is not None]
             error.verified_subtotal = max(scores) if scores else None
+            # 崩溃模型小计只入审计（P0-A：永不外泄进暂定/最终分，run166 拍板）
+            error.verified_subtotal_source = "model_crash"
             raise error
         key, source = matches[0]
         # Identity, owner and immutable quote remain in the host ledger and its
@@ -2519,6 +2522,7 @@ def synthesis_decision(gateway, criterion, pages, *, data_class, previous,
         if not hasattr(exc, "verified_subtotal"):
             scores = [item.score for item in decisions if item.score is not None]
             exc.verified_subtotal = max(scores) if scores else None
+            exc.verified_subtotal_source = "model_crash"
         if callable(final._invalidate_response):
             final._invalidate_response()
         raise
