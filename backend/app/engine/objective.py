@@ -108,6 +108,26 @@ def run_check(
                 "未在投标文本中定位到投标保证金缴纳凭证（可能为扫描件或 OCR 未识别），须人工核查原件",
                 need_human=True,
             )
+        if "分项报价表" in name and params.get("require_content"):
+            text = facts.text or ""
+            hits = list(re.finditer(r"投标分项报价表|分项报价表", text))
+            content_hits = []
+            for hit in hits:
+                segment = text[hit.end(): hit.end() + 2500]
+                if re.search(r"合计|总计|投标总价|单价|数量|金额", segment):
+                    content_hits.append(hit)
+            if content_hits:
+                return PrimitiveResult("pass", "已定位到分项报价表内容")
+            if text.strip():
+                return PrimitiveResult(
+                    "fail",
+                    "未定位到分项报价表内容（仅见要求/目录或无表格数据）",
+                )
+            return PrimitiveResult(
+                "unknown",
+                "分项报价表文本不可读，须人工核查原页",
+                need_human=True,
+            )
         if "投标函" in name or "授权" in name:
             # 按正文判断（章节标题在正文里）；文件名不含章节名，不能拿文件名当依据
             if "投标函" in facts.text:

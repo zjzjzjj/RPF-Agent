@@ -177,6 +177,8 @@ def infer_check(c: dict[str, Any]) -> tuple[str, dict[str, Any]] | None:
     if re.search(r"落款|签署", core) and re.search(r"日期|时间|截止", core):
         # 落款/签署日期类（如"授权书落款日期有效"）→ 确定性日期核查
         return "date_valid", {"document": core}
+    if "分项报价表" in core and re.search(r"未按要求提供|未提供", f"{name} {c.get('description') or ''}"):
+        return "document_present", {"document": "投标分项报价表", "require_content": True}
     if re.search(r"有效期|等级|一级|二级|三级|四级|达到|吊销|暂停|撤销|动态考核|复审|换证", core):
         return None  # 等级/有效性/状态要求，存在性检查判不了
     if re.search(r"证书|执照|许可证|登记证|认证书|合格证|资质证书|资质副本|资质证件", core):

@@ -14,6 +14,8 @@ from app.rules.compiler import (
     _parse_trim_tiers,
     parse_price_formula_text,
 )
+from app.engine.models import PriceBid
+from app.engine.price import compute_price_scores
 from app.rules.validators import run_validators
 
 
@@ -601,3 +603,50 @@ def test_lab_first_batch_no_gate_would_pick_cheapest_as_benchmark() -> None:
     ]
     comp = compute_price_scores(bids, no_gate, strict=True)
     assert comp.benchmark == D("7107700.00")  # 无门槛 → 最低价成基准（错误形态）
+
+
+def test_test2_effective_bidder_pool_reproduces_manual_price_scores() -> None:
+    """7家递交、2家无效、5家有效：门槛/去极值均按5家有效标判断。"""
+    formula = parse_price_formula_text(MM_TEXT)
+    formula["params_json"] = {
+        "deduct_rate_down": formula.pop("deduct_rate_down"),
+        "deduct_rate_up": formula.pop("deduct_rate_up"),
+        "trim_count": formula.pop("trim_count"),
+        "trim_threshold": formula.pop("trim_threshold"),
+        "trim_tiers": formula.pop("trim_tiers"),
+        "benchmark_gate": formula.pop("benchmark_gate"),
+        "outlier_policy": formula.pop("outlier_policy"),
+        "special_rules": formula.pop("special_rules"),
+    }
+    formula.update({
+        "max_score": Decimal("50"),
+        "upper_bound": Decimal("50"),
+        "lower_bound": Decimal("0"),
+        "rounding": 2,
+        "exclude_invalid": True,
+    })
+    prices = [
+        ("科通", Decimal("4296180"), False),
+        ("速腾", Decimal("4754100"), False),
+        ("安保", Decimal("4951260"), False),
+        ("西川", Decimal("4131668"), False),
+        ("集服", Decimal("4968432"), False),
+        ("金程", Decimal("4401120"), True),
+        ("卓高", Decimal("4017400"), True),
+    ]
+    bids = [PriceBid(i + 1, name, price, excluded) for i, (name, price, excluded) in enumerate(prices)]
+    comp = compute_price_scores(bids, formula, strict=True)
+    assert comp.benchmark == Decimal("4389311.60")
+    by_name = {row.name: row for row in comp.results}
+    expected = {
+        "科通": Decimal("49.15"),
+        "速腾": Decimal("43.35"),
+        "安保": Decimal("39.76"),
+        "西川": Decimal("47.65"),
+        "集服": Decimal("39.44"),
+    }
+    for name, score in expected.items():
+        assert by_name[name].price_score == score
+        assert not by_name[name].excluded_from_benchmark
+    assert by_name["金程"].excluded_from_benchmark
+    assert by_name["卓高"].excluded_from_benchmark

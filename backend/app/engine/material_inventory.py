@@ -844,6 +844,8 @@ _MID_TITLE = re.compile(r"(?<!高级)(?<!助理)(?<!维修)(?<!设备)工程师"
 _CERT_TOKENS = (
     "电工证", "特种作业操作证", "高处作业", "登高证",
     "音响系统设备维修工程师", "投影机维修工程师",
+    "中控系统维修工程师", "调音台维修工程师", "音箱维修工程师",
+    "功放维修工程师", "数字音频处理器维修工程师", "灯光系统维修工程师",
     "高级音响调音员", "音响调音员", "注册二级建造师", "二级建造师",
 )
 _ROLE_KEYWORDS = (
@@ -1532,7 +1534,7 @@ def _value_items_from_pages(pages: list[dict]) -> tuple[list[ValueItem], bool]:
         if _RE_VALUE_RULE_PAGE.search(text) and not _RE_VALUE_COMMITMENT.search(window_text):
             continue
         items: list[ValueItem] = []
-        categories: set[str] = set()
+        seen_names: set[str] = set()
         for candidate in window:
             candidate_text = str(candidate.get("text") or "")
             page_no = int(candidate.get("page_no") or 0)
@@ -1546,16 +1548,16 @@ def _value_items_from_pages(pages: list[dict]) -> tuple[list[ValueItem], bool]:
                 for pattern in (_RE_VALUE_NUMBERED, _RE_VALUE_CHINESE, _RE_VALUE_LETTER):
                     for match in pattern.finditer(region):
                         name = _value_name(match.group(1))
-                        category = _value_item_category(name)
-                        if not category or category in categories:
+                        key = re.sub(r"\s+", "", name).lower()
+                        if not _value_item_category(name) or key in seen_names:
                             continue
-                        categories.add(category)
+                        seen_names.add(key)
                         items.append(ValueItem(name=name, page=page_no))
                 for match in _RE_VALUE_SUBHEADING.finditer(region):
                     name = _value_name(match.group(1))
-                    category = _value_item_category(name)
-                    if category and category not in categories:
-                        categories.add(category)
+                    key = re.sub(r"\s+", "", name).lower()
+                    if _value_item_category(name) and key not in seen_names:
+                        seen_names.add(key)
                         items.append(ValueItem(name=name, page=page_no))
             if len(items) >= 3:
                 break

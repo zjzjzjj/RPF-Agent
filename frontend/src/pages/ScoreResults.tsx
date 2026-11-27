@@ -169,7 +169,13 @@ export default function ScoreResults() {
 
   const resumeRun = useMutation({
     mutationFn: async (id: number) => {
-      await api.patch(`/runs/${id}/failure-policy`, { failure_policy: "continue" });
+      // 材料待核验是已有运行的技术恢复，不改变已冻结的故障策略。
+      // 终态运行先 PATCH 会被“已结束的评分结果不能修改执行策略”拦截，
+      // 导致 POST /resume 根本没有机会执行。
+      const materialPending = (automation?.material_pending ?? 0) > 0;
+      if (!materialPending) {
+        await api.patch(`/runs/${id}/failure-policy`, { failure_policy: "continue" });
+      }
       return api.post<{ run_id: number; job_id: number }>(`/runs/${id}/resume`);
     },
     onSuccess: (r) => {
@@ -177,7 +183,11 @@ export default function ScoreResults() {
       setRunId(r.run_id);
       qc.invalidateQueries({ queryKey: ["runs", pid] });
       invalidateResults();
-      message.success("已继续评审，已记录故障直接跳过，其余项目继续评分");
+      message.success(
+        (automation?.material_pending ?? 0) > 0
+          ? "已继续核验材料，恢复任务已创建"
+          : "已继续评审，已记录故障直接跳过，其余项目继续评分",
+      );
     },
     onError: (e: Error) => message.error(e.message),
   });

@@ -762,10 +762,13 @@ def build_score_summary(
     bidders_out: list[dict] = []
     for bidder in all_bidders:
         is_dropped = bidder.name in auto_dropped_set
+        is_rejected = bidder.status == "rejected"
         is_participant = (not participant_ids) or bidder.id in set(participant_ids)
-        if is_dropped or not is_participant:
+        if is_dropped or is_rejected or not is_participant:
             reason = (
-                "未抽取到投标报价，已自动剔除（全自动模式）"
+                "人工确认否决/无效标，不参与正式排名"
+                if is_rejected
+                else "未抽取到投标报价，已自动剔除（全自动模式）"
                 if is_dropped
                 else "未参与本次运行（发起时未选择）"
             )

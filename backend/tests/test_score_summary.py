@@ -370,6 +370,31 @@ def test_run_not_ready(client, summary_chain):  # noqa: ANN001
     assert any("不完整" in w for w in d["warnings"])
 
 
+def test_rejected_bidder_keeps_audit_but_has_no_formal_rank(client, summary_chain):  # noqa: ANN001
+    from app.db.models import Bidder
+    from app.db.session import session_scope
+
+    target = summary_chain["bidder_ids"][2]
+    with session_scope() as s:
+        bidder = s.get(Bidder, target)
+        bidder.status = "rejected"
+
+    d = _get(client, summary_chain).json()
+    b = next(x for x in d["bidders"] if x["bidder_id"] == target)
+    assert b["state"] == "excluded"
+    assert b["rank"] is None
+    assert "人工确认否决" in b["excluded_reason"]
+
+    ranking = client.get(
+        f"/api/projects/{summary_chain['pid']}/ranking",
+        params={"run_id": summary_chain["run_id"]},
+    ).json()
+    row = next(x for x in ranking["rows"] if x["bidder_id"] == target)
+    assert row["rank"] is None
+    assert row["reference_rank"] is None
+    assert row["status"] == "rejected"
+
+
 def test_excluded_bidder(client, summary_chain):  # noqa: ANN001
     from app.db.models import Bidder, EvaluationRun
     from app.db.session import session_scope

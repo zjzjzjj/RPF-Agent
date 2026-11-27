@@ -2129,12 +2129,46 @@ def _price_stage(run_id: int, manifest: dict, criteria: list[dict], prices: dict
         gate_missing_by_bidder: dict[int, list[str]] = {}
         gate_fallback_by_bidder: dict[int, list[str]] = {}
         with session_scope() as s:
+            # 有效投标人集合必须先确定，才能判断“有效家数超过N家”等门槛。
+            # 不能用冻结 manifest 的上传家数代替有效家数（测试2：7家递交、5家有效）。
+            excluded_bidders: set[int] = set()
             for bid in manifest["bidders"]:
                 bid_id = int(bid["id"])
+                bidder = s.get(Bidder, bid_id)
+                price = prices.get(bid_id)
+                if bidder is not None and bidder.status == "rejected":
+                    excluded_bidders.add(bid_id)
+                if price is None or Decimal(str(price)) <= 0:
+                    excluded_bidders.add(bid_id)
+                if config.benchmark_exclude_suspect():
+                    veto_rows = list(s.execute(select(ScoreRecord).where(
+                        ScoreRecord.run_id == run_id,
+                        ScoreRecord.bidder_id == bid_id,
+                        ScoreRecord.machine_status == "recommend_reject",
+                    )).scalars())
+                    for row in veto_rows:
+                        warnings = row.warnings_json or []
+                        deterministic = any(
+                            str((item or {}).get("verdict_source")) in ("deterministic", "machine")
+                            for item in warnings
+                        )
+                        if deterministic:
+                            excluded_bidders.add(bid_id)
+                            break
+            effective_bidder_count = sum(
+                1 for bid in manifest["bidders"]
+                if int(bid["id"]) not in excluded_bidders
+            )
+            gate_enabled = bool(gate) and (
+                gate.get("min_valid_bidders") is None
+                or effective_bidder_count >= int(gate["min_valid_bidders"])
+            )
+            for bid in manifest["bidders"]:
+                bid_id = int(bid["id"])
+                excluded = bid_id in excluded_bidders
                 value = basis = None
                 sample_pass = None
-                if gate and (gate.get("min_valid_bidders") is None
-                             or len(manifest["bidders"]) >= int(gate["min_valid_bidders"])):
+                if gate_enabled:
                     on = gate.get("gate_on") or "tech"
                     categories = {"tech": {"technical"}, "tech_qualification": {"technical", "commercial", "qualification"},
                                   "biz_tech": {"technical", "commercial"},
@@ -2198,7 +2232,7 @@ def _price_stage(run_id: int, manifest: dict, criteria: list[dict], prices: dict
                 # 缺价公司（补抽失败）不在 prices 里：传 None，引擎按
                 # "报价为空或≤0"记 0 并排除基准——与 legacy 无效价语义一致。
                 bids.append(PriceBid(bid_id, str(bid.get("name") or bid_id), prices.get(bid_id),
-                                     False, gate_value=value, gate_basis=basis, sample_pass=sample_pass))
+                                     excluded, gate_value=value, gate_basis=basis, sample_pass=sample_pass))
             price_evidence = dict((s.get(EvaluationRun, run_id).config_json or {}).get("resolved_price_evidence") or {})
         strict_error: str | None = None
         try:

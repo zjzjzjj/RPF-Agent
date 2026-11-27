@@ -150,6 +150,9 @@ def compute_ranking(project_id: str, run_id: int | None = None) -> dict:
                 }
             )
 
+        # 人工确认无效/否决的投标人保留审计行，但不参与正式名次。
+        active_entries = [e for e in bidders.values() if e["status"] != "rejected"]
+        rejected_entries = [e for e in bidders.values() if e["status"] == "rejected"]
         rank_rows_in = [
             RankRow(
                 bidder_id=e["bidder_id"],
@@ -160,13 +163,21 @@ def compute_ranking(project_id: str, run_id: int | None = None) -> dict:
                 commercial_total=e["commercial"],
                 veto_flag=e["veto_flag"],
             )
-            for e in bidders.values()
+            for e in active_entries
         ]
         ranked = rank_rows(rank_rows_in)
+        ranked_by_id = {r.bidder_id: r for r in ranked}
 
         out_rows = []
-        for r in ranked:
-            e = bidders[r.bidder_id]
+        for e in [*(bidders[r.bidder_id] for r in ranked), *rejected_entries]:
+            r = ranked_by_id.get(e["bidder_id"])
+            if r is None:
+                # rejected 行保留给审计/报告展示，不产生参考名次或正式名次。
+                r = RankRow(
+                    bidder_id=e["bidder_id"], name=e["name"], total=e["total"],
+                    bid_price=e["bid_price"], tech_total=e["tech"],
+                    commercial_total=e["commercial"], veto_flag=True,
+                )
             # 技术待复核格不计分；此字段仅为旧版非技术兜底兼容展示。
             provisional_total = e["total"]
             out_rows.append(

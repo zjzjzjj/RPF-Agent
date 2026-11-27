@@ -61,7 +61,7 @@ def test_material_inventory_reads_contracts_personnel_certificates_and_services(
     assert len(inventory.contracts) == 3
     assert {str(c.amount_yuan) for c in inventory.contracts} == {"570000"}
     assert len(inventory.persons) == 7
-    assert len(inventory.value_items) == 1
+    assert len(inventory.value_items) == 3
     assert {c.normalized for c in inventory.certs} >= {"ISO9001", "ISO14001", "ISO45001"}
     assert any(c.level == "二级" for c in inventory.certs)
 
@@ -158,13 +158,29 @@ def test_objective_fastpath_scores_all_supported_plans():
             "具有音视频集成工程能力证书贰级得0.5 分，壹级得1 分。"),
     }
     expected = {"c39": "6.00", "c52": "3.00", "c53": "2.00", "c54": "2.00",
-                "c55": "2.00", "c57": "1.00", "c61": "2.00", "c62": "0.50"}
+                "c55": "2.00", "c57": "3.00", "c61": "2.00", "c62": "0.50"}
     for code, criterion in criteria.items():
         assert build_objective_plan(criterion) is not None, code
         result = score_objective(criterion, inventory)
         assert result is not None, code
         assert str(result.score) == expected[code], (code, result.detail)
         assert result.verdict == "pass"
+
+
+def test_response_commitment_is_binary_rule_not_response_hour_tier():
+    inventory = build_inventory(7, [{
+        "document_id": 1, "page_no": 8, "source": "text",
+        "text": "非招标人工作时间应急响应承诺：我方提供值班电话和远程支持方式，响应时间优于招标人要求响应时间一半。",
+    }])
+    criterion = _criterion(
+        "c56", "应急响应时间承诺", "subjective", "2",
+        "承诺在非招标人工作时间应急响应优于招标人要求响应时间一半的（要求提供可行的方式能够实现该项服务承诺的响应时间，且得到评标委员的认可）得2分，其它不得分。",
+    )
+    assert build_objective_plan(criterion) is not None
+    result = score_objective(criterion, inventory)
+    assert result is not None
+    assert result.score == Decimal("2.00")
+    assert result.verdict == "pass"
 
 
 def test_objective_fastpath_reports_zero_with_reason_when_absent():

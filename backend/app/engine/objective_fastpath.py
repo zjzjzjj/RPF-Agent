@@ -15,6 +15,7 @@ from typing import Any
 
 from app.engine.material_inventory import (
     CertRecord, ContractRecord, MaterialInventory, PersonRecord,
+    platform_query_details, requires_platform_certificate_query,
 )
 from app.engine.objective import (
     date_gate_state, date_window_from_rule, documented_project_type_state, normalize_cert,
@@ -143,6 +144,9 @@ def build_objective_plan(criterion: dict) -> ObjectivePlan | None:
             return None
         return ObjectivePlan("person_certs", params)
 
+    if ("应急响应" in expanded and ("一半" in expanded or "50%" in expanded)
+            and re.search(r"得\s*\d+(?:\.\d+)?\s*分", expanded)):
+        return ObjectivePlan("response_commitment", params)
     if "增值服务" in expanded:
         return ObjectivePlan("value_items", params)
     if "行业认证维修工程师" in expanded:
@@ -694,14 +698,76 @@ def _value_items_score(criterion: dict, inventory: MaterialInventory) -> FastPat
 
 
 # ---------------------------------------------------------------------------
+# Binary response commitment
+# ---------------------------------------------------------------------------
+def _response_commitment_score(criterion: dict, inventory: MaterialInventory) -> FastPathResult:
+    """“优于要求响应时间一半且有可行方式”是二值承诺项，不套响应小时档位。"""
+    maximum = _max(criterion) or Decimal(0)
+    text = inventory.full_text or ""
+    anchors = []
+    for match in re.finditer(r"应急响应|非招标人工作时间|响应时间", text):
+        start = max(0, match.start() - 300)
+        end = min(len(text), match.end() + 700)
+        anchors.append(text[start:end])
+    window = "\n".join(anchors)
+    has_half = bool(re.search(r"优于[^。；\n]{0,40}(?:一半|1\s*/\s*2|50\s*%)", window))
+    has_method = bool(re.search(r"方式|措施|流程|值班|电话|远程|到场|可行|响应机制", window))
+    score = maximum if has_half and has_method else Decimal(0)
+    score = _cap(score, criterion)
+    readable = bool(text.strip()) and not any(
+        str(page.get("source") or "") in ("ocr", "ocr_img") for page in inventory.pages
+    )
+    complete = readable or (has_half and has_method)
+    detail = (
+        "已核验非工作时间应急响应承诺优于要求一半，并含可行响应方式"
+        if score > 0 else
+        "未核验到同时满足‘优于要求一半’和可行响应方式的承诺"
+    )
+    return FastPathResult(
+        score=score, detail=detail + f"；合计 {score} 分",
+        verdict="pass" if score > 0 else ("fail" if complete else "concern"),
+        facts={"response_commitment": {"half": has_half, "method": has_method}},
+        pages=sorted({
+            int(page.get("page_no") or 0) for page in inventory.pages
+            if re.search(r"应急响应|非招标人工作时间|响应时间", str(page.get("text") or ""))
+        }),
+        zero_reason=None if score > 0 else ("confirmed_absent" if complete else "no_facts"),
+        complete=complete,
+        confidence=_confidence_from(inventory, complete),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Certificates
 # ---------------------------------------------------------------------------
+def _platform_query_families(inventory: MaterialInventory) -> set[str]:
+    families: set[str] = set()
+    for page in inventory.pages:
+        found, _numbers = platform_query_details(
+            str(page.get("text") or ""), require_seal=True
+        )
+        families.update(found)
+    return families
+
+
 def _cert_count_tier_score(criterion: dict, inventory: MaterialInventory) -> FastPathResult:
     maximum = _max(criterion) or Decimal(0)
+    query_required = requires_platform_certificate_query(criterion)
+    query_families = _platform_query_families(inventory) if query_required else set()
     families: list[str] = []
+    skipped_unverified: list[str] = []
     for cert in inventory.certs:
         key = cert.normalized or normalize_cert(cert.name)
-        if key.startswith("ISO") and key not in families:
+        if not (key.startswith("ISO") or "信息技术服务" in (cert.name or "")):
+            continue
+        if query_required:
+            if query_families and key not in query_families and cert.backing is False:
+                continue
+            if not query_families and cert.backing is False:
+                continue
+            if not query_families and cert.backing is None:
+                skipped_unverified.append(key)
+        if key not in families:
             families.append(key)
     # Tiers from the rule text: "两项得1分，三项得2分".
     tiers: dict[int, Decimal] = {}
@@ -724,6 +790,8 @@ def _cert_count_tier_score(criterion: dict, inventory: MaterialInventory) -> Fas
         f"有效体系认证 {len(families)} 项：{'、'.join(families)}"
         if families else "未检出 ISO/信息技术服务管理体系认证证书"
     )
+    if skipped_unverified:
+        detail += f"（{'、'.join(skipped_unverified)} 仅有申报/未见查询截图，按未核验计入）"
     complete = bool(inventory.certs) or inventory.cert_section_present
     zero_reason = None if score > 0 else ("confirmed_absent" if complete else "no_facts")
     return FastPathResult(
@@ -743,18 +811,21 @@ def _cert_level_sum_score(criterion: dict, inventory: MaterialInventory) -> Fast
         name = cert.name or ""
         level = cert.level or ""
         value = None
+        family = None
         if "电子与智能化" in name:
+            family = "电子与智能化工程专业承包"
             if level == "一级":
                 value = Decimal(1)
             elif level == "二级":
                 value = Decimal("0.5")
         elif "音视频集成" in name:
+            family = "音视频集成工程能力"
             if level == "一级":
                 value = Decimal(1)
             elif level == "二级":
                 value = Decimal("0.5")
-        if value is not None:
-            scores[name] = max(scores.get(name, Decimal(0)), value)
+        if value is not None and family is not None:
+            scores[family] = max(scores.get(family, Decimal(0)), value)
     score = min(maximum, sum(scores.values(), Decimal(0)))
     score = _cap(score, criterion)
     detail = (
@@ -954,6 +1025,8 @@ def score_objective(criterion: dict, inventory: MaterialInventory) -> FastPathRe
         return _person_equipment_score(criterion, inventory)
     if plan.kind == "value_items":
         return _value_items_score(criterion, inventory)
+    if plan.kind == "response_commitment":
+        return _response_commitment_score(criterion, inventory)
     if plan.kind == "person_certs":
         return _person_cert_score(criterion, inventory)
     if plan.kind == "cert_count_tier":
