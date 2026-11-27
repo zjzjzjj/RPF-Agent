@@ -2756,6 +2756,25 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
 
     # Qualification-light: one deterministic precheck + one consolidated LLM
     # screen per bidder.  Never OCR, never create collection batches.
+    submission_deadline = None
+    try:
+        with session_scope() as s:
+            tender_docs = list(s.execute(select(Document).where(
+                Document.project_id == run.project_id,
+                Document.kind == "tender",
+                Document.bidder_id.is_(None),
+            )).scalars())
+            tender_pages = []
+            for doc in tender_docs:
+                tender_pages.extend([
+                    ("", str(page.text or ""))
+                    for page in s.execute(select(DocumentPage).where(
+                        DocumentPage.document_id == doc.id).order_by(DocumentPage.page_no)).scalars()
+                ])
+            from app.rules.check_infer import extract_tender_submission_date
+            submission_deadline = extract_tender_submission_date(tender_pages)
+    except Exception:  # noqa: BLE001
+        submission_deadline = None
     light_criteria_by_bidder: dict[int, list[dict]] = {}
     light_reviews: dict[int, dict] = {}
     light_locks: dict[int, threading.Lock] = {}
@@ -2764,7 +2783,8 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
 
         for bid_id in bidder_ids:
             light_criteria_by_bidder[bid_id] = [
-                c for c in criteria
+                {**c, "_submission_deadline": submission_deadline}
+                for c in criteria
                 if c["score_type"] in ("veto", "match") and not _is_cross(c)
             ]
             light_locks[bid_id] = threading.Lock()

@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
+import re
 
 from pydantic import BaseModel, ConfigDict
 
@@ -279,12 +280,33 @@ def review_bidder_qualification(criteria: list[dict], pages: list[dict], data_cl
         if check_type not in _DETERMINISTIC_CHECKS:
             check_type = "human_only"
         try:
-            primitive = run_check(
-                check_type, criterion.get("params") or {}, facts, criterion=criterion
-            )
+            params = dict(criterion.get("params") or {})
+            name = str(criterion.get("name") or "")
+            text = _page_text(pages)
+            if "分项报价表" in name:
+                table_hits = re.findall(r"(?:投标分项报价表|分项报价表)[\s\S]{0,1200}", text)
+                has_content = any(re.search(r"合计|总计|投标总价|单价|数量|金额", hit) for hit in table_hits)
+                primitive = (run_check("document_present", {**params, "document": "投标分项报价表", "require_content": True},
+                                        facts, criterion=criterion) if has_content else None)
+                if primitive is None:
+                    from app.engine.models import PrimitiveResult
+                    primitive = PrimitiveResult("fail", "未按要求提供投标分项报价表")
+                det = "fail" if primitive.status == "fail" else "pass"
+            elif ("授权委托书" in name and
+                  (criterion.get("_submission_deadline") or params.get("not_after"))):
+                deadline = criterion.get("_submission_deadline") or params.get("not_after")
+                primitive = run_check("date_valid", {
+                    **params, "document": "授权委托书", "not_after": deadline,
+                }, facts, criterion=criterion)
+                det = _deterministic_state(primitive)
+            else:
+                primitive = run_check(
+                    check_type, params, facts, criterion=criterion
+                )
+                det = _deterministic_state(_apply_scan_hint(primitive, check_type, scan_hint)) if primitive else "unknown"
         except Exception:  # noqa: BLE001 - a broken primitive must not fail the run
             primitive = None
-        det = _deterministic_state(_apply_scan_hint(primitive, check_type, scan_hint)) if primitive else "unknown"
+            det = "unknown"
         visual = _is_visual_requirement(criterion)
         external = is_external_requirement(criterion)
         results[code] = LightResult(
