@@ -1,0 +1,10 @@
+{
+  "version": "2026-11-27.multi-project-bias.v1",
+  "biases": {
+    "commercial_objective": "0.60",
+    "technical_objective": "0.25",
+    "technical_subjective": "0.00",
+    "commercial_subjective": "0.00",
+    "price": "0.00"
+  }
+}

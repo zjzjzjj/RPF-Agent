@@ -469,6 +469,22 @@ def case_max_batches_ceiling() -> int:
     return max(1, int(os.environ.get("BID_EVAL_CASE_MAX_BATCHES_CEILING", 12)))
 
 
+def multi_project_bias_enabled() -> bool:
+    """多项目客观分偏差校准：使用跨项目通用偏差，不读取人工单项目答案。"""
+    return os.environ.get("BID_EVAL_MULTI_PROJECT_BIAS", "0").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def multi_project_bias_profile() -> dict:
+    import json as _json
+    path = data_dir() / "calibration" / "multi_project_bias.json"
+    try:
+        return _json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def subjective_relative_calibration_enabled() -> bool:
     """同项横向比例校准：按通用质量特征调整主观分高低顺序。"""
     return os.environ.get("BID_EVAL_SUBJECTIVE_RELATIVE_CALIBRATION", "0").strip().lower() not in (

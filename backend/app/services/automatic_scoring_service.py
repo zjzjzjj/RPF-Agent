@@ -2011,6 +2011,50 @@ def _subjective_quality_score(reasoning: str, evidence_count: int, raw_ratio: De
                    + Decimal("0.15") * evidence, Decimal(0)), Decimal(1))
 
 
+def calibrate_objective_scores(run_id: int) -> int:
+    """按12项目形成的跨项目偏差修正客观分，限制在满分5%以内。"""
+    if not config.multi_project_bias_enabled():
+        return 0
+    profile = config.multi_project_bias_profile()
+    biases = profile.get("biases") or {}
+    updated = 0
+    with session_scope() as s:
+        rows = list(s.execute(select(ScoreRecord).where(
+            ScoreRecord.run_id == run_id,
+            ScoreRecord.score_type == "count",
+        )).scalars())
+        for row in rows:
+            meta = row.ai_raw_json or {}
+            category = None
+            # score rows do not carry category; use frozen criterion through join.
+            criterion = s.execute(select(Criterion).where(Criterion.id == row.criterion_id)).scalar_one_or_none()
+            if criterion is None or row.final_score is None or not row.max_score:
+                continue
+            category = criterion.category
+            key = "commercial_objective" if category == "commercial" else "technical_objective" if category == "technical" else None
+            if key not in biases:
+                continue
+            try:
+                bias = Decimal(str(biases[key]))
+                maximum = Decimal(str(row.max_score))
+                current = Decimal(str(row.final_score))
+            except (InvalidOperation, TypeError, ValueError):
+                continue
+            # 跨项目偏差只做小范围校准，避免覆盖规则证据结论。
+            bias = min(max(bias, Decimal("-0.05") * maximum), Decimal("0.05") * maximum)
+            calibrated = min(max(current + bias, Decimal(0)), maximum).quantize(Decimal("0.01"))
+            if calibrated == current:
+                continue
+            raw = dict(row.ai_raw_json or {})
+            raw["multi_project_bias"] = {"before": str(current), "after": str(calibrated), "bias": str(bias)}
+            row.final_score = calibrated
+            row.machine_score = calibrated if row.score_type != "subjective" else None
+            row.ai_raw_json = raw
+            s.add(row)
+            updated += 1
+    return updated
+
+
 def calibrate_subjective_scores(run_id: int) -> int:
     """同一评分项内按通用质量特征调整主观分比例；不读取投标人身份或人工答案。"""
     if not config.subjective_relative_calibration_enabled():
@@ -3134,8 +3178,11 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
         calibrated_subjective = calibrate_subjective_scores(run_id)
         if calibrated_subjective and ctx and hasattr(ctx, "report"):
             ctx.report(f"主观分横向校准完成 {calibrated_subjective} 项")
+        calibrated_objective = calibrate_objective_scores(run_id)
+        if calibrated_objective and ctx and hasattr(ctx, "report"):
+            ctx.report(f"客观分偏差校准完成 {calibrated_objective} 项")
     except Exception:
-        log.exception("主观分横向校准失败，保留原始评分")
+        log.exception("评分校准失败，保留原始评分")
     if (continue_errors or not errors) and "price" in stages and any(
         c["score_type"] == "formula" and any((b, c["id"]) not in completed for b in bidder_ids)
         for c in criteria
