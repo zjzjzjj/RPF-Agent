@@ -144,7 +144,7 @@ def build_objective_plan(criterion: dict) -> ObjectivePlan | None:
             return None
         return ObjectivePlan("person_certs", params)
 
-    if ("应急响应" in expanded and ("一半" in expanded or "50%" in expanded)
+    if ("应急响应" in expanded and "响应" in expanded
             and re.search(r"得\s*\d+(?:\.\d+)?\s*分", expanded)):
         return ObjectivePlan("response_commitment", params)
     if "增值服务" in expanded:
@@ -163,11 +163,12 @@ def build_objective_plan(criterion: dict) -> ObjectivePlan | None:
             r"[一二两三四五六七八九十\d]+\s*项[^。；]{0,12}?得\s*\d", expanded):
         return ObjectivePlan("cert_count_tier", params)
     if "业绩" in expanded or "合同金额" in expanded or "类似项目" in expanded:
-        # P0-4：人员主体守卫（c51 项目经理类似项目经验）——命中人员主体词族时
-        # 一律不走公司级 contracts 桶，回退 LLM 人员经验评审（year 档 5/4/3 年）。
+        # P0-4：人员主体命中时按人员经验年限档计分；只有无法形成人员事实时
+        # 才回退到逐案例 LLM，避免公司合同金额桶吞掉项目经理经验项。
+        if (params.get("person_scope") == "leader"
+                or re.search(r"项目负责人|项目经理|项目总监|技术负责人|总负责人", name)):
+            return ObjectivePlan("leader_experience", params)
         if params.get("person_scope") or _PERSON_SUBJECT_KW.search(name):
-            # 人员级业绩必须逐案例核验人员归属（合同须体现拟派人员，否则需业主
-            # 证明）；公司级合同桶不得替代——run128 c29 曾把公司合同当团队经验。
             return None
         return ObjectivePlan("contracts", params)
 
@@ -532,6 +533,74 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
 # ---------------------------------------------------------------------------
 # Personnel
 # ---------------------------------------------------------------------------
+_RE_EXPERIENCE_RANGE = re.compile(
+    r"(20\d{2})\s*年?\s*(?:\d{1,2}\s*月)?\s*(?:至|—|~|－|\-|到)\s*"
+    r"(20\d{2})\s*年?\s*(?:\d{1,2}\s*月)?"
+)
+_RE_EXPERIENCE_YEARS = re.compile(r"(\d{1,2})\s*年(?:以上|及以上|余|多)?")
+
+
+def _experience_years(text: str) -> Decimal | None:
+    values: list[Decimal] = []
+    for match in _RE_EXPERIENCE_RANGE.finditer(text or ""):
+        values.append(Decimal(int(match.group(2)) - int(match.group(1)) + 1))
+    for match in _RE_EXPERIENCE_YEARS.finditer(text or ""):
+        value = Decimal(match.group(1))
+        if 0 < value <= 55:
+            values.append(value)
+    return max(values) if values else None
+
+
+def _leader_experience_score(criterion: dict, inventory: MaterialInventory) -> FastPathResult:
+    maximum = _max(criterion) or Decimal(0)
+    text = _rule_text(criterion)
+    tiers: list[tuple[Decimal, Decimal]] = []
+    for years, score in re.findall(
+            r"(\d+)\s*年(?:以上|及以上|或以上)?[^。；]{0,25}?得\s*(\d+(?:\.\d+)?)\s*分", text):
+        tiers.append((Decimal(years), Decimal(score)))
+    tiers.sort(reverse=True)
+    leader_re = re.compile(r"项目负责人|项目经理|项目总监|技术负责人|总负责人")
+    related_re = re.compile(r"会议|多媒体|音视频|运维|维护|维保")
+    candidates = []
+    for person in inventory.persons:
+        scope_ok = bool(leader_re.search(person.role or "")) or not any(
+            leader_re.search(p.role or "") for p in inventory.persons
+        )
+        if not scope_ok:
+            continue
+        name_text = person.experience or ""
+        for page in inventory.pages:
+            if person.name and person.name in str(page.get("text") or ""):
+                name_text += "\n" + str(page.get("text") or "")
+        years = person.years or _experience_years(name_text)
+        if years is None or not related_re.search(name_text):
+            continue
+        candidates.append((years, person, name_text))
+    if not candidates:
+        return FastPathResult(
+            Decimal(0), "未从项目负责人资料中核定满足年限的类似项目经验", "concern",
+            {"persons": [{"name": p.name, "role": p.role, "years": str(p.years) if p.years else None}
+                         for p in inventory.persons]},
+            sorted({page for p in inventory.persons for page in p.pages}),
+            zero_reason="no_facts", complete=False, confidence="low",
+        )
+    years, person, _name_text = max(candidates, key=lambda item: item[0])
+    score = Decimal(0)
+    for minimum, value in tiers:
+        if years >= minimum:
+            score = value
+            break
+    score = _cap(score, criterion)
+    detail = f"项目负责人{person.name}类似项目经验约{years}年，按年限档计{score}分"
+    return FastPathResult(
+        score=score, detail=detail, verdict="pass" if score > 0 else "fail",
+        facts={"persons": [{"name": person.name, "role": person.role, "years": str(years)}]},
+        pages=sorted(set(person.pages) | set(person.experience_pages)),
+        zero_reason=None if score > 0 else "confirmed_absent",
+        complete=True, confidence="high",
+    )
+
+
 def _person_experience_score(criterion: dict, inventory: MaterialInventory) -> FastPathResult:
     maximum = _max(criterion) or Decimal(0)
     minimum_years = None
@@ -541,14 +610,20 @@ def _person_experience_score(criterion: dict, inventory: MaterialInventory) -> F
     per_person = _RE_PER_PERSON.search(_rule_text(criterion))
     per = _decimal(per_person.group(1)) if per_person else Decimal(1)
     eligible: list[PersonRecord] = []
+    related_re = re.compile(r"会议|多媒体|音视频|运维|维护|维保")
     for person in inventory.persons:
         if not re.search(r"驻场|维保|成员|团队", person.role or ""):
             continue
-        if person.years is not None and minimum_years is not None:
-            if person.years >= minimum_years:
+        person_text = person.experience or ""
+        for page in inventory.pages:
+            if person.name and person.name in str(page.get("text") or ""):
+                person_text += "\n" + str(page.get("text") or "")
+        years = person.years or _experience_years(person_text)
+        if years is not None and minimum_years is not None:
+            if years >= minimum_years and related_re.search(person_text):
                 eligible.append(person)
             continue
-        if person.experience_pages or re.search(r"年|场", person.experience or ""):
+        if person.experience_pages or re.search(r"年|场", person_text):
             eligible.append(person)
     score = min(maximum, Decimal(len(eligible)) * (per or Decimal(0)))
     detail = (
@@ -597,7 +672,15 @@ def _person_special_certs(criterion: dict, inventory: MaterialInventory) -> Fast
     per_person = _RE_PER_PERSON.search(_rule_text(criterion))
     per = _decimal(per_person.group(1)) if per_person else Decimal(1)
     # P1-4：齐全 = 同时具备电工作业族 + 登高/高处族（见 _has_special_cert_pair）。
-    eligible = [p for p in inventory.persons if _has_special_cert_pair(p.certs)]
+    eligible = []
+    for person in inventory.persons:
+        person_text = person.name + "\n" + "、".join(person.certs or [])
+        for page in inventory.pages:
+            page_text = str(page.get("text") or "")
+            if person.name and person.name in page_text:
+                person_text += "\n" + page_text
+        if _has_special_cert_pair(person.certs) or _has_special_cert_pair([person_text]):
+            eligible.append(person)
     score = min(maximum, Decimal(len(eligible)) * (per or Decimal(0)))
     detail = (
         "特种作业证两证齐全人员：" + "、".join(f"{p.name}（{'/'.join(p.certs)}）" for p in eligible[:10])
@@ -1015,6 +1098,8 @@ def score_objective(criterion: dict, inventory: MaterialInventory) -> FastPathRe
         return None
     if plan.kind == "contracts":
         return _score_contracts(criterion, inventory)
+    if plan.kind == "leader_experience":
+        return _leader_experience_score(criterion, inventory)
     if plan.kind == "person_experience":
         return _person_experience_score(criterion, inventory)
     if plan.kind == "special_certs":
