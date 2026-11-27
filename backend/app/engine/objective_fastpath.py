@@ -65,7 +65,7 @@ _EQUIPMENT_CATEGORIES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("中控", ("中控",)),
     ("投影", ("投影",)),
     ("调音台", ("调音台", "调音")),
-    ("音箱", ("音箱",)),
+    ("音箱", ("音箱", "音响")),
     ("功放", ("功放",)),
     ("数字音频", ("数字音频",)),
     ("灯光", ("灯光",)),
@@ -563,7 +563,7 @@ def _leader_experience_score(criterion: dict, inventory: MaterialInventory) -> F
         tiers.append((Decimal(str(years_value)), Decimal(score)))
     tiers.sort(reverse=True)
     leader_re = re.compile(r"项目负责人|项目经理|项目总监|技术负责人|总负责人")
-    related_re = re.compile(r"会议|多媒体|音视频|运维|维护|维保")
+    related_re = re.compile(r"会议|多媒体|音视频|显示|扩声|大屏|音控")
     candidates = []
     for person in inventory.persons:
         scope_ok = bool(leader_re.search(person.role or "")) or not any(
@@ -576,9 +576,9 @@ def _leader_experience_score(criterion: dict, inventory: MaterialInventory) -> F
             if person.name and person.name in str(page.get("text") or ""):
                 name_text += "\n" + str(page.get("text") or "")
         years = person.years or _experience_years(name_text)
-        if years is None or not related_re.search(name_text):
-            continue
-        candidates.append((years, person, name_text))
+        related = bool(related_re.search((person.experience or "") + (person.role or "")))
+        if related:
+            candidates.append((years, person, name_text, related))
     if not candidates:
         return FastPathResult(
             Decimal(0), "未从项目负责人资料中核定满足年限的类似项目经验", "concern",
@@ -587,12 +587,17 @@ def _leader_experience_score(criterion: dict, inventory: MaterialInventory) -> F
             sorted({page for p in inventory.persons for page in p.pages}),
             zero_reason="no_facts", complete=False, confidence="low",
         )
-    years, person, _name_text = max(candidates, key=lambda item: item[0])
+    years, person, _name_text, _related = max(candidates, key=lambda item: item[0] or Decimal(0))
     score = Decimal(0)
-    for minimum, value in tiers:
-        if years >= minimum:
-            score = value
-            break
+    if years is None and _related:
+        # 人员表只证明相关经历但未写明确年限时，按最低档计入，避免把
+        # 有相关经历的人员因年限字段缺失误判为0；具体年限仍保留审计。
+        score = min((value for _minimum, value in tiers), default=Decimal(0))
+    else:
+        for minimum, value in tiers:
+            if years >= minimum:
+                score = value
+                break
     score = _cap(score, criterion)
     detail = f"项目负责人{person.name}类似项目经验约{years}年，按年限档计{score}分"
     return FastPathResult(
@@ -623,7 +628,7 @@ def _person_experience_score(criterion: dict, inventory: MaterialInventory) -> F
                 person_text += "\n" + str(page.get("text") or "")
         years = person.years or _experience_years(person_text)
         if years is not None and minimum_years is not None:
-            if years >= minimum_years and related_re.search((person.experience or "") + (person.role or "")):
+            if years >= minimum_years and re.search(r"驻场|维保|维护|团队|技术员", person.role or ""):
                 eligible.append(person)
             continue
         if person.experience_pages or re.search(r"年|场", person_text):
