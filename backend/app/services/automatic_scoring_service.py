@@ -2383,6 +2383,7 @@ def _price_stage(run_id: int, manifest: dict, criteria: list[dict], prices: dict
                     veto_rows = list(s.execute(select(ScoreRecord).where(
                         ScoreRecord.run_id == run_id,
                         ScoreRecord.bidder_id == bid_id,
+                        ScoreRecord.score_type.in_(("veto", "match")),
                         ScoreRecord.machine_status.in_(("recommend_reject", "fail")),
                     )).scalars())
                     for row in veto_rows:
