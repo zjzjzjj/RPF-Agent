@@ -555,9 +555,12 @@ def _leader_experience_score(criterion: dict, inventory: MaterialInventory) -> F
     maximum = _max(criterion) or Decimal(0)
     text = _rule_text(criterion)
     tiers: list[tuple[Decimal, Decimal]] = []
+    cn = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+          "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
     for years, score in re.findall(
-            r"(\d+)\s*年(?:以上|及以上|或以上)?[^。；]{0,25}?得\s*(\d+(?:\.\d+)?)\s*分", text):
-        tiers.append((Decimal(years), Decimal(score)))
+            r"([一二两三四五六七八九十\d]+)\s*年(?:以上|及以上|或以上)?[^。；]{0,25}?得\s*(\d+(?:\.\d+)?)\s*分", text):
+        years_value = cn.get(years, years)
+        tiers.append((Decimal(str(years_value)), Decimal(score)))
     tiers.sort(reverse=True)
     leader_re = re.compile(r"项目负责人|项目经理|项目总监|技术负责人|总负责人")
     related_re = re.compile(r"会议|多媒体|音视频|运维|维护|维保")
@@ -620,7 +623,7 @@ def _person_experience_score(criterion: dict, inventory: MaterialInventory) -> F
                 person_text += "\n" + str(page.get("text") or "")
         years = person.years or _experience_years(person_text)
         if years is not None and minimum_years is not None:
-            if years >= minimum_years and related_re.search(person_text):
+            if years >= minimum_years and related_re.search((person.experience or "") + (person.role or "")):
                 eligible.append(person)
             continue
         if person.experience_pages or re.search(r"年|场", person_text):
