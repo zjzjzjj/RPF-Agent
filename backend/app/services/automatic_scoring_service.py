@@ -3080,5 +3080,6 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
     with session_scope() as s:
         for bid in s.execute(select(Bidder).where(Bidder.id.in_(bidder_ids))).scalars():
             if automation["is_final"]:
-                bid.status = "scored"
+                if bid.status not in ("recommend_reject", "rejected"):
+                    bid.status = "scored"
     return _run_summary(run_id, manifest, automation)
