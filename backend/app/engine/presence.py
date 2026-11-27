@@ -134,9 +134,9 @@ def is_sample_criterion(criterion: dict) -> bool:
     params = _params(criterion)
     return bool(
         criterion.get("score_type") == "subjective"
-        and params.get("in_total") is False
         and "样品" in str(criterion.get("name") or "")
         and criterion.get("max_score") is not None
+        and (params.get("in_total") is False or "评审" in str(criterion.get("name") or ""))
     )
 
 
