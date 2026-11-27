@@ -360,10 +360,11 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
     def _material_heading_state(record: ContractRecord) -> None:
         """分类器漏绑时用案例块内的材料标题补三态；只有明确标题/凭证才升 True。"""
         block_text = "\n".join(page_text_by_no.get(int(no or 0), "") for no in (record.pages or []))
+        has_block_text = any(page_text_by_no.get(int(no or 0), "").strip() for no in (record.pages or []))
         state = dict(record.materials_state or {})
         materials = {k: list(v or []) for k, v in (record.materials or {}).items()}
         patterns = {
-            "contract": r"(?:^|\n)\s*(?:\d+(?:\.\d+)*\s*)?(?:合同(?:原件)?复印件|合同扫描件|合同\s*\(\d\))",
+            "contract": r"(?:^|\n)\s*(?:\d+(?:\.\d+)*\s*)?(?:合同(?:原件)?复印件|合同扫描件|合同\s*\(\d\)|（\d+）合同|\d+、合同)",
             "invoice": r"(?:^|\n)\s*(?:\d+(?:\.\d+)*\s*)?(?:发票(?:原件)?复印件|发票扫描件|电子发票|发票)",
             "acceptance": r"(?:^|\n)\s*(?:\d+(?:\.\d+)*\s*)?(?:验收报告|验收证明|验收单|终验证书|业主证明|用户证明)",
         }
@@ -374,6 +375,12 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
                 state[kind] = True
                 materials.setdefault(kind, [])
                 materials[kind] = sorted(set(materials[kind]) | set(hits))
+            elif (record.source != "table" and has_block_text
+                    and state.get(kind) is not True):
+                # 文本抽取常把合同正文里的“发票/验收”条款误当附件标题；
+                # 没有明确材料页标题时不得据此证明材料存在。
+                state[kind] = False
+                materials.pop(kind, None)
         record.materials_state = state
         record.materials = materials
     qualifying: list[tuple[ContractRecord, Decimal]] = []
@@ -398,6 +405,13 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
                     record.materials_state[kind] = bool(
                         (record.materials or {}).get(kind)
                     )
+        if record.period and record.signed_date:
+            try:
+                period_start = str(record.period).split("~", 1)[0]
+                if period_start and record.signed_date[:4] < period_start[:4]:
+                    record.signed_date = period_start
+            except Exception:  # noqa: BLE001
+                pass
         amount = record.amount_yuan
         fallback_rate = None
         if amount is None:
