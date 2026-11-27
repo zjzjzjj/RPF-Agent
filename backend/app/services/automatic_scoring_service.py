@@ -2281,6 +2281,64 @@ def _persist_cell(run_id: int, bidder_id: int, criterion: dict, outcome: CellOut
         _persist_light_reject_citations(run_id, bidder_id, criterion, outcome)
 
 
+def _authorization_date_outcome(criterion: dict, pages: list[dict]) -> CellOutcome | None:
+    """授权委托书落款日期的确定性核验；关键页 OCR 只补日期，不做泛化视觉评分。"""
+    if "授权委托书" not in str(criterion.get("name") or ""):
+        return None
+    from app.engine.facts import BidFacts
+    from app.engine.objective import run_check
+
+    text = _page_text(pages)
+    auth_pages = [
+        p for p in pages
+        if "授权委托书" in str(p.get("text") or "") or "法定代表人授权书" in str(p.get("text") or "")
+    ]
+    ocr_texts = []
+    for page in auth_pages[:3]:
+        stored = str(page.get("stored_path") or "")
+        if not stored:
+            continue
+        try:
+            import pymupdf as fitz
+            from app.config import OCR_IMAGE_MIN_RATIO
+            from app.parsing.pdf_pymupdf import _rescue_ocr_page_text
+
+            doc = fitz.open(stored)
+            page_no = int(page.get("page_no") or 0)
+            if 1 <= page_no <= len(doc):
+                ocr_texts.append(_rescue_ocr_page_text(
+                    doc, doc[page_no - 1], config.ocr_engine(), OCR_IMAGE_MIN_RATIO))
+            doc.close()
+        except Exception:  # noqa: BLE001 - OCR failure is not a bidder nonconformity
+            continue
+    combined = text + "\n" + "\n".join(ocr_texts)
+    deadline = criterion.get("_submission_deadline") or (criterion.get("params") or {}).get("not_after")
+    result = run_check("date_valid", {
+        "document": "授权委托书", "not_after": deadline,
+    }, BidFacts(text=combined), criterion=criterion)
+    raw = {"authorization_date_check": {
+        "status": result.status,
+        "message": result.message,
+        "ocr_pages": len(ocr_texts),
+    }}
+    if result.status == "fail":
+        return CellOutcome(
+            "fail", result.message, None, [], pages, "deterministic", 1,
+            {**raw, "deterministic_nonconformity": True},
+            [{"message": result.message, "verdict_source": "deterministic"}],
+        )
+    if result.status == "pass":
+        return CellOutcome(
+            "pass", result.message, None, [], pages, "deterministic", 1,
+            {**raw, "deterministic_nonconformity": False},
+            [{"message": result.message, "verdict_source": "deterministic"}],
+        )
+    return CellOutcome(
+        "concern", result.message, None, [], pages, "deterministic", 1,
+        raw, [{"message": result.message, "verdict_source": "deterministic"}],
+    )
+
+
 def _resolve_prices(run_id: int, manifest: dict, pages_by_bidder: dict, gateway_factory) -> dict[int, Decimal]:
     with session_scope() as s:
         run = s.get(EvaluationRun, run_id)
@@ -2956,6 +3014,12 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
                     {"external_requirement": True, "coverage_complete": True},
                     [{"verdict_source": "external", "message": reason}],
                 )
+            if criterion["score_type"] in ("veto", "match") and "授权委托书" in str(criterion.get("name") or ""):
+                pages, _data_class = pages_by_bidder[bid_id]
+                auth_outcome = _authorization_date_outcome(criterion, pages)
+                if auth_outcome is not None:
+                    notify("授权委托书日期确定性核验完成")
+                    return auth_outcome
             if (executor_version == 1 and config.subjective_direct_enabled()
                     and criterion["score_type"] == "subjective"
                     and not criterion.get("_objective_route")):
