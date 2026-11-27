@@ -10,7 +10,7 @@ from sqlalchemy import select
 from app.db.models import EvaluationRun, ScoreRecord
 from app.db.session import session_scope
 from app.errors import NotFound, ValidationFailed
-from app.services.automation_service import completed_keys, material_review_pending, progress
+from app.services.automation_service import completed_keys, material_review_pending, progress, settled_fallback_score
 
 
 def _text(value) -> str:
@@ -44,8 +44,8 @@ def export_results_csv(run_id: int) -> str:
             bid = int(bidder["id"])
             scoring = [c for c in manifest["criteria"] if c["score_type"] not in ("veto", "match")
                        and (c.get("params") or {}).get("in_total") is not False]
-            scores = [records[bid, int(c["id"])].final_score for c in scoring
-                      if (bid, int(c["id"])) in valid and records[bid, int(c["id"])].final_score is not None]
+            scores = [settled_fallback_score(records[bid, int(c["id"])]) or records[bid, int(c["id"])].final_score for c in scoring
+                      if (bid, int(c["id"])) in valid and (settled_fallback_score(records[bid, int(c["id"])]) is not None or records[bid, int(c["id"])].final_score is not None)]
             failed = sum(((records.get((bid, int(c["id"]))).ai_raw_json or {}).get("auto_review") or {}).get("state") == "failed"
                          for c in manifest["criteria"] if (bid, int(c["id"])) in records)
             writer.writerow([_text(bidder["name"]), str(sum(scores, Decimal(0))) if scores else "",
@@ -75,7 +75,7 @@ def export_results_csv(run_id: int) -> str:
                 else:
                     labels = verdicts
                 writer.writerow([_text(bidder["name"]), _text(criterion.get("code")), _text(criterion.get("name")),
-                                 criterion.get("max_score"), str(row.final_score) if completed and row.final_score is not None else "",
+                                 criterion.get("max_score"), str(settled_fallback_score(row) or row.final_score) if completed and (settled_fallback_score(row) is not None or row.final_score is not None) else "",
                                  labels.get(row.machine_status, row.machine_status) if completed else "", status,
                                  _text((row.ai_reasoning if completed or pending_material else meta.get("error"))
                                        if row else "尚未执行")])

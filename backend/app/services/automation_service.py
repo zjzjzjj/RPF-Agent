@@ -158,6 +158,23 @@ def _is_reading_gap_row(row: ScoreRecord) -> bool:
     return fallback.get("kind") == "material_review_pending" and value > 0
 
 
+def settled_fallback_score(score: ScoreRecord | None) -> Decimal | None:
+    """全自动收口的历史 fallback 分值（含 0），None 表示没有可定格分值。"""
+    if score is None or not config.full_auto_finalization_enabled():
+        return None
+    meta = (score.ai_raw_json or {}).get("auto_review") or {}
+    fallback = meta.get("fallback") or {}
+    if meta.get("basis") not in ("fallback", "deterministic"):
+        return None
+    kind = fallback.get("kind")
+    if not kind or kind == "duplicate_summary" or kind not in TECHNICAL_FALLBACK_KINDS:
+        return None
+    try:
+        return Decimal(str(fallback.get("value") or 0))
+    except (InvalidOperation, TypeError, ValueError):
+        return Decimal(0)
+
+
 def material_review_pending(score: ScoreRecord | None) -> dict | None:
     """Return technical pending work, including legacy provisional fallbacks."""
     if score is None:
@@ -172,9 +189,7 @@ def material_review_pending(score: ScoreRecord | None) -> dict | None:
             value = None
         # 已核实小计为正数时，按已核实材料直接定分；剩余未核验案例只留
         # 警示，不再把它当成阻塞排名的 material_review_pending。
-        if (config.full_auto_finalization_enabled()
-                and kind == "material_review_pending" and not fallback.get("technical_error")
-                and value is not None and value > 0):
+        if config.full_auto_finalization_enabled():
             return None
         return fallback
     return None

@@ -376,7 +376,10 @@ def _build_item(
     if max_dec is None:
         max_source = None
 
+    from app.services.automation_service import settled_fallback_score
     final_dec = _dec(score.final_score) if score is not None else None
+    if final_dec is None and score is not None:
+        final_dec = _dec(settled_fallback_score(score))
     machine_dec = _dec(score.machine_score) if score is not None else None
 
     # state 判定顺序：not_run → veto → match → missing_final → scored
@@ -488,6 +491,7 @@ def _build_item(
             (auto_review_out or {}).get("basis") == "fallback"
             and (((score.ai_raw_json or {}).get("auto_review") or {}).get("fallback") or {}).get("kind")
             != "duplicate_summary"
+            and settled_fallback_score(score) is None
         ),
         "ai_suggested": _s(_dec(score.ai_suggested_score)) if ai_visible and score is not None else None,
         "ai_level_label": score.ai_level_label if ai_visible and score is not None else None,

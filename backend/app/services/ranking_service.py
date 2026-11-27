@@ -102,16 +102,21 @@ def compute_ranking(project_id: str, run_id: int | None = None) -> dict:
                 and score.review_status != "human_confirmed"
             ):
                 entry["veto_flag"] = True
+            from app.services.automation_service import settled_fallback_score
             final = score.final_score
+            if final is None:
+                final = settled_fallback_score(score)
             _auto_meta = (score.ai_raw_json or {}).get("auto_review") or {}
             _fallback_kind = (_auto_meta.get("fallback") or {}).get("kind")
+            from app.services.automation_service import technical_fallback_kind as _tfk
             _is_fallback_cell = (
                 _auto_meta.get("basis") == "fallback" and _fallback_kind != "duplicate_summary"
+                and _tfk(score) is not None
             )
             if _is_fallback_cell:
-                entry["fallback"].append(criterion_name)
                 from app.services.automation_service import technical_fallback_kind
                 if technical_fallback_kind(score):
+                    entry["fallback"].append(criterion_name)
                     # Technical fallback values are audit subtotals only. They
                     # never enter totals, provisional totals or published rank.
                     final = None
