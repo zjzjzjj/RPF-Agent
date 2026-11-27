@@ -459,6 +459,7 @@ export interface AutomationProgress {
   pending?: number;
   execution_finished?: boolean;
   result_available?: boolean;
+  is_final?: boolean;
   execution_progress?: ExecutionProgress | null;
 }
 

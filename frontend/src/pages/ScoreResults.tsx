@@ -271,7 +271,7 @@ export default function ScoreResults() {
           onChange={(v) => setRunId(v)}
           options={runs.map((r) => ({
             value: r.id,
-            label: `运行 #${r.id}（${r.status}）`,
+            label: `运行 #${r.id}（${r.automation?.is_final ? "已完成" : r.status}）`,
           }))}
         />
         <Button
