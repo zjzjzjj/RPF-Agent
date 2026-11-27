@@ -394,7 +394,8 @@ def _valid_cell(score: ScoreRecord, criterion: dict, citations: list[EvidenceCit
         return False
     if not scoring and score.machine_status not in (
         "pass", "fail", "unverifiable",
-        *({"concern", "not_deeply_reviewed"} if lightweight or basis == "fallback" else ()),
+        *({"concern", "not_deeply_reviewed"}
+          if lightweight or basis == "fallback" or meta.get("auto_finalized") else ()),
     ):
         return False
     if any((score.ai_raw_json or {}).get(k) for k in ("fallback_score", "unresolved", "missing_evidence")):
