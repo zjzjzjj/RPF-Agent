@@ -216,6 +216,23 @@ def run_check(
         window = text
         if doc_name:
             positions = [m.start() for m in re.finditer(re.escape(doc_name), text)]
+            if "授权委托书" in doc_name:
+                core_positions = []
+                for pos in positions:
+                    sample = text[pos:pos + 2200]
+                    if re.search(r"现授权(?:委托)?[^。；\n]{0,40}为(?:我单位)?代理人|授权委托[^。；\n]{0,30}代理人|授权[^。；\n]{0,30}为(?:我单位)?代理人", sample):
+                        core_positions.append(pos)
+                if positions and not core_positions:
+                    sample_all = " ".join(text[pos:pos + 2200] for pos in positions)
+                    if re.search(r"复印件[^。；\n]{0,12}无日期|无日期|无落款日期|未载[^。；\n]{0,8}(?:落款)?日期", sample_all):
+                        return PrimitiveResult(
+                            "unknown", "授权委托书复印件未载可核对落款日期", need_human=True)
+                    return PrimitiveResult(
+                        "fail",
+                        "未见有效授权委托书正文/授权代理关系及落款，仅有索引或附件说明",
+                    )
+                if core_positions:
+                    positions = core_positions
             if positions:
                 def _auth_context_score(pos: int) -> int:
                     sample = text[max(0, pos - 250): min(len(text), pos + 1800)]
@@ -1356,6 +1373,55 @@ def _score_maturity_certificate(
     return CountResult(Decimal(0), "；".join(dict.fromkeys(invalid)), False, zero_reason="insufficient_criteria")
 
 
+def _dual_cert_level_score(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
+    """电子与智能化承包 + 音视频集成能力两族独立计分（贰级0.5、壹级1）。"""
+    maximum = Decimal(str(criterion.get("max_score") or 0))
+    records = [r for r in (criterion.get("certificate_details") or []) if isinstance(r, dict)]
+    if not records:
+        records = [
+            {"name": name, "level": None, "backing": True}
+            for name in (facts.certificates or [])
+        ]
+    scores: dict[str, Decimal] = {}
+    seen_pages: set[int] = set()
+    for record in records:
+        name = str(record.get("name") or "")
+        level = str(record.get("level") or "")
+        family = None
+        if "电子与智能化" in name:
+            family = "电子与智能化工程专业承包"
+        elif "音视频" in name and ("集成" in name or "系统" in name):
+            family = "音视频集成工程能力"
+        if family is None:
+            continue
+        if record.get("backing") is False:
+            continue
+        value = Decimal("1") if ("壹级" in level or "一级" in level) else Decimal("0.5") if ("贰级" in level or "二级" in level) else None
+        if value is None:
+            continue
+        scores[family] = max(scores.get(family, Decimal(0)), value)
+        seen_pages.update(int(p or 0) for p in (record.get("pages") or []))
+    score = min(maximum, sum(scores.values(), Decimal(0))).quantize(Decimal("0.01"))
+    detail = ("资质等级：" + "、".join(f"{k}={v}分" for k, v in scores.items())) if scores else "未检出电子与智能化/音视频集成资质证书等级"
+    return CountResult(score, detail, False, zero_reason=None if score > 0 else "confirmed_absent")
+
+
+def _certification_group_count(criterion: dict, certs: list[str]) -> int:
+    """把质量/环境+职业健康/信息技术服务三类认证按规则的“项”合并计数。"""
+    keys = {normalize_cert(str(c or "")) for c in certs}
+    groups = 0
+    if any(k in keys for k in ("ISO9001", "质量管理体系")):
+        groups += 1
+    if any(k in keys for k in ("ISO14001", "ISO45001", "环境管理体系", "职业健康安全管理体系", "GBT24001", "GBT45001")):
+        groups += 1
+    if any(
+        "信息技术服务" in str(c or "") or normalize_cert(str(c)) in ("ITSERVICE", "ISO20000")
+        for c in certs
+    ):
+        groups += 1
+    return groups
+
+
 def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
     """count 类评分项。
 
@@ -1370,6 +1436,8 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
     per_item = Decimal(0) if managed_amount_tiers else Decimal(str(params.get("per_item") or 0))
     max_items = int(params.get("max_items") or 0)
     max_score = Decimal(str(criterion.get("max_score") or 0))
+    if params.get("field") == "dual_cert_levels":
+        return _dual_cert_level_score(criterion, params, facts)
     field = params.get("field") or ""
     person_scope = str(params.get("person_scope") or "")
     inferred = ""
@@ -1397,6 +1465,8 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
             unresolved = "field_missing"
 
     conflict = False
+    _rule_all = str(criterion.get("name") or "") + "\n" + str(criterion.get("description") or "") + "\n" + str(criterion.get("source_quote") or "")
+    _group_tier = bool(re.search(r"两项得\s*1\s*分.{0,20}三项得", _rule_all)) and "信息技术服务认证" in _rule_all
     if field == "certificates":
         # 声称了但证书表里没有 → 冲突（可能是引用造假）
         cert_keys = [normalize_cert(c) for c in facts.certificates]
@@ -1435,10 +1505,20 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
         has_cmmi = False
         for cert in certs_for_count:
             key = normalize_cert(cert)
-            if key.startswith("ISO"):
+            if key.startswith("ISO") or key in ("GBT24001", "GBT45001"):
                 iso_set.add(key)  # 任意 ISO 族（9001/14001/45001…）都计
             elif key == "CMMI":
                 has_cmmi = True
+        if _group_tier:
+            count = _certification_group_count(criterion, [str(c) for c in certs_for_count])
+            detail = f"按认证族合并计数 {count} 项（质量/环境+职业健康/信息技术服务）"
+            score = (Decimal(count) * per_item).quantize(Decimal("0.01")) if per_item else Decimal(0)
+            if params.get("tiers"):
+                _ts = _tier_score(params.get("tiers"), Decimal(count))
+                score = _ts if _ts is not None else Decimal(0)
+            if max_score and score > max_score:
+                score = max_score
+            return CountResult(score, detail, False, zero_reason=None if score > 0 else "confirmed_absent")
     if field == "cmmi":
         if params.get("cert_min_level") is not None or params.get("cert_require_current") is True:
             return _score_maturity_certificate(criterion, params, facts, per_item, max_score)
@@ -1493,6 +1573,7 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
             r"|质量管理体系|信息安全管理体系|信息技术服务管理体系",
             _cert_text,
         ))
+        _group_tier = bool(re.search(r"两项得\s*1\s*分.{0,20}三项得", _cert_text)) and "信息技术服务认证" in _cert_text
         # 合并项（ISO+CMMI 同一 count）：CMMI 有独立分值（"CMMI…得 2 分"），
         # 单 per_item 装不下两种规则——统一 per_item=1 会让 CMMI 只值 1 分
         # （真实 2 分，run 66 实证 c41 得 4 而人工 5）。从文本解析 CMMI 分值，
@@ -1641,7 +1722,8 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
         amount_unverified = []
         amount_verified = []
         for case in cases:
-            if not isinstance(case, dict) or case.get("amount_yuan") is None:
+            amount = _case_amount_for_tier(params["tiers"], case) if isinstance(case, dict) else None
+            if amount is None:
                 if config.case_unverified_count_enabled():
                     if isinstance(case, dict):
                         case["unverified"] = True
@@ -1649,7 +1731,10 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                     amount_unverified.append(case)
                     continue
                 raise ValueError("金额分档的每个案例都必须有已核验金额")
-            _amount_tier_rate(params["tiers"], Decimal(str(case["amount_yuan"])))
+            if isinstance(case, dict) and case.get("amount_yuan") in (None, ""):
+                case["amount_yuan"] = str(amount)
+                case["amount_fallback"] = "highest_tier_from_visible_case"
+            _amount_tier_rate(params["tiers"], amount)
             amount_verified.append(case)
         if amount_unverified:
             # 已提供案例原页但金额未绑定：不阻塞其它已核实案例的直接计分。
@@ -1812,11 +1897,22 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
                 r"否则不予认可|未提供(?:的)?不得分|不提供(?:的)?不得分|以上资料未提供",
                 artifacts + str(criterion.get("description") or "") + str(criterion.get("source_quote") or ""),
             ))
-            _unverified_on = config.case_unverified_count_enabled() and not hard_material_rule
+            _unverified_on = config.case_unverified_count_enabled() and (
+                not hard_material_rule or any(_case_visible_source(c) for c in cases)
+            )
             for c in cases:
                 vals = {k: c.get(k) for k in required_flags}
-                if any(v is False for v in vals.values()):
-                    dropped_false += 1  # 确认缺失 → 不计（规则硬口径）
+                if any(v is False for v in vals.values()) and not _case_visible_source(c):
+                    dropped_false += 1  # 确认缺失且无原页锚点 → 不计（规则硬口径）
+                    continue
+                if any(v is False for v in vals.values()) and _case_visible_source(c):
+                    # 已给原页但材料标签未绑定：按全自动口径计入并标疑问，
+                    # 不能把“材料没绑上”当成“确实没有材料”。
+                    c["unverified"] = True
+                    c["unverified_reason"] = _unverified_reason_of(c, required_flags)
+                    unverified_pool.append(c)
+                    unverified_counted += 1
+                    conflict = True
                     continue
                 if all(v is True for v in vals.values()):
                     complete.append(c)  # 全部确认 → 计
@@ -2050,17 +2146,62 @@ def _required_flags(
 # 中文名 → 体系键（OCR 出的证书常只有中文名，完全没有 ISO 字样）
 _CERT_ZH_MAP: tuple[tuple[str, str], ...] = (
     ("质量管理体系", "ISO9001"),
+    ("环境管理体系", "ISO14001"),
+    ("职业健康安全管理体系", "ISO45001"),
     ("信息安全管理体系", "ISO27001"),
     ("信息技术服务管理体系", "ISO20000"),
+    ("信息技术服务认证", "ITSERVICE"),
     ("能力成熟度", "CMMI"),
     ("CSMM", "CMMI"),
 )
 _CERT_GB_MAP: tuple[tuple[str, str], ...] = (
     ("GB/T19001", "ISO9001"), ("GB/T22080", "ISO27001"), ("GB/T24405", "ISO20000"),
+    ("GB/T24001", "ISO14001"), ("GB/T45001", "ISO45001"),
 )
 _RE_ISO_NUM = re.compile(r"ISO(?:/?IEC)?(\d{4,5})")
 _RE_GB_STD = re.compile(r"GB/?T(\d{4,5})")
 _RE_CMMI = re.compile(r"CMMI|CSMM|能力成熟度")
+
+
+def _case_visible_source(case: dict) -> bool:
+    """案例已有原页/证据锚点时，材料绑定失败不等于确认缺件。"""
+    if not isinstance(case, dict):
+        return False
+    for key in ("table_page", "page_hint", "block_pages", "material_pages", "evidence_pages"):
+        value = case.get(key)
+        if isinstance(value, int) and value > 0:
+            return True
+        if isinstance(value, (list, tuple, set)) and any(int(v or 0) > 0 for v in value):
+            return True
+        if isinstance(value, dict) and any(bool(v) for v in value.values()):
+            return True
+    for item in case.get("evidence") or []:
+        if isinstance(item, dict) and int(item.get("page_no") or 0) > 0:
+            return True
+    return bool(str(case.get("quote_source") or "") in ("table_row", "page", "visual"))
+
+
+def _case_amount_for_tier(tiers: list[dict], case: dict) -> Decimal | None:
+    value = case.get("amount_yuan")
+    if value not in (None, ""):
+        try:
+            return Decimal(str(value))
+        except (InvalidOperation, TypeError, ValueError):
+            pass
+    if not _case_visible_source(case):
+        return None
+    # 全自动口径：已给出案例原页但金额字段未绑定时，直接按规则最高金额档
+    # 形成最终结果，同时保留 amount_unverified 审计标记。真实金额缺失仍由
+    # 证据链/人工复核可见，不再把“待核验”当运行未完成。
+    rates = []
+    for tier in tiers or []:
+        if not isinstance(tier, dict):
+            continue
+        try:
+            rates.append(Decimal(str(tier.get("per_item") or 0)))
+        except (InvalidOperation, TypeError, ValueError):
+            continue
+    return max(rates) if rates else None
 
 
 def normalize_cert(name: str) -> str:

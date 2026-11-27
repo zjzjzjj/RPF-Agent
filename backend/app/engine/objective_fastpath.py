@@ -147,6 +147,9 @@ def build_objective_plan(criterion: dict) -> ObjectivePlan | None:
     if ("应急响应" in expanded and "响应" in expanded
             and re.search(r"得\s*\d+(?:\.\d+)?\s*分", expanded)):
         return ObjectivePlan("response_commitment", params)
+    if ("额外增加" in expanded and "驻场人员" in expanded
+            and re.search(r"得\s*\d+(?:\.\d+)?\s*分", expanded)):
+        return ObjectivePlan("extra_resident_commitment", params)
     if "增值服务" in expanded:
         return ObjectivePlan("value_items", params)
     if "行业认证维修工程师" in expanded:
@@ -375,10 +378,18 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
                         (record.materials or {}).get(kind)
                     )
         amount = record.amount_yuan
+        fallback_rate = None
         if amount is None:
-            rejected.append(f"{record.name}（无金额）")
-            continue
-        if tiers and amount < Decimal(str(tiers[0].get("min_amount_yuan", 0))):
+            if not record.pages or not _config.case_unverified_count_enabled():
+                rejected.append(f"{record.name}（无金额）")
+                continue
+            # 已给案例原页但金额未绑定：按最高金额档直接计分并保留审计标记。
+            rates = [Decimal(str(t.get("per_item") or 0)) for t in tiers if isinstance(t, dict)]
+            fallback_rate = max(rates) if rates else None
+            if fallback_rate is None:
+                rejected.append(f"{record.name}（无金额）")
+                continue
+        elif tiers and amount < Decimal(str(tiers[0].get("min_amount_yuan", 0))):
             continue
         d_state = date_gate_state(record.signed_date, date_window)
         if d_state is False:
@@ -414,6 +425,9 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
                         f"{'/'.join(escalated)}目录列有材料页但绑定未闭合")
                     guard_escalated = True
                     missing = [m for m in missing if m not in escalated]
+            if missing and record.pages and _config.case_unverified_count_enabled():
+                record_unverified.append(f"{'/'.join(missing)}未绑定/未核验，已提供原页按全自动口径计分")
+                missing = []
             if missing:
                 rejected.append(f"{record.name}（缺{'/'.join(missing)}，细则：未提供的不得分）")
                 continue
@@ -440,7 +454,7 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
             # 盖章三态：VL has_seal=true→True；其余→None。文本路无法核验盖章
             # ≠未盖章——不阻计，记疑问（确认缺判 0 仅对可读确认缺）
             seal_unverified += 1
-        rate = _contract_rate(tiers, amount) if tiers else Decimal(0)
+        rate = fallback_rate if fallback_rate is not None else (_contract_rate(tiers, amount) if tiers else Decimal(0))
         if rate <= 0:
             continue
         qualifying.append((record, rate))
@@ -766,6 +780,52 @@ def _person_equipment_score(criterion: dict, inventory: MaterialInventory) -> Fa
 
 
 # ---------------------------------------------------------------------------
+# Additional resident commitment
+# ---------------------------------------------------------------------------
+def _extra_resident_commitment_score(criterion: dict, inventory: MaterialInventory) -> FastPathResult:
+    """“额外增加一名驻场人员（驻场地点由招标人确定）”按二值承诺项计分。"""
+    maximum = _max(criterion) or Decimal(0)
+    text = inventory.full_text or ""
+    windows = []
+    for match in re.finditer(r"额外增加|增加(?:一)?名[^。；\n]{0,20}驻场|驻场人员增加", text):
+        windows.append(text[max(0, match.start() - 180):min(len(text), match.end() + 260)])
+    window = "\n".join(windows)
+    has_extra = bool(re.search(r"额外增加|增加(?:一)?名[^。；\n]{0,20}驻场|驻场人员增加", window))
+    has_free_location = bool(re.search(
+        r"(?:驻场地点|地点|派驻地点)(?:由|需由|根据)?[^。；\n]{0,12}招标人(?:确定|指定|安排)"
+        r"|由招标人(?:确定|指定|安排)(?:驻场)?地点", window,
+    ))
+    has_fixed_location = bool(re.search(
+        r"(?:驻场(?:地点)?(?:在|位于|派驻)?)[^。；\n]{0,16}(?:本部|杭州卷烟厂|宁波卷烟厂|卷烟厂|园区|大楼)",
+        window,
+    ))
+    passed = has_extra and has_free_location and not (
+        has_fixed_location and not has_free_location
+    )
+    score = maximum if passed else Decimal(0)
+    detail = (
+        "已核验额外增加驻场人员承诺，且驻场地点由招标人确定"
+        if passed else
+        "未核验到同时满足‘额外增加驻场人员’和‘驻场地点由招标人确定’的承诺"
+    )
+    return FastPathResult(
+        score=_cap(score, criterion), detail=detail + f"；合计 {_cap(score, criterion)} 分",
+        verdict="pass" if passed else "fail",
+        facts={"extra_resident_commitment": {
+            "extra": has_extra, "free_location": has_free_location,
+            "fixed_location": has_fixed_location,
+        }},
+        pages=sorted({
+            int(page.get("page_no") or 0) for page in inventory.pages
+            if re.search(r"额外增加|驻场人员增加|驻场地点", str(page.get("text") or ""))
+        }),
+        zero_reason=None if passed else "confirmed_absent",
+        complete=bool(windows),
+        confidence=_confidence_from(inventory, bool(windows)),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Value-added services
 # ---------------------------------------------------------------------------
 def _value_items_score(criterion: dict, inventory: MaterialInventory) -> FastPathResult:
@@ -803,7 +863,12 @@ def _response_commitment_score(criterion: dict, inventory: MaterialInventory) ->
         end = min(len(text), match.end() + 700)
         anchors.append(text[start:end])
     window = "\n".join(anchors)
-    has_half = bool(re.search(r"优于[^。；\n]{0,40}(?:一半|1\s*/\s*2|50\s*%)", window))
+    has_half = bool(re.search(
+        r"优于[^。；\n]{0,50}(?:一半|1\s*/\s*2|50\s*%)"
+        r"|响应时间[^。；\n]{0,50}(?:常规要求|招标要求|要求)[^。；\n]{0,20}(?:50\s*%|一半)"
+        r"|控制在[^。；\n]{0,30}(?:50\s*%|一半)(?:以内|之内)?",
+        window,
+    ))
     has_method = bool(re.search(r"方式|措施|流程|值班|电话|远程|到场|可行|响应机制", window))
     score = maximum if has_half and has_method else Decimal(0)
     score = _cap(score, criterion)
@@ -843,10 +908,24 @@ def _platform_query_families(inventory: MaterialInventory) -> set[str]:
     return families
 
 
+def _query_screenshot_proof_present(inventory: MaterialInventory) -> bool:
+    """只认实际查询截图/平台详情页，不把证书上的‘可查询’免责声明当截图。"""
+    for page in inventory.pages:
+        text = re.sub(r"\s+", "", str(page.get("text") or ""))
+        if re.search(r"附[^。；\n]{0,20}(?:认证认可信息公共服务平台|住建部|建筑市场监管|音视频)[^。；\n]{0,20}查询截图", text):
+            return True
+        if _is_platform_detail_page(str(page.get("text") or "")):
+            return True
+        if re.search(r"(?:认证认可信息公共服务平台|cx\.cnca\.cn)[^。；\n]{0,30}查询截图", text):
+            return True
+    return False
+
+
 def _cert_count_tier_score(criterion: dict, inventory: MaterialInventory) -> FastPathResult:
     maximum = _max(criterion) or Decimal(0)
     query_required = requires_platform_certificate_query(criterion)
     query_families = _platform_query_families(inventory) if query_required else set()
+    query_proof = _query_screenshot_proof_present(inventory) if query_required else True
     families: list[str] = []
     skipped_unverified: list[str] = []
     for cert in inventory.certs:
@@ -854,6 +933,8 @@ def _cert_count_tier_score(criterion: dict, inventory: MaterialInventory) -> Fas
         if not (key.startswith("ISO") or "信息技术服务" in (cert.name or "")):
             continue
         if query_required:
+            if not query_proof:
+                continue
             if query_families and key not in query_families and cert.backing is False:
                 continue
             if not query_families and cert.backing is False:
@@ -874,15 +955,28 @@ def _cert_count_tier_score(criterion: dict, inventory: MaterialInventory) -> Fas
         value = _decimal(raw_score)
         if value is not None:
             tiers[n] = value
+    grouped_count = len(families)
+    rule_text = _rule_text(criterion)
+    if "信息技术服务认证" in rule_text and re.search(r"两项得\s*1\s*分.{0,20}三项得", rule_text):
+        keys = set(families)
+        grouped_count = 0
+        if any(k in keys for k in ("ISO9001", "质量管理体系")):
+            grouped_count += 1
+        if any(k in keys for k in ("ISO14001", "ISO45001", "环境管理体系", "职业健康安全管理体系", "GBT24001", "GBT45001")):
+            grouped_count += 1
+        if any(k in keys or "信息技术服务" in k for k in keys):
+            grouped_count += 1
     score = Decimal(0)
     for minimum in sorted(tiers):
-        if len(families) >= minimum:
+        if grouped_count >= minimum:
             score = max(score, tiers[minimum])
     score = _cap(score, criterion)
     detail = (
-        f"有效体系认证 {len(families)} 项：{'、'.join(families)}"
+        f"有效体系认证 {grouped_count} 项（原始证书族 {len(families)} 项）：{'、'.join(families)}"
         if families else "未检出 ISO/信息技术服务管理体系认证证书"
     )
+    if query_required and not query_proof:
+        detail = "未见认证平台查询结果截图，按规则不计体系认证分"
     if skipped_unverified:
         detail += f"（{'、'.join(skipped_unverified)} 仅有申报/未见查询截图，按未核验计入）"
     complete = bool(inventory.certs) or inventory.cert_section_present
@@ -1118,6 +1212,8 @@ def score_objective(criterion: dict, inventory: MaterialInventory) -> FastPathRe
         return _person_title_score(criterion, inventory)
     if plan.kind == "equipment_certs":
         return _person_equipment_score(criterion, inventory)
+    if plan.kind == "extra_resident_commitment":
+        return _extra_resident_commitment_score(criterion, inventory)
     if plan.kind == "value_items":
         return _value_items_score(criterion, inventory)
     if plan.kind == "response_commitment":

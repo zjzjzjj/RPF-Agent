@@ -292,11 +292,10 @@ def review_bidder_qualification(criteria: list[dict], pages: list[dict], data_cl
                     from app.engine.models import PrimitiveResult
                     primitive = PrimitiveResult("fail", "未按要求提供投标分项报价表")
                 det = "fail" if primitive.status == "fail" else "pass"
-            elif ("授权委托书" in name and
-                  (criterion.get("_submission_deadline") or params.get("not_after"))):
+            elif "授权委托书" in name:
                 deadline = criterion.get("_submission_deadline") or params.get("not_after")
                 primitive = run_check("date_valid", {
-                    **params, "document": "授权委托书", "not_after": deadline,
+                    **params, "document": "授权委托书", **({"not_after": deadline} if deadline else {}),
                 }, facts, criterion=criterion)
                 det = _deterministic_state(primitive)
             else:
@@ -413,7 +412,6 @@ def review_bidder_qualification(criteria: list[dict], pages: list[dict], data_cl
                 result.reason = ("建议否决（仅建议，需人工确认，不阻断计分/排名）：快审发现明确反面事实——"
                                  + quick_reason[:400])
             else:
-                # 反面引文缺失/无法逐字核验（可能编造）→ 不作为否决点，线索保留
                 result.status = "pass"
                 result.needs_human_check = True
                 result.reason = ("通过（未见确定性否决点）：快审拟判不符合但反面引文未能逐字核验，"

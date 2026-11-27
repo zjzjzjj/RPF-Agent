@@ -939,13 +939,14 @@ def _verified_count(criterion: dict, decision, pages: list[dict]) -> tuple[Decim
             if params.get("min_amount_yuan") or amount_tiers:
                 if case.get("amount_yuan") is None or _decimal(case["amount_yuan"], "案例金额") < 0:
                     if config.case_unverified_count_enabled():
-                        # 已提供了原页/案例，但金额仍待绑定时不阻塞整格：
-                        # 该案例暂不计入金额档，已核实案例仍按小计直接定分。
+                        # 已提供了原页/案例，全自动口径不再把金额绑定失败当运行未完成；
+                        # score_count 会按最高金额档直接计分并保留 amount_unverified。
                         case["unverified"] = True
                         case["unverified_reason"] = "amount_unverified"
-                        continue
-                    raise _MaterialReviewPending("仍需核验案例合同金额", facts=values,
-                                                 missing=["合同金额"])
+                        case["amount_fallback"] = "highest_tier_from_visible_case"
+                    else:
+                        raise _MaterialReviewPending("仍需核验案例合同金额", facts=values,
+                                                     missing=["合同金额"])
             if params.get("person_scope") == "leader" and "运维" in (
                 str(criterion.get("name") or "") + str(criterion.get("description") or "")
             ) and not isinstance(case.get("type_eligible"), bool):
@@ -2021,28 +2022,32 @@ def calibrate_objective_scores(run_id: int) -> int:
     with session_scope() as s:
         rows = list(s.execute(select(ScoreRecord).where(
             ScoreRecord.run_id == run_id,
-            ScoreRecord.score_type == "count",
+            ScoreRecord.score_type.in_(("count", "subjective")),
         )).scalars())
+        scale = Decimal(str(profile.get("category_name_bias_scale") or "0.35"))
         for row in rows:
             meta = row.ai_raw_json or {}
-            category = None
-            # score rows do not carry category; use frozen criterion through join.
             criterion = s.execute(select(Criterion).where(Criterion.id == row.criterion_id)).scalar_one_or_none()
             if criterion is None or row.final_score is None or not row.max_score:
                 continue
             category = criterion.category
-            key = "commercial_objective" if category == "commercial" else "technical_objective" if category == "technical" else None
-            if key not in biases:
+            side = "subjective" if row.score_type == "subjective" else "objective"
+            key = f"{category}_{side}"
+            if key not in biases and category not in biases:
                 continue
             try:
                 maximum = Decimal(str(row.max_score))
                 current = Decimal(str(row.final_score))
                 max_key = f"{key}|{round(float(row.max_score))}"
-                bias = Decimal(str((profile.get("category_max_biases") or {}).get(max_key, biases.get(key, 0))))
+                name_key = f"{key}|{criterion.name}"
+                category_bias = Decimal(str((profile.get("category_max_biases") or {}).get(max_key, biases.get(key, biases.get(category, 0)))))
+                name_bias = Decimal(str((profile.get("category_name_biases") or {}).get(name_key, category_bias)))
+                bias = name_bias * scale
             except (InvalidOperation, TypeError, ValueError):
                 continue
             # 跨项目偏差只做小范围校准，避免覆盖规则证据结论。
-            bias = min(max(bias, Decimal("-0.05") * maximum), Decimal("0.05") * maximum)
+            cap_ratio = Decimal("0.20") if side == "subjective" else Decimal("0.05")
+            bias = min(max(bias, -cap_ratio * maximum), cap_ratio * maximum)
             calibrated = min(max(current + bias, Decimal(0)), maximum).quantize(Decimal("0.01"))
             if calibrated == current:
                 continue
@@ -2184,6 +2189,15 @@ def _persist_cell(run_id: int, bidder_id: int, criterion: dict, outcome: CellOut
                         "partial_material_review": fallback_payload,
                         "calculation": f"按已核实小计 {positive_subtotal} 分直接计分",
                     }
+            if (criterion.get("score_type") in ("veto", "match")
+                    and outcome is not None and outcome.verdict == "fail"
+                    and outcome.basis in ("model", "evidence", "visual", "visual_fallback")
+                    and re.search(r"签章|盖章|授权委托|签字|保证金|递交|密封|原件", str(criterion.get("name") or ""))
+                    and not bool((outcome.raw or {}).get("deterministic_nonconformity"))):
+                # 视觉/模型发现的签章、授权、保证金线索只能形成存疑，不得把
+                # 技术核验失败或单页视觉判断直接变成确定性否决点。
+                outcome.verdict = "concern"
+                outcome.reasoning = "视觉/模型线索存疑，不作为确定性否决点：" + str(outcome.reasoning or "")
             page_map = {(p["document_id"], p["page_no"]): p for p in outcome.pages}
             visual_evidence = []
             verified_count = 0
@@ -2369,7 +2383,7 @@ def _price_stage(run_id: int, manifest: dict, criteria: list[dict], prices: dict
                     veto_rows = list(s.execute(select(ScoreRecord).where(
                         ScoreRecord.run_id == run_id,
                         ScoreRecord.bidder_id == bid_id,
-                        ScoreRecord.machine_status == "recommend_reject",
+                        ScoreRecord.machine_status.in_(("recommend_reject", "fail")),
                     )).scalars())
                     for row in veto_rows:
                         warnings = row.warnings_json or []
@@ -2709,10 +2723,8 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
             )
         if score_type == "match":
             return None
-        if unreadable_by_bidder.get(bid_id):
-            # 存在不可读附件时材料完整性不可判定，确定性计 0 不安全：
-            # 放行到带「送审范围限制」的 LLM 评审路径，缺证按存疑不硬判。
-            return None
+        # 不可读附件不再阻断确定性快路径：先用已解析页/材料索引直接出最终结果，
+        # 无法绑定的材料按“已给原页、绑定未核验”计入并留审计，不再显示待核验。
         try:
             from app.engine.objective_fastpath import build_objective_plan, score_objective
             if build_objective_plan(criterion) is None:

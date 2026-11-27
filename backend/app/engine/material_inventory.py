@@ -447,16 +447,17 @@ def _contracts_from_case_table(pages: list[dict], pdf_path: str | None) -> list[
 # ---------------------------------------------------------------------------
 _RE_LEVEL_TOKEN = r"[壹贰叁肆一二三四]级|一级|二级|三级"
 _RE_QUALIFICATION_CERT = re.compile(
-    r"(电子与智能化工程专业承包)[^。\n]{0,12}?(" + _RE_LEVEL_TOKEN + r")"
+    r"(电子与智能(?:化)?(?:工|巟)程专业承包)[^。\n]{0,12}?(" + _RE_LEVEL_TOKEN + r")"
 )
 _RE_AV_INTEGRATION_CERT = re.compile(
-    r"(音视频集成工程)[^。\n]{0,30}?(" + _RE_LEVEL_TOKEN + r")"
+    r"((?:音视频|音响)(?:系统)?集成(?:工|巟)程(?:综合技术)?能力|音视频集成工程|专业音响(?:工|巟)程设计施工(?:一体化)?能力)"
+    r"[^。\n]{0,30}?(" + _RE_LEVEL_TOKEN + r")"
 )
 _RE_ISO_TOKEN = re.compile(
     r"ISO\s*/?\s*IEC?\s*(\d{4,5})|ISO\s*(\d{4,5})|GB/?T\s*(\d{4,5})"
 )
 _RE_SYSTEM_CERT = re.compile(
-    r"(质量管理体系|环境管理体系|职业健康安全管理体系|信息技术服务管理体系|信息安全管理体系)"
+    r"(质量管理体系|环境管理体系|职业健康安全管理体系|信息技术服务管理体系|信息技术服务认证|信息安全管理体系)"
 )
 _RE_VALID_TO = re.compile(
     r"有效期(?:至|到)[：:]?\s*(20\d{2})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日"
