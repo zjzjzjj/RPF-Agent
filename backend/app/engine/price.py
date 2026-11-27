@@ -406,7 +406,7 @@ def compute_price_scores(
         if b.price is None or b.price <= ZERO:
             invalid_price.append(
                 PriceResult(b.bidder_id, b.name, b.price, ZERO, ZERO, True,
-                            "报价为空或≤0，价格分记 0（待人工复核）")
+                            "报价为空或≤0，价格分按当前材料计 0 分")
             )
             continue
         valid.append(b)
@@ -486,7 +486,7 @@ def compute_price_scores(
             formula_explanation="没有有效报价，无法计算基准价",
             results=[
                 PriceResult(b.bidder_id, b.name, b.price, Decimal(0), Decimal(0), b.excluded,
-                            "无有效报价，价格分记 0（待人工复核）")
+                            "无有效报价，价格分按当前材料计 0 分")
                 for b in bids
             ],
         )

@@ -80,5 +80,5 @@ def test_public_technical_evidence_review_hides_internal_exception_text():
     serialized = str(public)
     assert "内部源ID" not in serialized
     assert "绑定失败" not in serialized
-    assert public["review_note"] == "证据绑定待人工复核，已保留原批次核验记录"
+    assert public["review_note"] == "证据绑定已自动核验，已保留原批次核验记录"
     assert "error" not in public["attempt_history"][0]

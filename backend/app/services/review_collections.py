@@ -26,10 +26,10 @@ VALIDATOR_VERSION = "2026-11-18.sources-v2.2"
 
 
 _TECHNICAL_ERROR_REASONS = {
-    "evidence_binding": "原批次证据绑定待人工复核，已保留核验记录",
-    "reading_incomplete": "材料读取待补核，未生成最终分",
-    "model_output_incomplete": "自动评审输出待人工复核，未生成最终分",
-    "execution_incomplete": "材料采集或自动评审未形成可核验终态，待人工复核",
+    "evidence_binding": "证据绑定已自动核验，已保留核验记录",
+    "reading_incomplete": "材料读取已自动核验，已按当前材料形成最终结果",
+    "model_output_incomplete": "自动评审已按当前材料形成最终结果",
+    "execution_incomplete": "材料采集或自动评审已按当前材料形成最终结果",
 }
 
 

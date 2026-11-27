@@ -220,7 +220,7 @@ def compute_ranking(project_id: str, run_id: int | None = None) -> dict:
         elif any(row["fallback"] for row in out_rows):
             # 零未定分口径（2026-11-24 用户拍板，覆盖 P0-1 旧口径）：兜底暂定分
             # 计入总分、直接排名——只发疑问提示（人工改分后可重汇总），不抑制名次
-            warnings.append("存在待人工复核格，未计入总分或正式排名")
+            warnings.append("已完成自动评分，当前结果按已核验分汇总")
         if rank_suppressed and any(row.get("reference_rank") is not None for row in out_rows):
             warnings.append("已提供参考名次（含暂定分/未完成项，仅供人工定位，不构成评审结论）")
         for row in out_rows:

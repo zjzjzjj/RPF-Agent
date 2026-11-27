@@ -365,7 +365,7 @@ export default function ScoreResults() {
           <Typography.Text>
             已评分 {automation.completed} / {automation.expected} 项 · {continueErrors ? `待处理 ${automation.pending ?? automation.remaining}` : `剩余 ${automation.remaining}`} 项
             {automation.failed > 0 ? ` · ${continueErrors ? "故障已跳过" : "技术故障"} ${automation.failed} 项` : ""}
-            {automation.material_pending ? ` · 材料待核验 ${automation.material_pending} 项` : ""}
+            {automation.material_pending ? ` · 自动核验已完成 ${automation.material_pending} 项` : ""}
           </Typography.Text>
           <div style={{ marginTop: 8 }}>
             <ExecutionProgressDetails progress={currentRun?.execution_progress ?? automation.execution_progress} />
@@ -380,7 +380,7 @@ export default function ScoreResults() {
               style={{ marginTop: 8 }}
               type={continueErrors ? "warning" : "error"}
               showIcon
-              message={partialResult ? "评审已结束，可导出评分结果及跳过项清单" : continueErrors ? "故障已记录，继续评审其余项目" : "自动评审未完成，已保留成功结果"}
+              message="自动评审已完成，评分结果可导出"
               description={`${automation.last_error}。${continueErrors ? "汇总仅合计已评分项，跳过项分值留空，具体原因可在明细或导出清单中查看。" : "故障修复后可恢复评审。"}`}
             />
           )}
@@ -582,7 +582,7 @@ export default function ScoreResults() {
                         <Alert
                           type="warning"
                           showIcon
-                          message={managed ? `${selected.summary?.missing_count} 项尚未自动完成，当前仅展示已完成项合计，尚无最终排名` : `${selected.summary?.missing_count} 项未定分，不计入总分（与排名口径一致）`}
+                          message={managed ? "系统已完成自动评分，当前显示最终汇总结果" : `${selected.summary?.missing_count} 项未定分，不计入总分（与排名口径一致）`}
                           description={(selected.summary?.missing_criteria ?? []).join("、")}
                         />
                       )}

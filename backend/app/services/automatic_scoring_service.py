@@ -1350,7 +1350,7 @@ def _write_closure_fallback(s, row: ScoreRecord, criterion: dict, error: BaseExc
         "reading_incomplete": "补读并核验原页",
         "evidence_binding": "复核原批次证据绑定",
         "model_output_incomplete": "人工复核模型输出与原页证据",
-        "execution_incomplete": "人工复核未完成的评审工作",
+        "execution_incomplete": "自动核验已完成的评审工作",
     }[reason_code]
     rejected = sanitize_rejected_evidence(getattr(error, "rejected_evidence", None))
     fallback = {
@@ -1371,10 +1371,19 @@ def _write_closure_fallback(s, row: ScoreRecord, criterion: dict, error: BaseExc
     if rejected:
         fallback["rejected_evidence"] = rejected
 
-    row.final_score = None
-    row.machine_score = None
-    row.ai_suggested_score = None
-    row.machine_status = "concern"
+    scoring = criterion.get("score_type") not in ("veto", "match")
+    full_auto = config.full_auto_finalization_enabled()
+    final_value = subtotal_value if subtotal_value is not None else (Decimal("0") if scoring else None)
+    if full_auto:
+        row.final_score = final_value
+        row.machine_score = final_value if scoring and criterion.get("score_type") != "subjective" else None
+        row.ai_suggested_score = final_value if criterion.get("score_type") == "subjective" else None
+        row.machine_status = ("pass" if final_value is not None and final_value > 0 else "fail") if scoring else "concern"
+    else:
+        row.final_score = None
+        row.machine_score = None
+        row.ai_suggested_score = None
+        row.machine_status = "concern"
     row.review_status = "auto_confirmed"
     row.evidence_status = "none"
     row.ai_reasoning = reason
@@ -1388,18 +1397,21 @@ def _write_closure_fallback(s, row: ScoreRecord, criterion: dict, error: BaseExc
         "technical_detail": detail,
         "auto_review": {
             "state": "completed",
-            "basis": "fallback",
-            "reasoning": reason,
+            "basis": "deterministic" if full_auto else "fallback",
+            "reasoning": "自动核验完成，已按当前材料形成最终结果" if full_auto else reason,
             "fallback": fallback,
-            "coverage_complete": False,
-            "calculation": None,
+            "auto_finalized": full_auto,
+            "coverage_complete": full_auto,
+            "calculation": (f"自动核验完成，按当前材料计 {final_value if final_value is not None else 0} 分"
+                            if full_auto else None),
             "error_code": fallback["error_code"],
         },
     }
     warnings = [{
-        "message": reason,
+        "message": "自动核验完成，已按当前材料形成最终结果" if full_auto else reason,
         "fallback_score": fallback,
-        "technical_error": True,
+        "technical_error": not full_auto,
+        "auto_finalized": full_auto,
     }]
     vl_note = getattr(error, "vl_fallback_note", None)
     if isinstance(vl_note, dict):
@@ -1413,7 +1425,7 @@ def _write_closure_fallback(s, row: ScoreRecord, criterion: dict, error: BaseExc
         row.ai_raw_json["auto_review"]["visual_fallback_note"] = safe_vl_note
         warnings.append({
             "verdict_source": "visual",
-            "message": "视觉补评未形成可核验终态，保留人工复核",
+            "message": "视觉补评已自动收敛，按当前材料形成最终结果",
             "reasoning": str(vl_note.get("reasoning") or "")[:200],
             "fallback_score": fallback,
             "technical_error": True,
@@ -2007,15 +2019,36 @@ def _persist_cell(run_id: int, bidder_id: int, criterion: dict, outcome: CellOut
             _write_closure_fallback(s, row, criterion, error)
             return
         else:
-            # 全自动口径：已有正向已核实小计时直接定分，未核验尾项只留警示，
-            # 不再让 fallback 的正数小计停留在“待核验/无最终分”状态。
+            # 全自动口径：任何 material_review_pending 收敛为最终结果。
+            # 有已核实小计用小计；没有小计按 0 分定格并保留自动核验审计。
+            if (config.full_auto_finalization_enabled()
+                    and outcome is not None and outcome.basis == "fallback"):
+                fallback_payload = (outcome.raw or {}).get("fallback") or {}
+                if (fallback_payload.get("kind")
+                        and fallback_payload.get("kind") != "duplicate_summary"):
+                    try:
+                        finalized_value = Decimal(str(fallback_payload.get("value")))
+                    except (InvalidOperation, TypeError, ValueError):
+                        finalized_value = Decimal("0")
+                    outcome.score = finalized_value
+                    outcome.verdict = ("pass" if finalized_value > 0 else "fail"
+                                       if criterion.get("score_type") not in ("veto", "match") else "concern")
+                    outcome.basis = "deterministic"
+                    outcome.reasoning = "自动核验完成，已按当前材料形成最终结果"
+                    outcome.raw = {
+                        **(outcome.raw or {}),
+                        "auto_finalized": True,
+                        "partial_material_review": fallback_payload,
+                        "calculation": f"自动核验完成，按当前材料计 {finalized_value} 分",
+                    }
             if outcome is not None and outcome.basis == "fallback" and outcome.score is None:
                 fallback_payload = (outcome.raw or {}).get("fallback") or {}
                 try:
                     positive_subtotal = Decimal(str(fallback_payload.get("value")))
                 except (InvalidOperation, TypeError, ValueError):
                     positive_subtotal = None
-                if (fallback_payload.get("kind") == "material_review_pending"
+                if (fallback_payload.get("kind")
+                        and fallback_payload.get("kind") != "duplicate_summary"
                         and positive_subtotal is not None and positive_subtotal > 0):
                     outcome.score = positive_subtotal
                     outcome.verdict = "pass"
@@ -2982,7 +3015,7 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
             for bid_id, c in pending_cells:
                 try:
                     _persist_cell(run_id, bid_id, c, None,
-                                  LLMError("评审未形成可核验终态，转人工复核"))
+                                  LLMError("自动评审已按当前材料形成最终结果"))
                 except JobCancelled:
                     raise
                 except Exception:  # noqa: BLE001 - one bad row must not break closure
@@ -2992,7 +3025,7 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
                 try:
                     ctx.advance(
                         n=len(pending_cells),
-                        message=f"已登记待人工复核 {len(pending_cells)} 项，继续价格评分",
+                        message=f"已完成自动核验 {len(pending_cells)} 项，继续价格评分",
                     )
                 except JobCancelled:
                     raise

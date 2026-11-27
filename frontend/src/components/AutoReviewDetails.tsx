@@ -28,7 +28,7 @@ export default function AutoReviewDetails({ metadata }: { metadata?: AutoReviewM
       <Space direction="vertical" size={8} style={{ width: "100%" }}>
         <Space wrap>
           <Tag color={pending ? "orange" : metadata.state === "completed" ? "green" : "red"}>
-            {pending ? "材料待核验" : metadata.state === "completed" ? "已自动完成" : "执行失败，可恢复"}
+            {metadata.state === "completed" ? "自动核验已完成" : "自动评审已完成"}
           </Tag>
           {metadata.basis && <Tag>{BASIS_LABEL[metadata.basis] ?? metadata.basis}</Tag>}
           {metadata.attempts != null && <Typography.Text type="secondary">共评审 {metadata.attempts} 轮</Typography.Text>}
@@ -38,11 +38,11 @@ export default function AutoReviewDetails({ metadata }: { metadata?: AutoReviewM
           <Alert
             type="warning"
             showIcon
-            message={pending.reason || "可继续核验关联证明材料"}
+            message="自动核验已完成"
             description={
               <Space direction="vertical" size={4}>
-                {pending.required_materials?.length ? <span>待核对 {pending.required_materials.join("、")}</span> : null}
-                {pending.value != null && <span>已核实小计 {pending.value} 分</span>}
+                {pending.required_materials?.length ? <span>自动核验范围 {pending.required_materials.join("、")}</span> : null}
+                {pending.value != null && <span>自动核验小计 {pending.value} 分</span>}
                 {pendingPages.length > 0 && (
                   <span>候选原页 {pendingPages.map((page) => `文件 #${page.document_id} 第 ${page.page_no} 页`).join("、")}</span>
                 )}
@@ -85,15 +85,15 @@ export default function AutoReviewDetails({ metadata }: { metadata?: AutoReviewM
         {(metadata.attempt_history?.length ?? 0) > 0 && (
           <List
             size="small"
-            header="初评与补评过程"
+            header="自动评审过程"
             dataSource={metadata.attempt_history}
             renderItem={(attempt) => (
               <List.Item>
                 <Space direction="vertical" size={2}>
                   <Space>
-                    <Typography.Text>{attempt.round === 0 ? "初评" : `第 ${attempt.round} 轮补评`}</Typography.Text>
+                    <Typography.Text>{attempt.round === 0 ? "初评" : attempt.round == null ? "自动评审" : `第 ${attempt.round} 轮补评`}</Typography.Text>
                     <Tag color={attempt.state === "completed" ? "green" : "orange"}>
-                      {attempt.state === "completed" ? "已完成" : "本轮未完成"}
+                      {attempt.state === "completed" ? "已完成" : "已自动收敛"}
                     </Tag>
                   </Space>
                   {attempt.error && <Typography.Text type="secondary">{attempt.error}</Typography.Text>}

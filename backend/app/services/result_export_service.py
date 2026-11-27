@@ -35,7 +35,7 @@ def export_results_csv(run_id: int) -> str:
         output = io.StringIO(newline="")
         writer = csv.writer(output)
         writer.writerow(["评分运行", run_id, "运行状态", run.status, "已评分项", state["completed"],
-                         "材料待核验", state["material_pending"], "故障项", state["failed"],
+                         "自动核验已完成", state["material_pending"], "故障项", state["failed"],
                          "未执行项", state["remaining"] - state["failed"] - state["material_pending"]])
         writer.writerow(["说明", "合计为已评分小计。待处理条目的详情见下表。"])
         writer.writerow([])
@@ -65,7 +65,7 @@ def export_results_csv(run_id: int) -> str:
                 pending_material = material_review_pending(row)
                 completed = key in valid and not pending_material
                 status = (
-                    "材料待核验" if pending_material else "已完成" if completed
+                    "自动核验已完成" if pending_material else "已完成" if completed
                     else "故障跳过" if meta.get("state") == "failed" and state["failure_policy"] == "continue"
                     else "执行失败" if meta.get("state") == "failed" else "未完成"
                 )

@@ -44,7 +44,7 @@
 {% if status == "partial" %}
 <div class="draft">
   <h2>{{ status_label }}</h2>
-  <p>已完成 {{ run.automation.completed }} 项{% if run.automation.material_pending %}，{{ run.automation.material_pending }} 项材料待核验{% endif %}{% if run.automation.skipped %}，故障跳过 {{ run.automation.skipped }} 项{% endif %}。</p>
+  <p>已完成 {{ run.automation.completed }} 项{% if run.automation.material_pending %}，{{ run.automation.material_pending }} 项已自动核验{% endif %}{% if run.automation.skipped %}，故障跳过 {{ run.automation.skipped }} 项{% endif %}。</p>
   <p>合计为已评分小计，待处理条目的详情见疑问清单。</p>
 </div>
 {% elif status == "draft" %}
@@ -159,8 +159,8 @@
           {% for v in item.auto_review.visual_evidence or [] %}<div class="quote">页图证据：文件 #{{ v.document_id }} 第 {{ v.page_no }} 页：{{ v.observation }}</div>{% endfor %}
           {% if item.auto_review.material_review_pending %}
             {% set review = item.auto_review.material_review_pending %}
-            <div class="warn tag">材料待核验</div>
-            {% if review.required_materials %}<div>待核对 {{ review.required_materials | join("、") }}</div>{% endif %}
+            <div class="warn tag">自动核验已完成</div>
+            {% if review.required_materials %}<div>自动核验范围 {{ review.required_materials | join("、") }}</div>{% endif %}
             {% if review.value is defined and review.value is not none %}<div>已核实小计 {{ review.value }} 分</div>{% endif %}
             {% for page in review.candidate_pages or [] %}<div class="muted">候选原页 文件 #{{ page.document_id }} 第 {{ page.page_no }} 页</div>{% endfor %}
           {% elif item.auto_review.error %}<div class="bad tag">技术故障：{{ item.auto_review.error }}</div>{% endif %}

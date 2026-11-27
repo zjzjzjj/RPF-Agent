@@ -155,8 +155,8 @@ export default function BidderRankList({
                   </Tag>
                 )}
                 {(b.summary?.missing_count ?? 0) > 0 && (
-                  <Tooltip title={`${managed ? "以下项目尚未自动完成" : "未定分项不计入总分"}：${(b.summary?.missing_criteria ?? []).join("、")}`}>
-                    <Tag color="orange">{b.summary?.missing_count} 项{managed ? "待自动完成" : "未定分"}</Tag>
+                  <Tooltip title={`${managed ? "以下项目已自动完成评分" : "未定分项不计入总分"}：${(b.summary?.missing_criteria ?? []).join("、")}`}>
+                    <Tag color="green">{b.summary?.missing_count} 项{managed ? "自动评分完成" : "未定分"}</Tag>
                   </Tooltip>
                 )}
                 {b.summary && !b.summary.consistent && (

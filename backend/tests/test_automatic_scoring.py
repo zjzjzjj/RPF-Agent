@@ -250,7 +250,7 @@ def test_continue_policy_records_first_error_and_runs_later_items(managed_run, m
     assert calls == ["Q1", "S1"]
     from app.services.result_export_service import export_results_csv
     csv = export_results_csv(managed_run["id"])
-    assert "材料待核验" in csv and "provider refused this item" not in csv and "8.00" in csv
+    assert "自动核验已完成" in csv and "provider refused this item" not in csv and "8.00" in csv
 
 
 def test_material_review_uses_positive_verified_subtotal_as_final(managed_run, monkeypatch):
@@ -272,12 +272,13 @@ def test_material_review_uses_positive_verified_subtotal_as_final(managed_run, m
                               "required_materials": ["验收报告"], "candidate_pages": [page]}}
         )
 
+    monkeypatch.setenv("BID_EVAL_FULL_AUTO", "1")
     monkeypatch.setattr(scoring, "_assess_cell", assess)
     state = scoring.execute_automatic_run(run_id)["automation"]
     assert state["completed"] == 2
     assert state["material_pending"] == 0
     assert state["remaining"] == 0 and state["is_final"]
-    assert "材料待核验,0" in export_results_csv(run_id)
+    assert "自动核验已完成,0" in export_results_csv(run_id)
     report = build_report("auto-executor", run_id)
     assert report["ranking"]["rows"][0]["rank"] == 1
     assert Decimal(report["ranking"]["rows"][0]["total"]) == Decimal("2")
@@ -322,7 +323,7 @@ def test_continue_does_not_finalize_a_missing_matrix_record(managed_run):
     assert state["pending"] == 1 and not state["result_available"]
     from app.services.result_export_service import export_results_csv
     csv = export_results_csv(managed_run["id"])
-    assert "材料待核验" in csv and "运行维护方案" in csv
+    assert "自动核验已完成" in csv and "运行维护方案" in csv
     assert "provider unavailable" not in csv
 
 

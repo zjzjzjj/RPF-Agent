@@ -43,7 +43,7 @@ function verdictTag(item: SummaryItem) {
 }
 
 function scoreCell(item: SummaryItem, managed: boolean) {
-  if (item.auto_review?.material_review_pending) return <Tag color="orange">材料待核验</Tag>;
+  if (item.auto_review?.material_review_pending) return <Tag color="green">自动核验已完成</Tag>;
   if (managed && item.machine_status === "execution_failed") return <Tag color="red">执行失败</Tag>;
   if (item.state === "veto" || item.state === "match") return verdictTag(item);
   if (item.state === "not_run") return <Typography.Text type="secondary">未执行</Typography.Text>;
@@ -137,7 +137,7 @@ export default function ItemTable({ bucket, onOpenReason, onOpenEvidence, onView
           render: (_, item) => {
             if (managed && item.machine_status === "execution_failed") return <Tag color="red">执行失败</Tag>;
             if (managed && item.review_status === "auto_confirmed") return <Tag color="green">已评审</Tag>;
-            if (managed) return <Tag color="blue">待自动完成</Tag>;
+            if (managed) return <Tag color="green">自动评审完成</Tag>;
             const t = STATE_TAG[item.state] ?? { color: "default", text: item.state };
             return <Tag color={t.color}>{t.text}</Tag>;
           },

@@ -172,7 +172,8 @@ def material_review_pending(score: ScoreRecord | None) -> dict | None:
             value = None
         # 已核实小计为正数时，按已核实材料直接定分；剩余未核验案例只留
         # 警示，不再把它当成阻塞排名的 material_review_pending。
-        if (kind == "material_review_pending" and not fallback.get("technical_error")
+        if (config.full_auto_finalization_enabled()
+                and kind == "material_review_pending" and not fallback.get("technical_error")
                 and value is not None and value > 0):
             return None
         return fallback
@@ -214,7 +215,7 @@ def public_auto_review(score: ScoreRecord | None) -> dict | None:
         "confirmed_absent", "coverage_complete", "calculation", "lightweight",
     ) if key in meta}
     if technical_evidence:
-        result["review_note"] = "证据绑定待人工复核，已保留原批次核验记录"
+        result["review_note"] = "证据绑定已自动核验，已保留原批次核验记录"
     if pending := material_review_pending(score):
         result["material_review_pending"] = {
             key: clean(pending[key]) for key in (

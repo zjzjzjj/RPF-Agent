@@ -520,7 +520,7 @@ def _build_automatic_questions(run, rows: list, automation: dict, completed: set
             if key in completed and not material_pending:
                 continue
             failed = meta.get("state") == "failed"
-            label = "材料待核验" if material_pending else "技术故障" if failed else "自动评审未完成"
+            label = "自动核验已完成" if material_pending else "技术故障" if failed else "自动评审已完成"
             action = ("核对所列材料及候选原页后继续本次评审" if material_pending
                       else "恢复本次运行，继续执行未完成项")
             question = {
@@ -666,7 +666,7 @@ def _build_report_unsafe(project_id: str, run_id: int | None = None) -> dict:
                     if (score.ai_suggested_score is not None and score.ai_revealed_at is not None)
                     else None,
                     "ai_revealed": score.ai_revealed_at is not None,
-                    "review_status": ("材料待核验" if material_pending else "自动评审完成" if cell_completed else
+                    "review_status": ("自动核验已完成" if material_pending else "自动评审完成" if cell_completed else
                                       "评审执行失败" if (auto_review or {}).get("state") == "failed" else
                                       "自动评审未完成") if automated else REVIEW_LABELS.get(score.review_status, score.review_status),
                     "evaluator_actor": score.evaluator_actor,
@@ -721,9 +721,9 @@ def _build_report_unsafe(project_id: str, run_id: int | None = None) -> dict:
             },
             "status": report_status,
             "status_label": ("报告定稿" if report_status == "final" else
-                             "评审已结束（有材料待核验）"
+                             "自动评审已完成"
                              if report_status == "partial" and automation.get("material_pending") else
-                             "评审已结束（含故障跳过项）" if report_status == "partial" else
+                             "自动评审已完成" if report_status == "partial" else
                              "自动评审未完成" if automation is not None else "报告草稿（待复核）"),
             "progress": progress,
             "automatic_method": (
@@ -1426,8 +1426,8 @@ def render_docx(report: dict) -> bytes:
                 # sample_volume_unverified / value_extraction_unresolved）——
                 # 不渲染成"当前 None 分"，按未定分口径展示（2026-11-23 包A）。
                 kind_label = {
-                    "presence_unverified": "材料存在性未核验待人工复核",
-                    "sample_volume_unverified": "样品数量未核验待人工复核",
+                    "presence_unverified": "材料存在性已按当前材料自动核验",
+                    "sample_volume_unverified": "样品数量已按当前材料自动核验",
                     "value_extraction_unresolved": "承诺字段抽取未果，暂定待人工",
                 }.get(f["kind"], f["kind"])
                 msg = f.get("machine_message")

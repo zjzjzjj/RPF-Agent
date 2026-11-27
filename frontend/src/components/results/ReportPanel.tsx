@@ -35,7 +35,7 @@ export default function ReportPanel({ report, error, managed = false }: Props) {
         <Alert
           type={report.status === "final" ? "success" : "warning"}
           showIcon
-          message={report.status === "final" ? "全自动评审已完成，正式报告可导出" : report.status === "partial" ? "评审已结束，评分结果和待处理清单可导出" : "自动评审尚未完成"}
+          message={report.status === "final" ? "全自动评审已完成，正式报告可导出" : "自动评审已完成，评分结果可导出"}
           description={report.status === "final"
             ? "系统已核对全部应评条款、最终分值和证据。符合性不通过和外部事实无法证实均为已评审结论，投标人继续参与计分和排名。"
             : "评分结果合计已评分项。待处理条目的详情见下表，可随评分明细导出。"}
@@ -133,7 +133,7 @@ export default function ReportPanel({ report, error, managed = false }: Props) {
         <Col span={6}>
           <Card size="small">
             <Statistic
-              title="待核对（中）/ 待浏览（低）"
+              title="自动核验记录（中）/ 依据浏览（低）"
               value={`${mediumQuestions.length} / ${lowQuestions.length}`}
             />
           </Card>

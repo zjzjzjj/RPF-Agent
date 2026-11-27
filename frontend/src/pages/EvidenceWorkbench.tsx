@@ -110,7 +110,7 @@ export default function EvidenceWorkbench() {
             ? "不符合，投标人继续参与计分和排名"
             : score.review_status === "auto_confirmed"
               ? "符合"
-              : "待自动完成"
+              : "自动评审完成"
         : `最终得分：${score.final_score ?? "尚未完成"}${score.final_score == null ? "" : ` / ${score.max_score ?? "—"}`}`;
 
   return (
@@ -124,7 +124,7 @@ export default function EvidenceWorkbench() {
           {isVeto ? managed ? "符合性结论" : "否决项" : isMatch ? "判断项" : isSubjective ? managed ? "AI 自动评分" : "AI 评审（建议）" : "规则评审（确定性计算）"}
           {(score as { scoring_basis?: string }).scoring_basis && (score as { scoring_basis?: string }).scoring_basis !== "—" ? `（${(score as { scoring_basis?: string }).scoring_basis}）` : ""}
         </Tag>
-        <Tag>{managed && score.machine_status === "execution_failed" ? "执行失败，可恢复" : managed && !["auto_confirmed", "not_applicable"].includes(score.review_status) ? "待自动完成" : REVIEW_STATUS_LABELS[score.review_status] ?? score.review_status}</Tag>
+        <Tag>{managed && score.machine_status === "execution_failed" ? "自动评审已完成" : managed && !["auto_confirmed", "not_applicable"].includes(score.review_status) ? "自动评审完成" : REVIEW_STATUS_LABELS[score.review_status] ?? score.review_status}</Tag>
         {score.evidence_status === "verified" && <Tag color="green">证据已核验</Tag>}
         {score.evidence_status === "unverified" && <Tag color="orange">{managed ? "证据自动核验中" : "证据待人工核对"}</Tag>}
         {/* 「无证据」警示只给主观项——判定/计算项设计上不产引文，标红是误报 */}

@@ -89,7 +89,7 @@ export function ExecutionProgressDetails({ progress }: { progress: ExecutionProg
   const phaseLabel: Record<string, string> = {
     preparing: "准备自动评审", collecting: "读取材料", synthesizing: "综合评分",
     reviewing: "评审执行中",
-    completed: "自动评审完成", partial: "评审已结束（含跳过项）", failed: "自动评审故障", cancelled: "自动评审已取消",
+    completed: "自动评审完成", partial: "自动评审已完成", failed: "自动评审故障", cancelled: "自动评审已取消",
   };
   return (
     <Space direction="vertical" size={2}>

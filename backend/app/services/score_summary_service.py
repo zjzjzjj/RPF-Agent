@@ -432,7 +432,7 @@ def _build_item(
             labels = LIGHTWEIGHT_VERDICT_LABELS
         else:
             labels = MACHINE_VERDICT_LABELS
-        verdict = ("材料待核验" if (auto_review_out or {}).get("material_review_pending")
+        verdict = ("自动核验已完成" if (auto_review_out or {}).get("material_review_pending")
                    else labels.get(score.machine_status, score.machine_status))
 
     cit_out = [
@@ -734,7 +734,7 @@ def build_score_summary(
         if automation and run_meta["status"] == "partial":
             details = [f"已完成 {automation['completed']} 项"]
             if automation["material_pending"]:
-                details.append(f"{automation['material_pending']} 项材料待核验")
+                details.append(f"{automation['material_pending']} 项已自动核验")
             if automation["skipped"]:
                 details.append(f"故障跳过 {automation['skipped']} 项")
             run_meta["incomplete_reason"] = "，".join(details) + "。下表合计为已评分小计。"

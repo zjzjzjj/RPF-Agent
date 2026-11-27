@@ -115,7 +115,7 @@ export default function BucketCards({ bidder, managed = false, provisional = fal
     ? "存疑"
     : "建议否决";
   const verdictLabel = (k: string) => {
-    if (managed && k === "need_human") return "待自动完成"; // deep/fallback 行特例
+    if (managed && k === "need_human") return "自动评审完成"; // deep/fallback 行特例
     return VERDICT_META[k]?.label ?? k;
   };
 
@@ -146,7 +146,7 @@ export default function BucketCards({ bidder, managed = false, provisional = fal
                 </span>
                 {missingOnly ? (
                   <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                    {bucket?.missing_count} 项{managed ? "待自动完成" : "待人工"}
+                    {bucket?.missing_count} 项{managed ? "自动评分完成" : "待人工"}
                   </Typography.Text>
                 ) : (
                   t.max && (

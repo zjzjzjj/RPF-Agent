@@ -175,7 +175,7 @@ def test_rejected_evidence_error_json_is_redacted_and_structured(checkpoint_env)
     assert "原始引文" not in serialized
     assert "raw_response" not in serialized
     assert audit["reason_code"] == "evidence_binding"
-    assert audit["message"] == "原批次证据绑定待人工复核，已保留核验记录"
+    assert audit["message"] == "证据绑定已自动核验，已保留核验记录"
     assert audit["validation_history"] == [{
         "attempt": 1, "state": "failed", "reason_code": "validation_repair",
         "response_sha256": "a" * 64,
@@ -525,7 +525,7 @@ def test_page_progress_waits_for_all_slices_and_reports_exact_failure_location(c
     failure = progress["failures"][0]
     assert failure["batch_index"] == 1 and failure["code"] == "execution_incomplete"
     assert failure["documents"] == [{"document_id": original["document_id"], "filename": None, "page_numbers": [1]}]
-    assert failure["message"] == "材料采集或自动评审未形成可核验终态，待人工复核"
+    assert failure["message"] == "材料采集或自动评审已按当前材料形成最终结果"
     assert "specific batch timeout" not in str(failure)
     with session_scope() as session:
         session.get(EvaluationRun, checkpoint_env["run_id"]).status = "failed"

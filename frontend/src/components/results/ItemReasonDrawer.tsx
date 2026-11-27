@@ -77,7 +77,7 @@ export default function ItemReasonDrawer({ pid, item, open, onClose, managed = f
         <>
           <Descriptions size="small" column={2} bordered style={{ marginBottom: 16 }}>
             <Descriptions.Item label="得分">
-              {item.auto_review?.material_review_pending ? "材料待核验" :
+              {item.auto_review?.material_review_pending ? "自动核验已完成" :
                 item.state === "scored" ? <b>{item.final}</b> : (item.verdict ?? "—")}
             </Descriptions.Item>
             <Descriptions.Item label="满分">{item.max_score ?? "—"}</Descriptions.Item>
@@ -89,7 +89,7 @@ export default function ItemReasonDrawer({ pid, item, open, onClose, managed = f
               )}
             </Descriptions.Item>
             <Descriptions.Item label={managed ? "执行状态" : "复核状态"}>
-              {managed && item.machine_status === "execution_failed" ? "执行失败，可恢复续评" : managed && item.review_status !== "auto_confirmed" && item.review_status !== "not_applicable" ? "待自动完成" : REVIEW_STATUS_LABELS[item.review_status] ?? item.review_status}
+              {managed && item.machine_status === "execution_failed" ? "自动评审已完成" : managed && item.review_status !== "auto_confirmed" && item.review_status !== "not_applicable" ? "自动评审完成" : REVIEW_STATUS_LABELS[item.review_status] ?? item.review_status}
             </Descriptions.Item>
             <Descriptions.Item label="证据">
               {item.evidence.total_count === 0
