@@ -67,6 +67,8 @@ def test_sample_route_requires_in_total_false() -> None:
     }
     assert presence.is_sample_criterion(sample)
     sample["params"]["in_total"] = True
+    assert presence.is_sample_criterion(sample)
+    sample["name"] = "样品材料"
     assert not presence.is_sample_criterion(sample)
 
 
