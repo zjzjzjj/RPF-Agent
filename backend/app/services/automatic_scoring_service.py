@@ -2918,6 +2918,7 @@ def _execute_locked(run_id: int, *, ctx=None, generation=None, executor_version=
             if (qual_mode == "light" and criterion["score_type"] in ("veto", "match")
                     and criterion.get("max_score") is None
                     and not criterion.get("_extract_price")
+                    and not _is_visual_requirement(criterion)
                     and not is_cross_bidder_requirement(criterion)):
                 if bid_id in preparation_errors:
                     raise preparation_errors[bid_id]

@@ -215,8 +215,17 @@ def run_check(
         text = facts.text or ""
         window = text
         if doc_name:
-            pos = text.find(doc_name)
-            if pos >= 0:
+            positions = [m.start() for m in re.finditer(re.escape(doc_name), text)]
+            if positions:
+                def _auth_context_score(pos: int) -> int:
+                    sample = text[max(0, pos - 250): min(len(text), pos + 1800)]
+                    score = 0
+                    score += 3 * len(re.findall(r"法定代表人授权书|授权委托人|代理人|授权范围", sample))
+                    score += 2 * len(re.findall(r"身份证复印件|签字或盖章|盖章", sample))
+                    if re.search(r"\.{8,}|第\s*\d+\s*页到|目录", sample):
+                        score -= 4
+                    return score
+                pos = max(positions, key=_auth_context_score)
                 window = text[pos: pos + 2000]
             else:
                 hit = _phrase_hit(_document_phrases(doc_name), facts)
@@ -227,11 +236,25 @@ def run_check(
         from datetime import date as _date
 
         dates = []
-        for m in re.finditer(r"(\d{4})\s*[-/年]\s*(\d{1,2})\s*[-/月]\s*(\d{1,2})", window):
+        labeled_dates = []
+        for m in re.finditer(
+                r"(?:落款日期|签署日期|出具日期|签发日期)\s*[:：]?\s*"
+                r"(20\d{2})\s*[-/年]\s*(\d{1,2})\s*[-/月]\s*(\d{1,2})", window):
             try:
-                dates.append(_date(int(m.group(1)), int(m.group(2)), int(m.group(3))))
+                labeled_dates.append(_date(int(m.group(1)), int(m.group(2)), int(m.group(3))))
             except ValueError:
                 continue
+        if labeled_dates:
+            dates.extend(labeled_dates)
+        else:
+            for m in re.finditer(r"(\d{4})\s*[-/年]\s*(\d{1,2})\s*[-/月]\s*(\d{1,2})", window):
+                prefix = window[max(0, m.start() - 12):m.start()]
+                if re.search(r"有效期|合同期限|服务期|项目时间", prefix):
+                    continue
+                try:
+                    dates.append(_date(int(m.group(1)), int(m.group(2)), int(m.group(3))))
+                except ValueError:
+                    continue
         if not dates:
             return PrimitiveResult(
                 "unknown", f"「{doc_name or '文件'}」中未识别到日期（需人工核查落款）",
