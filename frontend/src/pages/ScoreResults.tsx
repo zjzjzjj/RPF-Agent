@@ -104,8 +104,9 @@ export default function ScoreResults() {
   const partialResult = currentRun?.status === "partial";
   const continueErrors = automation?.failure_policy === "continue";
   const formalReady = currentRun != null && (!managed || (
-    currentRun.status === "succeeded" && automation.expected > 0 &&
-    automation.completed === automation.expected && automation.remaining === 0 && automation.failed === 0
+    automation.is_final === true ||
+    (currentRun.status === "succeeded" && automation.expected > 0 &&
+     automation.completed === automation.expected && automation.remaining === 0 && automation.failed === 0)
   ));
 
   const [jobId, setJobId] = useState<number | null>(null);

@@ -706,8 +706,8 @@ def _build_report_unsafe(project_id: str, run_id: int | None = None) -> dict:
         # progress 归零，报告宣称"全部 0 项均已人工处置"，把失败读成完成。
         run_ok = (automation["is_final"] if automation is not None
                   else run.status == "succeeded" and bool(rows))
-        report_status = ("partial" if automated and run.status == "partial" else
-                         "final" if (progress["blocking_open"] == 0 and run_ok) else "draft")
+        report_status = ("final" if (progress["blocking_open"] == 0 and run_ok) else
+                         "partial" if automated and run.status == "partial" else "draft")
         if not run_ok:
             progress["incomplete_reason"] = (
                 f"评分运行 #{run.id} 状态为 {run.status}，报告内容不完整"

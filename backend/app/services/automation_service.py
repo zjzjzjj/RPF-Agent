@@ -512,7 +512,11 @@ def _state(s, run: EvaluationRun) -> tuple[dict | None, set[tuple[int, int]]]:
         ),
         "last_error": cfg.get("error") or latest_error,
         "complete": bool(expected) and remaining == 0,
-        "is_final": run.status == "succeeded" and bool(expected) and remaining == 0,
+        "is_final": (
+            (run.status == "succeeded" or
+             (config.full_auto_finalization_enabled() and run.status == "partial"))
+            and bool(expected) and remaining == 0
+        ),
         "failure_policy": failure_policy(run), "skipped": skipped,
         "processed": len(completed) + skipped, "pending": remaining - skipped - material_pending,
         "execution_finished": run.status in ("succeeded", "partial", "failed", "cancelled"),
