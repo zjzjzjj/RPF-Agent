@@ -381,12 +381,13 @@ def _valid_cell(score: ScoreRecord, criterion: dict, citations: list[EvidenceCit
         # "抽取失败"不是"不符合 0 分"结论，暂定待人工，不得按 provisional_zero
         # 收口（否则结论式 0 复活）。
         return bool(score.ai_reasoning or meta.get("reasoning"))
-    for warning in score.warnings_json or []:
-        if isinstance(warning, dict) and (warning.get("fallback_score") or warning.get("unresolved")):
-            # A closure fallback is a settled provisional score, not an
-            # unresolved evidence claim.  It owns its own basis branch below.
-            if not (basis == "fallback" and warning.get("fallback_score")):
-                return False
+    if not meta.get("auto_finalized"):
+        for warning in score.warnings_json or []:
+            if isinstance(warning, dict) and (warning.get("fallback_score") or warning.get("unresolved")):
+                # A closure fallback is a settled provisional score, not an
+                # unresolved evidence claim.  It owns its own basis branch below.
+                if not (basis == "fallback" and warning.get("fallback_score")):
+                    return False
     lightweight = basis == "lightweight"
     scoring = criterion.get("score_type") not in ("veto", "match")
     if lightweight and scoring:
