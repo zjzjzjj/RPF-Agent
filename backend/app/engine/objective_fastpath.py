@@ -356,6 +356,26 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
     # 非否决）；无法确认→保留+疑问。盖章：文本路无法核验≠未盖章，只记疑问。
     date_window = date_window_from_rule(text)
     seal_required = any(w in text for w in ("盖章", "公章", "签章"))
+    page_text_by_no = {int(p.get("page_no") or 0): str(p.get("text") or "") for p in inventory.pages}
+    def _material_heading_state(record: ContractRecord) -> None:
+        """分类器漏绑时用案例块内的材料标题补三态；只有明确标题/凭证才升 True。"""
+        block_text = "\n".join(page_text_by_no.get(int(no or 0), "") for no in (record.pages or []))
+        state = dict(record.materials_state or {})
+        materials = {k: list(v or []) for k, v in (record.materials or {}).items()}
+        patterns = {
+            "contract": r"(?:^|\n)\s*(?:\d+(?:\.\d+)*\s*)?(?:合同(?:原件)?复印件|合同扫描件|合同\s*\(\d\))",
+            "invoice": r"(?:^|\n)\s*(?:\d+(?:\.\d+)*\s*)?(?:发票(?:原件)?复印件|发票扫描件|电子发票|发票)",
+            "acceptance": r"(?:^|\n)\s*(?:\d+(?:\.\d+)*\s*)?(?:验收报告|验收证明|验收单|终验证书|业主证明|用户证明)",
+        }
+        for kind, pattern in patterns.items():
+            hits = sorted({int(no or 0) for no in (record.pages or [])
+                           if re.search(pattern, page_text_by_no.get(int(no or 0), ""))})
+            if hits:
+                state[kind] = True
+                materials.setdefault(kind, [])
+                materials[kind] = sorted(set(materials[kind]) | set(hits))
+        record.materials_state = state
+        record.materials = materials
     qualifying: list[tuple[ContractRecord, Decimal]] = []
     rejected: list[str] = []
     unverified_notes: list[str] = []
@@ -371,6 +391,7 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
     for record in inventory.contracts:
         if record.source == "person_proof":
             continue
+        _material_heading_state(record)
         if (record.materials_state or {}).get("_case_block_complete"):
             for kind in ("contract", "invoice", "acceptance"):
                 if (record.materials_state or {}).get(kind) is None:
@@ -910,6 +931,8 @@ def _platform_query_families(inventory: MaterialInventory) -> set[str]:
 
 def _query_screenshot_proof_present(inventory: MaterialInventory) -> bool:
     """只认实际查询截图/平台详情页，不把证书上的‘可查询’免责声明当截图。"""
+    from app.engine.material_inventory import _is_platform_detail_page
+
     for page in inventory.pages:
         raw = str(page.get("text") or "")
         text = re.sub(r"\s+", "", raw)
