@@ -2035,9 +2035,10 @@ def calibrate_objective_scores(run_id: int) -> int:
             if key not in biases:
                 continue
             try:
-                bias = Decimal(str(biases[key]))
                 maximum = Decimal(str(row.max_score))
                 current = Decimal(str(row.final_score))
+                max_key = f"{key}|{round(float(row.max_score))}"
+                bias = Decimal(str((profile.get("category_max_biases") or {}).get(max_key, biases.get(key, 0))))
             except (InvalidOperation, TypeError, ValueError):
                 continue
             # 跨项目偏差只做小范围校准，避免覆盖规则证据结论。

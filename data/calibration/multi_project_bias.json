@@ -1,10 +1,24 @@
 {
-  "version": "2026-11-27.multi-project-bias.v1",
+  "version": "2026-11-27.multi-project-bias.v2",
   "biases": {
     "commercial_objective": "0.60",
     "technical_objective": "0.25",
     "technical_subjective": "0.00",
     "commercial_subjective": "0.00",
     "price": "0.00"
+  },
+  "category_max_biases": {
+    "technical_objective|4": "0.017",
+    "technical_objective|6": "0.333",
+    "commercial_objective|6": "-1.25",
+    "commercial_objective|4": "1.861",
+    "commercial_objective|2": "0.133",
+    "technical_objective|3": "0.371",
+    "technical_objective|2": "0.815",
+    "commercial_objective|5": "1.111",
+    "technical_objective|1": "-0.111",
+    "commercial_objective|3": "1.381",
+    "technical_objective|7": "-0.333",
+    "technical_objective|20": "0.0"
   }
 }
