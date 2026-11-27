@@ -79,6 +79,43 @@ def _material_review_pending(criterion: dict, pages: list[dict], detail: str, *,
     attempts = attempts or []
     evidence = evidence or []
     records = facts.get("unverified_records") or facts.get("verified_cases") or []
+    # 已核实小计 > 0 时，先按已核实材料直接计分；未核验案例只留警示，
+    # 不让额外待核验案例把已有正向证据整体清零或阻塞排名。
+    if subtotal is not None and Decimal(str(subtotal)) > 0:
+        partial = {
+            "reason": detail,
+            "value": str(subtotal),
+            "value_role": "verified_subtotal",
+            "required_materials": list(dict.fromkeys([*(missing or []), *parse_required_artifacts(
+                "\n".join(str(criterion.get(key) or "") for key in
+                           ("required_evidence", "description", "source_quote"))
+            )])),
+            "candidate_pages": [
+                {"document_id": p.get("document_id"), "page_no": p.get("page_no")}
+                for p in pages
+            ],
+            "unverified_records": records,
+        }
+        return CellOutcome(
+            "pass", f"{detail}；未核验案例暂不计入，按已核实小计 {subtotal} 分直接计分",
+            Decimal(str(subtotal)), evidence, pages, "deterministic", len(attempts) or 1,
+            {
+                "auto_review": {
+                    "state": "completed",
+                    "basis": "deterministic",
+                    "reasoning": detail,
+                    "calculation": f"按已核实小计 {subtotal} 分直接计分",
+                    "partial_material_review": partial,
+                    "coverage_complete": False,
+                },
+                "verified_facts": facts,
+                "attempt_history": attempts,
+            },
+            [{
+                "message": f"{detail}；已核实小计 {subtotal} 分直接计分，未核验案例暂不计入",
+                "partial_material_review": partial,
+            }],
+        )
     named_pages = list(evidence)
     for record in records:
         if isinstance(record, dict):
@@ -901,6 +938,12 @@ def _verified_count(criterion: dict, decision, pages: list[dict]) -> tuple[Decim
                     case["role"] = role
             if params.get("min_amount_yuan") or amount_tiers:
                 if case.get("amount_yuan") is None or _decimal(case["amount_yuan"], "案例金额") < 0:
+                    if config.case_unverified_count_enabled():
+                        # 已提供了原页/案例，但金额仍待绑定时不阻塞整格：
+                        # 该案例暂不计入金额档，已核实案例仍按小计直接定分。
+                        case["unverified"] = True
+                        case["unverified_reason"] = "amount_unverified"
+                        continue
                     raise _MaterialReviewPending("仍需核验案例合同金额", facts=values,
                                                  missing=["合同金额"])
             if params.get("person_scope") == "leader" and "运维" in (
@@ -964,6 +1007,12 @@ def _verified_count(criterion: dict, decision, pages: list[dict]) -> tuple[Decim
             checked_facts = BidFacts(text="", certificates=[cert for cert in certificates
                                     if backing.get(normalize_cert(cert)) is True])
             verified_only = scorer(prepared, params, checked_facts).score
+        if result.score > 0 and config.case_unverified_count_enabled():
+            # 全自动模式：已提供原页/案例且已有正向可计分时直接定分，
+            # 未核验案例只留审计警示，不再阻塞整格或排名。
+            return (_score_in_range(result.score, criterion),
+                    result.detail + "；未核验案例暂不计入，按已核实分直接计分",
+                    values)
         raise _MaterialReviewPending(
             result.detail, facts=values,
             subtotal=_score_in_range(verified_only, criterion) if verified_only is not None else None,
@@ -1958,6 +2007,24 @@ def _persist_cell(run_id: int, bidder_id: int, criterion: dict, outcome: CellOut
             _write_closure_fallback(s, row, criterion, error)
             return
         else:
+            # 全自动口径：已有正向已核实小计时直接定分，未核验尾项只留警示，
+            # 不再让 fallback 的正数小计停留在“待核验/无最终分”状态。
+            if outcome is not None and outcome.basis == "fallback" and outcome.score is None:
+                fallback_payload = (outcome.raw or {}).get("fallback") or {}
+                try:
+                    positive_subtotal = Decimal(str(fallback_payload.get("value")))
+                except (InvalidOperation, TypeError, ValueError):
+                    positive_subtotal = None
+                if (fallback_payload.get("kind") == "material_review_pending"
+                        and positive_subtotal is not None and positive_subtotal > 0):
+                    outcome.score = positive_subtotal
+                    outcome.verdict = "pass"
+                    outcome.basis = "deterministic"
+                    outcome.raw = {
+                        **(outcome.raw or {}),
+                        "partial_material_review": fallback_payload,
+                        "calculation": f"按已核实小计 {positive_subtotal} 分直接计分",
+                    }
             page_map = {(p["document_id"], p["page_no"]): p for p in outcome.pages}
             visual_evidence = []
             verified_count = 0

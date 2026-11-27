@@ -1615,10 +1615,23 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
     if managed_amount_tiers and not cases:
         return CountResult(Decimal(0), "金额分档缺少逐案例金额核验", True, unresolved="no_facts")
     if managed_amount_tiers:
+        amount_unverified = []
+        amount_verified = []
         for case in cases:
             if not isinstance(case, dict) or case.get("amount_yuan") is None:
+                if config.case_unverified_count_enabled():
+                    if isinstance(case, dict):
+                        case["unverified"] = True
+                        case["unverified_reason"] = "amount_unverified"
+                    amount_unverified.append(case)
+                    continue
                 raise ValueError("金额分档的每个案例都必须有已核验金额")
             _amount_tier_rate(params["tiers"], Decimal(str(case["amount_yuan"])))
+            amount_verified.append(case)
+        if amount_unverified:
+            # 已提供案例原页但金额未绑定：不阻塞其它已核实案例的直接计分。
+            cases = amount_verified
+            conflict = True
     if cases:
         # 引文全部被 sanitize 降级（照抄要求文本/过短且无实体）→ 计数无依据，
         # 不能把 0 分当成评审结论（与"机器看不见 ≠ 不符合"同一哲学）

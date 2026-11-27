@@ -154,6 +154,15 @@ def material_review_pending(score: ScoreRecord | None) -> dict | None:
     fallback = meta.get("fallback") or {}
     kind = fallback.get("kind")
     if meta.get("basis") == "fallback" and kind in TECHNICAL_FALLBACK_KINDS:
+        try:
+            value = Decimal(str(fallback.get("value")))
+        except (InvalidOperation, TypeError, ValueError):
+            value = None
+        # 已核实小计为正数时，按已核实材料直接定分；剩余未核验案例只留
+        # 警示，不再把它当成阻塞排名的 material_review_pending。
+        if (kind == "material_review_pending" and not fallback.get("technical_error")
+                and value is not None and value > 0):
+            return None
         return fallback
     return None
 

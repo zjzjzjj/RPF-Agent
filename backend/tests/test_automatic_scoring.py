@@ -253,8 +253,7 @@ def test_continue_policy_records_first_error_and_runs_later_items(managed_run, m
     assert "材料待核验" in csv and "provider refused this item" not in csv and "8.00" in csv
 
 
-def test_material_review_keeps_verified_subtotal_out_of_final_results_and_can_resume(managed_run, monkeypatch):
-    from app.errors import ValidationFailed
+def test_material_review_uses_positive_verified_subtotal_as_final(managed_run, monkeypatch):
     from app.services.report_service import build_formal_report, build_report, render_html
     from app.services.result_export_service import export_results_csv
 
@@ -270,31 +269,20 @@ def test_material_review_keeps_verified_subtotal_out_of_final_results_and_can_re
         return scoring.CellOutcome(
             "concern", "还需核对验收报告", pages=pages, basis="fallback",
             raw={"fallback": {"kind": "material_review_pending", "value": "2",
-                              "required_materials": ["验收报告"], "candidate_pages": [page]}},
+                              "required_materials": ["验收报告"], "candidate_pages": [page]}}
         )
 
     monkeypatch.setattr(scoring, "_assess_cell", assess)
     state = scoring.execute_automatic_run(run_id)["automation"]
-    assert state["remaining"] == state["material_pending"] == state["completed"] == 1
-    assert state["processed"] == 2 and state["pending"] == state["failed"] == 0
-    assert state["resumable"] and state["result_available"] and not state["is_final"]
-    assert "材料待核验" in export_results_csv(run_id)
+    assert state["completed"] == 2
+    assert state["material_pending"] == 0
+    assert state["remaining"] == 0 and state["is_final"]
+    assert "材料待核验,0" in export_results_csv(run_id)
     report = build_report("auto-executor", run_id)
-    assert "候选原页" in render_html(report)
-    assert report["ranking"]["rows"][0]["rank"] is None
-    assert Decimal(report["ranking"]["rows"][0]["total"]) == 0
-    with pytest.raises(ValidationFailed):
-        build_formal_report("auto-executor", run_id)
-
-    def complete(rule, pages, *_):
-        calls.append(rule["code"])
-        return scoring.CellOutcome("pass", "验收报告已核对", Decimal("8"), pages=pages, basis="deterministic")
-
-    monkeypatch.setattr(scoring, "_assess_cell", complete)
-    automation.resume_run(run_id, "tester")
-    final = scoring.execute_automatic_run(run_id)["automation"]
-    assert final["is_final"] and final["material_pending"] == 0
-    assert calls.count("Q1") == 1 and calls.count("S1") == 2
+    assert report["ranking"]["rows"][0]["rank"] == 1
+    assert Decimal(report["ranking"]["rows"][0]["total"]) == Decimal("2")
+    build_formal_report("auto-executor", run_id)
+    assert calls == ["Q1", "S1"]
 
 
 def test_continue_resume_retries_pending_cells(managed_run, monkeypatch):
