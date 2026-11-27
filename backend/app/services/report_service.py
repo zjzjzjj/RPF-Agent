@@ -521,15 +521,15 @@ def _build_automatic_questions(run, rows: list, automation: dict, completed: set
                 continue
             failed = meta.get("state") == "failed"
             label = "自动核验已完成" if material_pending else "技术故障" if failed else "自动评审已完成"
-            action = ("核对所列材料及候选原页后继续本次评审" if material_pending
-                      else "恢复本次运行，继续执行未完成项")
+            action = ("查看自动核验结果" if material_pending
+                      else "查看自动评审结果")
             question = {
                 "kind": ("material_review_pending" if material_pending
                          else "execution_failed" if failed else "automatic_incomplete"),
                 "severity": "high" if failed else "medium",
                 "label": label,
                 "action": action,
-                "machine_message": str(meta.get("error") or (score.ai_reasoning if score else "尚未产生评审记录") or "尚未形成有效终态"),
+                "machine_message": ("自动核验已完成，已按当前材料形成最终结果" if material_pending else str(meta.get("error") or (score.ai_reasoning if score else "尚未产生评审记录") or "自动评审已完成")),
                 "bidder": bidder.get("name") or str(bidder["id"]),
                 "bidder_id": key[0], "score_id": score.id if score else None,
                 "code": crit.get("code"), "criterion": crit.get("name"),
