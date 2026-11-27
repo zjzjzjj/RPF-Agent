@@ -796,7 +796,21 @@ def score_sample_materials(
                 continue
         usable.append(window)
     if not usable:
-        return None
+        # 样品图片分散在多份附件/多个章节时，标题窗口定位不到不等于没有样品；
+        # 全页只统计图像型样品页，避免把“样品要求”正文误当样品。
+        all_sample_pages = [page for page in pages if _sample_material(page)]
+        if not all_sample_pages:
+            return None
+        maximum = _decimal(criterion.get("max_score")) or Decimal(0)
+        share = _sample_share(len(all_sample_pages))
+        score = (maximum * share).quantize(Decimal("0.01"))
+        return PresenceResult(
+            state="present", score=score,
+            detail=(f"按样品材料数量档位自动评分（质量未核验，最终以样品评审专家分为准）："
+                    f"全页统计样品材料页 {len(all_sample_pages)} 页，按 {int(share * 100)}% 计 {score} 分。"),
+            windows=[], material_pages=_material_page_dicts(all_sample_pages),
+            reason_code="sample_volume_global",
+        )
     best: tuple[int, LocatedWindow, list[dict]] | None = None
     for window in usable:
         win_pages = _window_pages(window, groups)
