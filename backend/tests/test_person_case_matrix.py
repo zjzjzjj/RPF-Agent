@@ -87,3 +87,25 @@ def test_expected_person_targets_match_manual_fixture():
     assert expected["c48"] == ["0", "4", "0", "2", "4"]
     assert expected["c49"] == ["0", "6", "0", "3", "6"]
 
+
+
+def test_person_proof_name_mismatch_is_binding_gap_not_absence():
+    """P1-②（2026-11-28）：人员证明存在但姓名对不上=绑定缺口，不得锁
+    confirmed_absent 0（结论 0 绕过 VL 翻案救不回；run195 c49 咏数
+    "未检出个人经验证明" 人工 3→AI 0）。交回 fallback→暂定+续跑/VL 翻案。"""
+    pages = [
+        {"document_id": 1, "page_no": 1,
+         "text": "项目团队人员情况表 姓名 王五 驻场运维工程师"},
+        {"document_id": 1, "page_no": 2,
+         "text": "项目经验 证明材料 某运维项目 合同复印件 李四 投标人：某公司（盖单位公章）"},
+    ]
+    records = [
+        ContractRecord(name="某运维项目运维服务", amount_yuan=Decimal("800000"),
+                       source="person_proof", pages=[2],
+                       person_names=["李四"],
+                       person_proofs={"李四": {"name_reflected": True, "work_proof": True,
+                                              "experience_proof": True, "social_security": True}}),
+    ]
+    persons = [PersonRecord(name="王五", role="驻场运维工程师", social_security=True)]
+    inventory = _inventory(records, persons, pages)
+    assert rescore_from_merged_facts(C49, inventory) is None

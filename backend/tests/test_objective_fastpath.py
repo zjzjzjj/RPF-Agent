@@ -445,3 +445,27 @@ def test_p14_special_certs_requires_electric_and_climbing_pair():
     assert result is not None
     assert result.score == Decimal("1.00"), "只数电工+登高两证齐全者"
     assert "杨育贵" in result.detail
+
+
+def test_leader_case_count_plan_defers_to_llm():
+    """P1（2026-11-28）c48 路由修复：负责人**案例计数**项（"每提供一个案例得
+    2分"）不得进年限档引擎——空档表曾把案例计分锁成 confirmed_absent 0
+    （run195 c48 海晟 人工 4→AI 0）；真年限档规则仍走 leader_experience。"""
+    case_count_rule = {
+        "code": "c48", "name": "项目团队—项目负责人业绩",
+        "score_type": "count", "max_score": "4",
+        "description": "项目负责人具有五年及以上工作经验且作为项目负责人具有类似系统运维项目的"
+                       "实施/服务经验的，每提供一个案例得2分，最高得4分。"
+                       "【证明材料】业绩证明复印件并加盖投标人公章。",
+        "params": {"field": "performance", "person_scope": "leader",
+                   "per_item": "2", "max_items": 2},
+    }
+    assert build_objective_plan(case_count_rule) is None
+    year_tier_rule = {
+        "code": "cX", "name": "项目负责人经验年限",
+        "score_type": "count", "max_score": "4",
+        "description": "项目负责人具有类似项目经验 5 年以上得 4 分。",
+        "params": {"field": "performance", "person_scope": "leader",
+                   "per_item": "2", "max_items": 2},
+    }
+    assert build_objective_plan(year_tier_rule).kind == "leader_experience"

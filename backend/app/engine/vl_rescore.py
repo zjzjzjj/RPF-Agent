@@ -479,10 +479,32 @@ def _rescore_person_cases(criterion: dict, inventory: MaterialInventory,
     cases = [c for c in cases if c.get("name")]
     if not cases:
         proof_names = {
-            name for record in inventory.contracts if record.source == "person_proof"
+            "".join(name.split()).lower()
+            for record in inventory.contracts if record.source == "person_proof"
             for name in record.person_proofs
         }
-        if people and not (set(people) & {"".join(name.split()).lower() for name in proof_names}):
+        people_names = {"".join(str(name or "").split()).lower() for name in people}
+        if people and not (people_names & proof_names):
+            # P1-②（2026-11-28）：「未检出个人经验证明」≠「确认没有」——
+            # 人员证明存在但姓名对不上=绑定缺口；人员页缺失/不可读=读取缺口。
+            # 两类缺口不得锁 confirmed_absent（结论 0 绕过 VL 翻案救不回），
+            # 交回 fallback → 暂定+续跑 / VL 翻案（只升不降）。只有人员页齐读
+            # 且全文确无任何个人证明记录时才按细则"未提供的不得分"结 0。
+            if proof_names:
+                return None
+            page_text_by_no = {
+                int(p.get("page_no") or 0): str(p.get("text") or "")
+                for p in inventory.pages
+            }
+            person_page_nos: set[int] = set()
+            for person in people.values():
+                person_page_nos.update(int(no or 0) for no in (person.pages or []))
+                for page in inventory.pages:
+                    if person.name and person.name in str(page.get("text") or ""):
+                        person_page_nos.add(int(page.get("page_no") or 0))
+            if not person_page_nos or any(
+                    not page_text_by_no.get(no, "").strip() for no in person_page_nos):
+                return None
             return FastPathResult(
                 score=Decimal("0.00"),
                 detail="已定位项目团队人员，但未检出满足细则的个人类似项目经验证明；合计 0.00 分",

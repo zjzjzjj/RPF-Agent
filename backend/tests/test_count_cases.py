@@ -1735,3 +1735,20 @@ def test_score_count_counted_but_zero_not_confirmed_absent() -> None:
     assert res.zero_reason == "cases_unverified"
     assert res.conflict is True
     assert "非确认未提供" in res.detail
+
+
+def test_score_count_confirmed_missing_with_visible_pages_still_zero(monkeypatch) -> None:  # noqa: ANN001
+    """P0-B（2026-11-28）：给了案例原页≠给了点名材料——三态 False（可读确认缺）
+    不得降级成"未核实计入"（run205 c43 咏数 +4/小河流 +2 放水；人工评语
+    "无验收报告"→0；细则"未提供的不得分"）。legacy 回滚开关开也不行。"""
+    from app.engine.objective import score_count
+
+    monkeypatch.setenv("BID_EVAL_CASE_UNVERIFIED_COUNT", "1")
+    facts = BidFacts(text="")
+    crit = _count_crit(verified_cases=[
+        {"name": "A", "role": "member", "work_proof": False,
+         "quote": "2023年6月签订合同，金额80万元", "sanitized": "ok", "table_page": 5},
+    ])
+    result = score_count(crit, crit["params"], facts)
+    assert result.score == Decimal("0")
+    assert result.conflict is True

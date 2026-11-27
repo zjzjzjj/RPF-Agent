@@ -1903,17 +1903,13 @@ def score_count(criterion: dict, params: dict, facts: BidFacts) -> CountResult:
             )
             for c in cases:
                 vals = {k: c.get(k) for k in required_flags}
-                if any(v is False for v in vals.values()) and not _case_visible_source(c):
-                    dropped_false += 1  # 确认缺失且无原页锚点 → 不计（规则硬口径）
-                    continue
-                if any(v is False for v in vals.values()) and _case_visible_source(c):
-                    # 已给原页但材料标签未绑定：按全自动口径计入并标疑问，
-                    # 不能把“材料没绑上”当成“确实没有材料”。
-                    c["unverified"] = True
-                    c["unverified_reason"] = _unverified_reason_of(c, required_flags)
-                    unverified_pool.append(c)
-                    unverified_counted += 1
-                    conflict = True
+                if any(v is False for v in vals.values()):
+                    # 确认缺失（三态 False=可读确认缺）→ 不计（细则"未提供的
+                    # 不得分"硬口径，run159 红线：False→0 不放宽）。
+                    # P0-B（2026-11-28）："给了案例原页"≠"给了点名材料"，不得
+                    # 降级成未核实计入；"材料没绑上"的双向防线由三态 None +
+                    # VL 翻案（只升不降）承担，不由 False 分支承担。
+                    dropped_false += 1
                     continue
                 if all(v is True for v in vals.values()):
                     complete.append(c)  # 全部确认 → 计

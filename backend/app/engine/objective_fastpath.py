@@ -170,6 +170,19 @@ def build_objective_plan(criterion: dict) -> ObjectivePlan | None:
         # 才回退到逐案例 LLM，避免公司合同金额桶吞掉项目经理经验项。
         if (params.get("person_scope") == "leader"
                 or re.search(r"项目负责人|项目经理|项目总监|技术负责人|总负责人", name)):
+            # P1（2026-11-28）c48 路由修复：负责人项有两种形态——年限档
+            # （"N年以上…得X分"）归 leader_experience；**案例计数**（"每提供
+            # 一个案例得X分"+per_item/max_items）必须落 LLM+vl_rescore
+            # （_rescore_person_cases 对 c48/c49 已证正确），否则年限档空表把
+            # 案例计分项锁成 confirmed_absent 0（run195 c48 海晟 人工 4→AI 0）。
+            if re.search(r"每\s*(?:提供\s*)?(?:一\s*)?个\s*案例|每个案例|每人[^。；]{0,12}?案例",
+                         expanded):
+                return None
+            if (params.get("per_item") and params.get("max_items")
+                    and not re.search(
+                        r"[一二两三四五六七八九十\d]+\s*年(?:以上|及以上|或以上)?[^。；]{0,25}?得\s*\d+(?:\.\d+)?\s*分",
+                        text)):
+                return None
             return ObjectivePlan("leader_experience", params)
         if params.get("person_scope") or _PERSON_SUBJECT_KW.search(name):
             return None
@@ -376,9 +389,14 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
                 materials.setdefault(kind, [])
                 materials[kind] = sorted(set(materials[kind]) | set(hits))
             elif (record.source != "table" and has_block_text
-                    and state.get(kind) is not True):
+                    and state.get(kind) is not True
+                    and state.get("_case_block_complete")):
                 # 文本抽取常把合同正文里的“发票/验收”条款误当附件标题；
                 # 没有明确材料页标题时不得据此证明材料存在。
+                # P0-B（2026-11-28）tri-state 诚实化：只有案例块完整可读
+                # （_case_block_complete）时"块内无材料标题"才够格判确认缺
+                # （False）；否则保持 None（未核实）→ 严口径剔除 + VL 翻案，
+                # 防 OCR/抽取漏标题造误杀（confirmed_absent 是结论 0，翻案救不回）。
                 state[kind] = False
                 materials.pop(kind, None)
         record.materials_state = state
@@ -460,9 +478,9 @@ def _score_contracts(criterion: dict, inventory: MaterialInventory) -> FastPathR
                         f"{'/'.join(escalated)}目录列有材料页但绑定未闭合")
                     guard_escalated = True
                     missing = [m for m in missing if m not in escalated]
-            if missing and record.pages and _config.case_unverified_count_enabled():
-                record_unverified.append(f"{'/'.join(missing)}未绑定/未核验，已提供原页按全自动口径计分")
-                missing = []
+            # P0-B（2026-11-28）：删「已提供原页→清 missing」放宽分支——
+            # "提供了案例页"≠"提供了点名材料"，确认缺失（三态 False）不得清成
+            # 未核实（run159 红线：False→0；细则"未提供的不得分"）。
             if missing:
                 rejected.append(f"{record.name}（缺{'/'.join(missing)}，细则：未提供的不得分）")
                 continue
@@ -611,6 +629,14 @@ def _leader_experience_score(criterion: dict, inventory: MaterialInventory) -> F
         years_value = cn.get(years, years)
         tiers.append((Decimal(str(years_value)), Decimal(score)))
     tiers.sort(reverse=True)
+    if not tiers:
+        # P1（2026-11-28）护栏：规则文本解析不出任何年限档（案例计数形态误入
+        # 本引擎等）→ 不给结论分，更不得锁 confirmed_absent 0（结论 0 绕过
+        # VL 翻案救不回）；交回 LLM/vl_rescore 逐案例路径。
+        return FastPathResult(
+            Decimal(0), "规则未解析出可执行的年限档，转逐案例核验", "concern",
+            {}, [], zero_reason="no_facts", complete=False, confidence="low",
+        )
     leader_re = re.compile(r"项目负责人|项目经理|项目总监|技术负责人|总负责人")
     related_re = re.compile(r"会议|多媒体|音视频|显示|扩声|大屏|音控")
     candidates = []
