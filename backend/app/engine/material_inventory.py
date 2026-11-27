@@ -1466,24 +1466,24 @@ def _overlay_social_security(persons: list[PersonRecord], pages: list[dict]) -> 
 # ---------------------------------------------------------------------------
 _RE_VALUE_HEADING = re.compile(
     r"^\s*(?:[（(]?\d+(?:\.\d+)*[）)]?|[一二三四五六七八九十]+[、.])?\s*"
-    r"增值服务(?:方案|承诺|清单)?\s*$", re.M,
+    r"(?:我司承诺)?(?:提供)?[^\n]{0,24}增值服务(?:方案|承诺|清单)?(?:如下)?\s*[:：]?$", re.M,
 )
 _RE_VALUE_NUMBERED = re.compile(r"^\s*\d{1,2}\s*、\s*([^\n]{2,40})\s*$", re.M)
 _RE_VALUE_CHINESE = re.compile(r"^\s*[一二三四五六七八九十]+\s*、\s*([^\n]{2,40})\s*$", re.M)
 _RE_VALUE_LETTER = re.compile(r"^\s*[A-DＡ-Ｄ]\s*[)）.、]\s*([^\n]{2,40})\s*$", re.M)
 _RE_VALUE_SUBHEADING = re.compile(
-    r"^\s*\d+(?:\.\d+){2,}\s+([^\n]{2,50}(?:增值|服务|保障|支持|优化|监控|"
+    r"^\s*\d+(?:\.\d+)+\s+([^\n]{2,50}(?:增值|服务|保障|支持|优化|监控|"
     r"备件|维修|节能|协同|集成|报告|平台|系统)[^\n]{0,20})\s*$", re.M,
 )
 _RE_VALUE_EXCLUDE = (
     "清单", "如下", "包括", "投标人", "中标人", "如不能", "得分",
-    "页", "见投标文件", "人员", "员工", "核心目标", "方案框架", "增值服务",
+    "页", "见投标文件", "人员", "员工", "驻场", "核心目标", "方案框架", "增值服务",
 )
-_RE_VALUE_COMMITMENT = re.compile(r"增值服务\s*(?:承诺函|实施方案)|2\.\d+(?:\.\d+)*\s*增值服务")
+_RE_VALUE_COMMITMENT = re.compile(r"增值服务\s*(?:承诺函|实施方案|如下|清单)|2\.\d+(?:\.\d+)*\s*增值服务")
 _RE_VALUE_RULE_PAGE = re.compile(r"每提供一项.{0,20}得\s*\d|最高不超过\s*\d+\s*分|【证明材料】")
 _RE_VALUE_EXTRA = re.compile(r"增加|额外|再增加|延长|补充|免费|新增")
 _RE_VALUE_CONCRETE = re.compile(
-    r"人员|工程师|支持|服务期|月|培训|名额|备件|巡检|保障|加固|优化|咨询|服务"
+    r"人员|工程师|支持|服务期|月|培训|名额|备件|巡检|保障|加固|优化|咨询|服务|检查|检测|升级|租赁|建议"
 )
 _RE_VALUE_STANDARD = re.compile(
     r"故障|SLA|响应时间|解决时间|本地化响应|到场机制|培训|业务共创|成本|效率|管理成本|价值"
@@ -1494,6 +1494,9 @@ _RE_VALUE_CATEGORIES = (
     ("extra_training", re.compile(r"(?:额外|增加|补充).{0,12}(?:培训|名额)")),
     ("priority_support", re.compile(r"重保|高峰保障|高并发")),
     ("security", re.compile(r"数据安全|安全加固")),
+    ("maintenance_check", re.compile(r"健康检查|设备检查|检测|巡检|寿命检测")),
+    ("optimization_advice", re.compile(r"优化建议|采购建议|布局建议|降本增效")),
+    ("equipment_rental", re.compile(r"设备租赁|租赁服务|临时增加")),
 )
 _RE_VALUE_ORDINARY = re.compile(
     r"驻场服务|电话支持|远程服务|本地(?:化)?响应|到场机制|故障(?:SLA|响应)|"
@@ -1541,8 +1544,11 @@ def _value_items_from_pages(pages: list[dict]) -> tuple[list[ValueItem], bool]:
             page_no = int(candidate.get("page_no") or 0)
             regions = [candidate_text]
             if _RE_VALUE_COMMITMENT.search(candidate_text):
-                commitment = candidate_text.split("增值服务承诺函", 1)[-1]
-                commitment = commitment.split("增值服务实施方案", 1)[0]
+                commitment = candidate_text
+                for marker in ("增值服务承诺函", "增值服务实施方案", "增值服务如下", "增值服务清单"):
+                    if marker in commitment:
+                        commitment = commitment.split(marker, 1)[-1]
+                        break
                 commitment = commitment.split("特此承诺", 1)[0]
                 regions = [commitment]
             for region in regions:
@@ -1621,9 +1627,22 @@ def build_inventory(bidder_id: int, pages: list[dict]) -> MaterialInventory:
             # names for the same agreement.  Same amount + overlapping pages is
             # one contract; distinct yearly contracts have disjoint page blocks.
             for existing in deduped.values():
+                same_identity = (
+                    re.sub(r"\s+", "", existing.name) == re.sub(r"\s+", "", record.name)
+                    or not re.sub(r"\s+", "", existing.name)
+                    or not re.sub(r"\s+", "", record.name)
+                )
+                same_period = (
+                    not existing.period or not record.period
+                    or existing.period == record.period
+                ) and (
+                    not existing.signed_date or not record.signed_date
+                    or existing.signed_date == record.signed_date
+                )
                 if (record.amount_yuan is not None
                         and existing.amount_yuan == record.amount_yuan
-                        and set(record.pages) & set(existing.pages)):
+                        and set(record.pages) & set(existing.pages)
+                        and same_identity and same_period):
                     current = existing
                     break
             if current is None:

@@ -2032,6 +2032,10 @@ def calibrate_objective_scores(run_id: int) -> int:
                 continue
             category = criterion.category
             side = "subjective" if row.score_type == "subjective" else "objective"
+            if side != "subjective":
+                # 确定性客观项以规则/证据链为准，不用历史项目偏差回写；
+                # 12项目校准只对主观比例做有限修正。
+                continue
             key = f"{category}_{side}"
             if key not in biases and category not in biases:
                 continue

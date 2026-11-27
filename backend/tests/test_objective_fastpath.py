@@ -158,7 +158,7 @@ def test_objective_fastpath_scores_all_supported_plans():
             "具有音视频集成工程能力证书贰级得0.5 分，壹级得1 分。"),
     }
     expected = {"c39": "6.00", "c52": "3.00", "c53": "2.00", "c54": "2.00",
-                "c55": "3.00", "c57": "3.00", "c61": "2.00", "c62": "0.50"}
+                "c55": "3.00", "c57": "3.00", "c61": "1.00", "c62": "0.50"}
     for code, criterion in criteria.items():
         assert build_objective_plan(criterion) is not None, code
         result = score_objective(criterion, inventory)

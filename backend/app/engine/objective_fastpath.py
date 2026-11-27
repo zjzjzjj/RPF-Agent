@@ -911,12 +911,13 @@ def _platform_query_families(inventory: MaterialInventory) -> set[str]:
 def _query_screenshot_proof_present(inventory: MaterialInventory) -> bool:
     """只认实际查询截图/平台详情页，不把证书上的‘可查询’免责声明当截图。"""
     for page in inventory.pages:
-        text = re.sub(r"\s+", "", str(page.get("text") or ""))
+        raw = str(page.get("text") or "")
+        text = re.sub(r"\s+", "", raw)
+        if _is_platform_detail_page(raw):
+            return True
         if re.search(r"附[^。；\n]{0,20}(?:认证认可信息公共服务平台|住建部|建筑市场监管|音视频)[^。；\n]{0,20}查询截图", text):
             return True
-        if _is_platform_detail_page(str(page.get("text") or "")):
-            return True
-        if re.search(r"(?:认证认可信息公共服务平台|cx\.cnca\.cn)[^。；\n]{0,30}查询截图", text):
+        if re.search(r"(?:认证认可信息公共服务平台|cx\.cnca\.cn|住建部|建筑市场监管|音视频)[^。；\n]{0,30}查询截图", text):
             return True
     return False
 
@@ -964,7 +965,7 @@ def _cert_count_tier_score(criterion: dict, inventory: MaterialInventory) -> Fas
             grouped_count += 1
         if any(k in keys for k in ("ISO14001", "ISO45001", "环境管理体系", "职业健康安全管理体系", "GBT24001", "GBT45001")):
             grouped_count += 1
-        if any(k in keys or "信息技术服务" in k for k in keys):
+        if any(k in ("ITSERVICE", "ISO20000") or "信息技术服务" in k for k in keys):
             grouped_count += 1
     score = Decimal(0)
     for minimum in sorted(tiers):
@@ -1005,7 +1006,7 @@ def _cert_level_sum_score(criterion: dict, inventory: MaterialInventory) -> Fast
                 value = Decimal(1)
             elif level == "二级":
                 value = Decimal("0.5")
-        elif "音视频集成" in name:
+        elif "音视频" in name and ("集成" in name or "系统" in name):
             family = "音视频集成工程能力"
             if level == "一级":
                 value = Decimal(1)
