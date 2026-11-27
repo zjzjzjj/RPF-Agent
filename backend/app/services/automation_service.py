@@ -400,7 +400,11 @@ def _valid_cell(score: ScoreRecord, criterion: dict, citations: list[EvidenceCit
         return False
     if scoring:
         try:
-            value = Decimal(str(score.final_score))
+            from app.services.automation_service import settled_fallback_score
+            resolved_score = score.final_score
+            if resolved_score is None:
+                resolved_score = settled_fallback_score(score)
+            value = Decimal(str(resolved_score))
             maximum = Decimal(str(criterion.get("max_score")))
         except (InvalidOperation, TypeError, ValueError):
             return False
