@@ -1191,11 +1191,12 @@ def date_window_from_rule(text: str) -> tuple[str | None, str | None]:
     "2022年1月1日起签订" → 同上；"…至2024年12月31日" → 补终点。
     只认细则明示日期（不对项目答案拟合）。
     """
-    m = _RE_DATE_START.search(text or "")
+    text = re.sub(r"\s+", "", text or "")
+    m = _RE_DATE_START.search(text)
     if not m:
         return None, None
     start = f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
-    m2 = _RE_DATE_END.search(text or "")
+    m2 = _RE_DATE_END.search(text)
     end = (f"{int(m2.group(1)):04d}-{int(m2.group(2)):02d}-{int(m2.group(3)):02d}"
            if m2 else None)
     return start, end

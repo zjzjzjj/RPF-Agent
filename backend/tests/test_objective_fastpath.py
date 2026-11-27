@@ -45,6 +45,8 @@ def _pages():
          "text": "环境管理体系认证证书\n环境管理体系符合GB/T24001-2016/ISO14001:2015标准\n"},
         {"document_id": 1, "page_no": 40, "source": "text",
          "text": "职业健康安全管理体系认证证书\n职业健康安全管理体系符合GB/T45001-2020/ISO45001:2018标准\n"},
+        {"document_id": 1, "page_no": 41, "source": "text",
+         "text": "附 全国认证认可信息公共服务平台查询截图\n"},
         {"document_id": 1, "page_no": 42, "source": "text",
          "text": "资质类别及等级：\n电子与智能化工程专业承包贰级\n"},
     ])

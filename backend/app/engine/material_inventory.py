@@ -706,7 +706,10 @@ def maturity_certificate_details(pages: list[dict], visual_records: list[dict] |
 
 def requires_platform_certificate_query(criterion: dict) -> bool:
     rule = "\n".join(str(criterion.get(key) or "") for key in
-                     ("required_evidence", "description", "source_quote"))
+                     ("required_evidence", "description", "source_quote", "name"))
+    if (re.search(r"资质实力[（(]1[）)]|体系认证", rule)
+            and re.search(r"ISO\s*(?:/IEC\s*)?\d|质量管理体系", rule, re.I)):
+        return True
     return bool(re.search(r"cx\.cnca\.cn|认证认可信息公共服务平台", rule, re.I)
                 and "截图" in rule and re.search(r"ISO\s*(?:/IEC\s*)?\d", rule, re.I))
 
@@ -1639,10 +1642,15 @@ def build_inventory(bidder_id: int, pages: list[dict]) -> MaterialInventory:
                     not existing.signed_date or not record.signed_date
                     or existing.signed_date == record.signed_date
                 )
-                if (record.amount_yuan is not None
-                        and existing.amount_yuan == record.amount_yuan
-                        and set(record.pages) & set(existing.pages)
-                        and same_identity and same_period):
+                overlapping = bool(set(record.pages) & set(existing.pages))
+                same_named_overlap = (
+                    same_identity and overlapping
+                    and re.sub(r"\s+", "", existing.name) == re.sub(r"\s+", "", record.name)
+                )
+                if ((record.amount_yuan is not None
+                     and existing.amount_yuan == record.amount_yuan
+                     and overlapping and same_identity and same_period)
+                        or same_named_overlap):
                     current = existing
                     break
             if current is None:
